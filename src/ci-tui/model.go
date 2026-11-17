@@ -549,6 +549,11 @@ func (m model) viewFooter() string {
 	if m.notice != "" {
 		text += "  " + styleWarn.Render(m.notice)
 	}
+	// Версия сборки - в правом нижнем углу; не помещается - не показывается.
+	ver := styleHelp.Render("ci " + version + " ")
+	if gap := m.width - lipgloss.Width(text) - lipgloss.Width(ver); gap >= 2 {
+		text += strings.Repeat(" ", gap) + ver
+	}
 	return text
 }
 
