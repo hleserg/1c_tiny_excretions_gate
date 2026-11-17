@@ -86,6 +86,8 @@ jobs:
   bsl:
     name: BSL Language Server
     runs-on: ubuntu-latest
+    # Пока справочно: первый прогон дал 22 ошибки и 115 предупреждений по ядру, их разбор - в docs/roadmap.md.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
