@@ -504,7 +504,8 @@ $tests = @(
                 Check (Test-Path -LiteralPath $diffFile) 'нет файла разницы снимков'
                 if (Test-Path -LiteralPath $diffFile) {
                     $diff = [System.IO.File]::ReadAllText($diffFile, $utf8)
-                    Check ($diff.Contains('- <Сумма>100</Сумма>') -and $diff.Contains('+ <Сумма>120</Сумма>')) ("в разнице нет изменённой суммы: {0}" -f $diff)
+                    # Строки разницы - с отступами разложенного XML: «-       <Сумма>100</Сумма>».
+                    Check ($diff -match '(?m)^- +<Сумма>100</Сумма>' -and $diff -match '(?m)^\+ +<Сумма>120</Сумма>') ("в разнице нет изменённой суммы: {0}" -f $diff)
                     Check (-not $diff.Contains('CreationDate') -and -not $diff.Contains('MessageNo')) 'в разнице поля заголовка, которые меняются сами по себе'
                 }
                 $reference = @(Get-ChildItem -LiteralPath (Join-Path $sb 'baseline') -Recurse -Filter 'selfcheck.snapshots.txt' -File)

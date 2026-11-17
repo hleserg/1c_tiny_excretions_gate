@@ -107,6 +107,8 @@ jobs:
         run: |
           gh release download --repo 1c-syntax/bsl-language-server --pattern '*-exec.jar' --output bsl-ls.jar
           set -o pipefail
+          # Отчёт json BSL LS пишет в готовую папку: сам он её не создаёт.
+          mkdir -p bsl-report
           java -jar bsl-ls.jar --analyze --srcDir bsl-src --outputDir bsl-report --reporter console --reporter json | tee bsl-console.txt
       - uses: actions/upload-artifact@v4
         if: always()
