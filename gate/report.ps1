@@ -652,6 +652,29 @@ if (Test-Path -LiteralPath $snapshotDiffFile) {
     }
 }
 
+# Карта покрытия: новое непокрытое - доработки, которых самопроверка не задевает.
+$coverageNewFile = Join-Path $RunDir 'coverage.new.txt'
+if (Test-Path -LiteralPath $coverageNewFile) {
+    $coverageNew = @([System.IO.File]::ReadAllLines($coverageNewFile, [System.Text.Encoding]::UTF8) | ForEach-Object { $_.TrimStart([char]0xFEFF) } | Where-Object { $_ })
+    if ($coverageNew.Count -gt 0) {
+        $comparedSomething = $true
+        $body.Add(("== Карта покрытия: нового непокрытого {0}" -f $coverageNew.Count))
+        $summary.Add(("[ЖЁЛТ] Карта покрытия: нового непокрытого {0} - доработки, которых самопроверка не задевает" -f $coverageNew.Count))
+        $number = 0
+        foreach ($line in $coverageNew) {
+            $number++
+            $parts = $line.Split("`t")
+            $levelText = 'не покрыто'
+            if ($parts[0] -eq 'compiled') { $levelText = 'только компиляция' }
+            $text = $line
+            if ($parts.Count -ge 3) { $text = $parts[2] }
+            $body.Add(("  {0}. [{1}] {2}" -f $number, $levelText, (Format-Short $text 220)))
+        }
+        $body.Add('  Что делать: проверить эти доработки руками на temp или добавить их объекты в проверки пакета (документы для операций и перепроведения). Принять как известное - ключом -AcceptBaseline. Вся карта - coverage.txt.')
+        $body.Add('')
+    }
+}
+
 # Расширения между самопроверками до и после загрузки.
 $extBefore = @(Read-InfoValues (Join-Path $RunDir 'selfcheck-before\try1\info.txt') 'ext')
 $extAfter = @(Read-InfoValues (Join-Path $RunDir 'selfcheck-after\try1\info.txt') 'ext')

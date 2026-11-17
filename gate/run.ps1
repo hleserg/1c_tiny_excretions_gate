@@ -801,6 +801,229 @@ function Read-SelfCheckSnapshots {
     return $result
 }
 
+#region Карта покрытия
+
+# Папки выгрузки расширения -> вид объекта метаданных, как он пишется в полном имени (Документ.Х).
+$CoverageTypeNames = @{
+    Catalogs = 'Справочник'; Documents = 'Документ'; CommonModules = 'ОбщийМодуль'; DataProcessors = 'Обработка'
+    Reports = 'Отчет'; InformationRegisters = 'РегистрСведений'; AccumulationRegisters = 'РегистрНакопления'
+    AccountingRegisters = 'РегистрБухгалтерии'; CalculationRegisters = 'РегистрРасчета'; Enums = 'Перечисление'
+    CommonForms = 'ОбщаяФорма'; Constants = 'Константа'; ChartsOfCharacteristicTypes = 'ПланВидовХарактеристик'
+    ChartsOfAccounts = 'ПланСчетов'; ExchangePlans = 'ПланОбмена'; BusinessProcesses = 'БизнесПроцесс'; Tasks = 'Задача'
+    DocumentJournals = 'ЖурналДокументов'; CommonCommands = 'ОбщаяКоманда'; HTTPServices = 'HTTPСервис'; WebServices = 'WebСервис'
+}
+# Тип источника подписки (DocumentObject.Х) -> вид объекта.
+$CoverageSourceTypes = @{
+    DocumentObject = 'Документ'; CatalogObject = 'Справочник'; InformationRegisterRecordSet = 'РегистрСведений'
+    AccumulationRegisterRecordSet = 'РегистрНакопления'; AccountingRegisterRecordSet = 'РегистрБухгалтерии'
+    ChartOfCharacteristicTypesObject = 'ПланВидовХарактеристик'; ExchangePlanObject = 'ПланОбмена'
+    BusinessProcessObject = 'БизнесПроцесс'; TaskObject = 'Задача'; DocumentManager = 'Документ'; CatalogManager = 'Справочник'
+}
+$CoverageObjectRegex = New-Object System.Text.RegularExpressions.Regex('(Документ|Справочник|РегистрСведений|РегистрНакопления|РегистрБухгалтерии|ПланВидовХарактеристик|ПланОбмена|БизнесПроцесс|Задача|Обработка|Отчет)\.[\wА-Яа-яЁё]+')
+
+function Get-CoverageItems {
+    # Что добавило расширение - по его выгрузке в файлы. Элемент: Key (для сравнения прогонов), Kind, Text,
+    # Objects (объекты метаданных, через которые его можно задеть), Module (общий модуль: только компиляция).
+    # Перехваты методов (&Перед, &После, &Вместо, &ИзменениеИКонтроль) - по тексту модулей; формы - модуль формы;
+    # подписки на события и регламентные задания - по описанию; свои (не заимствованные) документы и справочники.
+    param([string]$Dir, [string]$Extension)
+    $items = New-Object System.Collections.Generic.List[object]
+    if (-not (Test-Path -LiteralPath $Dir)) { return , $items.ToArray() }
+    $prefixLength = (Resolve-Path -LiteralPath $Dir).ProviderPath.TrimEnd('\', '/').Length + 1
+    $annotationRegex = New-Object System.Text.RegularExpressions.Regex('^\s*&(Перед|После|Вместо|ИзменениеИКонтроль)\s*\(\s*"([^"]+)"')
+    foreach ($file in @(Get-ChildItem -LiteralPath $Dir -Recurse -File)) {
+        $relative = $file.FullName.Substring($prefixLength).Replace('\', '/')
+        $parts = $relative.Split('/')
+        if ($parts.Count -lt 2 -or -not $CoverageTypeNames.ContainsKey($parts[0])) { continue }
+        $typeName = $CoverageTypeNames[$parts[0]]
+        $name = $parts[1]
+        if ($name.EndsWith('.xml')) { $name = $name.Substring(0, $name.Length - 4) }
+        $object = '{0}.{1}' -f $typeName, $name
+        $rest = ''
+        if ($parts.Count -gt 2) { $rest = ($parts[2..($parts.Count - 1)] -join '/') }
+
+        if ($relative.EndsWith('.bsl')) {
+            $part = $rest
+            $formName = ''
+            if ($rest -eq 'Ext/ObjectModule.bsl') { $part = 'модуль объекта' }
+            elseif ($rest -eq 'Ext/ManagerModule.bsl') { $part = 'модуль менеджера' }
+            elseif ($rest -eq 'Ext/RecordSetModule.bsl') { $part = 'модуль набора записей' }
+            elseif ($rest -eq 'Ext/Module.bsl') { $part = 'модуль' }
+            elseif ($rest -match '^Forms/([^/]+)/Ext/Form/Module\.bsl$') { $formName = $Matches[1]; $part = 'форма ' + $formName }
+            elseif ($rest -match '^Ext/Form/Module\.bsl$') { $formName = $name; $part = 'форма' }
+            $module = ''
+            if ($typeName -eq 'ОбщийМодуль') { $module = $name }
+            $lines = @([System.IO.File]::ReadAllLines($file.FullName, [System.Text.Encoding]::UTF8))
+            $intercepts = 0
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+                $found = $annotationRegex.Match($lines[$i])
+                if (-not $found.Success) { continue }
+                $intercepts++
+                $items.Add([pscustomobject]@{
+                        Key = ('перехват|{0}|{1}|{2}|{3}' -f $Extension, $object, $part, $found.Groups[2].Value)
+                        Kind = 'перехват'; Text = ('{0}, {1}: &{2}("{3}")' -f $object, $part, $found.Groups[1].Value, $found.Groups[2].Value)
+                        Objects = @($object); Module = $module
+                    })
+            }
+            if ($formName -and $intercepts -eq 0) {
+                # Модуль формы без перехватов: свои обработчики событий формы.
+                $items.Add([pscustomobject]@{
+                        Key = ('форма|{0}|{1}|{2}' -f $Extension, $object, $formName); Kind = 'форма'
+                        Text = ('{0}, {1}: свои обработчики' -f $object, $part); Objects = @($object); Module = ''
+                    })
+            }
+            continue
+        }
+        if ($rest -ne '') { continue }
+        # Файл описания объекта (<Вид>/<Имя>.xml).
+        $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
+        if ($parts[0] -eq 'Documents' -or $parts[0] -eq 'Catalogs' -or $parts[0] -like '*Registers') {
+            if ($text -notmatch '<ObjectBelonging>\s*Adopted\s*</ObjectBelonging>') {
+                $items.Add([pscustomobject]@{
+                        Key = ('объект|{0}|{1}' -f $Extension, $object); Kind = 'объект'
+                        Text = ('{0}: новый объект расширения' -f $object); Objects = @($object); Module = ''
+                    })
+            }
+        }
+    }
+    # Подписки на события и регламентные задания: в выгрузке это EventSubscriptions/<Имя>.xml и ScheduledJobs/<Имя>.xml.
+    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $Dir 'EventSubscriptions') -Filter '*.xml' -File -ErrorAction SilentlyContinue)) {
+        $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
+        $sources = New-Object System.Collections.Generic.List[string]
+        foreach ($match in [regex]::Matches($text, '<v8:Type>\s*(?:cfg:)?(\w+)\.([\wА-Яа-яЁё]+)\s*</v8:Type>')) {
+            $kind = $match.Groups[1].Value
+            if ($CoverageSourceTypes.ContainsKey($kind)) { $sources.Add(('{0}.{1}' -f $CoverageSourceTypes[$kind], $match.Groups[2].Value)) }
+        }
+        $handler = [regex]::Match($text, '<Handler>\s*([^<]+?)\s*</Handler>').Groups[1].Value
+        $subscription = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+        $sourceText = 'источники: все объекты'
+        if ($sources.Count -gt 0) { $sourceText = 'источники: ' + (@($sources | Select-Object -First 5) -join ', ') }
+        $items.Add([pscustomobject]@{
+                Key = ('подписка|{0}|{1}' -f $Extension, $subscription); Kind = 'подписка'
+                Text = ('Подписка {0} -> {1}, {2}' -f $subscription, $handler, $sourceText); Objects = $sources.ToArray(); Module = ''
+            })
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $Dir 'ScheduledJobs') -Filter '*.xml' -File -ErrorAction SilentlyContinue)) {
+        $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
+        $method = [regex]::Match($text, '<MethodName>\s*([^<]+?)\s*</MethodName>').Groups[1].Value
+        $job = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+        $items.Add([pscustomobject]@{
+                Key = ('регламентное|{0}|{1}' -f $Extension, $job); Kind = 'регламентное'
+                Text = ('Регламентное задание {0} -> {1}: самопроверка регламентные задания не выполняет' -f $job, $method); Objects = @(); Module = ''
+            })
+    }
+    return , $items.ToArray()
+}
+
+function Measure-Coverage {
+    # Чем задета каждая доработка в самопроверке. Уровни: covered - объект побывал в задании самопроверки, кроме
+    # компиляции (операции, перепроведение, формы, обмены...); compiled - общий модуль только компилируется;
+    # none - ничем не задета. Records - записи самопроверки «[ВИД] ключ :: текст».
+    param([object[]]$Items, [string[]]$Records)
+    $exercised = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $compiled = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($record in $Records) {
+        $keyMatch = [regex]::Match($record, '^\[[^\]]+\] (.*?) :: ')
+        $key = $keyMatch.Groups[1].Value
+        if ($key.StartsWith('КомпиляцияМодулей|')) {
+            foreach ($piece in $key.Split('|')) { if ($piece) { [void]$compiled.Add($piece) } }
+            foreach ($match in $CoverageObjectRegex.Matches($record)) { [void]$compiled.Add($match.Value) }
+            continue
+        }
+        foreach ($match in $CoverageObjectRegex.Matches($record)) { [void]$exercised.Add($match.Value) }
+    }
+    $result = New-Object System.Collections.Generic.List[object]
+    foreach ($item in $Items) {
+        $level = 'none'
+        foreach ($object in @($item.Objects)) { if ($exercised.Contains([string]$object)) { $level = 'covered'; break } }
+        if ($level -eq 'none' -and $item.Module -and $compiled.Contains([string]$item.Module)) { $level = 'compiled' }
+        if ($level -eq 'none') { foreach ($object in @($item.Objects)) { if ($compiled.Contains([string]$object)) { $level = 'compiled'; break } } }
+        $result.Add([pscustomobject]@{ Key = $item.Key; Kind = $item.Kind; Text = $item.Text; Level = $level })
+    }
+    return , $result.ToArray()
+}
+
+function Read-CoverageFile {
+    # Карта покрытия из файла «уровень<TAB>ключ<TAB>текст» -> таблица «ключ -> уровень». Файла нет - $null.
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $table = @{}
+    foreach ($line in [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)) {
+        $parts = $line.TrimStart([char]0xFEFF).Split("`t")
+        if ($parts.Count -ge 2) { $table[$parts[1]] = $parts[0] }
+    }
+    return $table
+}
+
+function Write-CoverageFile {
+    param([object[]]$Items, [string]$Path)
+    $lines = @($Items | Sort-Object Key | ForEach-Object { '{0}{1}{2}{1}{3}' -f $_.Level, "`t", $_.Key, $_.Text })
+    [System.IO.File]::WriteAllLines($Path, [string[]]$lines, $Utf8Bom)
+}
+
+function Invoke-CoverageStep {
+    # Шаг «Карта покрытия»: расширения из Extensions выгружаются в файлы (постоянная папка baseline\<база>\dump,
+    # повторно - только изменения), из выгрузки - что они добавили, против записей самопроверки - чем это задето.
+    # Новое непокрытое (его не было в эталоне карты или там оно было покрыто) - жёлтое. Эталон карты двигается сам,
+    # когда нового непокрытого нет, или ключом -AcceptBaseline.
+    param([string[]]$Records)
+    $stepName = 'Карта покрытия'
+    $dumpRoot = Join-Path $baselineDir 'dump'
+    $allItems = New-Object System.Collections.Generic.List[object]
+    $problems = New-Object System.Collections.Generic.List[string]
+    foreach ($extension in $knownExtensions) {
+        $extension = [string]$extension
+        $dir = Join-Path $dumpRoot $extension
+        $hasDump = Test-Path -LiteralPath (Join-Path $dir 'ConfigDumpInfo.xml')
+        $command = @('/DumpConfigToFiles', ('"{0}"' -f $dir), '-Extension', $extension)
+        if ($hasDump) { $command += '-update' } else { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $result = Invoke-Designer -Command $command -LogName ("dump_{0}.log" -f $extension) -TimeoutSec $timeoutLoadSec -Title ("Выгрузить {0} в файлы" -f $extension)
+        if ($result.ExitCode -ne 0 -and $hasDump -and -not $result.TimedOut) {
+            # Выгрузка с -update бывает недовольна прежней: заново целиком.
+            Remove-Item -LiteralPath $dir -Recurse -Force
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            $result = Invoke-Designer -Command @('/DumpConfigToFiles', ('"{0}"' -f $dir), '-Extension', $extension) `
+                -LogName ("dump_{0}_full.log" -f $extension) -TimeoutSec $timeoutLoadSec -Title ("Выгрузить {0} в файлы целиком" -f $extension)
+        }
+        if ($result.ExitCode -ne 0) {
+            $logText = (@($result.Lines | Where-Object { $_ }) -join ' ')
+            if ($logText -match 'не найден') { continue }
+            $problems.Add(("{0} не выгрузилось: {1}" -f $extension, $logText))
+            continue
+        }
+        foreach ($item in (Get-CoverageItems -Dir $dir -Extension $extension)) { $allItems.Add($item) }
+    }
+    $measured = Measure-Coverage -Items $allItems.ToArray() -Records $Records
+    $coverageFile = Join-Path $RunDir 'coverage.txt'
+    Write-CoverageFile -Items $measured -Path $coverageFile
+    $reference = Read-CoverageFile $coverageReferenceFile
+    $newUncovered = New-Object System.Collections.Generic.List[object]
+    if ($null -ne $reference) {
+        foreach ($item in $measured) {
+            if ($item.Level -eq 'covered') { continue }
+            if (-not $reference.ContainsKey($item.Key) -or $reference[$item.Key] -eq 'covered') { $newUncovered.Add($item) }
+        }
+    }
+    [System.IO.File]::WriteAllLines((Join-Path $RunDir 'coverage.new.txt'), [string[]]@($newUncovered | ForEach-Object { '{0}{1}{2}{1}{3}' -f $_.Level, "`t", $_.Key, $_.Text }), $Utf8Bom)
+
+    $covered = @($measured | Where-Object { $_.Level -eq 'covered' }).Count
+    $compiledOnly = @($measured | Where-Object { $_.Level -eq 'compiled' }).Count
+    $none = @($measured | Where-Object { $_.Level -eq 'none' }).Count
+    $detail = "доработок {0}: проверяется {1}, только компиляция {2}, не покрыто {3}" -f $measured.Count, $covered, $compiledOnly, $none
+    if ($null -eq $reference) { $detail += '; эталона карты ещё нет, этот прогон станет им' }
+    else { $detail += ("; нового непокрытого {0}" -f $newUncovered.Count) }
+    if ($newUncovered.Count -gt 0) { $detail += ('. Новое непокрытое: ' + (@($newUncovered | Select-Object -First 3 | ForEach-Object { $_.Text }) -join ' | ')) }
+    $detail += '; карта - coverage.txt'
+    if ($problems.Count -gt 0) { $detail += ('. ' + ($problems -join ' | ')) }
+
+    $status = 'OK'
+    if ($newUncovered.Count -gt 0 -or $problems.Count -gt 0) { $status = 'WARN' }
+    if ($status -eq 'OK') { Copy-Item -LiteralPath $coverageFile -Destination $coverageReferenceFile -Force }
+    Add-StepResult -Name $stepName -Status $status -Detail $detail -Log $coverageFile
+}
+
+#endregion
+
 function Compare-SelfCheckSnapshots {
     # Снимки прогона против эталонных. Изменился снимок с тем же ключом - это замечание: тот же объект
     # выгрузился по-другому. Новый ключ или пропавший - только сведения: объект для снимка выбирается
@@ -898,6 +1121,12 @@ if ($PSCmdlet.ParameterSetName -eq 'Accept') {
         [System.IO.File]::WriteAllLines((Join-Path $baselineTarget 'selfcheck.info.txt'), [string[]]$acceptInfo, $Utf8Bom)
         Write-Host ("Принято как известное: самопроверка, записей {0}" -f $acceptRecords.Count)
         # Снимки того прогона (сообщения обмена) становятся эталонными.
+        # Карта покрытия того прогона становится эталоном: её непокрытое больше не новое.
+        $acceptCoverage = Join-Path $acceptDir 'coverage.txt'
+        if (Test-Path -LiteralPath $acceptCoverage) {
+            Copy-Item -LiteralPath $acceptCoverage -Destination (Join-Path $baselineTarget 'coverage.txt') -Force
+            Write-Host 'Принято как известное: карта покрытия'
+        }
         $acceptSnapshots = Join-Path $acceptDir 'selfcheck-after.snapshots.txt'
         if (Test-Path -LiteralPath $acceptSnapshots) {
             Copy-Item -LiteralPath $acceptSnapshots -Destination (Join-Path $baselineTarget 'selfcheck.snapshots.txt') -Force
@@ -1344,6 +1573,9 @@ $selfCheckReferenceInfoFile = Join-Path $baselineDir 'selfcheck.info.txt'
 $selfCheckLastFile = Join-Path $baselineDir 'selfcheck.last.txt'
 # Эталонные снимки шагов самопроверки (сообщения обмена): с ними сравниваются снимки «после».
 $selfCheckSnapshotsFile = Join-Path $baselineDir 'selfcheck.snapshots.txt'
+# Эталон карты покрытия (что из доработок чем задето) и включатель шага.
+$coverageReferenceFile = Join-Path $baselineDir 'coverage.txt'
+$runCoverage = [bool](Get-Setting $cfg 'Coverage' $true)
 
 $selfCheckOff = ''
 if ($SkipSelfCheck) { $selfCheckOff = 'отключено ключом -SkipSelfCheck' }
@@ -2640,6 +2872,7 @@ else {
 if ($processingOnly) { Write-RunLog 'План: комплект только из внешних обработок, самопроверки нет' }
 elseif ($runSelfCheck -or $SkipSelfCheck) {
     if ($kitItems.Count -gt 0) { $planSteps.Add('Самопроверка после загрузки') } else { $planSteps.Add('Самопроверка') }
+    if ($runCoverage -and -not $SkipSelfCheck) { $planSteps.Add('Карта покрытия') }
 }
 Send-UiPlan -StepNames $planSteps.ToArray()
 
@@ -2873,7 +3106,7 @@ if ($kitItems.Count -gt 0) {
     $extensionsBefore = Get-ExtensionNamesBefore (Join-Path $RunDir 'selfcheck-before\try1\info.txt')
 
     New-Item -ItemType Directory -Path $referenceSnapshotDir -Force | Out-Null
-    foreach ($file in @($selfCheckReferenceFile, $selfCheckReferenceInfoFile, $selfCheckLastFile, $selfCheckSnapshotsFile)) {
+    foreach ($file in @($selfCheckReferenceFile, $selfCheckReferenceInfoFile, $selfCheckLastFile, $selfCheckSnapshotsFile, $coverageReferenceFile)) {
         if (Test-Path -LiteralPath $file) { Copy-Item -LiteralPath $file -Destination $referenceSnapshotDir -Force }
     }
 
@@ -3335,6 +3568,8 @@ else {
             }
         }
         Add-StepResult -Name $afterName -Status $status -Detail $detail -Log $after.Journal -Seconds $after.Seconds
+        # Карта покрытия - по записям этой самопроверки; при неполном прогоне покрытие было бы занижено.
+        if ($runCoverage -and $after.State -eq 'done' -and -not $script:StopRun) { Invoke-CoverageStep -Records $after.Records }
     }
 }
 
@@ -3556,7 +3791,7 @@ elseif ($anyTouched -gt 0) {
                 $decision = 'rolledBack'
                 $aftermath.Add('Откат выполнен: комплект возвращён к состоянию до загрузки.')
                 # Эталон самопроверки и отпечаток возвращаются к тем, что были перед загрузкой.
-                foreach ($name in @('selfcheck.norm.txt', 'selfcheck.info.txt', 'selfcheck.last.txt', 'selfcheck.snapshots.txt')) {
+                foreach ($name in @('selfcheck.norm.txt', 'selfcheck.info.txt', 'selfcheck.last.txt', 'selfcheck.snapshots.txt', 'coverage.txt')) {
                     $savedFile = Join-Path $referenceSnapshotDir $name
                     $currentFile = Join-Path $baselineDir $name
                     if (Test-Path -LiteralPath $savedFile) { Copy-Item -LiteralPath $savedFile -Destination $currentFile -Force }

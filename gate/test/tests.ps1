@@ -351,6 +351,27 @@ function New-ExchangeTasks {
     )
 }
 
+# Карта покрытия: выгрузка Адаптация (заимствованные документы с перехватами) и самопроверка, задевающая ЗаказКлиента.
+function New-AdoptedDocument {
+    param([string]$Name)
+    return ('<MetaDataObject><Document><Properties><ObjectBelonging>Adopted</ObjectBelonging><Name>{0}</Name></Properties></Document></MetaDataObject>' -f $Name)
+}
+$coverageTasks = @(
+    @{ key = 'Окружение'; title = 'Окружение и расширения'; step = 'Окружение'; lines = @('[ОК] Обработка запущена под полными правами') },
+    @{ key = 'ОперацииСДокументами|Документ.ЗаказКлиента'; title = 'Операции: ЗаказКлиента'; step = 'ОперацииСДокументами'; lines = @('[ОК] Документ.ЗаказКлиента: новый, проверка заполнения, запись копии') }
+)
+$coverageDumpFirst = @{
+    'Documents/ЗаказКлиента.xml' = (New-AdoptedDocument 'ЗаказКлиента')
+    'Documents/ЗаказКлиента/Ext/ObjectModule.bsl' = "&После(`"ОбработкаПроведения`")`nПроцедура Адаптация_ОбработкаПроведения(Отказ, РежимПроведения)`nКонецПроцедуры"
+}
+$coverageDumpSecond = @{
+    'Documents/ЗаказКлиента.xml' = (New-AdoptedDocument 'ЗаказКлиента')
+    'Documents/ЗаказКлиента/Ext/ObjectModule.bsl' = "&После(`"ОбработкаПроведения`")`nПроцедура Адаптация_ОбработкаПроведения(Отказ, РежимПроведения)`nКонецПроцедуры"
+    'Documents/РеализацияТоваровУслуг.xml' = (New-AdoptedDocument 'РеализацияТоваровУслуг')
+    'Documents/РеализацияТоваровУслуг/Ext/ObjectModule.bsl' = "&Вместо(`"ПередЗаписью`")`nПроцедура Адаптация_ПередЗаписью(Отказ, РежимЗаписи, РежимПроведения)`nКонецПроцедуры"
+    'ScheduledJobs/Адаптация_Чистка.xml' = '<MetaDataObject><ScheduledJob><Properties><Name>Адаптация_Чистка</Name><MethodName>CommonModule.Адаптация_Сервер.Чистка</MethodName></Properties></ScheduledJob></MetaDataObject>'
+}
+
 # deploy.ps1: базы кластера (подставной COM), рабочая - erp_base, запретных часов нет.
 $deployConfig = @{ File = ''; Server = 'fake'; Base = 'erp_temp_test'; ProdBase = 'erp_base'; DeployDeniedFrom = 0; DeployDeniedTo = 0; ComTimeoutSec = 60 }
 $printOld = "Процедура Печать()`nКонецПроцедуры"
@@ -618,6 +639,36 @@ $tests = @(
             $step = Get-Step $r 'Самопроверка после загрузки'
             if ($null -ne $step) { Check ([string]$step.detail -match 'снимков 1, изменились 0') ("в итоге шага нет сведений о снимках: {0}" -f $step.detail) }
             if ($r.RunDir) { Check (-not (Test-Path -LiteralPath (Join-Path $r.RunDir 'selfcheck-after.snapshots.diff.txt'))) 'файл разницы есть, хотя менялся только заголовок' }
+        }
+    },
+    @{
+        Name = 'gate-coverage-new-uncovered'
+        Text = 'карта покрытия: первый прогон - эталон, во втором новый перехват без проверки и регламентное задание - жёлтый'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ tasks = $coverageTasks }, @{ tasks = $coverageTasks; fingerprint = 'после' }); dumps = @{ 'Адаптация' = $coverageDumpFirst } }
+            $first = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $first; Check-Verdict $first 'GREEN' 0
+            Check-Step $first 'Карта покрытия' 'OK'
+            if ($first.RunDir) {
+                $map = [System.IO.File]::ReadAllText((Join-Path $first.RunDir 'coverage.txt'), $utf8)
+                Check ($map.Contains("covered`tперехват|Адаптация|Документ.ЗаказКлиента|модуль объекта|ОбработкаПроведения")) ("перехват ЗаказКлиента не покрыт: {0}" -f $map)
+            }
+            Start-Sleep -Seconds 2
+            Remove-Item -LiteralPath (Join-Path $sb 'fake\fake1c-state.json') -Force -ErrorAction SilentlyContinue
+            $fake = @{ selfcheck = @(@{ tasks = $coverageTasks; fingerprint = 'после' }, @{ tasks = $coverageTasks; fingerprint = 'после2' }); dumps = @{ 'Адаптация' = $coverageDumpSecond } }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'YELLOW' 2
+            Check-Step $r 'Карта покрытия' 'WARN'
+            if ($r.RunDir) {
+                $new = @([System.IO.File]::ReadAllLines((Join-Path $r.RunDir 'coverage.new.txt'), $utf8) | Where-Object { $_ })
+                Check ($new.Count -eq 2) ("нового непокрытого {0}, ждали 2: {1}" -f $new.Count, ($new -join ' | '))
+                Check (@($new | Where-Object { $_ -match 'РеализацияТоваровУслуг' -and $_ -match 'ПередЗаписью' }).Count -eq 1) 'новый перехват РеализацияТоваровУслуг не в новом непокрытом'
+                Check (@($new | Where-Object { $_ -match 'регламентное\|Адаптация\|Адаптация_Чистка' }).Count -eq 1) 'регламентное задание не в новом непокрытом'
+                Check (@($new | Where-Object { $_ -match 'ЗаказКлиента' }).Count -eq 0) 'покрытый перехват попал в новое непокрытое'
+            }
         }
     },
     @{

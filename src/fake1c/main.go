@@ -78,13 +78,15 @@ type processing struct {
 }
 
 type scenario struct {
-	Designer   []designerRule `json:"designer"`
-	Canary     []canary       `json:"canary"`
-	Selfcheck  []selfcheck    `json:"selfcheck"`
-	Regepf     []processing   `json:"regepf"`
-	Unregepf   []processing   `json:"unregepf"`
-	Kbarticle  []processing   `json:"kbarticle"`
-	ClientExit int            `json:"clientExit"`
+	Designer  []designerRule `json:"designer"`
+	Canary    []canary       `json:"canary"`
+	Selfcheck []selfcheck    `json:"selfcheck"`
+	Regepf    []processing   `json:"regepf"`
+	Unregepf  []processing   `json:"unregepf"`
+	Kbarticle []processing   `json:"kbarticle"`
+	// Выгрузка расширения в файлы (/DumpConfigToFiles): расширение -> путь файла от корня выгрузки -> текст.
+	Dumps      map[string]map[string]string `json:"dumps"`
+	ClientExit int                          `json:"clientExit"`
 }
 
 var logDir string
@@ -213,7 +215,12 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 		_ = os.WriteFile(file, []byte("FAKECFE "+valueAfter(args, "-Extension")), 0o644)
 	}
 	if dir := valueAfter(args, "/DumpConfigToFiles"); dir != "" {
-		writeUTF8(filepath.Join(dir, "Configuration.xml"), "<MetaDataObject><Configuration><Properties><Name>"+valueAfter(args, "-Extension")+"</Name></Properties></Configuration></MetaDataObject>")
+		ext := valueAfter(args, "-Extension")
+		writeUTF8(filepath.Join(dir, "Configuration.xml"), "<MetaDataObject><Configuration><Properties><Name>"+ext+"</Name></Properties></Configuration></MetaDataObject>")
+		writeUTF8(filepath.Join(dir, "ConfigDumpInfo.xml"), "<ConfigDumpInfo/>")
+		for rel, text := range sc.Dumps[ext] {
+			writeUTF8(filepath.Join(dir, filepath.FromSlash(rel)), text)
+		}
 	}
 	for i, a := range args {
 		// Выгрузка внешней обработки в файлы: корневой XML и модуль объекта - текст самого файла обработки
