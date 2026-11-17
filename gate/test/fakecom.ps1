@@ -30,6 +30,17 @@ deploy.ps1 берёт его вместо настоящего, когда за�
   Storage.Get().Write).
 #>
 
+if (-not ('FakeComList' -as [type])) {
+    Add-Type -TypeDefinition @'
+public class FakeComList {
+    private readonly object[] items;
+    public FakeComList(object[] items) { this.items = items; }
+    public int Count() { return items.Length; }
+    public object Get(int index) { return items[index]; }
+}
+'@
+}
+
 function Read-FakeComState {
     param([string]$File)
     return ([System.IO.File]::ReadAllText($File, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json)
@@ -167,10 +178,8 @@ function New-FakeComConnection {
             $extension | Add-Member -MemberType ScriptMethod -Name GetData -Value { return (New-FakeComData ([System.Text.Encoding]::UTF8.GetBytes('FAKECFE ' + $this.Name))) }
             $items.Add($extension)
         }
-        $list = [pscustomobject]@{ Items = $items.ToArray() }
-        $list | Add-Member -MemberType ScriptMethod -Name Count -Value { return @($this.Items).Count }
-        $list | Add-Member -MemberType ScriptMethod -Name Get -Value { param($Index) return @($this.Items)[[int]$Index] }
-        return $list
+        # Коллекция 1С: Count() - метод, а у объекта PowerShell Count - встроенное свойство, поэтому класс.
+        return (New-Object FakeComList -ArgumentList (, [object[]]$items.ToArray()))
     }
     $connection.ConfigurationExtensions = $extensions
     $connection | Add-Member -MemberType ScriptMethod -Name Base64String -Value { param($Value) return [string]$Value }

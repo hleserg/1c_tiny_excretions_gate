@@ -291,6 +291,9 @@ function Check-DeployCommon {
     Check ([string]::IsNullOrWhiteSpace($Result.Stderr)) ("stderr: " + ([string]$Result.Stderr).Trim())
     $deleteAll = @($Result.Calls | Where-Object { $_.Line.Contains('/DeleteCfg') -and $_.Line.Contains('-AllExtensions') })
     Check ($deleteAll.Count -eq 0) 'удаление всех расширений (-AllExtensions) - так нельзя никогда'
+    # Подставной COM отвечает всегда: «не прочитал» и «не выгрузил» - ошибка в самом скрипте или в подставном COM.
+    $comErrors = @($Result.Output | Where-Object { $_ -match ': не прочитал - |: не выгрузил - ' })
+    Check ($comErrors.Count -eq 0) ("внешнее соединение не сработало: " + (($comErrors | Select-Object -First 2) -join ' | '))
     if ($LocksExpected -and $null -ne $Result.ComState) {
         $prod = $Result.ComState.bases.erp_base
         Check (-not [bool]$prod.scheduledJobsDenied) 'в конце осталась блокировка регламентных заданий рабочей'
