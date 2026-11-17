@@ -624,6 +624,34 @@ if ($afterRecords.Count -gt 0 -or $newSelfCheck.Count -gt 0) {
     }
 }
 
+# Снимки самопроверки (сообщения обмена): изменившиеся по сравнению с эталоном.
+$snapshotDiffFile = Join-Path $RunDir 'selfcheck-after.snapshots.diff.txt'
+if (Test-Path -LiteralPath $snapshotDiffFile) {
+    $snapshotDiffs = [ordered]@{}
+    $snapshotKey = $null
+    foreach ($line in [System.IO.File]::ReadAllLines($snapshotDiffFile, [System.Text.Encoding]::UTF8)) {
+        $clean = $line.TrimStart([char]0xFEFF)
+        if ($clean.StartsWith('### ')) { $snapshotKey = $clean.Substring(4); $snapshotDiffs[$snapshotKey] = New-Object System.Collections.Generic.List[string]; continue }
+        if ($null -ne $snapshotKey -and $clean.Length -gt 0) { $snapshotDiffs[$snapshotKey].Add($clean) }
+    }
+    if ($snapshotDiffs.Count -gt 0) {
+        $comparedSomething = $true
+        $body.Add(("== Снимки самопроверки: изменились {0}" -f $snapshotDiffs.Count))
+        $summary.Add(("[ЖЁЛТ] Снимки самопроверки: изменились {0} (сообщения обмена и т.п.)" -f $snapshotDiffs.Count))
+        $number = 0
+        foreach ($snapshotKey in @($snapshotDiffs.Keys)) {
+            $number++
+            # Через конвейер, не @(): значение [ordered]-словаря - List[string] (см. выше про PSToObjectArrayBinder).
+            $lines = @($snapshotDiffs[$snapshotKey] | ForEach-Object { $_ })
+            $body.Add(("  {0}. {1}" -f $number, $snapshotKey))
+            foreach ($line in @($lines | Select-Object -First 8)) { $body.Add(('     ' + (Format-Short $line 200))) }
+            if ($lines.Count -gt 8) { $body.Add(("     и ещё строк: {0}" -f ($lines.Count - 8))) }
+        }
+        $body.Add('  Что делать: посмотреть разницу. Изменение по делу (поменяли правила обмена или реквизиты) - принять в эталон ключом -AcceptBaseline; не по делу - разбираться с доработкой, которая попала в выгрузку. Полностью - в selfcheck-after.snapshots.diff.txt.')
+        $body.Add('')
+    }
+}
+
 # Расширения между самопроверками до и после загрузки.
 $extBefore = @(Read-InfoValues (Join-Path $RunDir 'selfcheck-before\try1\info.txt') 'ext')
 $extAfter = @(Read-InfoValues (Join-Path $RunDir 'selfcheck-after\try1\info.txt') 'ext')

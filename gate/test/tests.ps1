@@ -283,6 +283,22 @@ $errorTasks = @(
 )
 $epfDump = '<?xml version="1.0" encoding="UTF-8"?><MetaDataObject><ExternalDataProcessor uuid="1"><Properties><Name>Печать</Name></Properties></ExternalDataProcessor></MetaDataObject>'
 
+# Сообщение обмена для снимка: заголовок с полями, которые меняются при каждой выгрузке, и тело.
+function New-ExchangeMessage {
+    param([string]$Created, [int]$Number, [string]$Sum)
+    return ('<Message xmlns:msg="http://www.1c.ru/SSL/Exchange/Message"><msg:Header><msg:Format>EnterpriseData/1.8</msg:Format>' +
+        '<msg:CreationDate>{0}</msg:CreationDate><msg:MessageNo>{1}</msg:MessageNo><msg:ReceivedNo>{2}</msg:ReceivedNo></msg:Header>' +
+        '<Body xmlns="EnterpriseData/1.8"><Документ.РеализацияТоваровУслуг><Сумма>{3}</Сумма><Номер>АА-1</Номер></Документ.РеализацияТоваровУслуг></Body></Message>') -f $Created, $Number, ($Number - 1), $Sum
+}
+function New-ExchangeTasks {
+    param([string]$Message)
+    return @(
+        @{ key = 'Окружение'; title = 'Окружение и расширения'; step = 'Окружение'; lines = @('[ОК] Обработка запущена под полными правами') },
+        @{ key = 'Обмены'; title = 'Обмены'; step = 'Обмены'; lines = @('[ОК] Бухгалтерия: Документ.РеализацияТоваровУслуг выгружается');
+            snapshots = @{ 'обмен|Бухгалтерия|Документ.РеализацияТоваровУслуг|11111111-2222-3333-4444-555555555555' = $Message } }
+    )
+}
+
 $tests = @(
     @{
         Name = 'gate-asis-green'
@@ -468,6 +484,51 @@ $tests = @(
                 if ($regAt -lt 0 -and $r.Calls[$i].Line.Contains('/Cregepf')) { $regAt = $i }
             }
             Check ($loadAt -ge 0 -and $regAt -gt $loadAt) ("обработка записана не после загрузки расширения (загрузка - вызов {0}, запись - {1})" -f $loadAt, $regAt)
+        }
+    },
+    @{
+        Name = 'gate-exchange-snapshot-changed'
+        Text = 'обмены: тот же документ выгрузился в сообщение по-другому - жёлтый, разница в файле, эталон снимков не сдвигается'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(
+                    @{ tasks = (New-ExchangeTasks (New-ExchangeMessage '2026-11-17T10:00:00' 5 '100')) },
+                    @{ tasks = (New-ExchangeTasks (New-ExchangeMessage '2026-11-17T11:30:00' 6 '120')); fingerprint = 'после' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'YELLOW' 2
+            Check-Step $r 'Самопроверка после загрузки' 'WARN'
+            if ($r.RunDir) {
+                $diffFile = Join-Path $r.RunDir 'selfcheck-after.snapshots.diff.txt'
+                Check (Test-Path -LiteralPath $diffFile) 'нет файла разницы снимков'
+                if (Test-Path -LiteralPath $diffFile) {
+                    $diff = [System.IO.File]::ReadAllText($diffFile, $utf8)
+                    Check ($diff.Contains('- <Сумма>100</Сумма>') -and $diff.Contains('+ <Сумма>120</Сумма>')) ("в разнице нет изменённой суммы: {0}" -f $diff)
+                    Check (-not $diff.Contains('CreationDate') -and -not $diff.Contains('MessageNo')) 'в разнице поля заголовка, которые меняются сами по себе'
+                }
+                $reference = @(Get-ChildItem -LiteralPath (Join-Path $sb 'baseline') -Recurse -Filter 'selfcheck.snapshots.txt' -File)
+                Check ($reference.Count -eq 1) 'нет эталонных снимков'
+                if ($reference.Count -eq 1) { Check ([System.IO.File]::ReadAllText($reference[0].FullName, $utf8).Contains('<Сумма>100</Сумма>')) 'эталон снимков сдвинулся на изменённый' }
+            }
+        }
+    },
+    @{
+        Name = 'gate-exchange-snapshot-same'
+        Text = 'обмены: сообщения отличаются только датой и номерами в заголовке - зелёный'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(
+                    @{ tasks = (New-ExchangeTasks (New-ExchangeMessage '2026-11-17T10:00:00' 5 '100')) },
+                    @{ tasks = (New-ExchangeTasks (New-ExchangeMessage '2026-11-17T11:30:00' 6 '100')); fingerprint = 'после' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            Check-Step $r 'Самопроверка после загрузки' 'OK'
+            $step = Get-Step $r 'Самопроверка после загрузки'
+            if ($null -ne $step) { Check ([string]$step.detail -match 'снимков 1, изменились 0') ("в итоге шага нет сведений о снимках: {0}" -f $step.detail) }
+            if ($r.RunDir) { Check (-not (Test-Path -LiteralPath (Join-Path $r.RunDir 'selfcheck-after.snapshots.diff.txt'))) 'файл разницы есть, хотя менялся только заголовок' }
         }
     }
 )

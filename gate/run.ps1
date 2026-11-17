@@ -585,13 +585,38 @@ function Read-KeyValueFile {
 function Read-SelfCheckPiece {
     # Часть журнала: заголовок из строк «@@имя=значение» до строки «@@journal», дальше строки журнала.
     param([string]$Path)
+    # После строк журнала могут идти снимки шагов: строка «@@snapshots», дальше блоки
+    # «@@snap <ключ>», строки текста с «|» в начале, «@@snap-end». В журнал и записи они не идут.
     $header = @{}
     $blocks = New-Object System.Collections.Generic.List[string]
     $body = New-Object System.Collections.Generic.List[string]
+    $snapshots = [ordered]@{}
     $inBody = $false
+    $inSnapshots = $false
+    $snapKey = $null
+    $snapLines = $null
     foreach ($line in [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)) {
         if ($null -eq $line) { continue }
-        if ($inBody) { $body.Add($line); continue }
+        if ($inSnapshots) {
+            if ($line.StartsWith('@@snap ', [System.StringComparison]::Ordinal)) {
+                $snapKey = $line.Substring(7).Trim()
+                $snapLines = New-Object System.Collections.Generic.List[string]
+            }
+            elseif ($line -eq '@@snap-end') {
+                if ($null -ne $snapKey -and $snapKey.Length -gt 0) { $snapshots[$snapKey] = $snapLines.ToArray() }
+                $snapKey = $null
+                $snapLines = $null
+            }
+            elseif ($null -ne $snapLines -and $line.StartsWith('|', [System.StringComparison]::Ordinal)) {
+                $snapLines.Add($line.Substring(1))
+            }
+            continue
+        }
+        if ($inBody) {
+            if ($line -eq '@@snapshots') { $inSnapshots = $true; continue }
+            $body.Add($line)
+            continue
+        }
         $clean = $line.TrimStart([char]0xFEFF)
         if ($clean -eq '@@journal') { $inBody = $true; continue }
         if ($clean.StartsWith('@@')) {
@@ -603,7 +628,7 @@ function Read-SelfCheckPiece {
             $header[$key] = $clean.Substring($position + 1)
         }
     }
-    return [pscustomobject]@{ Header = $header; Blocks = $blocks.ToArray(); Body = $body.ToArray(); Complete = $inBody }
+    return [pscustomobject]@{ Header = $header; Blocks = $blocks.ToArray(); Body = $body.ToArray(); Snapshots = $snapshots; Complete = $inBody }
 }
 
 function Get-SelfCheckPieceFiles {
@@ -707,6 +732,113 @@ function Compare-SelfCheck {
     }
 }
 
+function Format-SelfCheckSnapshot {
+    # Текст снимка -> строки для сравнения. XML (сообщение обмена) разбирается и раскладывается по строкам
+    # с отступами, из него убираются поля заголовка, которые меняются при каждой выгрузке сами по себе:
+    # дата создания и номера сообщений. Не XML - строки как есть, без хвостовых пробелов.
+    param([string[]]$Lines)
+    $text = ($Lines -join "`n").Trim()
+    if ($text.StartsWith('<')) {
+        try {
+            $document = New-Object System.Xml.XmlDocument
+            $document.PreserveWhitespace = $false
+            $document.LoadXml($text)
+            # Объявление XML (кодировка) убирается: при записи в строку оно мешает и сравнивать в нём нечего.
+            foreach ($child in @($document.ChildNodes)) { if ($child -is [System.Xml.XmlDeclaration]) { [void]$document.RemoveChild($child) } }
+            $volatile = @($document.SelectNodes("//*[local-name()='CreationDate' or local-name()='MessageNo' or local-name()='ReceivedNo']"))
+            foreach ($node in $volatile) { [void]$node.ParentNode.RemoveChild($node) }
+            $settings = New-Object System.Xml.XmlWriterSettings
+            $settings.Indent = $true
+            $settings.IndentChars = '  '
+            $settings.OmitXmlDeclaration = $true
+            $settings.NewLineChars = "`n"
+            $builder = New-Object System.Text.StringBuilder
+            $writer = [System.Xml.XmlWriter]::Create($builder, $settings)
+            $document.Save($writer)
+            $writer.Close()
+            return , @($builder.ToString().Split("`n") | ForEach-Object { $_.TrimEnd() } | Where-Object { $_.Length -gt 0 })
+        }
+        catch { }
+    }
+    return , @($Lines | ForEach-Object { $_.TrimEnd() })
+}
+
+function Write-SelfCheckSnapshots {
+    # Снимки -> файл: блоки «@@snap <ключ>», строки с «|» в начале, «@@snap-end». Ключи по порядку.
+    param($Snapshots, [string]$Path)
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($key in @($Snapshots.Keys | Sort-Object)) {
+        $lines.Add('@@snap ' + $key)
+        foreach ($line in @($Snapshots[$key])) { $lines.Add('|' + $line) }
+        $lines.Add('@@snap-end')
+    }
+    [System.IO.File]::WriteAllLines($Path, $lines.ToArray(), $Utf8Bom)
+}
+
+function Read-SelfCheckSnapshots {
+    # Файл снимков -> таблица «ключ -> строки». Файла нет - таблица пустая.
+    param([string]$Path)
+    $result = @{}
+    if (-not (Test-Path -LiteralPath $Path)) { return $result }
+    $key = $null
+    $lines = $null
+    foreach ($line in [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)) {
+        if ($null -eq $line) { continue }
+        $clean = $line.TrimStart([char]0xFEFF)
+        if ($clean.StartsWith('@@snap ', [System.StringComparison]::Ordinal)) {
+            $key = $clean.Substring(7).Trim()
+            $lines = New-Object System.Collections.Generic.List[string]
+        }
+        elseif ($clean -eq '@@snap-end') {
+            if ($null -ne $key) { $result[$key] = $lines.ToArray() }
+            $key = $null
+            $lines = $null
+        }
+        elseif ($null -ne $lines -and $clean.StartsWith('|', [System.StringComparison]::Ordinal)) {
+            $lines.Add($clean.Substring(1))
+        }
+    }
+    return $result
+}
+
+function Compare-SelfCheckSnapshots {
+    # Снимки прогона против эталонных. Изменился снимок с тем же ключом - это замечание: тот же объект
+    # выгрузился по-другому. Новый ключ или пропавший - только сведения: объект для снимка выбирается
+    # в базе заново («последний проведённый документ») и может смениться сам по себе.
+    # Разница по изменённым снимкам пишется в DiffPath: строки, которые ушли («-») и появились («+»).
+    param($Current, [string]$ReferenceFile, [string]$DiffPath)
+    $reference = Read-SelfCheckSnapshots $ReferenceFile
+    $changed = New-Object System.Collections.Generic.List[string]
+    $added = New-Object System.Collections.Generic.List[string]
+    $diff = New-Object System.Collections.Generic.List[string]
+    foreach ($key in @($Current.Keys | Sort-Object)) {
+        if (-not $reference.ContainsKey($key)) { $added.Add($key); continue }
+        $was = @($reference[$key])
+        $now = @($Current[$key])
+        if (($was -join "`n") -ceq ($now -join "`n")) { continue }
+        $changed.Add($key)
+        # Разница по строкам с учётом повторов: сколько раз строка была и сколько стала.
+        $counts = @{}
+        foreach ($line in $was) { if ($counts.ContainsKey($line)) { $counts[$line]-- } else { $counts[$line] = -1 } }
+        foreach ($line in $now) { if ($counts.ContainsKey($line)) { $counts[$line]++ } else { $counts[$line] = 1 } }
+        $diff.Add('### ' + $key)
+        foreach ($line in $was) { if ($counts[$line] -lt 0) { $diff.Add('- ' + $line); $counts[$line]++ } }
+        foreach ($line in $now) { if ($counts[$line] -gt 0) { $diff.Add('+ ' + $line); $counts[$line]-- } }
+        if ($diff[$diff.Count - 1] -ceq ('### ' + $key)) { $diff.Add('  (те же строки, другой порядок)') }
+        $diff.Add('')
+    }
+    $gone = New-Object System.Collections.Generic.List[string]
+    foreach ($key in @($reference.Keys | Sort-Object)) { if (-not $Current.Contains($key)) { $gone.Add($key) } }
+    if ($changed.Count -gt 0 -and $DiffPath) { [System.IO.File]::WriteAllLines($DiffPath, $diff.ToArray(), $Utf8Bom) }
+    return [pscustomobject]@{
+        HasReference = (Test-Path -LiteralPath $ReferenceFile)
+        Total        = @($Current.Keys).Count
+        Changed      = $changed.ToArray()
+        Added        = $added.ToArray()
+        Gone         = $gone.ToArray()
+    }
+}
+
 #endregion
 
 #region Режимы без прогона
@@ -765,6 +897,12 @@ if ($PSCmdlet.ParameterSetName -eq 'Accept') {
         )
         [System.IO.File]::WriteAllLines((Join-Path $baselineTarget 'selfcheck.info.txt'), [string[]]$acceptInfo, $Utf8Bom)
         Write-Host ("Принято как известное: самопроверка, записей {0}" -f $acceptRecords.Count)
+        # Снимки того прогона (сообщения обмена) становятся эталонными.
+        $acceptSnapshots = Join-Path $acceptDir 'selfcheck-after.snapshots.txt'
+        if (Test-Path -LiteralPath $acceptSnapshots) {
+            Copy-Item -LiteralPath $acceptSnapshots -Destination (Join-Path $baselineTarget 'selfcheck.snapshots.txt') -Force
+            Write-Host 'Принято как известное: снимки самопроверки'
+        }
     }
     Write-Host "Эталон базы «$($acceptMeta.baseKey)» обновлён: $baselineTarget"
     exit 0
@@ -1204,6 +1342,8 @@ if (($selfCheckSkipDocs + $selfCheckNotOlder + $RunDir + $selfCheckEpf) -match '
 $selfCheckReferenceFile = Join-Path $baselineDir 'selfcheck.norm.txt'
 $selfCheckReferenceInfoFile = Join-Path $baselineDir 'selfcheck.info.txt'
 $selfCheckLastFile = Join-Path $baselineDir 'selfcheck.last.txt'
+# Эталонные снимки шагов самопроверки (сообщения обмена): с ними сравниваются снимки «после».
+$selfCheckSnapshotsFile = Join-Path $baselineDir 'selfcheck.snapshots.txt'
 
 $selfCheckOff = ''
 if ($SkipSelfCheck) { $selfCheckOff = 'отключено ключом -SkipSelfCheck' }
@@ -1362,9 +1502,12 @@ function Add-CheckStep {
 
 function Save-SelfCheckReference {
     # Записи прогона становятся эталоном самопроверки этой базы.
-    param([string[]]$Records, [string]$Label, [string]$Fingerprint)
+    # Снимки шагов становятся эталонными вместе с записями. Снимков нет - эталонных снимков тоже нет.
+    param([string[]]$Records, [string]$Label, [string]$Fingerprint, $Snapshots = $null)
     if (-not (Test-Path -LiteralPath $baselineDir)) { New-Item -ItemType Directory -Path $baselineDir -Force | Out-Null }
     [System.IO.File]::WriteAllLines($selfCheckReferenceFile, [string[]]@($Records), $Utf8Bom)
+    if ($null -ne $Snapshots -and $Snapshots.Count -gt 0) { Write-SelfCheckSnapshots -Snapshots $Snapshots -Path $selfCheckSnapshotsFile }
+    elseif (Test-Path -LiteralPath $selfCheckSnapshotsFile) { Remove-Item -LiteralPath $selfCheckSnapshotsFile -Force }
     $info = @(
         ("run={0}" -f $runId),
         ("label={0}" -f $Label),
@@ -1592,6 +1735,7 @@ function Invoke-SelfCheck {
     # которое объявила предыдущая часть.
     $journal = New-Object System.Collections.Generic.List[string]
     $records = New-Object System.Collections.Generic.List[string]
+    $snapshots = [ordered]@{}
     $number = 0
     foreach ($session in $sessions) {
         $number++
@@ -1606,6 +1750,7 @@ function Invoke-SelfCheck {
             }
             foreach ($line in $piece.Body) { $journal.Add($line) }
             foreach ($record in @(ConvertTo-SelfCheckRecords -Key $key -Lines $piece.Body)) { $records.Add($record) }
+            foreach ($snapKey in @($piece.Snapshots.Keys)) { $snapshots[$snapKey] = Format-SelfCheckSnapshot $piece.Snapshots[$snapKey] }
             if ($piece.Header.ContainsKey('key')) { $key = [string]$piece.Header['key'] }
             else { $key = '(конец)' }
         }
@@ -1626,6 +1771,9 @@ function Invoke-SelfCheck {
     $journalPath = Join-Path $RunDir ("selfcheck-{0}.journal.txt" -f $Label)
     [System.IO.File]::WriteAllLines($journalPath, $journal.ToArray(), $Utf8Bom)
     [System.IO.File]::WriteAllLines((Join-Path $RunDir ("selfcheck-{0}.norm.txt" -f $Label)), $records.ToArray(), $Utf8Bom)
+    # Снимки шагов (сообщения обмена и т.п.) - уже приведённые к виду для сравнения. Файл пишется,
+    # только если снимки есть: обработка прежней версии их не присылает.
+    if ($snapshots.Count -gt 0) { Write-SelfCheckSnapshots -Snapshots $snapshots -Path (Join-Path $RunDir ("selfcheck-{0}.snapshots.txt" -f $Label)) }
 
     # Отпечаток состояния базы на начало первого сеанса. Ненадёжный отпечаток не используется вовсе.
     $fingerprint = ''
@@ -1642,6 +1790,7 @@ function Invoke-SelfCheck {
         Fingerprint = $fingerprint
         Seconds     = [int]$watch.Elapsed.TotalSeconds
         Journal     = $journalPath
+        Snapshots   = $snapshots
         Message     = [string](Get-Setting $lastSession.Result 'message' '')
         Windows     = $lastSession.Windows
         Sessions    = $sessions.Count
@@ -2698,7 +2847,7 @@ if ($kitItems.Count -gt 0 -and -not $selfCheckOff) {
         Add-StepResult -Name $stepName -Status 'OK' -Detail $detail -Seconds $before.Seconds
     }
     elseif ($before.State -eq 'done' -or $before.State -eq 'incomplete') {
-        Save-SelfCheckReference -Records $before.Records -Label 'before' -Fingerprint $before.Fingerprint
+        Save-SelfCheckReference -Records $before.Records -Label 'before' -Fingerprint $before.Fingerprint -Snapshots $before.Snapshots
         Save-SelfCheckLastState -Fingerprint $before.Fingerprint
         $detail = "состояние до загрузки снято и стало эталоном самопроверки: записей {0}, из них ошибок {1}; {2} мин" -f $before.Records.Count, $errorsBefore, $minutes
         if ($before.Problems.Count -gt 0) {
@@ -2724,7 +2873,7 @@ if ($kitItems.Count -gt 0) {
     $extensionsBefore = Get-ExtensionNamesBefore (Join-Path $RunDir 'selfcheck-before\try1\info.txt')
 
     New-Item -ItemType Directory -Path $referenceSnapshotDir -Force | Out-Null
-    foreach ($file in @($selfCheckReferenceFile, $selfCheckReferenceInfoFile, $selfCheckLastFile)) {
+    foreach ($file in @($selfCheckReferenceFile, $selfCheckReferenceInfoFile, $selfCheckLastFile, $selfCheckSnapshotsFile)) {
         if (Test-Path -LiteralPath $file) { Copy-Item -LiteralPath $file -Destination $referenceSnapshotDir -Force }
     }
 
@@ -3130,9 +3279,31 @@ else {
         $tail = "записей {0}, ошибок всего {1}; {2} мин; журнал selfcheck-after.journal.txt" -f $after.Records.Count, $comparison.ErrorsTotal, $minutes
         if ($after.Problems.Count -gt 0) { $tail += ('. Прогон неполный: ' + ($after.Problems -join ' | ')) }
 
+        # Снимки шагов (сообщения обмена): тот же объект выгрузился по-другому - замечание (жёлтый).
+        # Красным не делается: сообщение может измениться и по делу, решает человек, глядя на разницу.
+        $snapshotChanged = 0
+        if ($after.Snapshots.Count -gt 0 -or (Test-Path -LiteralPath $selfCheckSnapshotsFile)) {
+            if (Test-Path -LiteralPath $selfCheckSnapshotsFile) {
+                New-Item -ItemType Directory -Path $referenceCopyDir -Force | Out-Null
+                Copy-Item -LiteralPath $selfCheckSnapshotsFile -Destination $referenceCopyDir -Force
+            }
+            $snapshotComparison = Compare-SelfCheckSnapshots -Current $after.Snapshots -ReferenceFile $selfCheckSnapshotsFile -DiffPath (Join-Path $RunDir 'selfcheck-after.snapshots.diff.txt')
+            $snapshotChanged = $snapshotComparison.Changed.Count
+            if (-not $snapshotComparison.HasReference) {
+                $tail += ("; снимков {0}, эталонных снимков ещё нет" -f $snapshotComparison.Total)
+            }
+            else {
+                $tail += ("; снимков {0}, изменились {1}, новых {2}, пропало {3}" -f $snapshotComparison.Total, $snapshotChanged, $snapshotComparison.Added.Count, $snapshotComparison.Gone.Count)
+                if ($snapshotChanged -gt 0) {
+                    $tail += (". Изменившиеся снимки: {0}; разница в selfcheck-after.snapshots.diff.txt" -f ((@($snapshotComparison.Changed | Select-Object -First 3)) -join ' | '))
+                }
+            }
+            Write-RunLog ("Снимки самопроверки: всего {0}, изменились {1}, новых {2}, пропало {3}" -f $snapshotComparison.Total, $snapshotChanged, $snapshotComparison.Added.Count, $snapshotComparison.Gone.Count)
+        }
+
         if (-not $comparison.HasReference) {
             if ($kitItems.Count -eq 0 -and $after.State -eq 'done') {
-                Save-SelfCheckReference -Records $after.Records -Label 'after' -Fingerprint $after.Fingerprint
+                Save-SelfCheckReference -Records $after.Records -Label 'after' -Fingerprint $after.Fingerprint -Snapshots $after.Snapshots
                 $status = 'OK'
                 if ($comparison.ErrorsTotal -gt 0 -or $after.Problems.Count -gt 0) { $status = 'WARN' }
                 $detail = "эталона самопроверки не было: этот прогон стал эталоном, дальше красным будет только новое. Ошибки этого прогона посмотри в selfcheck-after.norm.txt. {0}" -f $tail
@@ -3155,12 +3326,12 @@ else {
             }
 
             if ($comparison.NewErrors.Count -gt 0) { $status = 'FAIL' }
-            elseif ($newAll.Count -gt 0 -or $after.Problems.Count -gt 0) { $status = 'WARN' }
+            elseif ($newAll.Count -gt 0 -or $after.Problems.Count -gt 0 -or $snapshotChanged -gt 0) { $status = 'WARN' }
             else { $status = 'OK' }
 
             # Эталон двигается сам, только когда нового нет совсем. Иначе - после просмотра, ключом -AcceptBaseline.
             if ($status -eq 'OK' -and $after.State -eq 'done') {
-                Save-SelfCheckReference -Records $after.Records -Label 'after' -Fingerprint $after.Fingerprint
+                Save-SelfCheckReference -Records $after.Records -Label 'after' -Fingerprint $after.Fingerprint -Snapshots $after.Snapshots
             }
         }
         Add-StepResult -Name $afterName -Status $status -Detail $detail -Log $after.Journal -Seconds $after.Seconds
@@ -3385,7 +3556,7 @@ elseif ($anyTouched -gt 0) {
                 $decision = 'rolledBack'
                 $aftermath.Add('Откат выполнен: комплект возвращён к состоянию до загрузки.')
                 # Эталон самопроверки и отпечаток возвращаются к тем, что были перед загрузкой.
-                foreach ($name in @('selfcheck.norm.txt', 'selfcheck.info.txt', 'selfcheck.last.txt')) {
+                foreach ($name in @('selfcheck.norm.txt', 'selfcheck.info.txt', 'selfcheck.last.txt', 'selfcheck.snapshots.txt')) {
                     $savedFile = Join-Path $referenceSnapshotDir $name
                     $currentFile = Join-Path $baselineDir $name
                     if (Test-Path -LiteralPath $savedFile) { Copy-Item -LiteralPath $savedFile -Destination $currentFile -Force }

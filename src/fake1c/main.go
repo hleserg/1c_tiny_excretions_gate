@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -39,6 +40,8 @@ type task struct {
 	Title string   `json:"title"`
 	Step  string   `json:"step"`
 	Lines []string `json:"lines"`
+	// Снимки задания (ключ -> текст): уходят в следующую часть журнала после строк задания, как у обработки.
+	Snapshots map[string]string `json:"snapshots"`
 }
 
 type selfcheck struct {
@@ -343,6 +346,25 @@ func selfcheckRun(s selfcheck, dir, known string) {
 		}
 	}
 	now := time.Now().Format("15:04:05")
+	snaps := func(m map[string]string) string {
+		if len(m) == 0 {
+			return ""
+		}
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		out := []string{"", "@@snapshots"}
+		for _, k := range keys {
+			out = append(out, "@@snap "+k)
+			for _, l := range strings.Split(m[k], "\n") {
+				out = append(out, "|"+l)
+			}
+			out = append(out, "@@snap-end")
+		}
+		return strings.Join(out, "\n")
+	}
 	journal := func(lines []string) string {
 		out := []string{}
 		for _, l := range lines {
@@ -371,21 +393,23 @@ func selfcheckRun(s selfcheck, dir, known string) {
 	}
 	pieces := 0
 	previous := []string{"[ИНФО] Самопроверка (подставная 1С)"}
+	var previousSnaps map[string]string
 	for n, t := range tasks {
 		if s.ExitAfter > 0 && n >= s.ExitAfter {
 			return
 		}
 		pieces++
 		head := fmt.Sprintf("@@n=%d\n@@total=%d\n@@key=%s\n@@title=%s\n@@step=%s\n@@block=%d/%d/0/0/0/0|%s\n@@journal\n", n, len(tasks), t.Key, t.Title, t.Step, n, len(tasks), t.Step)
-		writeUTF8(fmt.Sprintf("%sp%06d.txt", dir, pieces), head+journal(previous))
+		writeUTF8(fmt.Sprintf("%sp%06d.txt", dir, pieces), head+journal(previous)+snaps(previousSnaps))
 		count(t.Lines)
 		previous = t.Lines
+		previousSnaps = t.Snapshots
 		if s.Sleep > 0 {
 			time.Sleep(time.Duration(s.Sleep * float64(time.Second)))
 		}
 	}
 	pieces++
-	writeUTF8(fmt.Sprintf("%sp%06d.txt", dir, pieces), "@@journal\n"+journal(previous))
+	writeUTF8(fmt.Sprintf("%sp%06d.txt", dir, pieces), "@@journal\n"+journal(previous)+snaps(previousSnaps))
 	status := s.Status
 	if status == "" {
 		status = "done"
