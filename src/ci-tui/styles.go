@@ -31,6 +31,7 @@ var (
 	styleProgressBox   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colAccent).Padding(0, 1)
 	styleProgressTitle = lipgloss.NewStyle().Bold(true).Foreground(colText)
 	styleDialog        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colAccent).Padding(1, 2)
+	styleDocked        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colAccent).Padding(0, 1)
 	styleDialogTitle   = lipgloss.NewStyle().Bold(true).Foreground(colText)
 	styleCursor        = lipgloss.NewStyle().Foreground(colAccent).Bold(true)
 	styleSelected      = lipgloss.NewStyle().Foreground(colAccent).Bold(true)

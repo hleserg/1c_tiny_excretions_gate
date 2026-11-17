@@ -145,6 +145,10 @@ func (m *model) layout() {
 	if m.prog != nil {
 		bodyHeight -= lipgloss.Height(m.viewProgress())
 	}
+	if m.dialog != nil && m.dialog.docked() {
+		// Полоса вопроса встаёт на место строки подсказки.
+		bodyHeight -= lipgloss.Height(m.dialog.ViewDocked(m.width)) - 1
+	}
 	if bodyHeight < 3 {
 		bodyHeight = 3
 	}
@@ -172,6 +176,22 @@ func (m *model) openNextDialog() {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	wasDocked := m.dialog != nil && m.dialog.docked()
+	next, cmd := m.update(msg)
+	nm := next.(model)
+	if nowDocked := nm.dialog != nil && nm.dialog.docked(); nowDocked != wasDocked {
+		// Полоса вопроса появилась или ушла: журнал меняет высоту; на появлении - к концу журнала, к итогу.
+		nm.layout()
+		nm.refreshLog()
+		if nowDocked {
+			nm.follow = true
+			nm.logView.GotoBottom()
+		}
+	}
+	return nm, cmd
+}
+
+func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		// На столбец уже окна: консоль Windows переносит строку во всю ширину, и экран съезжает вниз.
@@ -291,7 +311,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmd1, cmd2)
 
 	case tea.MouseMsg:
-		if m.dialog == nil {
+		if m.dialog == nil || m.dialog.docked() {
 			var cmd tea.Cmd
 			m.logView, cmd = m.logView.Update(msg)
 			m.follow = m.logView.AtBottom()
@@ -300,6 +320,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.dialog != nil && m.dialog.docked() {
+			switch msg.String() {
+			case "up", "down", "pgup", "pgdown", "home", "end":
+				var cmd tea.Cmd
+				m.logView, cmd = m.logView.Update(msg)
+				m.follow = m.logView.AtBottom()
+				return m, cmd
+			}
+		}
 		if m.dialog != nil {
 			cmd := m.dialog.Update(msg)
 			if m.dialog.finished {
@@ -429,8 +458,11 @@ func (m model) View() string {
 		panel = m.viewProgress()
 	}
 	footer := m.viewFooter()
+	if m.dialog != nil && m.dialog.docked() {
+		footer = m.dialog.ViewDocked(m.width)
+	}
 	screen := lipgloss.JoinVertical(lipgloss.Left, header, body, panel, footer)
-	if m.dialog != nil {
+	if m.dialog != nil && !m.dialog.docked() {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.dialog.View(),
 			lipgloss.WithWhitespaceChars(" "))
 	}

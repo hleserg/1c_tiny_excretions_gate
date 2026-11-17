@@ -94,7 +94,14 @@ func engineCommand(baseDir, script string, extra []string, channel string) *exec
 
 // startEngine запускает движок и отдаёт его вывод в программу через p.Send.
 func startEngine(p *tea.Program, baseDir, script string, extra []string) (*engine, error) {
-	channel, err := os.MkdirTemp("", "ci-ui-")
+	// Папка канала - в папке гейта (ui\), а не в %TEMP%: сессионную временную папку RDP Windows чистит при
+	// отключении, и вопрос, оставшийся без ответа на ночь, уже не получал ответа. Не вышло - %TEMP%, как раньше.
+	uiDir := filepath.Join(baseDir, "ui")
+	_ = os.MkdirAll(uiDir, 0o755)
+	channel, err := os.MkdirTemp(uiDir, "ci-ui-")
+	if err != nil {
+		channel, err = os.MkdirTemp("", "ci-ui-")
+	}
 	if err != nil {
 		return nil, fmt.Errorf("не создал папку канала: %w", err)
 	}

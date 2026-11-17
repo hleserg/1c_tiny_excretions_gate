@@ -407,3 +407,34 @@ func (d *dialog) isDanger(i int) bool {
 	}
 	return false
 }
+
+// docked - вопрос да/нет рисуется полосой внизу экрана, а не окном поверх: чтобы решить «оставить или
+// откатить», надо видеть итог прогона. Журнал при этом листается (↑↓ PgUp PgDn).
+func (d *dialog) docked() bool {
+	return d.ev.Kind == "confirm"
+}
+
+// ViewDocked - полоса вопроса во всю ширину экрана.
+func (d *dialog) ViewDocked(width int) string {
+	inner := max(20, width-6)
+	var b strings.Builder
+	b.WriteString(styleDialogTitle.Width(inner).Render(d.ev.Header))
+	b.WriteString("\n")
+	for _, note := range d.ev.Notes {
+		b.WriteString(styleDim.Width(inner).Render(note))
+		b.WriteString("\n")
+	}
+	if d.ev.Poll {
+		b.WriteString(styleDim.Width(inner).Render("Вопрос снимется сам, когда условие выполнится."))
+		b.WriteString("\n")
+	}
+	yes := nonEmpty(d.ev.Yes, "Да")
+	no := nonEmpty(d.ev.No, "Нет")
+	yb, nb := styleButton.Render(yes), styleButtonActive.Render(no)
+	if d.yes {
+		yb, nb = styleButtonActive.Render(yes), styleButton.Render(no)
+	}
+	help := styleHelp.Render("←→ выбор · enter ок · y/n · ↑↓ PgUp PgDn журнал · esc отмена")
+	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Center, yb, "  ", nb, "   ", help))
+	return styleDocked.Width(width - 2).Render(b.String())
+}
