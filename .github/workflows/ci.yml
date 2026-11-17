@@ -95,7 +95,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
       - name: Собрать исходники обработки с пакетами
         working-directory: src/build
         run: go run . -root ../.. -check -src-out ../../bsl-src
@@ -104,6 +104,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release download --repo 1c-syntax/bsl-language-server --pattern '*-exec.jar' --output bsl-ls.jar
+          set -o pipefail
           java -jar bsl-ls.jar --analyze --srcDir bsl-src --outputDir bsl-report --reporter console --reporter json | tee bsl-console.txt
       - uses: actions/upload-artifact@v4
         if: always()
