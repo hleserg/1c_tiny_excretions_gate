@@ -643,7 +643,8 @@ function Invoke-UiBackground {
     try {
         $output = $shell.EndInvoke($handle)
         if ($output.Count -gt 0) { $result = $output[$output.Count - 1] }
-        if ($result -is [System.Management.Automation.PSObject]) { $result = $result.BaseObject }
+        # .PSObject.BaseObject, а не .BaseObject: у хеш-таблицы точка ищет ключ, и под StrictMode это ошибка.
+        if ($result -is [System.Management.Automation.PSObject]) { $result = $result.PSObject.BaseObject }
         if ($shell.Streams.Error.Count -gt 0) { $errorText = [string]$shell.Streams.Error[0] }
     }
     catch {
