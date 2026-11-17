@@ -652,6 +652,61 @@ if (Test-Path -LiteralPath $snapshotDiffFile) {
     }
 }
 
+# Обмены: итоги пробной выгрузки «после» против «до» или эталона. Строки идут ещё и в самое начало разбора:
+# сломанный обмен останавливает весь обмен узла, и это не прячется в эталоне.
+$exchangeTop = New-Object System.Collections.Generic.List[string]
+$exchangeCompareFile = Join-Path $RunDir 'exchange-compare.txt'
+if (Test-Path -LiteralPath $exchangeCompareFile) {
+    $exchangeLines = @([System.IO.File]::ReadAllLines($exchangeCompareFile, [System.Text.Encoding]::UTF8) | ForEach-Object { $_.TrimStart([char]0xFEFF) } | Where-Object { $_ })
+    if ($exchangeLines.Count -gt 0) {
+        $comparedSomething = $true
+        $body.Add('== Обмены: до и после')
+        foreach ($line in $exchangeLines) {
+            $parts = $line.Split("`t")
+            $kind = $parts[0]
+            $text = $line
+            if ($parts.Count -ge 2) { $text = $parts[1] }
+            $body.Add(("  [{0}] {1}" -f $kind, (Format-Short $text 600)))
+            if ($kind -eq 'ОШИБКА') { $summary.Add(('[КРАСН] Обмены: ' + (Format-Short $text 220))); $exchangeTop.Add(('ОБМЕН СЛОМАН КОМПЛЕКТОМ: ' + (Format-Short $text 300))) }
+            elseif ($kind -eq 'ВНИМАНИЕ') { $summary.Add(('[ЖЁЛТ] Обмены: ' + (Format-Short $text 220))); $exchangeTop.Add(('ОБМЕН: ' + (Format-Short $text 300))) }
+            else { $summary.Add(('[ИНФО] Обмены: ' + (Format-Short $text 220))) }
+        }
+        $body.Add('  Что делать: выгрузка упала - одна такая ошибка обрывает всё сообщение узла, встаёт весь обмен. Текст ошибки и объект - в selfcheck-after.journal.txt (запись «выгрузка упала» и ИНФО с подробностями). Сломано ещё до комплекта - чинить отдельно, гейт будет напоминать каждый прогон.')
+        $body.Add('')
+    }
+}
+
+# Правила обмена по выгрузке расширений (R1-R4) и изменения перехватов правил обмена (R3).
+$exchangeRulesNewFile = Join-Path $RunDir 'exchange-rules.new.txt'
+if (Test-Path -LiteralPath $exchangeRulesNewFile) {
+    $rulesNew = @([System.IO.File]::ReadAllLines($exchangeRulesNewFile, [System.Text.Encoding]::UTF8) | ForEach-Object { $_.TrimStart([char]0xFEFF) } | Where-Object { $_ })
+    if ($rulesNew.Count -gt 0) {
+        $comparedSomething = $true
+        $rulesErrors = @($rulesNew | Where-Object { $_.StartsWith('[ОШИБКА]') }).Count
+        $body.Add(("== Правила обмена: ошибок {0}, новых замечаний {1}" -f $rulesErrors, ($rulesNew.Count - $rulesErrors)))
+        if ($rulesErrors -gt 0) { $summary.Add(("[КРАСН] Правила обмена: ошибок {0} - правило со структурой читает свойство, которого в структуре нет" -f $rulesErrors)) }
+        if ($rulesNew.Count - $rulesErrors -gt 0) { $summary.Add(("[ЖЁЛТ] Правила обмена: новых замечаний {0}" -f ($rulesNew.Count - $rulesErrors))) }
+        $number = 0
+        foreach ($line in @($rulesNew | Select-Object -First 20)) {
+            $number++
+            $body.Add(("  {0}. {1}" -f $number, (Format-Short $line 700)))
+        }
+        $body.Add('  Что делать: R1 - поправить правило в расширении (пустое свойство конфигурации, значение - ключом структуры) или, если ключ в структуре гарантирует наш перехват, завести исключение площадки (ExchangeRuleExceptions) со ссылкой на этот перехват. R2, R4 - посмотреть; принять как известное - ключом -AcceptBaseline. Всё - в exchange-rules.txt.')
+        $body.Add('')
+    }
+}
+$exchangeRulesChangesFile = Join-Path $RunDir 'exchange-rules.changes.txt'
+if (Test-Path -LiteralPath $exchangeRulesChangesFile) {
+    $rulesChanges = @([System.IO.File]::ReadAllLines($exchangeRulesChangesFile, [System.Text.Encoding]::UTF8) | ForEach-Object { $_.TrimStart([char]0xFEFF) } | Where-Object { $_ })
+    if ($rulesChanges.Count -gt 0) {
+        $comparedSomething = $true
+        $body.Add(("== Изменения правил обмена: {0}" -f $rulesChanges.Count))
+        $summary.Add(("[ИНФО] Изменения правил обмена: {0} - шаг «Обмены» в этом прогоне обязателен" -f $rulesChanges.Count))
+        foreach ($line in @($rulesChanges | Select-Object -First 30)) { $body.Add(('  - ' + (Format-Short $line 300))) }
+        $body.Add('')
+    }
+}
+
 # Время ключевых операций: заметно медленнее истории.
 $metricsSlowFile = Join-Path $RunDir 'metrics-slow.txt'
 if (Test-Path -LiteralPath $metricsSlowFile) {
@@ -811,6 +866,9 @@ if ($kitDecision) {
 }
 if ($referenceNote -and $comparedSomething) { $report.Add($referenceNote) }
 $report.Add('')
+# Сломанный обмен - первой строкой, до «КОРОТКО».
+foreach ($line in $exchangeTop) { $report.Add($line) }
+if ($exchangeTop.Count -gt 0) { $report.Add('') }
 $report.Add('КОРОТКО')
 if ($summary.Count -eq 0) { $report.Add('  Нового ничего нет.') }
 foreach ($line in $summary) { $report.Add(('  ' + $line)) }

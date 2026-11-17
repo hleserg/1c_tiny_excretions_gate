@@ -32,6 +32,13 @@ type progressState struct {
 	at       time.Time
 }
 
+// runEta - оценка, сколько осталось всего прогона: секунды на момент at и шаги без статистики.
+type runEta struct {
+	seconds float64
+	unknown int
+	at      time.Time
+}
+
 type tickMsg time.Time
 type engineStartedMsg struct {
 	eng *engine
@@ -57,6 +64,7 @@ type model struct {
 	logView   viewport.Model
 	follow    bool
 	prog      *progressState
+	eta       *runEta
 	bar       progress.Model
 	spin      spinner.Model
 	dialog    *dialog
@@ -204,6 +212,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.layout()
 		case "progress":
 			m.prog = &progressState{title: ev.Title, elapsed: ev.Elapsed, expected: ev.Expected, done: ev.Done, total: ev.Total, detail: ev.Detail, at: time.Now()}
+			if ev.Remaining != nil && *ev.Remaining >= 0 {
+				m.eta = &runEta{seconds: *ev.Remaining, unknown: ev.RemainingUnknown, at: time.Now()}
+			}
 			var cmds []tea.Cmd
 			if ev.Title != m.barTitle {
 				// Новый шаг - новая полоса: старая не должна «отъезжать» назад к нулю.

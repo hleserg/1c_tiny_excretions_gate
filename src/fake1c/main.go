@@ -109,6 +109,10 @@ func main() {
 	}
 	line := strings.Join(args, " ")
 	state := loadState()
+	before := map[string]int{}
+	for k, v := range state {
+		before[k] = v
+	}
 	code := 0
 	mode := "?"
 	if len(args) > 0 && strings.EqualFold(args[0], "DESIGNER") {
@@ -118,7 +122,19 @@ func main() {
 		mode = "ENTERPRISE"
 		code = client(sc, args, state)
 	}
-	saveState(state)
+	// Гейт может держать два процесса 1С сразу (проверка конфигурации параллельно с остальными шагами):
+	// счётчики дописываются к тому, что лежит в файле сейчас, а не перезаписывают его прежней копией.
+	changed := false
+	fresh := loadState()
+	for k, v := range state {
+		if v != before[k] {
+			fresh[k] += v - before[k]
+			changed = true
+		}
+	}
+	if changed {
+		saveState(fresh)
+	}
 	if logFile != "" {
 		f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err == nil {

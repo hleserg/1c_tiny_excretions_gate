@@ -44,9 +44,13 @@ type uiEvent struct {
 	Title       string     `json:"title"`
 	Elapsed     float64    `json:"elapsed"`
 	Expected    float64    `json:"expected"`
-	Done        int        `json:"done"`
-	Total       int        `json:"total"`
-	Detail      string     `json:"detail"`
+	// Сколько осталось всего прогона по оценке скрипта, секунд; -1 - неизвестно. RemainingUnknown - сколько
+	// оставшихся шагов без статистики (их время в оценку не вошло).
+	Remaining        *float64 `json:"remaining"`
+	RemainingUnknown int      `json:"remainingUnknown"`
+	Done             int      `json:"done"`
+	Total            int      `json:"total"`
+	Detail           string   `json:"detail"`
 }
 
 // answer - ответ на вопрос, файл a-<id>.json в папке канала.

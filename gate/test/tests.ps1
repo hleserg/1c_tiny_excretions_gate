@@ -10,12 +10,15 @@
 Запуск:  powershell -ExecutionPolicy Bypass -File test\tests.ps1
          ... -Only epf      только тесты, в имени которых есть «epf»
          ... -Keep          не удалять песочницы (для разбора)
+         ... -Extra <файл>  добавить тесты площадки (приватный репозиторий)
 Итог - в консоли и в test\last-run.txt: его и присылать.
 #>
 param(
     [string]$Only = '',
     [switch]$Keep,
-    [int]$TimeoutSec = 300
+    [int]$TimeoutSec = 300,
+    # Тесты площадки из приватного репозитория: файл, который возвращает массив тестов в том же виде.
+    [string]$Extra = ''
 )
 
 Set-StrictMode -Version 2.0
@@ -408,6 +411,67 @@ function New-PrintProcessing {
 $deployRiskAnswer = @{ Kind = 'confirm'; Header = 'хотя прогонов гейта нет'; Yes = $true }
 $deployNameAnswer = @{ Kind = 'text'; Header = 'Это рабочая база'; Text = 'erp_base' }
 
+# Обмены, итоги выгрузки: один объект узла «Бухгалтерия», выгрузился (ok) или упал (fail) - как пишет обработка.
+$exchangeUid = 'aaaaaaaa-1111-2222-3333-444444444444'
+function New-ExchangeResultTasks {
+    param([string]$State)
+    $presentation = 'Обмены, Бухгалтерия: Документ.СписаниеДС «Списание ДС 00-000001 от 01.11.2026 12:00:00»'
+    $line = '[ОК] {0}: сообщение обмена сформировано без ошибок' -f $presentation
+    $value = 'ok'
+    if ($State -ne 'ok') {
+        $error1 = 'Поле объекта не обнаружено (ГосКонтракт) (Событие: Отправка. Объект: Списание ДС 00-000001 от 01.11.2026 12:00:00)'
+        $line = '[ОШИБКА] {0}: выгрузка упала: {1}' -f $presentation, $error1
+        $value = "fail`n" + $error1
+    }
+    return @(
+        @{ key = 'Окружение'; title = 'Окружение и расширения'; step = 'Окружение'; lines = @('[ОК] Обработка запущена под полными правами') },
+        @{ key = 'Обмены'; title = 'Обмены'; step = 'Обмены'; lines = @($line); snapshots = @{ ('выгрузка|Бухгалтерия|Документ.СписаниеДС|' + $exchangeUid) = $value } }
+    )
+}
+
+# Правила обмена: модуль менеджера обмена из выгрузки расширения подрядчика (имена выдуманные).
+# Правило со структурой (ОбъектДанных = Неопределено) и ПКС со свойством конфигурации во #Вставка - R1;
+# такая же вставка в правило с объектом - без замечания; ПКС в #Удаление - без замечания;
+# &После правила «...ИзСтруктуры» с ПКС - R1 по имени; у этого перехвата пометка автора - без R4.
+$rulesControlLines = @(
+    '&ИзменениеИКонтроль("ДобавитьПКО_Справочник_Склады_ИзСтруктуры")',
+    'Процедура Доработки_ДобавитьПКО_Справочник_Склады_ИзСтруктуры(ПравилаКонвертации)',
+    '	ПравилоКонвертации = ПравилаКонвертации.Добавить();',
+    '	ПравилоКонвертации.ИмяПКО = "Справочник_Склады_ИзСтруктуры";',
+    '	ПравилоКонвертации.ОбъектДанных      = Неопределено; // источник - структура',
+    '	СвойстваШапки = ПравилоКонвертации.Свойства;',
+    '	ДобавитьПКС(СвойстваШапки, "", "Наименование");',
+    '	#Вставка',
+    '	ДобавитьПКС(СвойстваШапки, "Ответственный", "ОтветственныйЛицо", 1,',
+    '		"Справочник_Сотрудники");',
+    '	#КонецВставки',
+    '	#Удаление',
+    '	ДобавитьПКС(СвойстваШапки, "Старое", "Старое");',
+    '	#КонецУдаления',
+    'КонецПроцедуры',
+    '',
+    '&ИзменениеИКонтроль("ДобавитьПКО_Справочник_Склады")',
+    'Процедура Доработки_ДобавитьПКО_Справочник_Склады(ПравилаКонвертации)',
+    '	ПравилоКонвертации = ПравилаКонвертации.Добавить();',
+    '	ПравилоКонвертации.ИмяПКО = "Справочник_Склады";',
+    '	ПравилоКонвертации.ОбъектДанных = Метаданные.Справочники.Склады;',
+    '	СвойстваШапки = ПравилоКонвертации.Свойства;',
+    '	#Вставка',
+    '	ДобавитьПКС(СвойстваШапки, "Ответственный", "ОтветственныйЛицо", 1, "Справочник_Сотрудники");',
+    '	#КонецВставки',
+    'КонецПроцедуры')
+$rulesInsertLine = 9
+$rulesAfterLines = @(
+    '',
+    '// ** Тестов А.Б. 20261117 валюта кассы в обмене',
+    '&После("ДобавитьПКО_Справочник_Кассы_ИзСтруктуры")',
+    'Процедура Доработки_ДобавитьПКО_Справочник_Кассы_ИзСтруктуры(ПравилаКонвертации)',
+    '	ПравилоКонвертации = ПравилаКонвертации[ПравилаКонвертации.Количество() - 1];',
+    '	ДобавитьПКС(ПравилоКонвертации.Свойства, "Валюта", "Валюта"); // в «http://» комментарий не мешает',
+    'КонецПроцедуры')
+$rulesModuleControlOnly = $rulesControlLines -join "`n"
+$rulesModule = (@($rulesControlLines) + @($rulesAfterLines)) -join "`n"
+
 $tests = @(
     @{
         Name = 'gate-asis-green'
@@ -671,6 +735,182 @@ $tests = @(
                 Check (@($new | Where-Object { $_ -match 'регламентное\|Адаптация\|Адаптация_Чистка' }).Count -eq 1) 'регламентное задание не в новом непокрытом'
                 Check (@($new | Where-Object { $_ -match 'ЗаказКлиента' }).Count -eq 0) 'покрытый перехват попал в новое непокрытое'
             }
+        }
+    },
+    @{
+        Name = 'gate-exchange-kit-broke'
+        Text = 'обмены: до загрузки выгрузка проходила, после упала - красный; «после» выгружает набор «до» (exch=), строка в начале разбора'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ tasks = (New-ExchangeResultTasks 'ok') }, @{ tasks = (New-ExchangeResultTasks 'fail'); fingerprint = 'после' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'RED' 1
+            Check-Step $r 'Обмены: до и после' 'FAIL'
+            Check-Step $r 'Самопроверка после загрузки' 'FAIL'
+            Check ((Get-Calls $r @('selfcheck', 'exch=')).Count -eq 1) 'набор объектов «до» (exch=) не передан в самопроверку «после» ровно один раз'
+            if ($r.RunDir) {
+                $setFile = Join-Path $r.RunDir 'exchange-set.txt'
+                Check (Test-Path -LiteralPath $setFile) 'нет файла набора объектов exchange-set.txt'
+                if (Test-Path -LiteralPath $setFile) {
+                    Check ([System.IO.File]::ReadAllText($setFile, $utf8).Contains(("Бухгалтерия`tДокумент.СписаниеДС`t{0}" -f $exchangeUid))) 'в наборе нет объекта прогона «до»'
+                }
+                $reportText = [System.IO.File]::ReadAllText((Join-Path $r.RunDir 'report.txt'), $utf8)
+                $top = $reportText.Substring(0, [Math]::Max(0, $reportText.IndexOf('КОРОТКО')))
+                Check ($top.Contains('ОБМЕН СЛОМАН КОМПЛЕКТОМ')) ("в начале разбора нет строки о сломанном обмене: {0}" -f $top)
+            }
+        }
+    },
+    @{
+        Name = 'gate-exchange-kit-still-broken'
+        Text = 'обмены: выгрузка падает и до, и после загрузки - жёлтый «обмен сломан ещё до загрузки комплекта», в эталоне не прячется'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ tasks = (New-ExchangeResultTasks 'fail') }, @{ tasks = (New-ExchangeResultTasks 'fail'); fingerprint = 'после' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'YELLOW' 2
+            Check-Step $r 'Обмены: до и после' 'WARN'
+            Check-Step $r 'Самопроверка после загрузки' 'OK'
+            $step = Get-Step $r 'Обмены: до и после'
+            if ($null -ne $step) { Check ([string]$step.detail -match 'обмен сломан ещё до загрузки комплекта' -and [string]$step.detail -match 'ГосКонтракт') ("в шаге нет текста о сломанном до комплекта обмене: {0}" -f $step.detail) }
+            if ($r.RunDir) {
+                $reportText = [System.IO.File]::ReadAllText((Join-Path $r.RunDir 'report.txt'), $utf8)
+                $top = $reportText.Substring(0, [Math]::Max(0, $reportText.IndexOf('КОРОТКО')))
+                Check ($top.Contains('обмен сломан ещё до загрузки комплекта')) ("в начале разбора нет строки о сломанном обмене: {0}" -f $top)
+            }
+        }
+    },
+    @{
+        Name = 'gate-exchange-kit-fixed'
+        Text = 'обмены: до загрузки выгрузка падала, после проходит - зелёный, «выгрузка починилась»'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ tasks = (New-ExchangeResultTasks 'fail') }, @{ tasks = (New-ExchangeResultTasks 'ok'); fingerprint = 'после' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            Check-Step $r 'Обмены: до и после' 'OK'
+            $step = Get-Step $r 'Обмены: до и после'
+            if ($null -ne $step) { Check ([string]$step.detail -match 'выгрузка починилась') ("в шаге нет «выгрузка починилась»: {0}" -f $step.detail) }
+        }
+    },
+    @{
+        Name = 'gate-exchange-rules-r1'
+        Text = 'правила обмена: ПКС со свойством конфигурации в правиле со структурой - красный (ИзменениеИКонтроль и &После по имени), правило с объектом и #Удаление - без замечаний, R4 по подрядчику'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ ContractorExtensions = @('Доработки') }
+            $fake = @{ selfcheck = @(@{ tasks = (New-ExchangeResultTasks 'ok') }); dumps = @{ 'Доработки' = @{ 'CommonModules/МенеджерОбменаЧерезУниверсальныйФормат/Ext/Module.bsl' = $rulesModule } } }
+            $r = Invoke-Script -Sandbox $sb -Fake $fake
+            Check-Common $r; Check-Verdict $r 'RED' 1
+            Check-Step $r 'Правила обмена' 'FAIL'
+            if ($r.RunDir) {
+                $lines = @([System.IO.File]::ReadAllLines((Join-Path $r.RunDir 'exchange-rules.txt'), $utf8) | Where-Object { $_ })
+                $r1 = @($lines | Where-Object { $_.StartsWith('[ОШИБКА] R1 ') })
+                Check ($r1.Count -eq 2) ("ошибок R1 {0}, ждали 2: {1}" -f $r1.Count, ($lines -join ' | '))
+                $control = @($r1 | Where-Object { $_ -match 'Склады_ИзСтруктуры' -and $_ -match ('строка {0}:' -f $rulesInsertLine) -and $_ -match '«Ответственный»' })
+                Check ($control.Count -eq 1) ("нет R1 на строке {0} в правиле со структурой: {1}" -f $rulesInsertLine, ($r1 -join ' | '))
+                Check (@($r1 | Where-Object { $_ -match 'Кассы_ИзСтруктуры' -and $_ -match 'определено по имени' }).Count -eq 1) 'нет R1 для &После по имени правила'
+                Check (@($lines | Where-Object { $_ -match 'R1 ' -and $_ -match 'Доработки_ДобавитьПКО_Справочник_Склады \(' }).Count -eq 0) 'замечание на правило с объектом-источником'
+                Check (@($lines | Where-Object { $_ -match '«Старое»' }).Count -eq 0) 'замечание на ПКС из #Удаление'
+                $r4 = @($lines | Where-Object { $_.StartsWith('[ВНИМАНИЕ] R4 ') })
+                Check ($r4.Count -gt 0) 'нет замечаний R4 по расширению подрядчика'
+                Check (@($r4 | Where-Object { $_ -match 'Доработки_ДобавитьПКО_Справочник_Кассы_ИзСтруктуры' -and $_ -match 'перехват' }).Count -eq 0) 'R4 на перехват с пометкой автора'
+            }
+        }
+    },
+    @{
+        Name = 'gate-exchange-rules-exception'
+        Text = 'правила обмена: исключение площадки с живым перехватом-гарантией снимает R1 (ИНФО); перехват пропал - снова красный'
+        Run = {
+            param($Name)
+            $exception = @{ Rule = 'Справочник_Склады_ИзСтруктуры'; Property = 'Ответственный'; Reason = 'ключ дописывает перехват'; GuardExtension = 'Адаптация'; GuardMethod = 'СтруктураКлючейСклада' }
+            $sb = New-Sandbox $Name -Config @{ ExchangeRuleExceptions = @($exception) }
+            $guard = "&Вместо(`"СтруктураКлючейСклада`")`nФункция Адаптация_СтруктураКлючейСклада()`n`tВозврат ПродолжитьВызов();`nКонецФункции"
+            $fake = @{ selfcheck = @(@{ tasks = (New-ExchangeResultTasks 'ok') }); dumps = @{
+                    'Доработки' = @{ 'CommonModules/МенеджерОбменаЧерезУниверсальныйФормат/Ext/Module.bsl' = $rulesModuleControlOnly }
+                    'Адаптация' = @{ 'CommonModules/МенеджерОбменаЧерезУниверсальныйФормат/Ext/Module.bsl' = $guard } } }
+            $first = Invoke-Script -Sandbox $sb -Fake $fake
+            Check-Common $first; Check-Verdict $first 'GREEN' 0
+            Check-Step $first 'Правила обмена' 'OK'
+            if ($first.RunDir) {
+                $lines = @([System.IO.File]::ReadAllLines((Join-Path $first.RunDir 'exchange-rules.txt'), $utf8) | Where-Object { $_ })
+                Check (@($lines | Where-Object { $_.StartsWith('[ИНФО] R1 ') -and $_ -match 'снято исключением' }).Count -eq 1) ("нет ИНФО «снято исключением»: {0}" -f ($lines -join ' | '))
+            }
+            Start-Sleep -Seconds 2
+            Remove-Item -LiteralPath (Join-Path $sb 'fake\fake1c-state.json') -Force -ErrorAction SilentlyContinue
+            $fake.dumps['Адаптация'] = @{ 'CommonModules/МенеджерОбменаЧерезУниверсальныйФормат/Ext/Module.bsl' = "Функция Адаптация_СтруктураКлючейСклада()`n`tВозврат Новый Структура;`nКонецФункции" }
+            $r = Invoke-Script -Sandbox $sb -Fake $fake
+            Check-Common $r; Check-Verdict $r 'RED' 1
+            Check-Step $r 'Правила обмена' 'FAIL'
+            $step = Get-Step $r 'Правила обмена'
+            if ($r.RunDir) {
+                $lines = @([System.IO.File]::ReadAllLines((Join-Path $r.RunDir 'exchange-rules.txt'), $utf8) | Where-Object { $_ })
+                Check (@($lines | Where-Object { $_.StartsWith('[ОШИБКА] R1 ') -and $_ -match 'оно не действует' }).Count -eq 1) ("нет R1 «исключение не действует»: {0}" -f ($lines -join ' | '))
+            }
+        }
+    },
+    @{
+        Name = 'gate-exchange-rules-changed-skip'
+        Text = 'правила обмена изменены (R3), а шаг «Обмены» ничего не выгрузил (пропуск) - не зелёный'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $skipTasks = @(
+                @{ key = 'Окружение'; title = 'Окружение и расширения'; step = 'Окружение'; lines = @('[ОК] Обработка запущена под полными правами') },
+                @{ key = 'Обмены'; title = 'Обмены'; step = 'Обмены'; lines = @('[ПРОПУСК] Обмены: пакет сценариев не назвал узлы обмена для снимков.') })
+            $module = "&ИзменениеИКонтроль(`"ДобавитьПКО_Справочник_Склады`")`nПроцедура Доработки_ДобавитьПКО_Справочник_Склады(ПравилаКонвертации)`n`tПравилоКонвертации.ОбъектДанных = Метаданные.Справочники.Склады;`nКонецПроцедуры"
+            $fake = @{ selfcheck = @(@{ tasks = $skipTasks }); dumps = @{ 'Доработки' = @{ 'CommonModules/МенеджерОбменаЧерезУниверсальныйФормат/Ext/Module.bsl' = $module } } }
+            $first = Invoke-Script -Sandbox $sb -Fake $fake
+            Check-Common $first; Check-Verdict $first 'GREEN' 0
+            Check-Step $first 'Правила обмена' 'OK'
+            Check ($null -eq (Get-Step $first 'Обмены: до и после')) 'шаг «Обмены: до и после» в первом прогоне, хотя правила не менялись и выгрузок нет'
+            Start-Sleep -Seconds 2
+            Remove-Item -LiteralPath (Join-Path $sb 'fake\fake1c-state.json') -Force -ErrorAction SilentlyContinue
+            $fake.dumps['Доработки'] = @{ 'CommonModules/МенеджерОбменаЧерезУниверсальныйФормат/Ext/Module.bsl' = ($module.Replace('КонецПроцедуры', "`tПравилоКонвертации.ИспользоватьКэш = Ложь;`nКонецПроцедуры")) }
+            $fake.selfcheck = @(@{ tasks = $skipTasks; fingerprint = 'второй' })
+            $r = Invoke-Script -Sandbox $sb -Fake $fake
+            Check-Common $r; Check-Verdict $r 'YELLOW' 2
+            Check-Step $r 'Обмены: до и после' 'WARN'
+            $step = Get-Step $r 'Обмены: до и после'
+            if ($null -ne $step) { Check ([string]$step.detail -match 'правила обмена изменены, а обмен не проверен') ("нет текста «обмен не проверен»: {0}" -f $step.detail) }
+            if ($r.RunDir) {
+                $changes = @([System.IO.File]::ReadAllLines((Join-Path $r.RunDir 'exchange-rules.changes.txt'), $utf8) | Where-Object { $_ })
+                Check ($changes.Count -eq 1 -and $changes[0] -match '^изменён перехват: ') ("изменения перехватов: {0}" -f ($changes -join ' | '))
+            }
+        }
+    },
+    @{
+        Name = 'gate-parallel-checkconfig'
+        Text = 'проверка конфигурации идёт параллельно с канарейкой и самопроверкой, итог - перед вердиктом; ci.exe получает оценку, сколько осталось'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ designer = @(@{ match = @('/CheckConfig'); sleep = 6 }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            Check-Step $r 'Проверка конфигурации' 'OK'
+            if ($null -ne $r.Verdict) {
+                $names = @($r.Verdict.steps | ForEach-Object { [string]$_.name })
+                $checkAt = [array]::IndexOf($names, 'Проверка конфигурации (all)')
+                $selfAt = [array]::IndexOf($names, 'Самопроверка после загрузки')
+                Check ($checkAt -gt $selfAt -and $selfAt -ge 0) ("итог проверки конфигурации не после самопроверки: {0}" -f ($names -join ' | '))
+            }
+            $checkCall = -1
+            $selfCall = -1
+            for ($i = 0; $i -lt $r.Calls.Count; $i++) {
+                if ($checkCall -lt 0 -and $r.Calls[$i].Line.Contains('/CheckConfig')) { $checkCall = $i }
+                if ($r.Calls[$i].Line.Contains('selfcheck')) { $selfCall = $i }
+            }
+            # Журнал подставной 1С пишется по завершении вызова: самопроверка «после» кончилась раньше проверки.
+            Check ($selfCall -ge 0 -and $checkCall -gt $selfCall) ("проверка конфигурации кончилась не после самопроверки (вызовы {0} и {1})" -f $checkCall, $selfCall)
+            $eta = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('"progress"') -and $_ -match '"remaining":\d+' })
+            Check ($eta.Count -gt 0) 'в событиях хода нет оценки, сколько осталось (remaining)'
         }
     },
     @{
@@ -979,6 +1219,10 @@ $tests = @(
 #endregion
 
 #region Прогон тестов
+
+# Тесты площадки (приватный репозиторий): файл подключается точкой и возвращает массив тестов; ему доступны
+# песочница, запуск скрипта и проверки отсюда.
+if ($Extra) { $tests = @($tests) + @(. $Extra) }
 
 $selected = @($tests | Where-Object { -not $Only -or $_.Name -like "*$Only*" })
 $report.Add(('Тесты гейта без 1С, {0}, тестов {1}' -f (Get-Date -Format 'dd.MM.yyyy HH:mm'), $selected.Count))

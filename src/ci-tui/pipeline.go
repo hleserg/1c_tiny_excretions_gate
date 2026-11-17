@@ -315,7 +315,17 @@ func (m model) viewPipe(width, height int) string {
 	}
 	head := styleSection.Render("Шаги прогона")
 	if len(m.pipe) > 0 {
-		count := styleDim.Render(fmt.Sprintf("%d/%d", done, len(m.pipe)))
+		countText := fmt.Sprintf("%d/%d", done, len(m.pipe))
+		// Сколько осталось всего прогона: оценка скрипта, дальше тикает по часам. «+» - есть шаги без статистики.
+		if m.eta != nil && m.running {
+			left := m.eta.seconds - time.Since(m.eta.at).Seconds()
+			etaText := "~" + formatDuration(left)
+			if m.eta.unknown > 0 {
+				etaText += "+"
+			}
+			countText = etaText + "  " + countText
+		}
+		count := styleDim.Render(countText)
 		gap := width - lipgloss.Width(head) - lipgloss.Width(count)
 		if gap < 1 {
 			gap = 1

@@ -118,6 +118,10 @@ $script:SessionLockCode = ''
 # (или настройкой ReleaseJobsLock) снимает в конце, но только если поставил её сам.
 $script:JobsLockSet = $false
 $script:JobsLockRelease = $false
+# Проверка конфигурации, которая идёт параллельно с остальными шагами, и ожидаемые длительности шагов плана
+# (для оценки, сколько осталось всего прогона).
+$script:BackgroundCheck = $null
+$script:RunPlanExpected = [ordered]@{}
 
 # Скрипт остановился: причина одной строкой. Место в скрипте показывается только для неожиданной
 # ошибки. У остановки по throw с текстом оно ничего не объясняет; отличить её можно по тому,
@@ -125,6 +129,8 @@ $script:JobsLockRelease = $false
 trap {
     Write-Host ''
     Write-Host ("Остановлено: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    # Проверка конфигурации, запущенная параллельно (ParallelCheckConfig), не должна пережить скрипт.
+    if ($null -ne $script:BackgroundCheck) { try { Stop-Process -Id $script:BackgroundCheck.Process.Id -Force -ErrorAction Stop } catch { } }
     if ([string]$_.FullyQualifiedErrorId -ne [string]$_.Exception.Message -and $null -ne $_.InvocationInfo) {
         Write-Host ("  {0}" -f ($_.InvocationInfo.PositionMessage -split "`r?`n")[0]) -ForegroundColor DarkGray
     }
@@ -801,6 +807,139 @@ function Read-SelfCheckSnapshots {
     return $result
 }
 
+#region Обмены: итоги пробной выгрузки «до» и «после»
+
+function Write-ExchangeResults {
+    # Итоги выгрузки -> файл «состояние<TAB>узел|объект|УИД<TAB>описание ошибки», ключи по порядку.
+    param($Results, [string]$Path)
+    $lines = @($Results.Keys | Sort-Object | ForEach-Object { '{0}{1}{2}{1}{3}' -f $Results[$_].State, "`t", $_, $Results[$_].Text })
+    [System.IO.File]::WriteAllLines($Path, [string[]]$lines, $Utf8Bom)
+}
+
+function Read-ExchangeResults {
+    # Файл итогов выгрузки -> таблица «ключ -> State, Text». Файла нет - $null.
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    $table = [ordered]@{}
+    foreach ($line in [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)) {
+        $parts = $line.TrimStart([char]0xFEFF).Split("`t")
+        if ($parts.Count -lt 2 -or -not $parts[1]) { continue }
+        $text = ''
+        if ($parts.Count -ge 3) { $text = $parts[2] }
+        $table[$parts[1]] = [pscustomobject]@{ State = $parts[0]; Text = $text }
+    }
+    return $table
+}
+
+function Write-ExchangeSetFile {
+    # Набор объектов прогона «до» для «после»: строки «узел<TAB>полное имя<TAB>УИД» (параметр exch= обработки).
+    param($Results, [string]$Path)
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($key in @($Results.Keys | Sort-Object)) {
+        $parts = ([string]$key).Split('|')
+        if ($parts.Count -lt 3) { continue }
+        $lines.Add(('{0}{1}{2}{1}{3}' -f $parts[0], "`t", $parts[1], $parts[2]))
+    }
+    [System.IO.File]::WriteAllLines($Path, $lines.ToArray(), $Utf8Bom)
+}
+
+function Format-ExchangeKey {
+    # «узел|Документ.Х|УИД» -> «узел: Документ.Х <УИД>» для текстов шага.
+    param([string]$Key)
+    $parts = $Key.Split('|')
+    if ($parts.Count -ge 3) { return ('{0}: {1} {2}' -f $parts[0], $parts[1], $parts[2]) }
+    return $Key
+}
+
+function Compare-ExchangeResults {
+    # Итоги выгрузки «до» и «после» по одному набору объектов:
+    # Broken - выгрузился до, упал после (комплект сломал обмен); StillBroken - упал и до, и после
+    # (обмен сломан ещё до загрузки комплекта); Fixed - упал до, выгрузился после; NewFailed - объекта в «до» нет,
+    # после упал; Gone - объект был в «до», после его нет (не выгружался).
+    param($Before, $After)
+    $broken = New-Object System.Collections.Generic.List[string]
+    $still = New-Object System.Collections.Generic.List[string]
+    $fixed = New-Object System.Collections.Generic.List[string]
+    $newFailed = New-Object System.Collections.Generic.List[string]
+    $gone = New-Object System.Collections.Generic.List[string]
+    $okAfter = 0
+    foreach ($key in @($After.Keys)) {
+        $now = $After[$key]
+        if ($now.State -eq 'ok') { $okAfter++ }
+        $was = $null
+        if ($null -ne $Before -and $Before.Contains($key)) { $was = $Before[$key] }
+        $label = Format-ExchangeKey $key
+        if ($now.State -ne 'ok') { $label += (': ' + $now.Text) }
+        if ($null -eq $was) {
+            if ($now.State -ne 'ok') { $newFailed.Add($label) }
+            continue
+        }
+        if ($was.State -eq 'ok' -and $now.State -ne 'ok') { $broken.Add($label) }
+        elseif ($was.State -ne 'ok' -and $now.State -ne 'ok') { $still.Add($label) }
+        elseif ($was.State -ne 'ok' -and $now.State -eq 'ok') { $fixed.Add(((Format-ExchangeKey $key) + ' (было: ' + $was.Text + ')')) }
+    }
+    if ($null -ne $Before) {
+        foreach ($key in @($Before.Keys)) { if (-not $After.Contains($key)) { $gone.Add((Format-ExchangeKey $key)) } }
+    }
+    return [pscustomobject]@{
+        Total = @($After.Keys).Count; OkAfter = $okAfter
+        Broken = $broken.ToArray(); StillBroken = $still.ToArray(); Fixed = $fixed.ToArray()
+        NewFailed = $newFailed.ToArray(); Gone = $gone.ToArray()
+    }
+}
+
+function Invoke-ExchangeCompareStep {
+    # Шаг «Обмены: до и после». Красный - выгрузка, которая была целой до загрузки комплекта (или в эталоне), упала
+    # после, либо упал объект, которого в «до» не было. Жёлтый - обмен сломан ещё до загрузки комплекта: в эталоне
+    # это не прячется, строка идёт и в начало report.txt. Починившаяся выгрузка - сведения. Правила обмена изменены
+    # (R3), а выгрузок нет - жёлтый: обмен не проверен. Строки для report.txt - в exchange-compare.txt.
+    param($After, $BeforeFile, [bool]$WithKit)
+    $stepName = 'Обмены: до и после'
+    $before = Read-ExchangeResults $BeforeFile
+    $changed = @($script:ExchangeRulesChanged)
+    if ($After.Count -eq 0) {
+        if ($changed.Count -gt 0) {
+            $detail = "правила обмена изменены, а обмен не проверен: шаг «Обмены» самопроверки ни одного объекта не выгрузил (нет узлов, нет объектов или запись запрещена - причина в журнале самопроверки). Изменения: {0}" -f ((@($changed | Select-Object -First 3)) -join ' | ')
+            [System.IO.File]::WriteAllLines((Join-Path $RunDir 'exchange-compare.txt'), [string[]]@(('ВНИМАНИЕ' + "`t" + $detail)), $Utf8Bom)
+            Add-StepResult -Name $stepName -Status 'WARN' -Detail $detail
+        }
+        return
+    }
+    $comparison = Compare-ExchangeResults -Before $before -After $After
+    $whenBefore = 'до загрузки комплекта'
+    if (-not $WithKit) { $whenBefore = 'в эталоне (прошлый принятый прогон)' }
+    $parts = New-Object System.Collections.Generic.List[string]
+    $reportLines = New-Object System.Collections.Generic.List[string]
+    $parts.Add(("выгружено объектов {0}, без ошибок {1}" -f $comparison.Total, $comparison.OkAfter))
+    if ($null -eq $before) { $parts.Add('итогов «до» нет: сравнивать не с чем, упавшая выгрузка считается новой') }
+    if ($comparison.Broken.Count -gt 0) {
+        $text = "выгрузка упала, а {0} проходила: {1}" -f $whenBefore, ((@($comparison.Broken | Select-Object -First 3)) -join ' | ')
+        $parts.Add($text); $reportLines.Add(('ОШИБКА' + "`t" + $text))
+    }
+    if ($comparison.NewFailed.Count -gt 0) {
+        $text = "выгрузка упала, объекта {0} не было: {1}" -f $whenBefore, ((@($comparison.NewFailed | Select-Object -First 3)) -join ' | ')
+        $parts.Add($text); $reportLines.Add(('ОШИБКА' + "`t" + $text))
+    }
+    if ($comparison.StillBroken.Count -gt 0) {
+        $text = "обмен сломан ещё {0}: {1}" -f $whenBefore, ((@($comparison.StillBroken | Select-Object -First 3)) -join ' | ')
+        if ($comparison.StillBroken.Count -gt 3) { $text += (" и ещё {0}" -f ($comparison.StillBroken.Count - 3)) }
+        $parts.Add($text); $reportLines.Add(('ВНИМАНИЕ' + "`t" + $text))
+    }
+    if ($comparison.Fixed.Count -gt 0) {
+        $text = "выгрузка починилась: {0}" -f ((@($comparison.Fixed | Select-Object -First 3)) -join ' | ')
+        $parts.Add($text); $reportLines.Add(('ИНФО' + "`t" + $text))
+    }
+    if ($comparison.Gone.Count -gt 0) { $parts.Add(("объектов из «до», которые после не выгружались: {0}" -f $comparison.Gone.Count)) }
+    if ($changed.Count -gt 0) { $parts.Add(("правила обмена изменены: {0}" -f ((@($changed | Select-Object -First 3)) -join ' | '))) }
+    $status = 'OK'
+    if ($comparison.StillBroken.Count -gt 0) { $status = 'WARN' }
+    if ($comparison.Broken.Count -gt 0 -or $comparison.NewFailed.Count -gt 0) { $status = 'FAIL' }
+    [System.IO.File]::WriteAllLines((Join-Path $RunDir 'exchange-compare.txt'), $reportLines.ToArray(), $Utf8Bom)
+    Add-StepResult -Name $stepName -Status $status -Detail ($parts -join '; ') -Log (Join-Path $RunDir 'selfcheck-after.exchange.txt')
+}
+
+#endregion
+
 #region Карта покрытия
 
 # Папки выгрузки расширения -> вид объекта метаданных, как он пишется в полном имени (Документ.Х).
@@ -863,6 +1002,7 @@ function Get-CoverageItems {
                         Key = ('перехват|{0}|{1}|{2}|{3}' -f $Extension, $object, $part, $found.Groups[2].Value)
                         Kind = 'перехват'; Text = ('{0}, {1}: &{2}("{3}")' -f $object, $part, $found.Groups[1].Value, $found.Groups[2].Value)
                         Objects = @($object); Module = $module
+                        ExchangeRule = (Test-ExchangeRuleMethod -Module $name -Target $found.Groups[2].Value -TypeName $typeName)
                     })
             }
             if ($formName -and $intercepts -eq 0) {
@@ -919,7 +1059,8 @@ function Measure-Coverage {
     # Чем задета каждая доработка в самопроверке. Уровни: covered - объект побывал в задании самопроверки, кроме
     # компиляции (операции, перепроведение, формы, обмены...); compiled - общий модуль только компилируется;
     # none - ничем не задета. Records - записи самопроверки «[ВИД] ключ :: текст».
-    param([object[]]$Items, [string[]]$Records)
+    # Перехват правил обмена (ExchangeRule) задет, только если шаг «Обмены» что-то выгрузил: ExchangeRan.
+    param([object[]]$Items, [string[]]$Records, [bool]$ExchangeRan = $false)
     $exercised = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $compiled = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($record in $Records) {
@@ -935,7 +1076,9 @@ function Measure-Coverage {
     $result = New-Object System.Collections.Generic.List[object]
     foreach ($item in $Items) {
         $level = 'none'
-        foreach ($object in @($item.Objects)) { if ($exercised.Contains([string]$object)) { $level = 'covered'; break } }
+        $isExchangeRule = ($null -ne $item.PSObject.Properties['ExchangeRule'] -and [bool]$item.ExchangeRule)
+        if ($isExchangeRule -and $ExchangeRan) { $level = 'covered' }
+        foreach ($object in @($item.Objects)) { if ($level -eq 'none' -and -not $isExchangeRule -and $exercised.Contains([string]$object)) { $level = 'covered'; break } }
         if ($level -eq 'none' -and $item.Module -and $compiled.Contains([string]$item.Module)) { $level = 'compiled' }
         if ($level -eq 'none') { foreach ($object in @($item.Objects)) { if ($compiled.Contains([string]$object)) { $level = 'compiled'; break } } }
         $result.Add([pscustomobject]@{ Key = $item.Key; Kind = $item.Kind; Text = $item.Text; Level = $level })
@@ -961,15 +1104,12 @@ function Write-CoverageFile {
     [System.IO.File]::WriteAllLines($Path, [string[]]$lines, $Utf8Bom)
 }
 
-function Invoke-CoverageStep {
-    # Шаг «Карта покрытия»: расширения из Extensions выгружаются в файлы (постоянная папка baseline\<база>\dump,
-    # повторно - только изменения), из выгрузки - что они добавили, против записей самопроверки - чем это задето.
-    # Новое непокрытое (его не было в эталоне карты или там оно было покрыто) - жёлтое. Эталон карты двигается сам,
-    # когда нового непокрытого нет, или ключом -AcceptBaseline.
-    param([string[]]$Records)
-    $stepName = 'Карта покрытия'
+function Invoke-ExtensionDumps {
+    # Расширения из Extensions выгружаются в файлы: постоянная папка baseline\<база>\dump, повторно - только изменения
+    # (-update). Выгрузку берут карта покрытия и проверка правил обмена. Итог: Dirs - расширение -> папка
+    # (только выгрузившиеся), Problems - что не выгрузилось. Расширения, которого в базе нет, просто нет в Dirs.
     $dumpRoot = Join-Path $baselineDir 'dump'
-    $allItems = New-Object System.Collections.Generic.List[object]
+    $dirs = [ordered]@{}
     $problems = New-Object System.Collections.Generic.List[string]
     foreach ($extension in $knownExtensions) {
         $extension = [string]$extension
@@ -991,9 +1131,26 @@ function Invoke-CoverageStep {
             $problems.Add(("{0} не выгрузилось: {1}" -f $extension, $logText))
             continue
         }
-        foreach ($item in (Get-CoverageItems -Dir $dir -Extension $extension)) { $allItems.Add($item) }
+        $dirs[$extension] = $dir
     }
-    $measured = Measure-Coverage -Items $allItems.ToArray() -Records $Records
+    return [pscustomobject]@{ Dirs = $dirs; Problems = $problems.ToArray() }
+}
+
+function Invoke-CoverageStep {
+    # Шаг «Карта покрытия»: из выгрузки расширений (Invoke-ExtensionDumps) - что они добавили, против записей
+    # самопроверки - чем это задето. Новое непокрытое (его не было в эталоне карты или там оно было покрыто) - жёлтое.
+    # Эталон карты двигается сам, когда нового непокрытого нет, или ключом -AcceptBaseline.
+    # Перехваты правил обмена считаются покрытыми шагом «Обмены», только если он что-то выгрузил (ExchangeRan).
+    param([string[]]$Records, [bool]$ExchangeRan = $false)
+    $stepName = 'Карта покрытия'
+    $allItems = New-Object System.Collections.Generic.List[object]
+    $problems = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $script:ExtensionDumps) { $script:ExtensionDumps = Invoke-ExtensionDumps }
+    foreach ($problem in @($script:ExtensionDumps.Problems)) { $problems.Add($problem) }
+    foreach ($extension in @($script:ExtensionDumps.Dirs.Keys)) {
+        foreach ($item in (Get-CoverageItems -Dir $script:ExtensionDumps.Dirs[$extension] -Extension $extension)) { $allItems.Add($item) }
+    }
+    $measured = Measure-Coverage -Items $allItems.ToArray() -Records $Records -ExchangeRan $ExchangeRan
     $coverageFile = Join-Path $RunDir 'coverage.txt'
     Write-CoverageFile -Items $measured -Path $coverageFile
     $reference = Read-CoverageFile $coverageReferenceFile
@@ -1020,6 +1177,500 @@ function Invoke-CoverageStep {
     if ($newUncovered.Count -gt 0 -or $problems.Count -gt 0) { $status = 'WARN' }
     if ($status -eq 'OK') { Copy-Item -LiteralPath $coverageFile -Destination $coverageReferenceFile -Force }
     Add-StepResult -Name $stepName -Status $status -Detail $detail -Log $coverageFile
+}
+
+#endregion
+
+#region Правила обмена: проверка по выгрузке расширений, без 1С
+
+# Методы правил обмена: конвертация объектов (ПКО), обработка данных (ПОД) и их заполнение в менеджере обмена.
+$ExchangeRuleTargetRegex = New-Object System.Text.RegularExpressions.Regex('^(ДобавитьПКО_|ПКО_|ДобавитьПОД_|ПОД_)|^(ЗаполнитьПравилаКонвертацииОбъектов|ЗаполнитьПравилаОбработкиДанных)$')
+$BslAnnotationRegex = New-Object System.Text.RegularExpressions.Regex('^\s*&(Перед|После|Вместо|ИзменениеИКонтроль)\s*\(\s*"([^"]+)"')
+$BslMethodRegex = New-Object System.Text.RegularExpressions.Regex('^\s*(?:Асинх\s+)?(Процедура|Функция)\s+([\wА-Яа-яЁё]+)\s*\(', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+$BslMethodEndRegex = New-Object System.Text.RegularExpressions.Regex('^\s*(КонецПроцедуры|КонецФункции)\b', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+$BslMarkRegex = New-Object System.Text.RegularExpressions.Regex('//.*[А-Яа-яЁёA-Za-z]{2,}.*(\b\d{8}\b|\b\d{1,2}\.\d{1,2}\.\d{2,4}\b)|//.*(\b\d{8}\b|\b\d{1,2}\.\d{1,2}\.\d{2,4}\b).*[А-Яа-яЁёA-Za-z]{2,}')
+
+function Test-ExchangeRuleMethod {
+    # Перехват относится к правилам обмена: метод ПКО/ПОД или их заполнения, любой перехват в менеджере обмена
+    # через универсальный формат и в ОбменДаннымиXDTOСервер.
+    param([string]$Module, [string]$Target, [string]$TypeName = 'ОбщийМодуль')
+    if ($ExchangeRuleTargetRegex.IsMatch($Target)) { return $true }
+    if ($TypeName -eq 'ОбщийМодуль' -and ($Module -like 'МенеджерОбменаЧерезУниверсальныйФормат*' -or $Module -eq 'ОбменДаннымиXDTOСервер')) { return $true }
+    return $false
+}
+
+function ConvertTo-BslCodeLines {
+    # Строки модуля без комментариев: «//» вне строковых литералов и всё после. Литералы остаются, многострочные
+    # литералы («|» в начале строки) учитываются.
+    param([string[]]$Lines)
+    $result = New-Object System.Collections.Generic.List[string]
+    $inString = $false
+    foreach ($line in $Lines) {
+        if ($null -eq $line) { $result.Add(''); continue }
+        $builder = New-Object System.Text.StringBuilder
+        $index = 0
+        $length = $line.Length
+        while ($index -lt $length) {
+            $char = $line[$index]
+            if ($inString) {
+                [void]$builder.Append($char)
+                if ($char -eq '"') { $inString = $false }
+                $index++
+                continue
+            }
+            if ($char -eq '"') { $inString = $true; [void]$builder.Append($char); $index++; continue }
+            if ($char -eq '/' -and $index + 1 -lt $length -and $line[$index + 1] -eq '/') { break }
+            [void]$builder.Append($char)
+            $index++
+        }
+        $result.Add($builder.ToString())
+    }
+    return , $result.ToArray()
+}
+
+function Get-BslMethods {
+    # Методы модуля: имя, перехват (вид и метод), первая и последняя строка (с 1), признак строк в #Удаление.
+    param([string[]]$Lines)
+    $methods = New-Object System.Collections.Generic.List[object]
+    $annotationKind = ''
+    $annotationTarget = ''
+    $annotationLine = 0
+    $current = $null
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $line = $Lines[$i]
+        if ($null -eq $current) {
+            $found = $BslAnnotationRegex.Match($line)
+            if ($found.Success) { $annotationKind = $found.Groups[1].Value; $annotationTarget = $found.Groups[2].Value; $annotationLine = $i + 1; continue }
+            $declaration = $BslMethodRegex.Match($line)
+            if ($declaration.Success) {
+                $current = [pscustomobject]@{
+                    Name = $declaration.Groups[2].Value; Kind = $annotationKind; Target = $annotationTarget
+                    AnnotationLine = $annotationLine; Start = $i + 1; End = $Lines.Count
+                }
+                $annotationKind = ''; $annotationTarget = ''; $annotationLine = 0
+                continue
+            }
+            $trimmed = $line.Trim()
+            # Директивы компиляции и пустые строки между аннотацией и объявлением аннотацию не сбрасывают.
+            if ($trimmed -ne '' -and -not $trimmed.StartsWith('&') -and -not $trimmed.StartsWith('//')) { $annotationKind = ''; $annotationTarget = ''; $annotationLine = 0 }
+            continue
+        }
+        if ($BslMethodEndRegex.IsMatch($line)) { $current.End = $i + 1; $methods.Add($current); $current = $null }
+    }
+    if ($null -ne $current) { $methods.Add($current) }
+    return , $methods.ToArray()
+}
+
+function Get-BslDeletedLines {
+    # Номера строк (с 1) внутри #Удаление ... #КонецУдаления: этого кода в перехвате нет.
+    param([string[]]$Lines)
+    $deleted = New-Object 'System.Collections.Generic.HashSet[int]'
+    $inDeletion = $false
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $trimmed = ([string]$Lines[$i]).Trim()
+        if ($trimmed -match '^#Удаление\b') { $inDeletion = $true; [void]$deleted.Add($i + 1); continue }
+        if ($trimmed -match '^#КонецУдаления\b') { $inDeletion = $false; [void]$deleted.Add($i + 1); continue }
+        if ($inDeletion) { [void]$deleted.Add($i + 1) }
+    }
+    return , $deleted
+}
+
+function Get-BslInsertedLines {
+    # Номера строк (с 1) внутри #Вставка ... #КонецВставки.
+    param([string[]]$Lines)
+    $inserted = New-Object 'System.Collections.Generic.HashSet[int]'
+    $inInsertion = $false
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $trimmed = ([string]$Lines[$i]).Trim()
+        if ($trimmed -match '^#Вставка\b') { $inInsertion = $true; continue }
+        if ($trimmed -match '^#КонецВставки\b') { $inInsertion = $false; continue }
+        if ($inInsertion) { [void]$inserted.Add($i + 1) }
+    }
+    return , $inserted
+}
+
+function Get-BslCalls {
+    # Вызовы метода (ДобавитьПКС и т.п.) в строках кода без комментариев: строка вызова и аргументы верхнего
+    # уровня как текст. FromLine, ToLine - диапазон строк (с 1).
+    param([string[]]$CodeLines, [string]$MethodName, [int]$FromLine, [int]$ToLine)
+    $calls = New-Object System.Collections.Generic.List[object]
+    $callRegex = New-Object System.Text.RegularExpressions.Regex(('(?<![\wА-Яа-яЁё.])' + [regex]::Escape($MethodName) + '\s*\('))
+    $lineStarts = New-Object System.Collections.Generic.List[int]
+    $builder = New-Object System.Text.StringBuilder
+    for ($i = $FromLine; $i -le $ToLine -and $i -le $CodeLines.Count; $i++) {
+        $lineStarts.Add($builder.Length)
+        [void]$builder.Append($CodeLines[$i - 1]).Append("`n")
+    }
+    $text = $builder.ToString()
+    foreach ($match in $callRegex.Matches($text)) {
+        $position = $match.Index + $match.Length
+        $depth = 1
+        $inString = $false
+        $arguments = New-Object System.Collections.Generic.List[string]
+        $argument = New-Object System.Text.StringBuilder
+        while ($position -lt $text.Length -and $depth -gt 0) {
+            $char = $text[$position]
+            if ($inString) {
+                if ($char -eq '"') { $inString = $false }
+                [void]$argument.Append($char)
+            }
+            elseif ($char -eq '"') { $inString = $true; [void]$argument.Append($char) }
+            elseif ($char -eq '(') { $depth++; [void]$argument.Append($char) }
+            elseif ($char -eq ')') {
+                $depth--
+                if ($depth -gt 0) { [void]$argument.Append($char) }
+            }
+            elseif ($char -eq ',' -and $depth -eq 1) { $arguments.Add($argument.ToString()); $argument = New-Object System.Text.StringBuilder }
+            elseif ($char -eq "`n") { [void]$argument.Append(' ') }
+            else { [void]$argument.Append($char) }
+            $position++
+        }
+        $arguments.Add($argument.ToString())
+        # Строка вызова: последняя начавшаяся до позиции совпадения.
+        $lineIndex = 0
+        for ($k = 0; $k -lt $lineStarts.Count; $k++) { if ($lineStarts[$k] -le $match.Index) { $lineIndex = $k } else { break } }
+        $calls.Add([pscustomobject]@{ Line = $FromLine + $lineIndex; Arguments = @($arguments | ForEach-Object { $_.Trim() }) })
+    }
+    return , $calls.ToArray()
+}
+
+function Get-BslLiteral {
+    # Текст аргумента -> значение строкового литерала; не литерал - $null.
+    param([string]$Argument)
+    $value = $Argument.Trim()
+    if ($value -match '^"((?:[^"]|"")*)"$') { return $Matches[1].Replace('""', '"') }
+    return $null
+}
+
+function Get-ExchangeRuleModules {
+    # Модули выгрузок расширений, которые нужно разобрать: где есть перехваты или ДобавитьПКС/ДобавитьПКТЧ.
+    # Заодно все перехваты всех модулей (для исключений R1: есть ли перехват, который гарантирует ключ).
+    param($Dumps)
+    $modules = New-Object System.Collections.Generic.List[object]
+    $intercepts = New-Object System.Collections.Generic.List[object]
+    foreach ($extension in @($Dumps.Dirs.Keys)) {
+        $dir = [string]$Dumps.Dirs[$extension]
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        $prefixLength = (Resolve-Path -LiteralPath $dir).ProviderPath.TrimEnd('\', '/').Length + 1
+        foreach ($file in @(Get-ChildItem -LiteralPath $dir -Recurse -File -Filter '*.bsl')) {
+            $relative = $file.FullName.Substring($prefixLength).Replace('\', '/')
+            $parts = $relative.Split('/')
+            if ($parts.Count -lt 2 -or -not $CoverageTypeNames.ContainsKey($parts[0])) { continue }
+            $typeName = $CoverageTypeNames[$parts[0]]
+            $name = $parts[1]
+            $lines = @([System.IO.File]::ReadAllLines($file.FullName, [System.Text.Encoding]::UTF8))
+            $hasInterest = $false
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+                $found = $BslAnnotationRegex.Match($lines[$i])
+                if ($found.Success) {
+                    $intercepts.Add([pscustomobject]@{ Extension = $extension; Object = ('{0}.{1}' -f $typeName, $name); Target = $found.Groups[2].Value })
+                    if (Test-ExchangeRuleMethod -Module $name -Target $found.Groups[2].Value -TypeName $typeName) { $hasInterest = $true }
+                }
+                elseif (-not $hasInterest -and ($lines[$i].Contains('ДобавитьПКС') -or $lines[$i].Contains('ДобавитьПКТЧ') -or $lines[$i].Contains('ПриОтправкеДанных'))) { $hasInterest = $true }
+            }
+            $isContractor = (@($contractorExtensions | Where-Object { [string]$_ -eq $extension }).Count -gt 0)
+            if (-not $hasInterest -and -not $isContractor) { continue }
+            $modules.Add([pscustomobject]@{
+                    Extension = $extension; TypeName = $typeName; Name = $name; Object = ('{0}.{1}' -f $typeName, $name)
+                    Part = $relative; Lines = $lines; Interest = $hasInterest; Contractor = $isContractor
+                })
+        }
+    }
+    return [pscustomobject]@{ Modules = $modules.ToArray(); Intercepts = $intercepts.ToArray() }
+}
+
+function Get-ExchangeRuleFindings {
+    # Правила R1-R4 по выгрузкам расширений. Замечание: Rule, Level (ОШИБКА, ВНИМАНИЕ, ИНФО), Key (без номеров
+    # строк - для эталона), Text. State - перехваты правил обмена: ключ -> хеш тела и текст (для R3).
+    param($Dumps, [object[]]$Exceptions)
+    $parsed = Get-ExchangeRuleModules $Dumps
+    $findings = New-Object System.Collections.Generic.List[object]
+    $state = [ordered]@{}
+    $handlers = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $structureRegex = New-Object System.Text.RegularExpressions.Regex('ОбъектДанных\s*=\s*Неопределено(?![\wА-Яа-яЁё])')
+    $byNameRegex = New-Object System.Text.RegularExpressions.Regex('ИзСтруктуры|Из_Структуры')
+    $ruleNameRegex = New-Object System.Text.RegularExpressions.Regex('ИмяПКО\s*=\s*"([^"]+)"')
+    $handlerRegex = New-Object System.Text.RegularExpressions.Regex('ПриОтправкеДанных\s*=\s*"([^"]+)"')
+    # Начало участка правила в методе заполнения: правило добавляют в таблицу правил или находят в ней.
+    $segmentStartRegex = New-Object System.Text.RegularExpressions.Regex('Правила[\wА-Яа-яЁё]*\s*\.\s*(Добавить|Найти)\s*\(', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    # Имя правила участка: ИмяПКО = "..." или Найти("...", ...).
+    $segmentRuleRegex = New-Object System.Text.RegularExpressions.Regex('(?:ИмяПКО\s*=\s*|Найти\s*\(\s*)"([^"]+)"')
+    # Источник - объект метаданных: у такого правила структуры нет.
+    $objectSourceRegex = New-Object System.Text.RegularExpressions.Regex('ОбъектДанных\s*=\s*Метаданные')
+
+    foreach ($module in $parsed.Modules) {
+        if (-not $module.Interest) { continue }
+        $code = ConvertTo-BslCodeLines $module.Lines
+        $deleted = Get-BslDeletedLines $module.Lines
+        foreach ($method in (Get-BslMethods $module.Lines)) {
+            # Свои функции правил (ДобавитьПКО_... без перехвата) тоже разбираются: правило со структурой может быть
+            # и новым, но признак структуры у них - только ОбъектДанных = Неопределено.
+            $ownRule = (-not $method.Target -and $method.Name -match 'ДобавитьПКО_')
+            if (-not $method.Target -and -not $ownRule) { continue }
+            if ($method.Target -and -not (Test-ExchangeRuleMethod -Module $module.Name -Target $method.Target -TypeName $module.TypeName)) { continue }
+            $place = '{0}, {1}, {2}' -f $module.Extension, $module.Object, $method.Name
+            if ($method.Target) {
+                $place = '{0}, {1}, {2} (&{3}("{4}"))' -f $module.Extension, $module.Object, $method.Name, $method.Kind, $method.Target
+                # R3: состояние перехвата - хеш тела.
+                $bodyLines = @($module.Lines[($method.AnnotationLine - 1)..($method.End - 1)] | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -ne '' })
+                $hashBytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes(($bodyLines -join "`n")))
+                $state[('{0}|{1}|{2}|{3}' -f $module.Extension, $module.Object, $method.Kind, $method.Target)] = [pscustomobject]@{
+                    Hash = ([System.BitConverter]::ToString($hashBytes).Replace('-', '')); Text = $place
+                }
+            }
+            if ($method.Kind -eq 'Перед') { continue }
+
+            $liveText = (@($method.Start..$method.End | Where-Object { -not $deleted.Contains($_) } | ForEach-Object { $code[$_ - 1] })) -join "`n"
+            $isStructureMethod = $structureRegex.IsMatch($liveText) -or ($method.Target -and $byNameRegex.IsMatch($method.Target))
+            if ($isStructureMethod) { foreach ($handlerMatch in $handlerRegex.Matches($liveText)) { [void]$handlers.Add($handlerMatch.Groups[1].Value) } }
+
+            # Участки правил: метод одного правила (ДобавитьПКО_..., ИзменениеИКонтроль) - одним участком; в остальных
+            # (заполнение правил и т.п.) участок начинается там, где правило добавляют или находят в таблице правил.
+            $segments = New-Object System.Collections.Generic.List[object]
+            $singleRule = ($ownRule -or $method.Kind -eq 'ИзменениеИКонтроль' -or $method.Target.StartsWith('ДобавитьПКО_'))
+            if ($singleRule) {
+                $ruleName = ''
+                $ruleMatch = $ruleNameRegex.Match($liveText)
+                if ($ruleMatch.Success) { $ruleName = $ruleMatch.Groups[1].Value }
+                elseif ($method.Target.StartsWith('ДобавитьПКО_')) { $ruleName = $method.Target.Substring(12) }
+                elseif ($ownRule) { $ruleName = $method.Name }
+                $isStructure = $structureRegex.IsMatch($liveText)
+                $byName = $false
+                if (-not $isStructure -and $method.Kind -ne 'ИзменениеИКонтроль' -and $method.Target -and $byNameRegex.IsMatch($method.Target)) { $isStructure = $true; $byName = $true }
+                $segments.Add([pscustomobject]@{ From = $method.Start; To = $method.End; Rule = $ruleName; Structure = $isStructure; ByName = $byName })
+            }
+            else {
+                $starts = New-Object System.Collections.Generic.List[int]
+                for ($n = $method.Start; $n -le $method.End; $n++) {
+                    if ($deleted.Contains($n)) { continue }
+                    if ($segmentStartRegex.IsMatch($code[$n - 1])) { $starts.Add($n) }
+                }
+                for ($s = 0; $s -lt $starts.Count; $s++) {
+                    $from = $starts[$s]
+                    $to = $method.End
+                    if ($s + 1 -lt $starts.Count) { $to = $starts[$s + 1] - 1 }
+                    $segmentText = (@($from..$to | Where-Object { -not $deleted.Contains($_) } | ForEach-Object { $code[$_ - 1] })) -join "`n"
+                    $isStructure = $structureRegex.IsMatch($segmentText)
+                    $byName = $false
+                    $ruleName = ''
+                    $named = $segmentRuleRegex.Match($segmentText)
+                    if ($named.Success) { $ruleName = $named.Groups[1].Value }
+                    if (-not $isStructure -and $named.Success -and $byNameRegex.IsMatch($ruleName) -and -not $objectSourceRegex.IsMatch($segmentText)) { $isStructure = $true; $byName = $true }
+                    $segments.Add([pscustomobject]@{ From = $from; To = $to; Rule = $ruleName; Structure = $isStructure; ByName = $byName })
+                }
+            }
+
+            foreach ($segment in $segments) {
+            if (-not $segment.Structure) { continue }
+            $ruleName = $segment.Rule
+            $byName = $segment.ByName
+            foreach ($callName in @('ДобавитьПКС', 'ДобавитьПКТЧ')) {
+                foreach ($call in (Get-BslCalls -CodeLines $code -MethodName $callName -FromLine $segment.From -ToLine $segment.To)) {
+                    if ($deleted.Contains($call.Line)) { continue }
+                    if ($call.Arguments.Count -lt 2) { continue }
+                    $second = [string]$call.Arguments[1]
+                    $formatProperty = ''
+                    if ($call.Arguments.Count -ge 3) {
+                        $formatLiteral = Get-BslLiteral ([string]$call.Arguments[2])
+                        if ($null -ne $formatLiteral) { $formatProperty = $formatLiteral } else { $formatProperty = [string]$call.Arguments[2] }
+                    }
+                    $literal = Get-BslLiteral $second
+                    if ($second -eq '' -or ($null -ne $literal -and $literal -eq '')) { continue }
+                    $how = ''
+                    if ($byName) { $how = ' Правило со структурой определено по имени.' }
+                    $why = ('{0} собирает источник структурой, ВыгрузитьСвойство прочитает ДанныеИБ[свойство] и упадёт, если в структуре нет такого ключа; в типовой так не делает ни одно правило со структурой. Исправить: пустое свойство конфигурации, значение - ключом структуры с именем свойства формата.' -f ('правило ' + $ruleName))
+                    if ($null -eq $literal) {
+                        $findings.Add([pscustomobject]@{
+                                Rule = 'R1'; Level = 'ВНИМАНИЕ'
+                                Key = ('R1|{0}|{1}|{2}|{3}|{4}' -f $module.Extension, $module.Object, $method.Name, $callName, $second)
+                                Text = ('R1 {0}, строка {1}: {2} со свойством конфигурации из выражения «{3}» (формат «{4}»): проверь, что оно пустое. {5}{6}' -f $place, $call.Line, $callName, $second, $formatProperty, $why, $how)
+                            })
+                        continue
+                    }
+                    $text = ('R1 {0}, строка {1}: {2} задаёт свойство конфигурации «{3}» (свойство формата «{4}»), а {5}{6}' -f $place, $call.Line, $callName, $literal, $formatProperty, $why, $how)
+                    $level = 'ОШИБКА'
+                    foreach ($exception in $Exceptions) {
+                        $exRule = [string](Get-Setting $exception 'Rule' '')
+                        $exProperty = [string](Get-Setting $exception 'Property' '')
+                        if ($exRule -ne $ruleName -or $exProperty -ne $literal) { continue }
+                        # Перехватов-гарантий может быть несколько (структуру собирают разные функции): нужны все.
+                        $guardExtension = [string](Get-Setting $exception 'GuardExtension' '')
+                        $guardMethods = @(Get-Setting $exception 'GuardMethod' @() | Where-Object { $_ } | ForEach-Object { [string]$_ })
+                        $reason = [string](Get-Setting $exception 'Reason' '')
+                        $missing = @($guardMethods | Where-Object { $method0 = $_; @($parsed.Intercepts | Where-Object { $_.Extension -eq $guardExtension -and $_.Target -eq $method0 }).Count -eq 0 })
+                        if ($guardMethods.Count -gt 0 -and $missing.Count -eq 0) {
+                            $level = 'ИНФО'
+                            $text = ('R1 {0}, строка {1}: {2} «{3}» снято исключением: {4}. Ключ в структуре гарантирует перехват {5} / {6}.' -f $place, $call.Line, $callName, $literal, $reason, $guardExtension, ($guardMethods -join ', '))
+                        }
+                        else {
+                            $text += (' Исключение площадки для этого правила есть, но перехвата {0} / {1} в выгрузке нет: оно не действует.' -f $guardExtension, $(if ($guardMethods.Count -eq 0) { '(в исключении не указан GuardMethod)' } else { $missing -join ', ' }))
+                        }
+                    }
+                    $findings.Add([pscustomobject]@{
+                            Rule = 'R1'; Level = $level
+                            Key = ('R1|{0}|{1}|{2}|{3}|{4}' -f $module.Extension, $module.Object, $method.Name, $callName, $literal)
+                            Text = $text
+                        })
+                }
+            }
+            }
+        }
+    }
+
+    # R2: обработчики ПриОтправкеДанных правил со структурой обращаются к ДанныеИБ без Свойство().
+    $fieldRegex = New-Object System.Text.RegularExpressions.Regex('ДанныеИБ\s*(\.\s*([\wА-Яа-яЁё]+)|\[)')
+    foreach ($module in $parsed.Modules) {
+        if (-not $module.Interest) { continue }
+        $code = $null
+        foreach ($method in (Get-BslMethods $module.Lines)) {
+            $handlerName = $method.Name
+            if ($method.Target) { $handlerName = $method.Target }
+            $isHandler = $handlers.Contains($handlerName) -or ($handlerName -match '(ИзСтруктуры|Из_Структуры).*ПриОтправкеДанных$')
+            if (-not $isHandler) { continue }
+            if ($null -eq $code) { $code = ConvertTo-BslCodeLines $module.Lines }
+            $inserted = $null
+            if ($method.Kind -eq 'ИзменениеИКонтроль') { $inserted = Get-BslInsertedLines $module.Lines }
+            $deleted = Get-BslDeletedLines $module.Lines
+            $fields = New-Object System.Collections.Generic.List[string]
+            $safe = $false
+            for ($n = $method.Start; $n -le $method.End; $n++) {
+                if ($deleted.Contains($n)) { continue }
+                if ($null -ne $inserted -and -not $inserted.Contains($n)) { continue }
+                $lineCode = $code[$n - 1]
+                if ($lineCode -match 'ДанныеИБ\s*\.\s*Свойство\s*\(') { $safe = $true }
+                foreach ($fieldMatch in $fieldRegex.Matches($lineCode)) {
+                    $field = $fieldMatch.Groups[2].Value
+                    if ($field -eq 'Свойство') { continue }
+                    if (-not $field) { $field = '[...]' }
+                    $fields.Add(('{0} (строка {1})' -f $field, $n))
+                }
+            }
+            if ($fields.Count -eq 0 -or $safe) { continue }
+            $place = '{0}, {1}, {2}' -f $module.Extension, $module.Object, $method.Name
+            if ($method.Target) { $place += (' (&{0}("{1}"))' -f $method.Kind, $method.Target) }
+            $findings.Add([pscustomobject]@{
+                    Rule = 'R2'; Level = 'ВНИМАНИЕ'
+                    Key = ('R2|{0}|{1}|{2}' -f $module.Extension, $module.Object, $method.Name)
+                    Text = ('R2 {0}: обработчик ПриОтправкеДанных правила со структурой обращается к ДанныеИБ без Свойство(): {1}. В структуре такого ключа может не быть. Эвристика, не блокирует.' -f $place, ((@($fields | Select-Object -First 5)) -join ', '))
+                })
+        }
+    }
+
+    # R4: в расширениях подрядчиков #Вставка, #Удаление и перехваты без пометки автора с датой рядом.
+    foreach ($module in $parsed.Modules) {
+        if (-not $module.Contractor) { continue }
+        $methods = Get-BslMethods $module.Lines
+        $counter = @{}
+        for ($i = 0; $i -lt $module.Lines.Count; $i++) {
+            $line = [string]$module.Lines[$i]
+            $kind = ''
+            if ($line -match '^\s*#(Вставка|Удаление)\b') { $kind = '#' + $Matches[1] }
+            elseif ($BslAnnotationRegex.IsMatch($line)) { $kind = 'перехват' }
+            if (-not $kind) { continue }
+            $marked = $false
+            for ($k = [Math]::Max(0, $i - 3); $k -le [Math]::Min($module.Lines.Count - 1, $i + 1); $k++) {
+                if ($BslMarkRegex.IsMatch([string]$module.Lines[$k])) { $marked = $true; break }
+            }
+            if ($marked) { continue }
+            $methodName = '(вне метода)'
+            foreach ($method in $methods) {
+                if (($i + 1) -ge $method.Start -and ($i + 1) -le $method.End) { $methodName = $method.Name; break }
+                if ($kind -eq 'перехват' -and $method.AnnotationLine -eq ($i + 1)) { $methodName = $method.Name; break }
+            }
+            $counterKey = '{0}|{1}' -f $methodName, $kind
+            if (-not $counter.ContainsKey($counterKey)) { $counter[$counterKey] = 0 }
+            $counter[$counterKey]++
+            $findings.Add([pscustomobject]@{
+                    Rule = 'R4'; Level = 'ВНИМАНИЕ'
+                    Key = ('R4|{0}|{1}|{2}|{3}|{4}' -f $module.Extension, $module.Object, $methodName, $kind, $counter[$counterKey])
+                    Text = ('R4 {0}, {1}, {2}, строка {3}: {4} без пометки автора с датой рядом (регламент: «// ** Фамилия И.О. ГГГГММДД что и зачем»). Только сообщение, в чужой код гейт не пишет.' -f $module.Extension, $module.Object, $methodName, ($i + 1), $kind)
+                })
+        }
+    }
+    $sha.Dispose()
+    return [pscustomobject]@{ Findings = $findings.ToArray(); State = $state; Modules = $parsed.Modules.Count }
+}
+
+function Read-ExchangeRuleState {
+    # Эталон перехватов правил обмена: «ключ<TAB>хеш<TAB>текст» -> таблица. Файла нет - $null.
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $table = @{}
+    foreach ($line in [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)) {
+        $parts = $line.TrimStart([char]0xFEFF).Split("`t")
+        if ($parts.Count -ge 2) { $table[$parts[0]] = $parts[1] }
+    }
+    return $table
+}
+
+function Invoke-ExchangeRulesStep {
+    # Шаг «Правила обмена»: R1 (ОШИБКА, эталоном не снимается; снимает только исключение площадки с живым
+    # перехватом-гарантией), R2 и R4 (ВНИМАНИЕ: жёлтое только новое против эталона), R3 (без цвета: что изменилось
+    # в перехватах правил обмена против эталона - в отчёт и в шаг «Обмены: до и после»).
+    param($Dumps)
+    $stepName = 'Правила обмена'
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    if ($null -eq $Dumps -or @($Dumps.Dirs.Keys).Count -eq 0) {
+        $detail = 'выгрузки расширений нет, проверять нечего'
+        if ($null -ne $Dumps -and @($Dumps.Problems).Count -gt 0) { $detail += ('. ' + (@($Dumps.Problems) -join ' | ')) }
+        Add-StepResult -Name $stepName -Status 'WARN' -Detail $detail
+        return
+    }
+    $result = Get-ExchangeRuleFindings -Dumps $Dumps -Exceptions $exchangeRuleExceptions
+
+    # R3: перехваты правил обмена против эталона.
+    $reference = Read-ExchangeRuleState $exchangeRulesStateFile
+    $changes = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $reference) {
+        foreach ($key in @($result.State.Keys)) {
+            if (-not $reference.ContainsKey($key)) { $changes.Add(('новый перехват: ' + $result.State[$key].Text)) }
+            elseif ($reference[$key] -ne $result.State[$key].Hash) { $changes.Add(('изменён перехват: ' + $result.State[$key].Text)) }
+        }
+        foreach ($key in @($reference.Keys)) { if (-not $result.State.Contains($key)) { $changes.Add(('перехвата больше нет: ' + $key)) } }
+    }
+    $script:ExchangeRulesChanged = $changes.ToArray()
+    $stateFile = Join-Path $RunDir 'exchange-rules.state.txt'
+    [System.IO.File]::WriteAllLines($stateFile, [string[]]@($result.State.Keys | Sort-Object | ForEach-Object { '{0}{1}{2}{1}{3}' -f $_, "`t", $result.State[$_].Hash, $result.State[$_].Text }), $Utf8Bom)
+    [System.IO.File]::WriteAllLines((Join-Path $RunDir 'exchange-rules.changes.txt'), $changes.ToArray(), $Utf8Bom)
+
+    # Замечания: все - в exchange-rules.txt, ключи - в exchange-rules.findings.txt (эталон R2/R4).
+    $known = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    $hasFindingsReference = Test-Path -LiteralPath $exchangeRulesFindingsFile
+    if ($hasFindingsReference) { foreach ($line in [System.IO.File]::ReadAllLines($exchangeRulesFindingsFile, [System.Text.Encoding]::UTF8)) { [void]$known.Add($line.TrimStart([char]0xFEFF)) } }
+    $errors = @($result.Findings | Where-Object { $_.Level -eq 'ОШИБКА' })
+    $warnings = @($result.Findings | Where-Object { $_.Level -eq 'ВНИМАНИЕ' })
+    $infos = @($result.Findings | Where-Object { $_.Level -eq 'ИНФО' })
+    $newWarnings = @($warnings | Where-Object { -not $known.Contains($_.Key) })
+    $logFile = Join-Path $RunDir 'exchange-rules.txt'
+    [System.IO.File]::WriteAllLines($logFile, [string[]]@($result.Findings | ForEach-Object { '[{0}] {1}' -f $_.Level, $_.Text }), $Utf8Bom)
+    [System.IO.File]::WriteAllLines((Join-Path $RunDir 'exchange-rules.findings.txt'), [string[]]@($warnings | ForEach-Object { $_.Key } | Sort-Object -Unique), $Utf8Bom)
+    $newFile = Join-Path $RunDir 'exchange-rules.new.txt'
+    [System.IO.File]::WriteAllLines($newFile, [string[]]@((@($errors) + @($newWarnings)) | ForEach-Object { '[{0}] {1}' -f $_.Level, $_.Text }), $Utf8Bom)
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    $parts.Add(("перехватов правил обмена {0}, модулей разобрано {1}" -f $result.State.Count, $result.Modules))
+    $parts.Add(("R1: ошибок {0}, снято исключением {1}" -f $errors.Count, $infos.Count))
+    $parts.Add(("R2/R4 и R1 по выражению: замечаний {0}, новых {1}" -f $warnings.Count, $newWarnings.Count))
+    if ($null -eq $reference) { $parts.Add('эталона перехватов ещё нет, этот прогон станет им') }
+    else { $parts.Add(("R3: изменений в перехватах правил обмена {0}" -f $changes.Count)) }
+    if (@($contractorExtensions).Count -eq 0) { $parts.Add('R4 не проверялось: ContractorExtensions пустой') }
+    if (@($Dumps.Problems).Count -gt 0) { $parts.Add((@($Dumps.Problems) -join ' | ')) }
+    $sample = @((@($errors) + @($newWarnings)) | Select-Object -First 2 | ForEach-Object { if ($_.Text.Length -gt 260) { $_.Text.Substring(0, 260) + '...' } else { $_.Text } })
+    $detail = ($parts -join '; ') + '; всё - в exchange-rules.txt'
+    if ($sample.Count -gt 0) { $detail += ('. Начало: ' + ($sample -join ' | ')) }
+
+    $status = 'OK'
+    if ($newWarnings.Count -gt 0 -or @($Dumps.Problems).Count -gt 0) { $status = 'WARN' }
+    if ($errors.Count -gt 0) { $status = 'FAIL' }
+    # Эталон перехватов и замечаний двигается сам, только когда шаг зелёный.
+    if ($status -eq 'OK') {
+        if (-not (Test-Path -LiteralPath $baselineDir)) { New-Item -ItemType Directory -Path $baselineDir -Force | Out-Null }
+        Copy-Item -LiteralPath $stateFile -Destination $exchangeRulesStateFile -Force
+        Copy-Item -LiteralPath (Join-Path $RunDir 'exchange-rules.findings.txt') -Destination $exchangeRulesFindingsFile -Force
+    }
+    $watch.Stop()
+    Add-StepResult -Name $stepName -Status $status -Detail $detail -Log $logFile -Seconds ([int]$watch.Elapsed.TotalSeconds)
 }
 
 #endregion
@@ -1205,6 +1856,20 @@ if ($PSCmdlet.ParameterSetName -eq 'Accept') {
         if (Test-Path -LiteralPath $acceptSnapshots) {
             Copy-Item -LiteralPath $acceptSnapshots -Destination (Join-Path $baselineTarget 'selfcheck.snapshots.txt') -Force
             Write-Host 'Принято как известное: снимки самопроверки'
+        }
+        # Итоги пробной выгрузки шага «Обмены» того прогона становятся эталонными.
+        $acceptExchange = Join-Path $acceptDir 'selfcheck-after.exchange.txt'
+        if (Test-Path -LiteralPath $acceptExchange) {
+            Copy-Item -LiteralPath $acceptExchange -Destination (Join-Path $baselineTarget 'selfcheck.exchange.txt') -Force
+            Write-Host 'Принято как известное: итоги выгрузки шага «Обмены»'
+        }
+    }
+    # Проверка правил обмена того прогона: перехваты и замечания R2/R4 становятся известными (R1 эталоном не снимается).
+    foreach ($acceptPair in @(@('exchange-rules.state.txt', 'exchange-rules.state.txt'), @('exchange-rules.findings.txt', 'exchange-rules.findings.txt'))) {
+        $acceptFile = Join-Path $acceptDir $acceptPair[0]
+        if (Test-Path -LiteralPath $acceptFile) {
+            Copy-Item -LiteralPath $acceptFile -Destination (Join-Path $baselineTarget $acceptPair[1]) -Force
+            Write-Host ("Принято как известное: {0}" -f $acceptPair[0])
         }
     }
     Write-Host "Эталон базы «$($acceptMeta.baseKey)» обновлён: $baselineTarget"
@@ -1667,6 +2332,27 @@ $selfCheckSnapshotsFile = Join-Path $baselineDir 'selfcheck.snapshots.txt'
 # Эталон карты покрытия (что из доработок чем задето) и включатель шага.
 $coverageReferenceFile = Join-Path $baselineDir 'coverage.txt'
 $runCoverage = [bool](Get-Setting $cfg 'Coverage' $true)
+# Шаг «Обмены» самопроверки (раздел 5.17): Full - объекты пакета, очередь узла и срезы пакета; Light - только объекты
+# пакета. Лимиты очереди узла: на вид и всего. Итоги выгрузки по объектам - эталон selfcheck.exchange.txt.
+$exchangeMode = ([string](Get-Setting $cfg 'ExchangeMode' 'Full')).Trim()
+if (@('Full', 'Light') -notcontains $exchangeMode) {
+    throw "Настройка ExchangeMode в config.psd1: допустимо Full или Light, а стоит «$exchangeMode»."
+}
+$exchangeQueuePerType = [int](Get-Setting $cfg 'ExchangeQueuePerType' 5)
+$exchangeQueueTotal = [int](Get-Setting $cfg 'ExchangeQueueTotal' 50)
+$selfCheckExchangeFile = Join-Path $baselineDir 'selfcheck.exchange.txt'
+if ($baselineDir -match '[;"]') { throw 'В пути к папке эталонов не должно быть точки с запятой и кавычек.' }
+# Проверка правил обмена по выгрузке расширений, без 1С (раздел 5.18): правила R1-R4, исключения площадки,
+# расширения подрядчиков для R4. Эталон: состояние перехватов правил обмена и принятые замечания.
+$runExchangeRules = [bool](Get-Setting $cfg 'ExchangeRules' $true)
+$exchangeRuleExceptions = @(Get-Setting $cfg 'ExchangeRuleExceptions' @() | Where-Object { $_ })
+$contractorExtensions = @(Get-Setting $cfg 'ContractorExtensions' @() | Where-Object { $_ })
+$exchangeRulesStateFile = Join-Path $baselineDir 'exchange-rules.state.txt'
+$exchangeRulesFindingsFile = Join-Path $baselineDir 'exchange-rules.findings.txt'
+# Что изменилось в перехватах правил обмена (R3) и выгрузки расширений этого прогона (общие для карты покрытия
+# и проверки правил обмена).
+$script:ExchangeRulesChanged = @()
+$script:ExtensionDumps = $null
 
 $selfCheckOff = ''
 if ($SkipSelfCheck) { $selfCheckOff = 'отключено ключом -SkipSelfCheck' }
@@ -1713,6 +2399,77 @@ function Invoke-Designer {
         Log      = $logPath
         Lines    = @(Read-V8Log $logPath)
     }
+}
+
+function Start-DesignerBackground {
+    # Конфигуратор с командой - без ожидания: процесс идёт параллельно со следующими шагами.
+    # Итог берёт Complete-BackgroundCheck. Тот же журнал вызова и маскировка паролей, что у Invoke-V8.
+    param([string[]]$Command, [string]$LogName, [int]$TimeoutSec, [string]$Title, [string]$FileKey)
+    $logPath = Join-Path $RunDir $LogName
+    $argLine = ($designerBase + $Command + @('/Out', ('"{0}"' -f $logPath))) -join ' '
+    Write-RunLog ("> {0} {1} (параллельно)" -f (Split-Path -Leaf $v8), [regex]::Replace([regex]::Replace($argLine, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"'))
+    Write-Host ("  ...  {0}: начато в {1}, идёт параллельно с остальными шагами, итог - перед вердиктом" -f $Title, (Get-Date -Format 'HH:mm:ss')) -ForegroundColor DarkGray
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $process = Start-Process -FilePath $v8 -ArgumentList $argLine -PassThru
+    $null = $process.Handle
+    return [pscustomobject]@{
+        Process = $process; Watch = $watch; Log = $logPath; TimeoutSec = $TimeoutSec; Title = $Title; FileKey = $FileKey
+        Expected = [double](Get-ExpectedStepSeconds $Title)
+    }
+}
+
+function Complete-BackgroundCheck {
+    # Ждёт параллельную проверку конфигурации (в пределах её таймаута от начала) и оценивает её, как Add-CheckStep.
+    $background = $script:BackgroundCheck
+    $finished = Wait-UiProcess -Process $background.Process -Watch $background.Watch -TimeoutSec $background.TimeoutSec -Title $background.Title -Expected $background.Expected
+    $exitCode = $null
+    if ($finished) { $background.Process.WaitForExit(); $exitCode = $background.Process.ExitCode }
+    else { try { Stop-Process -Id $background.Process.Id -Force -ErrorAction Stop } catch { } }
+    $background.Watch.Stop()
+    $seconds = [int]$background.Watch.Elapsed.TotalSeconds
+    Write-RunLog ("  {0}: код={1} таймаут={2} секунд={3}" -f $background.Title, $exitCode, (-not $finished), $seconds)
+    $statStatus = 'FAIL'
+    if (-not $finished) { $statStatus = 'TIMEOUT' } elseif ($exitCode -eq 0 -or $exitCode -eq 101) { $statStatus = 'OK' }
+    Add-StatFact -Title $background.Title -Seconds $background.Watch.Elapsed.TotalSeconds -Status $statStatus
+    $script:BackgroundCheck = $null
+    $result = [pscustomobject]@{ ExitCode = $exitCode; TimedOut = (-not $finished); Seconds = $seconds; Log = $background.Log; Lines = @(Read-V8Log $background.Log) }
+    Add-CheckStep -Name $background.Title -Result $result -FileKey $background.FileKey -Blocking $true
+}
+
+function Get-RunRemainingSeconds {
+    # Сколько ещё идти прогону: ожидаемое время шагов плана, которых ещё нет в итогах, минус то, что текущий шаг
+    # уже прошёл. Параллельная проверка конфигурации считается отдельно: осталось - большее из двух.
+    # Unknown - сколько оставшихся шагов без статистики (их время в оценку не входит).
+    param([string]$Title, [double]$Elapsed, [double]$Expected)
+    $doneNames = @($script:Steps | ForEach-Object { [string]$_.name })
+    $sequential = 0.0
+    $unknown = 0
+    $currentSeen = $false
+    $backgroundTitle = ''
+    if ($null -ne $script:BackgroundCheck) { $backgroundTitle = [string]$script:BackgroundCheck.Title }
+    foreach ($name in @($script:RunPlanExpected.Keys)) {
+        if ($name -eq $backgroundTitle -or $name.StartsWith('Подготовка')) { continue }
+        $isDone = $false
+        foreach ($doneName in $doneNames) {
+            if ($doneName.StartsWith($name, [System.StringComparison]::OrdinalIgnoreCase) -or $name.StartsWith($doneName, [System.StringComparison]::OrdinalIgnoreCase)) { $isDone = $true; break }
+        }
+        if ($isDone) { continue }
+        $planned = [double]$script:RunPlanExpected[$name]
+        if (-not $currentSeen -and $Title -and ($Title.StartsWith($name, [System.StringComparison]::OrdinalIgnoreCase) -or $name.StartsWith($Title, [System.StringComparison]::OrdinalIgnoreCase))) {
+            $currentSeen = $true
+            $currentExpected = [Math]::Max($planned, $Expected)
+            if ($currentExpected -gt 0) { $sequential += [Math]::Max(0, $currentExpected - $Elapsed) } else { $unknown++ }
+            continue
+        }
+        if ($planned -gt 0) { $sequential += $planned } else { $unknown++ }
+    }
+    $total = $sequential
+    if ($null -ne $script:BackgroundCheck) {
+        $backgroundLeft = [Math]::Max(0, $script:BackgroundCheck.Expected - $script:BackgroundCheck.Watch.Elapsed.TotalSeconds)
+        if ($Title -eq $backgroundTitle) { $backgroundLeft = [Math]::Max(0, [Math]::Max($script:BackgroundCheck.Expected, $Expected) - $Elapsed) }
+        $total = [Math]::Max($sequential, $backgroundLeft)
+    }
+    return [pscustomobject]@{ Seconds = [int]$total; Unknown = $unknown }
 }
 
 function Split-KitName {
@@ -1826,11 +2583,14 @@ function Add-CheckStep {
 function Save-SelfCheckReference {
     # Записи прогона становятся эталоном самопроверки этой базы.
     # Снимки шагов становятся эталонными вместе с записями. Снимков нет - эталонных снимков тоже нет.
-    param([string[]]$Records, [string]$Label, [string]$Fingerprint, $Snapshots = $null)
+    # Итоги пробной выгрузки шага «Обмены» - тоже: с ними сравнивается следующий прогон, когда «до» не снимается.
+    param([string[]]$Records, [string]$Label, [string]$Fingerprint, $Snapshots = $null, $Exchange = $null)
     if (-not (Test-Path -LiteralPath $baselineDir)) { New-Item -ItemType Directory -Path $baselineDir -Force | Out-Null }
     [System.IO.File]::WriteAllLines($selfCheckReferenceFile, [string[]]@($Records), $Utf8Bom)
     if ($null -ne $Snapshots -and $Snapshots.Count -gt 0) { Write-SelfCheckSnapshots -Snapshots $Snapshots -Path $selfCheckSnapshotsFile }
     elseif (Test-Path -LiteralPath $selfCheckSnapshotsFile) { Remove-Item -LiteralPath $selfCheckSnapshotsFile -Force }
+    if ($null -ne $Exchange -and $Exchange.Count -gt 0) { Write-ExchangeResults -Results $Exchange -Path $selfCheckExchangeFile }
+    elseif (Test-Path -LiteralPath $selfCheckExchangeFile) { Remove-Item -LiteralPath $selfCheckExchangeFile -Force }
     $info = @(
         ("run={0}" -f $runId),
         ("label={0}" -f $Label),
@@ -1860,7 +2620,7 @@ function Invoke-SelfCheckSession {
     # Чем кончился: result - обработка записала итог; exited - клиент закрылся без итога;
     # nostart - обработка не открылась; stalled - новых частей журнала нет дольше SelfCheckStallMin;
     # timeout - сеанс идёт дольше SelfCheckTimeoutMin.
-    param([string]$OutDir, [string]$Known, [int]$StartFrom, [string]$Title)
+    param([string]$OutDir, [string]$Known, [int]$StartFrom, [string]$Title, [string]$ExchangeSetFile = '')
 
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
@@ -1874,6 +2634,10 @@ function Invoke-SelfCheckSession {
     if ($selfCheckNotOlder) { $launch.Add(("notolder={0}" -f $selfCheckNotOlder)) }
     if ($Known) { $launch.Add(("known={0}" -f $Known)) }
     if ($StartFrom -gt 0) { $launch.Add(("start={0}" -f $StartFrom)) }
+    # Шаг «Обмены»: режим, лимиты очереди узла и набор объектов прогона «до» (тот же набор для «после»).
+    if ($exchangeMode -eq 'Light') { $launch.Add('exchmode=light') }
+    $launch.Add(("exchq={0}/{1}" -f $exchangeQueuePerType, $exchangeQueueTotal))
+    if ($ExchangeSetFile) { $launch.Add(("exch={0}" -f $ExchangeSetFile)) }
 
     $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -User $adminUser -Password $adminPassword) + @(
         '/DisableStartupDialogs',
@@ -2011,7 +2775,7 @@ function Invoke-SelfCheck {
     # Самопроверка базы целиком: сеансы обработки с перезапуском после зависшего задания, сборка журнала
     # и записей для сравнения. Итог: done - выполнена; same - база не менялась, не запускалась;
     # incomplete - выполнена не до конца; nostart, refused, failed - не выполнялась.
-    param([string]$Label, [string]$Known, [string]$Title)
+    param([string]$Label, [string]$Known, [string]$Title, [string]$ExchangeSetFile = '')
 
     $baseDir = Join-Path $RunDir ("selfcheck-{0}" -f $Label)
     $sessions = New-Object System.Collections.Generic.List[object]
@@ -2027,7 +2791,7 @@ function Invoke-SelfCheck {
         $attempt++
         $knownNow = ''
         if ($attempt -eq 1) { $knownNow = $Known }
-        $session = Invoke-SelfCheckSession -OutDir (Join-Path $baseDir ("try{0}" -f $attempt)) -Known $knownNow -StartFrom $startFrom -Title $Title
+        $session = Invoke-SelfCheckSession -OutDir (Join-Path $baseDir ("try{0}" -f $attempt)) -Known $knownNow -StartFrom $startFrom -Title $Title -ExchangeSetFile $ExchangeSetFile
         $sessions.Add($session)
 
         if ($session.State -eq 'result') {
@@ -2060,6 +2824,7 @@ function Invoke-SelfCheck {
     $records = New-Object System.Collections.Generic.List[string]
     $snapshots = [ordered]@{}
     $metrics = @{}
+    $exchange = [ordered]@{}
     $number = 0
     foreach ($session in $sessions) {
         $number++
@@ -2080,6 +2845,17 @@ function Invoke-SelfCheck {
                     $msText = (@($piece.Snapshots[$snapKey]) -join '').Trim()
                     $msValue = 0
                     if ([int]::TryParse($msText, [ref]$msValue)) { $metrics[$snapKey.Substring(6)] = $msValue }
+                    continue
+                }
+                # «выгрузка|<узел>|<объект>|<УИД>» - итог пробной выгрузки объекта в шаге «Обмены»: ok или fail
+                # и описание ошибки. Не снимок: по этим итогам сравниваются «до» и «после» (Compare-ExchangeResults).
+                if ($snapKey.StartsWith('выгрузка|')) {
+                    $exchangeLines = @($piece.Snapshots[$snapKey] | Where-Object { $null -ne $_ })
+                    $exchangeState = 'fail'
+                    if ($exchangeLines.Count -gt 0 -and ([string]$exchangeLines[0]).Trim() -eq 'ok') { $exchangeState = 'ok' }
+                    $exchangeText = ''
+                    if ($exchangeLines.Count -gt 1) { $exchangeText = ((@($exchangeLines | Select-Object -Skip 1) -join ' ').Trim()) }
+                    $exchange[$snapKey.Substring(9)] = [pscustomobject]@{ State = $exchangeState; Text = $exchangeText }
                     continue
                 }
                 $snapshots[$snapKey] = Format-SelfCheckSnapshot $piece.Snapshots[$snapKey]
@@ -2107,6 +2883,7 @@ function Invoke-SelfCheck {
     # Снимки шагов (сообщения обмена и т.п.) - уже приведённые к виду для сравнения. Файл пишется,
     # только если снимки есть: обработка прежней версии их не присылает.
     if ($snapshots.Count -gt 0) { Write-SelfCheckSnapshots -Snapshots $snapshots -Path (Join-Path $RunDir ("selfcheck-{0}.snapshots.txt" -f $Label)) }
+    if ($exchange.Count -gt 0) { Write-ExchangeResults -Results $exchange -Path (Join-Path $RunDir ("selfcheck-{0}.exchange.txt" -f $Label)) }
     if ($metrics.Count -gt 0) {
         [System.IO.File]::WriteAllLines((Join-Path $RunDir ("selfcheck-{0}.metrics.txt" -f $Label)), [string[]]@($metrics.Keys | Sort-Object | ForEach-Object { '{0}{1}{2}' -f $metrics[$_], "`t", $_ }), $Utf8Bom)
     }
@@ -2128,6 +2905,7 @@ function Invoke-SelfCheck {
         Journal     = $journalPath
         Snapshots   = $snapshots
         Metrics     = $metrics
+        Exchange    = $exchange
         Message     = [string](Get-Setting $lastSession.Result 'message' '')
         Windows     = $lastSession.Windows
         Sessions    = $sessions.Count
@@ -2940,6 +3718,11 @@ Set-StatRun $runId
 $processingOnly = ($kitItems.Count -eq 0 -and $kitProcessings.Count -gt 0)
 $processingOnlyText = 'комплект только из внешних обработок: конфигурация и расширения не менялись, обработку проверила запись в справочник'
 
+# Проверка конфигурации одним проходом (без CheckOnly на несколько расширений) идёт параллельно с остальными
+# шагами после загрузки: она самая долгая (около 27 минут на temp), а канарейка, самопроверка и выгрузка
+# расширений от неё не зависят. Итог берётся перед вердиктом. $false - как раньше, по очереди.
+$parallelCheckConfig = ([bool](Get-Setting $cfg 'ParallelCheckConfig' $true) -and $checkOnly.Count -le 1 -and [bool](Get-Setting $cfg 'RunCheckConfig' $true) -and -not [bool](Get-Setting $cfg 'RunCheckModules' $false))
+
 # План прогона для ci.exe: шаги, которые пойдут, если ничего не упадёт.
 $planSteps = New-Object System.Collections.Generic.List[string]
 $planSteps.Add('Подготовка базы')
@@ -2959,7 +3742,7 @@ elseif (-not $SkipChecks) {
     if ($checkOnly.Count -gt 0) { $planKeys = @($checkOnly | ForEach-Object { [string]$_ }) }
     foreach ($planKey in $planKeys) {
         if ([bool](Get-Setting $cfg 'RunCheckModules' $false)) { $planSteps.Add(("Синтаксис-контроль ({0})" -f $planKey)) }
-        if ([bool](Get-Setting $cfg 'RunCheckConfig' $true)) { $planSteps.Add(("Проверка конфигурации ({0})" -f $planKey)) }
+        if ([bool](Get-Setting $cfg 'RunCheckConfig' $true) -and -not $parallelCheckConfig) { $planSteps.Add(("Проверка конфигурации ({0})" -f $planKey)) }
     }
     if ([bool](Get-Setting $cfg 'RunCheckCanApply' $true)) { $planSteps.Add('Проверка применимости') }
 }
@@ -2975,10 +3758,16 @@ else {
     }
 }
 if ($processingOnly) { Write-RunLog 'План: комплект только из внешних обработок, самопроверки нет' }
+if (-not $processingOnly -and $runExchangeRules) { $planSteps.Add('Правила обмена') }
 elseif ($runSelfCheck -or $SkipSelfCheck) {
     if ($kitItems.Count -gt 0) { $planSteps.Add('Самопроверка после загрузки') } else { $planSteps.Add('Самопроверка') }
     if ($runCoverage -and -not $SkipSelfCheck) { $planSteps.Add('Карта покрытия') }
 }
+# Параллельная проверка конфигурации кончается последней - перед вердиктом.
+if ($parallelCheckConfig -and -not $processingOnly -and -not $SkipChecks) {
+    foreach ($planKey in @(@($checkOnly | ForEach-Object { [string]$_ }) + @('all') | Select-Object -First 1)) { $planSteps.Add(("Проверка конфигурации ({0})" -f $planKey)) }
+}
+foreach ($planName in $planSteps) { $script:RunPlanExpected[$planName] = [double](Get-ExpectedStepSeconds $planName) }
 Send-UiPlan -StepNames $planSteps.ToArray()
 
 # 0. Подготовка базы. Блокировка регламентных заданий ставится всегда и остаётся: у копии рабочей базы
@@ -3167,6 +3956,10 @@ $script:StopRun = $false
 
 # Замеры самопроверки до загрузки (старый код): идут в историю раньше замеров после, см. Invoke-MetricsStep.
 $beforeMetrics = @{}
+# Итоги выгрузки шага «Обмены» до загрузки: файл прогона или эталон (если «до» не снималась). Из него же -
+# набор объектов для «после» (exch=): «до» и «после» сравниваются на одном наборе.
+$exchangeBeforeFile = ''
+$exchangeSetFile = ''
 
 # 1. Самопроверка до загрузки: состояние, с которым будет сравниваться состояние после.
 # Заодно из её сведений известно, какие расширения стояли в базе до загрузки.
@@ -3183,14 +3976,16 @@ if ($kitItems.Count -gt 0 -and -not $selfCheckOff) {
     $minutes = [int][Math]::Ceiling($before.Seconds / 60)
 
     if ($before.State -eq 'same') {
+        if (Test-Path -LiteralPath $selfCheckExchangeFile) { $exchangeBeforeFile = $selfCheckExchangeFile }
         $referenceInfo = Read-KeyValueFile $selfCheckReferenceInfoFile
         $detail = "не запускалась: расширения и параметры те же, что после прошлой самопроверки гейта. Сравнение будет с эталоном самопроверки от прогона {0}" -f (Get-Setting $referenceInfo 'run' 'неизвестно')
         Add-StepResult -Name $stepName -Status 'OK' -Detail $detail -Seconds $before.Seconds
     }
     elseif ($before.State -eq 'done' -or $before.State -eq 'incomplete') {
-        Save-SelfCheckReference -Records $before.Records -Label 'before' -Fingerprint $before.Fingerprint -Snapshots $before.Snapshots
+        Save-SelfCheckReference -Records $before.Records -Label 'before' -Fingerprint $before.Fingerprint -Snapshots $before.Snapshots -Exchange $before.Exchange
         Save-SelfCheckLastState -Fingerprint $before.Fingerprint
         $beforeMetrics = $before.Metrics
+        if ($before.Exchange.Count -gt 0) { $exchangeBeforeFile = Join-Path $RunDir 'selfcheck-before.exchange.txt' }
         $detail = "состояние до загрузки снято и стало эталоном самопроверки: записей {0}, из них ошибок {1}; {2} мин" -f $before.Records.Count, $errorsBefore, $minutes
         if ($before.Problems.Count -gt 0) {
             $detail += ('. Прогон неполный: ' + ($before.Problems -join ' | '))
@@ -3215,7 +4010,7 @@ if ($kitItems.Count -gt 0) {
     $extensionsBefore = Get-ExtensionNamesBefore (Join-Path $RunDir 'selfcheck-before\try1\info.txt')
 
     New-Item -ItemType Directory -Path $referenceSnapshotDir -Force | Out-Null
-    foreach ($file in @($selfCheckReferenceFile, $selfCheckReferenceInfoFile, $selfCheckLastFile, $selfCheckSnapshotsFile, $coverageReferenceFile)) {
+    foreach ($file in @($selfCheckReferenceFile, $selfCheckReferenceInfoFile, $selfCheckLastFile, $selfCheckSnapshotsFile, $selfCheckExchangeFile, $coverageReferenceFile, $exchangeRulesStateFile, $exchangeRulesFindingsFile)) {
         if (Test-Path -LiteralPath $file) { Copy-Item -LiteralPath $file -Destination $referenceSnapshotDir -Force }
     }
 
@@ -3441,7 +4236,13 @@ else {
                 -FileKey ("checkmodules_{0}" -f $target.Key) -Blocking $true
         }
 
-        if ($runCheckConfig -and -not $script:StopRun) {
+        if ($runCheckConfig -and -not $script:StopRun -and $parallelCheckConfig) {
+            # Идёт параллельно: итог - в Complete-BackgroundCheck перед вердиктом.
+            $script:BackgroundCheck = Start-DesignerBackground -Command (@('/CheckConfig', $checkConfigFlags) + $target.Selector) `
+                -LogName ("checkconfig_{0}.log" -f $target.Key) -TimeoutSec $timeoutCheckSec -Title ("Проверка конфигурации ({0})" -f $target.Key) `
+                -FileKey ("checkconfig_{0}" -f $target.Key)
+        }
+        elseif ($runCheckConfig -and -not $script:StopRun) {
             $result = Invoke-Designer -Command (@('/CheckConfig', $checkConfigFlags) + $target.Selector) `
                 -LogName ("checkconfig_{0}.log" -f $target.Key) -TimeoutSec $timeoutCheckSec -Title ("Проверка конфигурации ({0})" -f $target.Key)
             Add-CheckStep -Name ("Проверка конфигурации ({0})" -f $target.Key) -Result $result `
@@ -3574,6 +4375,28 @@ else {
     }
 }
 
+# 5а. Выгрузка расширений в файлы и проверка правил обмена по ней (без 1С). Идёт до самопроверки «после»:
+# что изменилось в правилах обмена (R3), нужно знать до её итогов. Та же выгрузка - для карты покрытия.
+if (-not $processingOnly -and $proceed -and -not $script:StopRun -and (($runCoverage -and -not $SkipSelfCheck) -or $runExchangeRules)) {
+    $script:ExtensionDumps = Invoke-ExtensionDumps
+    if ($runExchangeRules) { Invoke-ExchangeRulesStep -Dumps $script:ExtensionDumps }
+}
+
+# Набор объектов для шага «Обмены» после загрузки - из прогона «до» (с комплектом). Без комплекта набор
+# собирается заново: очередь узла и срезы - то, что уйдёт ближайшим обменом, - а итоги сравниваются с эталоном.
+if ($kitItems.Count -gt 0 -and $exchangeBeforeFile) {
+    $exchangeSetFile = Join-Path $RunDir 'exchange-set.txt'
+    $beforeExchange = Read-ExchangeResults $exchangeBeforeFile
+    if ($null -ne $beforeExchange -and $beforeExchange.Count -gt 0) { Write-ExchangeSetFile -Results $beforeExchange -Path $exchangeSetFile }
+    else { $exchangeSetFile = '' }
+}
+if ($kitItems.Count -eq 0 -and (Test-Path -LiteralPath $selfCheckExchangeFile)) {
+    $referenceExchangeCopy = Join-Path $referenceCopyDir 'selfcheck.exchange.txt'
+    New-Item -ItemType Directory -Path $referenceCopyDir -Force | Out-Null
+    Copy-Item -LiteralPath $selfCheckExchangeFile -Destination $referenceExchangeCopy -Force
+    $exchangeBeforeFile = $referenceExchangeCopy
+}
+
 # 6. Самопроверка: автозапуск обработки «Выполнить после обновления». Красное - только то, чего нет в эталоне
 # самопроверки: новые ошибки. Новые предупреждения и пропуски - жёлтое.
 $afterName = 'Самопроверка'
@@ -3599,7 +4422,7 @@ elseif ($canaryFailed) {
     Add-StepResult -Name $afterName -Status 'SKIP' -Detail 'пропущено: канареечный вход не прошёл, сеанс не запускается'
 }
 else {
-    $after = Invoke-SelfCheck -Label 'after' -Known '' -Title $afterName
+    $after = Invoke-SelfCheck -Label 'after' -Known '' -Title $afterName -ExchangeSetFile $exchangeSetFile
     $minutes = [int][Math]::Ceiling($after.Seconds / 60)
 
     if ($after.State -ne 'done' -and $after.State -ne 'incomplete') {
@@ -3645,7 +4468,7 @@ else {
 
         if (-not $comparison.HasReference) {
             if ($kitItems.Count -eq 0 -and $after.State -eq 'done') {
-                Save-SelfCheckReference -Records $after.Records -Label 'after' -Fingerprint $after.Fingerprint -Snapshots $after.Snapshots
+                Save-SelfCheckReference -Records $after.Records -Label 'after' -Fingerprint $after.Fingerprint -Snapshots $after.Snapshots -Exchange $after.Exchange
                 $status = 'OK'
                 if ($comparison.ErrorsTotal -gt 0 -or $after.Problems.Count -gt 0) { $status = 'WARN' }
                 $detail = "эталона самопроверки не было: этот прогон стал эталоном, дальше красным будет только новое. Ошибки этого прогона посмотри в selfcheck-after.norm.txt. {0}" -f $tail
@@ -3673,17 +4496,22 @@ else {
 
             # Эталон двигается сам, только когда нового нет совсем. Иначе - после просмотра, ключом -AcceptBaseline.
             if ($status -eq 'OK' -and $after.State -eq 'done') {
-                Save-SelfCheckReference -Records $after.Records -Label 'after' -Fingerprint $after.Fingerprint -Snapshots $after.Snapshots
+                Save-SelfCheckReference -Records $after.Records -Label 'after' -Fingerprint $after.Fingerprint -Snapshots $after.Snapshots -Exchange $after.Exchange
             }
         }
         Add-StepResult -Name $afterName -Status $status -Detail $detail -Log $after.Journal -Seconds $after.Seconds
+        # Обмены: итоги выгрузки «после» против «до» (с комплектом) или эталона (без комплекта).
+        Invoke-ExchangeCompareStep -After $after.Exchange -BeforeFile $exchangeBeforeFile -WithKit ($kitItems.Count -gt 0)
         # Карта покрытия - по записям этой самопроверки; при неполном прогоне покрытие было бы занижено.
-        if ($runCoverage -and $after.State -eq 'done' -and -not $script:StopRun) { Invoke-CoverageStep -Records $after.Records }
+        if ($runCoverage -and $after.State -eq 'done' -and -not $script:StopRun) { Invoke-CoverageStep -Records $after.Records -ExchangeRan ($after.Exchange.Count -gt 0) }
         if ($after.Metrics.Count -gt 0 -or $beforeMetrics.Count -gt 0) { Invoke-MetricsStep -Before $beforeMetrics -After $after.Metrics }
     }
 }
 
 #endregion
+
+# Проверка конфигурации, которая шла параллельно: дождаться и оценить, как обычно.
+if ($null -ne $script:BackgroundCheck) { Complete-BackgroundCheck }
 
 #region Вердикт
 

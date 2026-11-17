@@ -336,6 +336,15 @@ function Format-UiDuration {
     return ('{0}:{1:00}' -f $span.Minutes, $span.Seconds)
 }
 
+function Get-UiRunRemaining {
+    # Сколько осталось всего прогона, секунд (-1 - неизвестно), и сколько оставшихся шагов без статистики.
+    # Считает скрипт, который подключил ui.ps1, своей функцией Get-RunRemainingSeconds; её нет - неизвестно.
+    param([string]$Title, [double]$Elapsed, [double]$Expected)
+    $unknownResult = [pscustomobject]@{ Seconds = -1; Unknown = 0 }
+    if (-not (Get-Command -Name 'Get-RunRemainingSeconds' -CommandType Function -ErrorAction SilentlyContinue)) { return $unknownResult }
+    try { return (Get-RunRemainingSeconds -Title $Title -Elapsed $Elapsed -Expected $Expected) } catch { return $unknownResult }
+}
+
 function Write-UiProgress {
     # Title - что идёт; Elapsed - секунд с начала; Expected - сколько шло обычно (0 - неизвестно);
     # Done и Total - сделано и всего (Total 0 - неизвестно); Detail - что именно сейчас.
@@ -346,7 +355,10 @@ function Write-UiProgress {
         $now = Get-Date
         $key = '{0}|{1}|{2}' -f $Title, $Done, $Detail
         if ($null -eq $script:UiProgressSent -or $script:UiProgressSent.Key -ne $key -or ($now - $script:UiProgressSent.Time).TotalSeconds -ge 1) {
-            Send-UiEvent @{ kind = 'progress'; title = $Title; elapsed = [int]$Elapsed; expected = [int]$Expected; done = $Done; total = $Total; detail = $Detail }
+            # Сколько осталось всего прогона - считает скрипт, если умеет (run.ps1: Get-RunRemainingSeconds).
+            $uiRemaining = Get-UiRunRemaining -Title $Title -Elapsed $Elapsed -Expected $Expected
+            Send-UiEvent @{ kind = 'progress'; title = $Title; elapsed = [int]$Elapsed; expected = [int]$Expected; done = $Done; total = $Total; detail = $Detail
+                remaining = [int]$uiRemaining.Seconds; remainingUnknown = [int]$uiRemaining.Unknown }
             $script:UiProgressSent = @{ Key = $key; Time = $now }
         }
         return
@@ -358,6 +370,8 @@ function Write-UiProgress {
             $text = '       {0}: идёт {1}' -f $Title, (Format-UiDuration $Elapsed)
             if ($Total -gt 0 -and $Done -ge 0) { $text += (', {0} из {1}' -f $Done, $Total) }
             if ($Detail) { $text += (', ' + $Detail) }
+            $uiRemaining = Get-UiRunRemaining -Title $Title -Elapsed $Elapsed -Expected $Expected
+            if ($uiRemaining.Seconds -ge 0) { $text += ('; весь прогон - ещё ~{0}' -f (Format-UiDuration $uiRemaining.Seconds)) }
             Write-Host $text
         }
         return
