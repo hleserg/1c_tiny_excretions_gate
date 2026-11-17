@@ -1544,6 +1544,23 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         }
         $menu.Add([pscustomobject]@{ Key = 'exit'; Label = 'Выход' })
         $notes = @()
+        # Итог ночного прогона (nightly.ps1) - первой строкой: его смотрят утром.
+        $nightlyLast = Join-Path $Root 'nightly\last.json'
+        if (Test-Path -LiteralPath $nightlyLast) {
+            try {
+                $nightly = [System.IO.File]::ReadAllText($nightlyLast, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                $nightlyNames = @{ GREEN = 'ЗЕЛЁНЫЙ'; YELLOW = 'ЖЁЛТЫЙ'; RED = 'КРАСНЫЙ'; NONE = 'итога нет' }
+                $nightlyVerdict = [string]$nightly.verdict
+                if ($nightlyNames.ContainsKey($nightlyVerdict)) { $nightlyVerdict = $nightlyNames[$nightlyVerdict] }
+                $nightlyNote = "ночной прогон {0}: {1}, прогон {2}" -f $nightly.time, $nightlyVerdict, $nightly.runId
+                $nightlyTime = [datetime]::MinValue
+                if ([datetime]::TryParseExact([string]$nightly.time, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$nightlyTime) -and ((Get-Date) - $nightlyTime).TotalHours -gt 36) {
+                    $nightlyNote += ' - давно: проверь задание (.\nightly.ps1 -Status)'
+                }
+                $notes += $nightlyNote
+            }
+            catch { $notes += 'ночной прогон: nightly\last.json не читается' }
+        }
         if ($usable.Count -eq 0) { $notes += 'в inbox нет обновлений расширений и обработок: прогон с обновлением недоступен' }
         $picked = Select-UiOne -Header ("Гейт расширений: {0} на {1}" -f $script:Base, $script:Server) -Items @($menu | ForEach-Object { $_.Label }) -Notes $notes
         if ($picked -lt 0) { $choice = 'exit' } else { $choice = $menu[$picked].Key }

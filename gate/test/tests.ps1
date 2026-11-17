@@ -51,7 +51,7 @@ function New-Sandbox {
     param([string]$Name, [hashtable]$Config = @{})
     $dir = Join-Path $workRoot $Name
     foreach ($sub in @('bin', 'tools', 'inbox', 'fake')) { New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null }
-    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1')) {
+    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1')) {
         Copy-Item -LiteralPath (Join-Path $ciRoot $script) -Destination $dir
     }
     # Подставной COM для deploy.ps1: скрипт берёт его из test\ рядом с собой, когда задан CI_FAKE_COM.
@@ -709,6 +709,40 @@ $tests = @(
             }
             $after = @([System.IO.File]::ReadAllLines((Join-Path $statsDir 'metrics.csv'), $utf8) | Where-Object { $_ -match [regex]::Escape($metricKey) })
             Check ($after.Count -eq 4) ("в истории {0} замеров ключа, ждали 4 (2 было, до и после)" -f $after.Count)
+        }
+    },
+    @{
+        Name = 'nightly-asis-and-menu'
+        Text = 'ночной прогон: run.ps1 «как есть» без вопросов, итог в nightly\last.json, утром он в меню гейта'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $r = Invoke-Script -Sandbox $sb -Script 'nightly.ps1'
+            Check (-not $r.TimedOut) 'ночной прогон не уложился'
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check ([string]::IsNullOrWhiteSpace($r.Stderr)) ("stderr: " + ([string]$r.Stderr).Trim())
+            $lastFile = Join-Path $sb 'nightly\last.json'
+            if (Test-Path -LiteralPath $lastFile) {
+                $last = [System.IO.File]::ReadAllText($lastFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check ($last.verdict -eq 'GREEN') ("вердикт ночного прогона {0}, ждали GREEN" -f $last.verdict)
+                Check ($last.runId -match '^\d{8}-\d{6}$' -and (Test-Path -LiteralPath (Join-Path $sb ('runs\' + $last.runId + '\verdict.json')))) ("нет прогона {0}" -f $last.runId)
+                Check (Test-Path -LiteralPath ([string]$last.log)) 'нет файла вывода ночного прогона'
+            }
+            else { Check $false 'нет nightly\last.json' }
+            $menu = Invoke-Script -Sandbox $sb -Answers @(@{ Kind = 'one'; Header = '^Гейт расширений'; Item = '^Выход$' })
+            Check ($menu.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($menu.Unexpected -join ' | '))
+            Check (@($menu.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('ночной прогон') -and $_.Contains('ЗЕЛЁНЫЙ') }).Count -gt 0) 'в меню гейта нет итога ночного прогона'
+        }
+    },
+    @{
+        Name = 'nightly-install-denied-window'
+        Text = 'ночной прогон: время из окна 22:00-02:00 не принимается, задание не создаётся'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $r = Invoke-Script -Sandbox $sb -Script 'nightly.ps1' -Arguments '-Install -At 23:15'
+            Check ($r.ExitCode -eq 1) ("код возврата {0}, ждали 1" -f $r.ExitCode)
+            Check (@($r.Output | Where-Object { $_ -match 'окно 22:00-02:00' }).Count -gt 0) 'нет объяснения про окно 22:00-02:00'
         }
     },
     @{

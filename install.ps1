@@ -4,7 +4,7 @@
 
 Запуск: install.cmd из распакованного архива ci-gate_<версия>.zip (рядом с install.cmd лежит папка ci).
 Что делает:
-  1. копирует гейт в папку установки (по умолчанию C:\ci). Свои данные не трогает: config.psd1, runs, baseline,
+  1. копирует гейт в папку установки (по умолчанию C:\ci). Свои данные не трогает: config.psd1, runs, baseline, nightly,
      stats, inbox, secrets, deploy и собранные обработки в tools остаются как были;
   2. если config.psd1 ещё нет - спрашивает главное (платформа, тестовая база, рабочая база, расширения,
      под кем запускать конфигуратор) и пишет config.psd1 из образца config.example.psd1;
@@ -90,7 +90,7 @@ if (-not $Target) { $Target = Read-Answer 'Папка установки' 'C:\ci
 $Target = [System.IO.Path]::GetFullPath($Target)
 New-Item -ItemType Directory -Path $Target -Force | Out-Null
 # Своё: не затирается никогда. Остальное в папке установки - файлы гейта, их заменяет новая версия.
-$keep = @('config.psd1', 'config.psd1.bak', 'runs', 'baseline', 'stats', 'inbox', 'secrets', 'deploy', 'kit')
+$keep = @('config.psd1', 'config.psd1.bak', 'runs', 'baseline', 'stats', 'inbox', 'secrets', 'deploy', 'kit', 'nightly')
 $copied = 0
 foreach ($item in @(Get-ChildItem -LiteralPath $source -Recurse -File)) {
     $relative = $item.FullName.Substring($source.Length + 1)

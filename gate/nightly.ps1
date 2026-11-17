@@ -1,0 +1,145 @@
+﻿#requires -Version 5.1
+<#
+.SYNOPSIS
+    Ночной прогон гейта: «как есть» на тестовой базе по расписанию Windows.
+.DESCRIPTION
+    Версия 00000000.000000.
+
+    .\nightly.ps1 -Install [-At 03:30]
+        Задание планировщика Windows ci-gate-nightly: каждый день в At (или NightlyAt из config.psd1,
+        по умолчанию 03:30) запускать этот скрипт. Время с 22:00 до 02:00 не принимается: в это окно
+        ставят обновления. Задание - от текущего пользователя (его файлы паролей DPAPI), только пока
+        он вошёл в систему; «выполнять для всех пользователей» - в планировщике руками, с паролем.
+
+    .\nightly.ps1 -Uninstall      снять задание.
+    .\nightly.ps1 -Status         задание (следующий запуск, итог прошлого) и итог последнего прогона.
+
+    .\nightly.ps1
+        Сам ночной прогон: run.ps1 «как есть» без вопросов (-OnNotGreen Keep -OnSessions Continue).
+        Вывод - в nightly\<время>.log, итог - в nightly\last.json и строкой в nightly\history.txt.
+        Утром итог виден в меню гейта (ci, .\run.cmd).
+#>
+[CmdletBinding()]
+param(
+    [switch]$Install,
+    [switch]$Uninstall,
+    [switch]$Status,
+    [string]$At = '',
+    # Задаёт ci.exe; ночному прогону канал не нужен: вопросов нет.
+    [string]$UiChannel = ''
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+$Root = $PSScriptRoot
+$TaskName = 'ci-gate-nightly'
+$nightlyDir = Join-Path $Root 'nightly'
+$utf8Bom = New-Object System.Text.UTF8Encoding($true)
+
+$cfg = @{}
+$configPath = Join-Path $Root 'config.psd1'
+if (Test-Path -LiteralPath $configPath) { $cfg = Import-PowerShellDataFile -LiteralPath $configPath }
+
+function Get-NightlySetting {
+    param([string]$Key, $Default)
+    if ($cfg.ContainsKey($Key) -and $null -ne $cfg[$Key]) { return $cfg[$Key] }
+    return $Default
+}
+
+function ConvertTo-NightlyTime {
+    # «ЧЧ:ММ» -> DateTime сегодня в это время. Не время или окно 22:00-02:00 - исключение.
+    param([string]$Text)
+    $parsed = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact($Text.Trim(), 'H:mm', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
+        throw ("время «{0}» не в виде ЧЧ:ММ" -f $Text)
+    }
+    if ($parsed.Hour -ge 22 -or $parsed.Hour -lt 2) {
+        throw ("время {0} попадает в окно 22:00-02:00: в него ставят обновления, ночной прогон там мешает. Возьми, например, 03:30" -f $parsed.ToString('HH:mm'))
+    }
+    return $parsed
+}
+
+if ($Install) {
+    $timeText = $At
+    if (-not $timeText) { $timeText = [string](Get-NightlySetting 'NightlyAt' '03:30') }
+    try { $time = ConvertTo-NightlyTime $timeText }
+    catch { Write-Host ("Задание не создано: {0}" -f $_.Exception.Message) -ForegroundColor Red; exit 1 }
+    $script = Join-Path $Root 'nightly.ps1'
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $script) -WorkingDirectory $Root
+    $trigger = New-ScheduledTaskTrigger -Daily -At $time
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 6)
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Force `
+        -Description 'Гейт расширений 1С: ночной прогон «как есть» на тестовой базе (nightly.ps1)' | Out-Null
+    Write-Host ("Задание {0}: каждый день в {1}, от пользователя {2}, пока он в системе." -f $TaskName, $time.ToString('HH:mm'), $env:USERNAME) -ForegroundColor Green
+    Write-Host 'Итог - nightly\last.json, утром он виден в меню гейта.'
+    exit 0
+}
+
+if ($Uninstall) {
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($null -eq $task) { Write-Host ("Задания {0} нет." -f $TaskName); exit 0 }
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    Write-Host ("Задание {0} снято." -f $TaskName) -ForegroundColor Green
+    exit 0
+}
+
+if ($Status) {
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($null -eq $task) { Write-Host ("Задания {0} нет: поставить - .\nightly.ps1 -Install" -f $TaskName) }
+    else {
+        $info = Get-ScheduledTaskInfo -TaskName $TaskName
+        Write-Host ("Задание {0}: {1}; следующий запуск {2}; прошлый {3}, код {4}" -f $TaskName, $task.State, $info.NextRunTime, $info.LastRunTime, $info.LastTaskResult)
+    }
+    $lastFile = Join-Path $nightlyDir 'last.json'
+    if (Test-Path -LiteralPath $lastFile) {
+        $last = [System.IO.File]::ReadAllText($lastFile, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+        Write-Host ("Последний ночной прогон: {0}, вердикт {1}, прогон {2}, вывод {3}" -f $last.time, $last.verdict, $last.runId, $last.log)
+    }
+    else { Write-Host 'Ночных прогонов ещё не было.' }
+    exit 0
+}
+
+# Ночной прогон.
+New-Item -ItemType Directory -Path $nightlyDir -Force | Out-Null
+$started = Get-Date
+$stamp = $started.ToString('yyyyMMdd-HHmmss')
+$logFile = Join-Path $nightlyDir ($stamp + '.log')
+$runsRoot = Join-Path $Root ([string](Get-NightlySetting 'RunsDir' 'runs'))
+if ([System.IO.Path]::IsPathRooted([string](Get-NightlySetting 'RunsDir' 'runs'))) { $runsRoot = [string](Get-NightlySetting 'RunsDir' 'runs') }
+$known = @{}
+if (Test-Path -LiteralPath $runsRoot) { foreach ($dir in @(Get-ChildItem -LiteralPath $runsRoot -Directory)) { $known[$dir.Name] = $true } }
+
+# Отдельный процесс: у run.ps1 свои trap и exit, ночной скрипт должен дожить до итога.
+# Строки stderr при 2>&1 в PowerShell 5.1 становятся ошибками: при Stop они прервали бы ночной скрипт.
+$ErrorActionPreference = 'Continue'
+$output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'run.ps1') -OnNotGreen Keep -OnSessions Continue 2>&1
+$exitCode = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
+[System.IO.File]::WriteAllLines($logFile, [string[]]@($output | ForEach-Object { [string]$_ }), $utf8Bom)
+
+$runId = ''
+$verdict = 'NONE'
+if (Test-Path -LiteralPath $runsRoot) {
+    $fresh = @(Get-ChildItem -LiteralPath $runsRoot -Directory | Where-Object { -not $known.ContainsKey($_.Name) -and $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name | Select-Object -Last 1)
+    if ($fresh.Count -gt 0) {
+        $runId = $fresh[0].Name
+        $verdictFile = Join-Path $fresh[0].FullName 'verdict.json'
+        if (Test-Path -LiteralPath $verdictFile) {
+            $verdictData = [System.IO.File]::ReadAllText($verdictFile, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+            $verdict = [string]$verdictData.verdict
+        }
+    }
+}
+$record = [ordered]@{
+    time     = $started.ToString('yyyy-MM-dd HH:mm:ss')
+    finished = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    runId    = $runId
+    verdict  = $verdict
+    exitCode = $exitCode
+    log      = $logFile
+}
+[System.IO.File]::WriteAllText((Join-Path $nightlyDir 'last.json'), (ConvertTo-Json -InputObject $record), $utf8Bom)
+[System.IO.File]::AppendAllText((Join-Path $nightlyDir 'history.txt'), ("{0}`t{1}`t{2}`t{3}`r`n" -f $record.time, $verdict, $runId, $exitCode), $utf8Bom)
+Write-Host ("Ночной прогон: вердикт {0}, прогон {1}, код {2}. Вывод - {3}" -f $verdict, $runId, $exitCode, $logFile)
+exit $exitCode
