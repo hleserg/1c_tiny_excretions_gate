@@ -674,6 +674,44 @@ $tests = @(
         }
     },
     @{
+        Name = 'gate-metrics-slow'
+        Text = 'время ключевых операций: проведение стало в 9 раз дольше истории - жёлтый; замер не попадает в снимки'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $statsDir = Join-Path $sb 'stats'
+            New-Item -ItemType Directory -Path $statsDir -Force | Out-Null
+            $metricKey = 'проведение|Документ.РеализацияТоваровУслуг|11111111-0000-0000-0000-000000000001'
+            $history = @(
+                ("2026-11-10 10:00:00`terp_temp_test`t20261110-100000`tafter`t{0}`t110" -f $metricKey),
+                ("2026-11-11 10:00:00`terp_temp_test`t20261111-100000`tafter`t{0}`t95" -f $metricKey),
+                ("2026-11-11 10:00:00`terp_temp_test`t20261111-100000`tafter`tпроведение|Документ.Другой|x`t5000" -f $metricKey))
+            [System.IO.File]::WriteAllLines((Join-Path $statsDir 'metrics.csv'), [string[]]$history, $utf8Bom)
+            $tasksWith = {
+                param([string]$Ms)
+                return @(
+                    @{ key = 'Окружение'; title = 'Окружение и расширения'; step = 'Окружение'; lines = @('[ОК] Обработка запущена под полными правами') },
+                    @{ key = 'ПерепроведениеДокументов|Документ|РеализацияТоваровУслуг'; title = 'Перепроведение'; step = 'ПерепроведениеДокументов'
+                        lines = @('[ОК] Реализация 1: перепроведён, движений 4, как и было'); snapshots = @{ ('время|' + $metricKey) = $Ms } }
+                )
+            }
+            $fake = @{ selfcheck = @(@{ tasks = (& $tasksWith '100') }, @{ tasks = (& $tasksWith '900'); fingerprint = 'после' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'YELLOW' 2
+            Check-Step $r 'Время ключевых операций' 'WARN'
+            $step = Get-Step $r 'Время ключевых операций'
+            if ($null -ne $step) { Check ([string]$step.detail -match '900 мс, обычно 100 мс') ("в шаге нет замера: {0}" -f $step.detail) }
+            if ($r.RunDir) {
+                Check (-not (Test-Path -LiteralPath (Join-Path $r.RunDir 'selfcheck-after.snapshots.txt'))) 'замер попал в снимки'
+                $metricsFile = Join-Path $r.RunDir 'selfcheck-after.metrics.txt'
+                Check ((Test-Path -LiteralPath $metricsFile) -and [System.IO.File]::ReadAllText($metricsFile, $utf8).Contains("900`t" + $metricKey)) 'нет файла замеров после'
+            }
+            $after = @([System.IO.File]::ReadAllLines((Join-Path $statsDir 'metrics.csv'), $utf8) | Where-Object { $_ -match [regex]::Escape($metricKey) })
+            Check ($after.Count -eq 4) ("в истории {0} замеров ключа, ждали 4 (2 было, до и после)" -f $after.Count)
+        }
+    },
+    @{
         Name = 'deploy-all-green'
         Text = 'обновление рабочей «все»: изменённое расширение и обработка, блокировки поставлены и сняты, отчёт с разницей по обработке'
         Run = {

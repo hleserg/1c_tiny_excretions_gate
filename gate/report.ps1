@@ -652,6 +652,24 @@ if (Test-Path -LiteralPath $snapshotDiffFile) {
     }
 }
 
+# Время ключевых операций: заметно медленнее истории.
+$metricsSlowFile = Join-Path $RunDir 'metrics-slow.txt'
+if (Test-Path -LiteralPath $metricsSlowFile) {
+    $metricsSlow = @([System.IO.File]::ReadAllLines($metricsSlowFile, [System.Text.Encoding]::UTF8) | ForEach-Object { $_.TrimStart([char]0xFEFF) } | Where-Object { $_ })
+    if ($metricsSlow.Count -gt 0) {
+        $comparedSomething = $true
+        $body.Add(("== Время ключевых операций: заметно медленнее {0}" -f $metricsSlow.Count))
+        $summary.Add(("[ЖЁЛТ] Время ключевых операций: заметно медленнее {0}" -f $metricsSlow.Count))
+        $number = 0
+        foreach ($line in @($metricsSlow | Select-Object -First 20)) {
+            $number++
+            $body.Add(("  {0}. {1}" -f $number, (Format-Short $line 220)))
+        }
+        $body.Add('  Что делать: посмотреть, что из комплекта трогает эти операции (перехваты проведения, подписки, запросы в модулях). Один медленный прогон бывает от нагрузки на сервер: если в следующем прогоне время вернулось - не беда. История - stats\metrics.csv.')
+        $body.Add('')
+    }
+}
+
 # Карта покрытия: новое непокрытое - доработки, которых самопроверка не задевает.
 $coverageNewFile = Join-Path $RunDir 'coverage.new.txt'
 if (Test-Path -LiteralPath $coverageNewFile) {

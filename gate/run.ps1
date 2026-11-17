@@ -1024,6 +1024,80 @@ function Invoke-CoverageStep {
 
 #endregion
 
+#region Время ключевых операций
+
+function Read-MetricsHistory {
+    # История замеров базы: stats\metrics.csv, строки «время<TAB>база<TAB>прогон<TAB>метка<TAB>ключ<TAB>мс».
+    # Возвращает таблицу «ключ -> список мс» по порядку записи.
+    param([string]$Path, [string]$Base)
+    $table = @{}
+    if (-not (Test-Path -LiteralPath $Path)) { return $table }
+    foreach ($line in [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)) {
+        $parts = $line.TrimStart([char]0xFEFF).Split("`t")
+        if ($parts.Count -lt 6 -or $parts[1] -ne $Base) { continue }
+        $ms = 0
+        if (-not [int]::TryParse($parts[5], [ref]$ms)) { continue }
+        if (-not $table.ContainsKey($parts[4])) { $table[$parts[4]] = New-Object System.Collections.Generic.List[int] }
+        $table[$parts[4]].Add($ms)
+    }
+    return $table
+}
+
+function Add-MetricsHistory {
+    param([string]$Path, [string]$Base, [string]$Label, $Metrics)
+    if ($Metrics.Count -eq 0) { return }
+    $folder = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+    $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $lines = @($Metrics.Keys | Sort-Object | ForEach-Object { '{0}{1}{2}{1}{3}{1}{4}{1}{5}{1}{6}' -f $stamp, "`t", $Base, $runId, $Label, $_, $Metrics[$_] })
+    [System.IO.File]::AppendAllText($Path, (($lines -join "`r`n") + "`r`n"), $Utf8Bom)
+}
+
+function Invoke-MetricsStep {
+    # Шаг «Время ключевых операций»: замеры самопроверки (проведение, печать, отчёты, сценарии) против истории
+    # по той же базе и тому же ключу. Заметно медленнее - дольше медианы последних MetricHistory замеров в
+    # MetricSlowFactor раз и на MetricMinDeltaMs мс; замеров в истории меньше MetricMinHistory - не сравнивается.
+    # Замеры «до» (старый код) пишутся в историю первыми: с ними и сравниваются замеры «после».
+    param($Before, $After)
+    $stepName = 'Время ключевых операций'
+    $historyFile = Join-Path (Resolve-RootPath ([string](Get-Setting $cfg 'StatsDir' 'stats'))) 'metrics.csv'
+    $factor = [double](Get-Setting $cfg 'MetricSlowFactor' 1.5)
+    $minDelta = [int](Get-Setting $cfg 'MetricMinDeltaMs' 500)
+    $minHistory = [int](Get-Setting $cfg 'MetricMinHistory' 3)
+    $depth = [int](Get-Setting $cfg 'MetricHistory' 10)
+
+    Add-MetricsHistory -Path $historyFile -Base $baseKey -Label 'before' -Metrics $Before
+    $history = Read-MetricsHistory -Path $historyFile -Base $baseKey
+    $slow = New-Object System.Collections.Generic.List[object]
+    $compared = 0
+    foreach ($key in @($After.Keys | Sort-Object)) {
+        if (-not $history.ContainsKey($key)) { continue }
+        $values = @($history[$key] | ForEach-Object { $_ })
+        if ($values.Count -gt $depth) { $values = @($values | Select-Object -Last $depth) }
+        if ($values.Count -lt $minHistory) { continue }
+        $compared++
+        $sorted = @($values | Sort-Object)
+        $median = [double]$sorted[[int][Math]::Floor(($sorted.Count - 1) / 2)]
+        if ($sorted.Count % 2 -eq 0) { $median = ([double]$sorted[$sorted.Count / 2 - 1] + [double]$sorted[$sorted.Count / 2]) / 2 }
+        $now = [int]$After[$key]
+        if ($now -gt $median * $factor -and ($now - $median) -ge $minDelta) {
+            $slow.Add([pscustomobject]@{ Key = $key; Now = $now; Median = [int]$median; Ratio = ($now / [Math]::Max($median, 1)) })
+        }
+    }
+    Add-MetricsHistory -Path $historyFile -Base $baseKey -Label 'after' -Metrics $After
+
+    $slowLines = @($slow | Sort-Object Ratio -Descending | ForEach-Object { '{0} мс, обычно {1} мс (в {2:0.0} раза): {3}' -f $_.Now, $_.Median, $_.Ratio, $_.Key })
+    [System.IO.File]::WriteAllLines((Join-Path $RunDir 'metrics-slow.txt'), [string[]]$slowLines, $Utf8Bom)
+    $detail = "замеров {0}, сравнено с историей {1}, заметно медленнее {2}" -f $After.Count, $compared, $slow.Count
+    if ($compared -eq 0) { $detail += ("; истории пока мало (нужно замеров: {0}), прогон её пополнил" -f $minHistory) }
+    if ($slow.Count -gt 0) { $detail += ('. ' + (@($slowLines | Select-Object -First 3) -join ' | ') + '; все - metrics-slow.txt') }
+    $status = 'OK'
+    if ($slow.Count -gt 0) { $status = 'WARN' }
+    Add-StepResult -Name $stepName -Status $status -Detail $detail -Log (Join-Path $RunDir 'metrics-slow.txt')
+}
+
+#endregion
+
 function Compare-SelfCheckSnapshots {
     # Снимки прогона против эталонных. Изменился снимок с тем же ключом - это замечание: тот же объект
     # выгрузился по-другому. Новый ключ или пропавший - только сведения: объект для снимка выбирается
@@ -1968,6 +2042,7 @@ function Invoke-SelfCheck {
     $journal = New-Object System.Collections.Generic.List[string]
     $records = New-Object System.Collections.Generic.List[string]
     $snapshots = [ordered]@{}
+    $metrics = @{}
     $number = 0
     foreach ($session in $sessions) {
         $number++
@@ -1982,7 +2057,16 @@ function Invoke-SelfCheck {
             }
             foreach ($line in $piece.Body) { $journal.Add($line) }
             foreach ($record in @(ConvertTo-SelfCheckRecords -Key $key -Lines $piece.Body)) { $records.Add($record) }
-            foreach ($snapKey in @($piece.Snapshots.Keys)) { $snapshots[$snapKey] = Format-SelfCheckSnapshot $piece.Snapshots[$snapKey] }
+            foreach ($snapKey in @($piece.Snapshots.Keys)) {
+                # «время|...» - замер длительности операции: не снимок, а число миллисекунд (шаг «Время ключевых операций»).
+                if ($snapKey.StartsWith('время|')) {
+                    $msText = (@($piece.Snapshots[$snapKey]) -join '').Trim()
+                    $msValue = 0
+                    if ([int]::TryParse($msText, [ref]$msValue)) { $metrics[$snapKey.Substring(6)] = $msValue }
+                    continue
+                }
+                $snapshots[$snapKey] = Format-SelfCheckSnapshot $piece.Snapshots[$snapKey]
+            }
             if ($piece.Header.ContainsKey('key')) { $key = [string]$piece.Header['key'] }
             else { $key = '(конец)' }
         }
@@ -2006,6 +2090,9 @@ function Invoke-SelfCheck {
     # Снимки шагов (сообщения обмена и т.п.) - уже приведённые к виду для сравнения. Файл пишется,
     # только если снимки есть: обработка прежней версии их не присылает.
     if ($snapshots.Count -gt 0) { Write-SelfCheckSnapshots -Snapshots $snapshots -Path (Join-Path $RunDir ("selfcheck-{0}.snapshots.txt" -f $Label)) }
+    if ($metrics.Count -gt 0) {
+        [System.IO.File]::WriteAllLines((Join-Path $RunDir ("selfcheck-{0}.metrics.txt" -f $Label)), [string[]]@($metrics.Keys | Sort-Object | ForEach-Object { '{0}{1}{2}' -f $metrics[$_], "`t", $_ }), $Utf8Bom)
+    }
 
     # Отпечаток состояния базы на начало первого сеанса. Ненадёжный отпечаток не используется вовсе.
     $fingerprint = ''
@@ -2023,6 +2110,7 @@ function Invoke-SelfCheck {
         Seconds     = [int]$watch.Elapsed.TotalSeconds
         Journal     = $journalPath
         Snapshots   = $snapshots
+        Metrics     = $metrics
         Message     = [string](Get-Setting $lastSession.Result 'message' '')
         Windows     = $lastSession.Windows
         Sessions    = $sessions.Count
@@ -3060,6 +3148,9 @@ if (Test-Path -LiteralPath $baselineDir) {
 }
 $script:StopRun = $false
 
+# Замеры самопроверки до загрузки (старый код): идут в историю раньше замеров после, см. Invoke-MetricsStep.
+$beforeMetrics = @{}
+
 # 1. Самопроверка до загрузки: состояние, с которым будет сравниваться состояние после.
 # Заодно из её сведений известно, какие расширения стояли в базе до загрузки.
 # Если база не менялась после прошлой самопроверки гейта, заново она не выполняется: эталон уже есть.
@@ -3082,6 +3173,7 @@ if ($kitItems.Count -gt 0 -and -not $selfCheckOff) {
     elseif ($before.State -eq 'done' -or $before.State -eq 'incomplete') {
         Save-SelfCheckReference -Records $before.Records -Label 'before' -Fingerprint $before.Fingerprint -Snapshots $before.Snapshots
         Save-SelfCheckLastState -Fingerprint $before.Fingerprint
+        $beforeMetrics = $before.Metrics
         $detail = "состояние до загрузки снято и стало эталоном самопроверки: записей {0}, из них ошибок {1}; {2} мин" -f $before.Records.Count, $errorsBefore, $minutes
         if ($before.Problems.Count -gt 0) {
             $detail += ('. Прогон неполный: ' + ($before.Problems -join ' | '))
@@ -3570,6 +3662,7 @@ else {
         Add-StepResult -Name $afterName -Status $status -Detail $detail -Log $after.Journal -Seconds $after.Seconds
         # Карта покрытия - по записям этой самопроверки; при неполном прогоне покрытие было бы занижено.
         if ($runCoverage -and $after.State -eq 'done' -and -not $script:StopRun) { Invoke-CoverageStep -Records $after.Records }
+        if ($after.Metrics.Count -gt 0 -or $beforeMetrics.Count -gt 0) { Invoke-MetricsStep -Before $beforeMetrics -After $after.Metrics }
     }
 }
 
