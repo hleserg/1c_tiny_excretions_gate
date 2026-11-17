@@ -1,0 +1,20 @@
+# Сборка
+/dist/
+*.exe
+
+# Данные установленного гейта: если папку gate запускать прямо из репозитория
+/gate/config.psd1
+/gate/config.psd1.bak
+/gate/runs/
+/gate/baseline/
+/gate/stats/
+/gate/inbox/
+/gate/secrets/
+/gate/deploy/
+/gate/kit/
+/gate/tools/
+/gate/test/last-run.txt
+
+# Собранные обработки
+*.epf
+*.erf

@@ -1,0 +1,182 @@
+package main
+
+// Движок - run.ps1 или deploy.ps1. ci.exe запускает его с ключом -UiChannel <папка>, читает его вывод
+// построчно и отвечает на вопросы файлами в папке канала. Протокол описан в ui.ps1.
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+const uiPrefix = "@@ui:"
+
+// uiEvent - строка «@@ui:{json}» из вывода движка.
+type uiEvent struct {
+	Kind        string     `json:"kind"`
+	ID          int        `json:"id"`
+	Header      string     `json:"header"`
+	Notes       []string   `json:"notes"`
+	Items       []string   `json:"items"`
+	Steps       []string   `json:"steps"`
+	Groups      []string   `json:"groups"`
+	Value       string     `json:"value"`
+	Secret      bool       `json:"secret"`
+	Danger      []int      `json:"danger"`
+	Current     string     `json:"current"`
+	Blocks      []subBlock `json:"blocks"`
+	Preselected []int      `json:"preselected"`
+	Yes         string     `json:"yes"`
+	No          string     `json:"no"`
+	Lines       []string   `json:"lines"`
+	Poll        bool       `json:"poll"`
+	Style       string     `json:"style"`
+	Text        string     `json:"text"`
+	More        []string   `json:"more"`
+	Title       string     `json:"title"`
+	Elapsed     float64    `json:"elapsed"`
+	Expected    float64    `json:"expected"`
+	Done        int        `json:"done"`
+	Total       int        `json:"total"`
+	Detail      string     `json:"detail"`
+}
+
+// answer - ответ на вопрос, файл a-<id>.json в папке канала.
+type answer struct {
+	Cancel  bool   `json:"cancel"`
+	Index   int    `json:"index"`
+	Indexes []int  `json:"indexes"`
+	Yes     bool   `json:"yes"`
+	Text    string `json:"text"`
+}
+
+// Сообщения от движка в модель.
+type lineMsg struct{ text string }
+type eventMsg struct{ ev uiEvent }
+type exitMsg struct {
+	code int
+	err  error
+}
+
+type engine struct {
+	cmd     *exec.Cmd
+	channel string
+	started time.Time
+	script  string
+}
+
+// engineCommand - чем запускать движок. Переменная CI_ENGINE (команда через «|») - для проверки ci.exe
+// без 1С: подставляется поддельный движок.
+func engineCommand(baseDir, script string, extra []string, channel string) *exec.Cmd {
+	if fake := os.Getenv("CI_ENGINE"); fake != "" {
+		parts := strings.Split(fake, "|")
+		args := append(parts[1:], extra...)
+		args = append(args, "-UiChannel", channel)
+		return exec.Command(parts[0], args...)
+	}
+	args := []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(baseDir, script)}
+	args = append(args, extra...)
+	args = append(args, "-UiChannel", channel)
+	return exec.Command("powershell.exe", args...)
+}
+
+// startEngine запускает движок и отдаёт его вывод в программу через p.Send.
+func startEngine(p *tea.Program, baseDir, script string, extra []string) (*engine, error) {
+	channel, err := os.MkdirTemp("", "ci-ui-")
+	if err != nil {
+		return nil, fmt.Errorf("не создал папку канала: %w", err)
+	}
+	cmd := engineCommand(baseDir, script, extra, channel)
+	cmd.Dir = baseDir
+	cmd.Stdin = nil
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
+	hideChildWindow(cmd)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("не запустился %s: %w", script, err)
+	}
+	e := &engine{cmd: cmd, channel: channel, started: time.Now(), script: script}
+
+	done := make(chan struct{}, 2)
+	go readLines(p, stdout, done)
+	go readLines(p, stderr, done)
+	go func() {
+		<-done
+		<-done
+		err := cmd.Wait()
+		code := 0
+		if cmd.ProcessState != nil {
+			code = cmd.ProcessState.ExitCode()
+		}
+		p.Send(exitMsg{code: code, err: err})
+	}()
+	return e, nil
+}
+
+func readLines(p *tea.Program, r io.Reader, done chan<- struct{}) {
+	defer func() { done <- struct{}{} }()
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimRight(scanner.Text(), "\r")
+		line = strings.TrimPrefix(line, "\ufeff")
+		if strings.HasPrefix(line, uiPrefix) {
+			var ev uiEvent
+			if err := json.Unmarshal([]byte(line[len(uiPrefix):]), &ev); err == nil {
+				p.Send(eventMsg{ev: ev})
+				continue
+			}
+		}
+		p.Send(lineMsg{text: line})
+	}
+}
+
+// answerQuestion кладёт ответ в папку канала. Сначала во временный файл, потом переименование:
+// движок не прочитает недописанный ответ.
+func (e *engine) answerQuestion(id int, a answer) error {
+	if a.Indexes == nil {
+		a.Indexes = []int{}
+	}
+	data, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	final := filepath.Join(e.channel, fmt.Sprintf("a-%d.json", id))
+	tmp := final + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, final)
+}
+
+// requestStop - просьба движку остановиться штатно (со снятием блокировок).
+func (e *engine) requestStop() error {
+	return os.WriteFile(filepath.Join(e.channel, "stop"), []byte("stop"), 0o644)
+}
+
+// kill - если движок не реагирует на просьбу.
+func (e *engine) kill() {
+	if e.cmd != nil && e.cmd.Process != nil {
+		_ = e.cmd.Process.Kill()
+	}
+}
+
+func (e *engine) cleanup() {
+	if e.channel != "" {
+		_ = os.RemoveAll(e.channel)
+	}
+}

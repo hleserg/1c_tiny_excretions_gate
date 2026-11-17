@@ -1,0 +1,17 @@
+# Скрипты и исходники 1С - для Windows: CRLF. Go и документация - LF.
+*.ps1   text eol=crlf
+*.psd1  text eol=crlf
+*.cmd   text eol=crlf
+*.bsl   text eol=crlf
+*.xml   text eol=crlf
+gate/readme.txt text eol=crlf
+*.go    text eol=lf
+go.mod  text eol=lf
+go.sum  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+*.exe   binary
+*.epf   binary
+*.erf   binary
+*.cfe   binary

@@ -1,0 +1,75 @@
+name: Codex review
+
+# Ревью PR от Codex через openai/codex-action. Нужен секрет OPENAI_API_KEY; без него задача пропускается.
+# Правила ревью - раздел «Review guidelines» в AGENTS.md.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  codex:
+    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      final_message: ${{ steps.run_codex.outputs.final-message }}
+    steps:
+      - name: Есть ли ключ
+        id: key
+        env:
+          KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: echo "present=$([ -n "$KEY" ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.key.outputs.present == 'yes'
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Ветки PR
+        if: steps.key.outputs.present == 'yes'
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: git fetch --no-tags origin "$BASE_REF" "+refs/pull/$PR_NUMBER/head"
+
+      - name: Codex
+        id: run_codex
+        if: steps.key.outputs.present == 'yes'
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: |
+            Это PR #${{ github.event.pull_request.number }} в ${{ github.repository }}.
+            Сделай ревью ТОЛЬКО изменений этого PR:
+              git log --oneline ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
+              git diff ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
+            Правила проекта и что важно на ревью - в AGENTS.md (раздел «Review guidelines»).
+            Пиши по-русски. Сначала блокирующие замечания (P0/P1) с файлом и строкой, потом остальное коротко.
+            Если замечаний нет - так и напиши одной строкой.
+
+            Заголовок и описание PR:
+            ${{ github.event.pull_request.title }}
+            ${{ github.event.pull_request.body }}
+
+  post:
+    needs: codex
+    if: needs.codex.outputs.final_message != ''
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          REVIEW: ${{ needs.codex.outputs.final_message }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: '### Ревью Codex\n\n' + process.env.REVIEW,
+            });

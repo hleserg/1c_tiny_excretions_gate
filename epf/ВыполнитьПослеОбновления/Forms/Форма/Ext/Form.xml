@@ -1,0 +1,366 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:app="http://v8.1c.ru/8.2/managed-application/core" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:dcscor="http://v8.1c.ru/8.1/data-composition-system/core" xmlns:dcssch="http://v8.1c.ru/8.1/data-composition-system/schema" xmlns:dcsset="http://v8.1c.ru/8.1/data-composition-system/settings" xmlns:ent="http://v8.1c.ru/8.1/data/enterprise" xmlns:lf="http://v8.1c.ru/8.2/managed-application/logform" xmlns:style="http://v8.1c.ru/8.1/data/ui/style" xmlns:sys="http://v8.1c.ru/8.1/data/ui/fonts/system" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:v8ui="http://v8.1c.ru/8.1/data/ui" xmlns:web="http://v8.1c.ru/8.1/data/ui/colors/web" xmlns:win="http://v8.1c.ru/8.1/data/ui/colors/windows" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20">
+	<AutoCommandBar name="ФормаКоманднаяПанель" id="-1"/>
+	<Events>
+		<Event name="OnOpen">ПриОткрытии</Event>
+		<Event name="OnCreateAtServer">ПриСозданииНаСервере</Event>
+	</Events>
+	<ChildItems>
+		<HTMLDocumentField name="ПанельАвтозапуска" id="49">
+			<DataPath>ПанельАвтозапускаHTML</DataPath>
+			<TitleLocation>None</TitleLocation>
+			<Width>110</Width>
+			<Height>32</Height>
+			<HorizontalStretch>true</HorizontalStretch>
+			<VerticalStretch>true</VerticalStretch>
+			<ContextMenu name="ПанельАвтозапускаКонтекстноеМеню" id="50"/>
+			<ExtendedTooltip name="ПанельАвтозапускаРасширеннаяПодсказка" id="51"/>
+		</HTMLDocumentField>
+		<Button name="ПроверитьПередОбновлением" id="1">
+			<Type>UsualButton</Type>
+			<CommandName>Form.Command.ПроверитьПередОбновлением</CommandName>
+			<ExtendedTooltip name="ПроверитьПередОбновлениемРасширеннаяПодсказка" id="2"/>
+		</Button>
+		<Button name="СоздатьНастройкиВРегистре" id="3">
+			<Type>UsualButton</Type>
+			<CommandName>Form.Command.СоздатьНастройкиВРегистре</CommandName>
+			<ExtendedTooltip name="СоздатьНастройкиВРегистреРасширеннаяПодсказка" id="4"/>
+		</Button>
+		<Button name="ДописатьРасходЗаказаннойНоменклатуры" id="5">
+			<Type>UsualButton</Type>
+			<CommandName>Form.Command.ДописатьРасходЗаказаннойНоменклатуры</CommandName>
+			<ExtendedTooltip name="ДописатьРасходЗаказаннойНоменклатурыРасширеннаяПодсказка" id="6"/>
+		</Button>
+		<InputField name="НазваниеСтатьиБазыЗнаний" id="7">
+			<DataPath>НазваниеСтатьиБазыЗнаний</DataPath>
+			<AutoMaxWidth>false</AutoMaxWidth>
+			<HorizontalStretch>true</HorizontalStretch>
+			<ContextMenu name="НазваниеСтатьиБазыЗнанийКонтекстноеМеню" id="8"/>
+			<ExtendedTooltip name="НазваниеСтатьиБазыЗнанийРасширеннаяПодсказка" id="9"/>
+		</InputField>
+		<InputField name="ТекстСтатьиБазыЗнаний" id="10">
+			<DataPath>ТекстСтатьиБазыЗнаний</DataPath>
+			<AutoMaxWidth>false</AutoMaxWidth>
+			<Height>3</Height>
+			<AutoMaxHeight>false</AutoMaxHeight>
+			<HorizontalStretch>true</HorizontalStretch>
+			<MultiLine>true</MultiLine>
+			<ContextMenu name="ТекстСтатьиБазыЗнанийКонтекстноеМеню" id="11"/>
+			<ExtendedTooltip name="ТекстСтатьиБазыЗнанийРасширеннаяПодсказка" id="12"/>
+		</InputField>
+		<Button name="СоздатьСтатьюБазыЗнаний" id="13">
+			<Type>UsualButton</Type>
+			<CommandName>Form.Command.СоздатьСтатьюБазыЗнаний</CommandName>
+			<ExtendedTooltip name="СоздатьСтатьюБазыЗнанийРасширеннаяПодсказка" id="14"/>
+		</Button>
+		<LabelDecoration name="ДекорацияПояснение" id="15">
+			<AutoMaxWidth>false</AutoMaxWidth>
+			<Title formatted="false">
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Тестирование проверяет всё, что добавлено в расширения, и собирает журнал. В базу тесты пишут только внутри транзакции, которая всегда отменяется, и только если имя базы похоже на тестовое. В рабочей базе выполняются только проверки без записи. Кнопка «Проверка перед обновлением» только читает: её нажимают до загрузки комплекта, чтобы увидеть, что изменит обновление.</v8:content>
+				</v8:item>
+			</Title>
+			<ContextMenu name="ДекорацияПояснениеКонтекстноеМеню" id="16"/>
+			<ExtendedTooltip name="ДекорацияПояснениеРасширеннаяПодсказка" id="17"/>
+		</LabelDecoration>
+		<CheckBoxField name="РазрешитьЗапись" id="18">
+			<DataPath>РазрешитьЗапись</DataPath>
+			<TitleLocation>Right</TitleLocation>
+			<CheckBoxType>Auto</CheckBoxType>
+			<ContextMenu name="РазрешитьЗаписьКонтекстноеМеню" id="19"/>
+			<ExtendedTooltip name="РазрешитьЗаписьРасширеннаяПодсказка" id="20"/>
+		</CheckBoxField>
+		<CheckBoxField name="ПроводитьДокументы" id="21">
+			<DataPath>ПроводитьДокументы</DataPath>
+			<TitleLocation>Right</TitleLocation>
+			<CheckBoxType>Auto</CheckBoxType>
+			<ContextMenu name="ПроводитьДокументыКонтекстноеМеню" id="22"/>
+			<ExtendedTooltip name="ПроводитьДокументыРасширеннаяПодсказка" id="23"/>
+		</CheckBoxField>
+		<CheckBoxField name="ОтключатьПочту" id="24">
+			<DataPath>ОтключатьПочту</DataPath>
+			<TitleLocation>Right</TitleLocation>
+			<CheckBoxType>Auto</CheckBoxType>
+			<ContextMenu name="ОтключатьПочтуКонтекстноеМеню" id="25"/>
+			<ExtendedTooltip name="ОтключатьПочтуРасширеннаяПодсказка" id="26"/>
+		</CheckBoxField>
+		<InputField name="КоличествоДокументов" id="27">
+			<DataPath>КоличествоДокументов</DataPath>
+			<ContextMenu name="КоличествоДокументовКонтекстноеМеню" id="28"/>
+			<ExtendedTooltip name="КоличествоДокументовРасширеннаяПодсказка" id="29"/>
+		</InputField>
+		<InputField name="НеПроводитьДокументы" id="30">
+			<DataPath>НеПроводитьДокументы</DataPath>
+			<AutoMaxWidth>false</AutoMaxWidth>
+			<HorizontalStretch>true</HorizontalStretch>
+			<ContextMenu name="НеПроводитьДокументыКонтекстноеМеню" id="31"/>
+			<ExtendedTooltip name="НеПроводитьДокументыРасширеннаяПодсказка" id="32"/>
+		</InputField>
+		<InputField name="ДокументыНеСтарше" id="33">
+			<DataPath>ДокументыНеСтарше</DataPath>
+			<ContextMenu name="ДокументыНеСтаршеКонтекстноеМеню" id="34"/>
+			<ExtendedTooltip name="ДокументыНеСтаршеРасширеннаяПодсказка" id="35"/>
+		</InputField>
+		<CheckBoxField name="ПроверятьПрименимость" id="36">
+			<DataPath>ПроверятьПрименимость</DataPath>
+			<TitleLocation>Right</TitleLocation>
+			<CheckBoxType>Auto</CheckBoxType>
+			<ContextMenu name="ПроверятьПрименимостьКонтекстноеМеню" id="37"/>
+			<ExtendedTooltip name="ПроверятьПрименимостьРасширеннаяПодсказка" id="38"/>
+		</CheckBoxField>
+		<CheckBoxField name="ПроверятьФормы" id="39">
+			<DataPath>ПроверятьФормы</DataPath>
+			<TitleLocation>Right</TitleLocation>
+			<CheckBoxType>Auto</CheckBoxType>
+			<ContextMenu name="ПроверятьФормыКонтекстноеМеню" id="40"/>
+			<ExtendedTooltip name="ПроверятьФормыРасширеннаяПодсказка" id="41"/>
+		</CheckBoxField>
+		<Button name="ВыполнитьТестирование" id="42">
+			<Type>UsualButton</Type>
+			<CommandName>Form.Command.ВыполнитьТестирование</CommandName>
+			<ExtendedTooltip name="ВыполнитьТестированиеРасширеннаяПодсказка" id="43"/>
+		</Button>
+		<Button name="ПоказатьЖурнал" id="44">
+			<Type>UsualButton</Type>
+			<CommandName>Form.Command.ПоказатьЖурнал</CommandName>
+			<ExtendedTooltip name="ПоказатьЖурналРасширеннаяПодсказка" id="45"/>
+		</Button>
+		<InputField name="ЖурналТестирования" id="46">
+			<DataPath>ЖурналТестирования</DataPath>
+			<TitleLocation>None</TitleLocation>
+			<AutoMaxWidth>false</AutoMaxWidth>
+			<Height>20</Height>
+			<AutoMaxHeight>false</AutoMaxHeight>
+			<HorizontalStretch>true</HorizontalStretch>
+			<VerticalStretch>true</VerticalStretch>
+			<MultiLine>true</MultiLine>
+			<ContextMenu name="ЖурналТестированияКонтекстноеМеню" id="47"/>
+			<ExtendedTooltip name="ЖурналТестированияРасширеннаяПодсказка" id="48"/>
+		</InputField>
+	</ChildItems>
+	<Attributes>
+		<Attribute name="Объект" id="1">
+			<Type>
+				<v8:Type>cfg:ExternalDataProcessorObject.ВыполнитьПослеОбновления</v8:Type>
+			</Type>
+			<MainAttribute>true</MainAttribute>
+		</Attribute>
+		<Attribute name="ЖурналТестирования" id="2">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Журнал тестирования</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="РазрешитьЗапись" id="3">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Тесты с записью в базу (в транзакции, всё отменяется; только в тестовой базе)</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:boolean</v8:Type>
+			</Type>
+		</Attribute>
+		<Attribute name="ПроводитьДокументы" id="4">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Проводить документы (в транзакции, всё отменяется)</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:boolean</v8:Type>
+			</Type>
+		</Attribute>
+		<Attribute name="ОтключатьПочту" id="5">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>На время проведения отключать почту (внутри той же транзакции)</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:boolean</v8:Type>
+			</Type>
+		</Attribute>
+		<Attribute name="КоличествоДокументов" id="6">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Документов каждого вида для перепроведения (не больше 50)</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:decimal</v8:Type>
+				<v8:NumberQualifiers>
+					<v8:Digits>2</v8:Digits>
+					<v8:FractionDigits>0</v8:FractionDigits>
+					<v8:AllowedSign>Any</v8:AllowedSign>
+				</v8:NumberQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="ПроверятьПрименимость" id="7">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Платформенная проверка применимости расширений (может занять несколько минут)</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:boolean</v8:Type>
+			</Type>
+		</Attribute>
+		<Attribute name="ПроверятьФормы" id="8">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Проверять формы (создаются без открытия)</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:boolean</v8:Type>
+			</Type>
+		</Attribute>
+		<Attribute name="НеПроводитьДокументы" id="9">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Не проводить документы (имена видов через запятую)</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="НазваниеСтатьиБазыЗнаний" id="10">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>База знаний: название статьи об обновлении</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="ТекстСтатьиБазыЗнаний" id="11">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>База знаний: текст статьи (HTML)</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="ДокументыНеСтарше" id="12">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Документы не старше (пусто - с начала месяца самого нового документа базы)</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:dateTime</v8:Type>
+				<v8:DateQualifiers>
+					<v8:DateFractions>Date</v8:DateFractions>
+				</v8:DateQualifiers>
+			</Type>
+		</Attribute>
+		<Attribute name="ПанельАвтозапускаHTML" id="13">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Экран автозапуска</v8:content>
+				</v8:item>
+			</Title>
+			<Type>
+				<v8:Type>xs:string</v8:Type>
+				<v8:StringQualifiers>
+					<v8:Length>0</v8:Length>
+					<v8:AllowedLength>Variable</v8:AllowedLength>
+				</v8:StringQualifiers>
+			</Type>
+		</Attribute>
+	</Attributes>
+	<Commands>
+		<Command name="ПроверитьПередОбновлением" id="1">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Проверка перед обновлением (только чтение)</v8:content>
+				</v8:item>
+			</Title>
+			<Action>ПроверитьПередОбновлением</Action>
+		</Command>
+		<Command name="СоздатьНастройкиВРегистре" id="2">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Создать настройки в регистре</v8:content>
+				</v8:item>
+			</Title>
+			<Action>СоздатьНастройкиВРегистре</Action>
+		</Command>
+		<Command name="ВыполнитьТестирование" id="3">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Выполнить тестирование</v8:content>
+				</v8:item>
+			</Title>
+			<Action>ВыполнитьТестирование</Action>
+		</Command>
+		<Command name="ПоказатьЖурнал" id="4">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Показать журнал в отдельном окне</v8:content>
+				</v8:item>
+			</Title>
+			<Action>ПоказатьЖурнал</Action>
+		</Command>
+		<Command name="СоздатьСтатьюБазыЗнаний" id="5">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Создать статью в базе знаний (пишет в базу)</v8:content>
+				</v8:item>
+			</Title>
+			<Action>СоздатьСтатьюБазыЗнаний</Action>
+		</Command>
+		<Command name="ДописатьРасходЗаказаннойНоменклатуры" id="6">
+			<Title>
+				<v8:item>
+					<v8:lang>ru</v8:lang>
+					<v8:content>Заказанная номенклатура: дописать расход по приобретениям (пишет в базу)</v8:content>
+				</v8:item>
+			</Title>
+			<Action>ДописатьРасходЗаказаннойНоменклатуры</Action>
+		</Command>
+	</Commands>
+</Form>

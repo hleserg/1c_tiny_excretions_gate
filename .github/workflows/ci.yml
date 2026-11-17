@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Скрипты, тесты без 1С, сборка
+    runs-on: windows-latest
+    permissions:
+      contents: write   # релиз по тегу
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/ci-tui/go.mod
+          cache: false
+
+      - name: go vet
+        shell: pwsh
+        run: |
+          foreach ($m in 'ci-tui', 'fake1c', 'build') {
+            Push-Location "src/$m"
+            go vet ./...
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            Pop-Location
+          }
+
+      - name: Разбор скриптов PowerShell 5.1 (check.ps1)
+        shell: powershell
+        run: |
+          & ./gate/check.ps1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Подставная 1С
+        shell: pwsh
+        working-directory: src/fake1c
+        run: go build -o ../../gate/test/fake1c.exe .
+
+      - name: Тесты гейта без 1С (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          & ./gate/test/tests.ps1 -TimeoutSec 600
+          exit $LASTEXITCODE
+
+      - name: Отчёт тестов
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-last-run
+          path: gate/test/last-run.txt
+          if-no-files-found: ignore
+
+      - name: Сборка
+        shell: pwsh
+        run: |
+          $stamp = ''
+          if ('${{ github.ref_type }}' -eq 'tag') { $stamp = '${{ github.ref_name }}'.TrimStart('v') }
+          Push-Location src/build
+          if ($stamp) { go run . -root ../.. -out ../../dist -stamp $stamp } else { go run . -root ../.. -out ../../dist }
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Pop-Location
+          Remove-Item dist/*.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*.zip
+
+      - name: Релиз
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: gh release create '${{ github.ref_name }}' dist/*.zip --title '${{ github.ref_name }}' --notes "Сборка ${{ github.ref_name }}. Установка: распаковать ci-gate_*.zip и запустить install.cmd."
+
+  bsl:
+    name: BSL Language Server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/build/go.mod
+          cache: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Собрать исходники обработки с пакетами
+        working-directory: src/build
+        run: go run . -root ../.. -check -src-out ../../bsl-src
+      - name: Анализ
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo 1c-syntax/bsl-language-server --pattern '*-exec.jar' --output bsl-ls.jar
+          java -jar bsl-ls.jar --analyze --srcDir bsl-src --outputDir bsl-report --reporter console --reporter json | tee bsl-console.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bsl-report
+          path: |
+            bsl-report
+            bsl-console.txt
+          if-no-files-found: ignore
