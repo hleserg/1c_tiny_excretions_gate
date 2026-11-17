@@ -805,7 +805,7 @@ $tests = @(
             param($Name)
             $sb = New-Sandbox $Name -Config @{ ContractorExtensions = @('Доработки') }
             $fake = @{ selfcheck = @(@{ tasks = (New-ExchangeResultTasks 'ok') }); dumps = @{ 'Доработки' = @{ 'CommonModules/МенеджерОбменаЧерезУниверсальныйФормат/Ext/Module.bsl' = $rulesModule } } }
-            $r = Invoke-Script -Sandbox $sb -Fake $fake
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
             Check-Common $r; Check-Verdict $r 'RED' 1
             Check-Step $r 'Правила обмена' 'FAIL'
             if ($r.RunDir) {
@@ -834,7 +834,7 @@ $tests = @(
             $fake = @{ selfcheck = @(@{ tasks = (New-ExchangeResultTasks 'ok') }); dumps = @{
                     'Доработки' = @{ 'CommonModules/МенеджерОбменаЧерезУниверсальныйФормат/Ext/Module.bsl' = $rulesModuleControlOnly }
                     'Адаптация' = @{ 'CommonModules/МенеджерОбменаЧерезУниверсальныйФормат/Ext/Module.bsl' = $guard } } }
-            $first = Invoke-Script -Sandbox $sb -Fake $fake
+            $first = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
             Check-Common $first; Check-Verdict $first 'GREEN' 0
             Check-Step $first 'Правила обмена' 'OK'
             if ($first.RunDir) {
@@ -844,7 +844,7 @@ $tests = @(
             Start-Sleep -Seconds 2
             Remove-Item -LiteralPath (Join-Path $sb 'fake\fake1c-state.json') -Force -ErrorAction SilentlyContinue
             $fake.dumps['Адаптация'] = @{ 'CommonModules/МенеджерОбменаЧерезУниверсальныйФормат/Ext/Module.bsl' = "Функция Адаптация_СтруктураКлючейСклада()`n`tВозврат Новый Структура;`nКонецФункции" }
-            $r = Invoke-Script -Sandbox $sb -Fake $fake
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
             Check-Common $r; Check-Verdict $r 'RED' 1
             Check-Step $r 'Правила обмена' 'FAIL'
             $step = Get-Step $r 'Правила обмена'
@@ -865,7 +865,7 @@ $tests = @(
                 @{ key = 'Обмены'; title = 'Обмены'; step = 'Обмены'; lines = @('[ПРОПУСК] Обмены: пакет сценариев не назвал узлы обмена для снимков.') })
             $module = "&ИзменениеИКонтроль(`"ДобавитьПКО_Справочник_Склады`")`nПроцедура Доработки_ДобавитьПКО_Справочник_Склады(ПравилаКонвертации)`n`tПравилоКонвертации.ОбъектДанных = Метаданные.Справочники.Склады;`nКонецПроцедуры"
             $fake = @{ selfcheck = @(@{ tasks = $skipTasks }); dumps = @{ 'Доработки' = @{ 'CommonModules/МенеджерОбменаЧерезУниверсальныйФормат/Ext/Module.bsl' = $module } } }
-            $first = Invoke-Script -Sandbox $sb -Fake $fake
+            $first = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
             Check-Common $first; Check-Verdict $first 'GREEN' 0
             Check-Step $first 'Правила обмена' 'OK'
             Check ($null -eq (Get-Step $first 'Обмены: до и после')) 'шаг «Обмены: до и после» в первом прогоне, хотя правила не менялись и выгрузок нет'
@@ -873,7 +873,7 @@ $tests = @(
             Remove-Item -LiteralPath (Join-Path $sb 'fake\fake1c-state.json') -Force -ErrorAction SilentlyContinue
             $fake.dumps['Доработки'] = @{ 'CommonModules/МенеджерОбменаЧерезУниверсальныйФормат/Ext/Module.bsl' = ($module.Replace('КонецПроцедуры', "`tПравилоКонвертации.ИспользоватьКэш = Ложь;`nКонецПроцедуры")) }
             $fake.selfcheck = @(@{ tasks = $skipTasks; fingerprint = 'второй' })
-            $r = Invoke-Script -Sandbox $sb -Fake $fake
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
             Check-Common $r; Check-Verdict $r 'YELLOW' 2
             Check-Step $r 'Обмены: до и после' 'WARN'
             $step = Get-Step $r 'Обмены: до и после'
