@@ -1135,7 +1135,8 @@ $tests = @(
             Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
             Check (@($r.ComLog | Where-Object { $_ -match 'TerminateSession 7$' }).Count -eq 1) 'конфигуратор temp не закрыт'
             Check ((Get-Calls $r @('/UpdateDBCfg', '-Extension Адаптация', 'fake\erp_base')).Count -eq 1) 'конфигурация БД рабочей не обновлена'
-            Check ((Get-Calls $r @('/UC"0"')).Count -gt 0) 'конфигуратор запускался без кода разрешения 0 (UnlockCode по умолчанию)'
+            # Кавычки ключа /UC"0" подставная 1С получает уже разобранными: /UC0.
+            Check ((Get-Calls $r @('/UC0')).Count -gt 0) 'конфигуратор запускался без кода разрешения 0 (UnlockCode по умолчанию)'
         }
     },
     @{

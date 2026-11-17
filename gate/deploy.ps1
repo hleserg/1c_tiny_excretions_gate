@@ -1450,6 +1450,15 @@ else {
         if ($kitText) { Write-Line ("  комплект: {0}" -f $kitText); $ciLines.Add(("Комплект: {0}." -f $kitText)) }
         $decisionNames = @{ kept = 'оставлен в базе'; rolledBack = 'откачен'; rollbackFailed = 'откат прошёл не полностью' }
         if ($decision -and $decisionNames.ContainsKey($decision)) { Write-Line ("  комплект после вердикта: {0}" -f $decisionNames[$decision]) }
+        # Принятие в эталон вердикт этого прогона не меняет (он уже записан), но говорит: новое разобрано и признано
+        # допустимым. Зелёным станет следующий прогон, который сравнится с этим эталоном.
+        $acceptedFile = Join-Path $lastRun.FullName 'accepted.txt'
+        $gateAccepted = (Test-Path -LiteralPath $acceptedFile)
+        if ($gateAccepted) {
+            $acceptedAt = ([string](@([System.IO.File]::ReadAllLines($acceptedFile, [System.Text.Encoding]::UTF8)) | Select-Object -First 1)) -replace '^time=', ''
+            Write-Line ("  новое этого прогона принято в эталон {0}: разобрано и признано допустимым; зелёным будет следующий прогон" -f $acceptedAt) 'Green'
+            $ciLines.Add(("Новое этого прогона принято в эталон {0}." -f $acceptedAt))
+        }
 
         $badSteps = @(@(Get-JsonValue $lastVerdict 'steps' @()) | Where-Object { $_.status -eq 'FAIL' -or $_.status -eq 'WARN' })
         foreach ($step in $badSteps) {
@@ -1492,6 +1501,9 @@ else {
         }
         if ($verdict -eq 'GREEN') {
             $advice.Add([pscustomobject]@{ Kind = 'do'; Text = 'гейт зелёный: можно обновлять. Перед этим пройти сценарий проверки на temp, если он есть' })
+        }
+        elseif ($verdict -eq 'YELLOW' -and $gateAccepted) {
+            $advice.Add([pscustomobject]@{ Kind = 'do'; Text = 'гейт жёлтый, его новое принято в эталон (разобрано): можно обновлять' })
         }
         elseif ($verdict -eq 'YELLOW') {
             $advice.Add([pscustomobject]@{ Kind = 'do'; Text = 'гейт жёлтый: посмотреть новое в report.txt. Если допустимо - обновлять' })
