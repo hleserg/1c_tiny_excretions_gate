@@ -18,6 +18,11 @@
     .\deploy.ps1 -PullExtensions / -PullProcessings
         Положить в inbox расширения (внешние обработки) рабочей базы, которые отличаются от temp.
 
+    Внешние обработки и отчёты справочника «Дополнительные отчёты и обработки» сравниваются так же:
+    изменённые и новые в temp можно обновить вместе с расширениями или отдельно («Обновить только
+    внешние обработки»: без блокировок рабочей базы, без обновления конфигурации БД). Записывает их
+    «Выполнить после обновления» в режиме regepf; прежняя версия сохраняется до записи - это откат.
+
     .\deploy.ps1 -NoDump
         Ничего не делает: сравнение теперь по хеш-суммам через внешнее соединение, без выгрузки.
         Ключ оставлен, чтобы старые ярлыки не ломались.
@@ -504,6 +509,8 @@ $canaryEpf = Resolve-RootPath ([string](Get-Setting $cfg 'CanaryEpf' 'tools\Ка
 $selfCheckEpf = Resolve-RootPath ([string](Get-Setting $cfg 'SelfCheckEpf' 'tools\ВыполнитьПослеОбновления.epf'))
 $canaryTimeoutSec = [int](Get-Setting $cfg 'CanaryTimeoutSec' 300)
 $comTimeoutSec = [int](Get-Setting $cfg 'ComTimeoutSec' 300)
+# Сколько ждать один сеанс записи внешней обработки в справочник (regepf, unregepf).
+$processingTimeoutSec = [int](Get-Setting $cfg 'ProcessingTimeoutSec' 600)
 
 
 # Статистика длительностей шагов: тот же журнал, что у гейта, база - рабочая (stats.ps1).
@@ -752,7 +759,7 @@ function Get-DeployHistory {
 function Get-DeployModeText {
     param($Record)
     $mode = [string](Get-JsonValue $Record 'mode' '')
-    $names = @{ '1' = 'все из temp'; '2' = 'выбранные из temp'; 'asis' = 'как есть'; 'rollback' = 'откат' }
+    $names = @{ '1' = 'все из temp'; '2' = 'выбранные из temp'; 'epf' = 'только внешние обработки'; 'asis' = 'как есть'; 'rollback' = 'откат' }
     if ($names.ContainsKey($mode)) { return $names[$mode] }
     return 'обновление'
 }
@@ -809,7 +816,28 @@ function Get-DeployDetailLines {
     $processings = @(Get-JsonValue $Record 'processings' @())
     $lines.Add(("ВНЕШНИЕ ОБРАБОТКИ ({0})" -f $processings.Count))
     if ($processings.Count -eq 0) { $lines.Add('  нет: в этом обновлении обработки не менялись') }
-    foreach ($item in $processings) { $lines.Add(("  - {0}" -f $item.name)) }
+    foreach ($item in $processings) {
+        $title = [string](Get-JsonValue $item 'title' '')
+        $label = [string]$item.name
+        if ($title) { $label = '{0} ({1})' -f $item.name, $title }
+        $oldVersion = [string](Get-JsonValue $item 'oldVersion' '')
+        $newVersion = [string](Get-JsonValue $item 'newVersion' '')
+        if ($oldVersion -or $newVersion) { $label += ("  версия {0} -> {1}" -f $oldVersion, $newVersion) }
+        $lines.Add(("  - {0}" -f $label))
+        $backup = [string](Get-JsonValue $item 'backup' '')
+        $file = [string](Get-JsonValue $item 'file' '')
+        $backupText = 'прежней версии нет и новой не отмечена: откатом не трогается'
+        if ([string](Get-JsonValue $item 'action' '') -eq 'unregister') {
+            if ($file -and (Test-Path -LiteralPath (Join-Path $Record.Dir $file))) { $backupText = "была снята из справочника; откат запишет её снова из $file" }
+            else { $backupText = 'была снята из справочника; файла для отката нет' }
+        }
+        elseif ($backup) {
+            if (Test-Path -LiteralPath (Join-Path $Record.Dir $backup)) { $backupText = "откат вернёт прежнюю версию $backup" }
+            else { $backupText = "РЕЗЕРВНОЙ КОПИИ НЕТ НА ДИСКЕ: $backup" }
+        }
+        elseif ([string](Get-JsonValue $item 'isNew' '') -eq 'yes') { $backupText = 'новая: откат снимет её из справочника (публикация «Отключена», пометка удаления)' }
+        $lines.Add(("      {0}" -f $backupText))
+    }
     $lines.Add('')
 
     $gate = Get-JsonValue $Record 'gate' $null
@@ -915,6 +943,174 @@ function Export-Processings {
     }
 }
 
+function Invoke-ProdClient {
+    # Тонкий клиент рабочей базы с внешней обработкой; ждём файл $DoneFile не дольше $TimeoutSec.
+    param([string]$Epf, [string]$Parameter, [string]$DoneFile, [int]$TimeoutSec, [string]$Title)
+    $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword) + @(
+        '/DisableStartupDialogs', '/DisableStartupMessages', '/Execute', ('"{0}"' -f $Epf), ('/C"{0}"' -f $Parameter))
+    $argLine = $argList -join ' '
+    Write-RunLog ("> 1cv8c.exe {0}" -f (Get-MaskedLine $argLine))
+    Write-Host ("  ...  {0}: начато в {1}, жду не дольше {2} мин" -f $Title, (Get-Date -Format 'HH:mm:ss'), [int]($TimeoutSec / 60)) -ForegroundColor DarkGray
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $process = Start-Process -FilePath $script:V8C -ArgumentList $argLine -PassThru
+    $null = $process.Handle
+    # Строка хода. У самопроверки - настоящая полоса по заданиям: последняя часть журнала в папке итога.
+    $outDir = Split-Path -Parent $DoneFile
+    $nextLook = 0
+    $done = -1
+    $total = 0
+    $detail = ''
+    while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec -and -not (Test-Path -LiteralPath $DoneFile) -and -not $process.HasExited) {
+        if ($watch.Elapsed.TotalSeconds -ge $nextLook) {
+            $nextLook = $watch.Elapsed.TotalSeconds + 3
+            $last = @(Get-ChildItem -LiteralPath $outDir -Filter 'p*.txt' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^p\d{6}\.txt$' } | Sort-Object Name | Select-Object -Last 1)
+            if ($last.Count -gt 0) {
+                try {
+                    $header = @{}
+                    $blocks = New-Object System.Collections.Generic.List[string]
+                    foreach ($line in [System.IO.File]::ReadAllLines($last[0].FullName, [System.Text.Encoding]::UTF8)) {
+                        $clean = $line.TrimStart([char]0xFEFF)
+                        if ($clean -eq '@@journal') { break }
+                        $position = $clean.IndexOf('=')
+                        if (-not $clean.StartsWith('@@') -or $position -le 2) { continue }
+                        if ($clean.StartsWith('@@block=')) { $blocks.Add($clean.Substring($position + 1)); continue }
+                        $header[$clean.Substring(2, $position - 2)] = $clean.Substring($position + 1)
+                    }
+                    if ($header.ContainsKey('n') -and $header.ContainsKey('total')) {
+                        $done = [int]$header['n']
+                        $total = [int]$header['total']
+                        $detail = 'задание {0} из {1}: {2}' -f ($done + 1), $total, $header['title']
+                    }
+                    # Шаги самопроверки - вторым трубопроводом в ci.exe.
+                    if ($blocks.Count -gt 0) { Send-UiSubPlan -Title $Title -Current ([string]$header['step']) -Task ([string]$header['title']) -Blocks $blocks.ToArray() }
+                }
+                catch { }
+            }
+        }
+        Write-UiProgress -Title $Title -Elapsed $watch.Elapsed.TotalSeconds -Expected (Get-StatPlan $Title) -Done $done -Total $total -Detail $detail
+        Start-Sleep -Milliseconds 250
+    }
+    Complete-UiProgress
+    $done = Test-Path -LiteralPath $DoneFile
+    if ($done) { if (-not $process.WaitForExit(60000)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } } }
+    elseif (-not $process.HasExited) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
+    $statStatus = 'TIMEOUT'
+    if ($done) { $statStatus = 'OK' }
+    Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status $statStatus -Size ([Math]::Max(0, $total))
+    return [pscustomobject]@{ Done = $done; Seconds = [int]$watch.Elapsed.TotalSeconds }
+}
+
+function Invoke-ProdProcessing {
+    # Один сеанс «Выполнить после обновления» на рабочей базе в режиме regepf или unregepf - тот же, что у гейта
+    # на temp. regepf: записать обработку в справочник «Дополнительные отчёты и обработки» (элемент с тем же
+    # именем объекта обновляется, иначе добавляется новый); прежняя версия до записи ложится в old.b64 папки
+    # OutDir, без неё обработка не заменяется. File - сам .epf/.erf, TextFile - уже base64 (откат из old.b64).
+    # unregepf: снять обработку - по имени объекта и ссылке элемента вместе.
+    param([string]$Mode, [string]$OutDir, [string]$File = '', [string]$TextFile = '', [string]$Name, [string]$Ref = '', [string]$Title)
+    New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+    $parts = New-Object System.Collections.Generic.List[string]
+    $parts.Add($Mode)
+    $parts.Add(("out={0}" -f $OutDir))
+    $parts.Add(("name={0}" -f $Name))
+    if ($Mode -eq 'regepf') {
+        $newB64 = Join-Path $OutDir 'new.b64'
+        if ($TextFile) { Copy-Item -LiteralPath $TextFile -Destination $newB64 -Force }
+        else { [System.IO.File]::WriteAllText($newB64, [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($File)), [System.Text.Encoding]::ASCII) }
+        $parts.Add(("file={0}" -f $newB64))
+    }
+    if ($Ref) { $parts.Add(("ref={0}" -f $Ref)) }
+    $resultFile = Join-Path $OutDir 'result.txt'
+    $client = Invoke-ProdClient -Epf $selfCheckEpf -Parameter ($parts.ToArray() -join ';') -DoneFile $resultFile -TimeoutSec $processingTimeoutSec -Title $Title
+    $values = @{}
+    $formErrors = New-Object System.Collections.Generic.List[string]
+    if (Test-Path -LiteralPath $resultFile) {
+        foreach ($line in @([System.IO.File]::ReadAllLines($resultFile, [System.Text.Encoding]::UTF8))) {
+            $clean = ([string]$line).TrimStart([char]0xFEFF)
+            $position = $clean.IndexOf('=')
+            if ($position -le 0) { continue }
+            $key = $clean.Substring(0, $position).Trim()
+            if ($key -eq 'formerror') { $formErrors.Add($clean.Substring($position + 1)); continue }
+            if (-not $values.ContainsKey($key)) { $values[$key] = $clean.Substring($position + 1) }
+        }
+    }
+    $oldFile = Join-Path $OutDir 'old.b64'
+    $savedOld = ''
+    if (Test-Path -LiteralPath $oldFile) { $savedOld = $oldFile }
+    $message = [string](Get-Setting $values 'message' '')
+    if (-not $client.Done) {
+        $message = ("за {0} с итога нет: обработка «Выполнить после обновления» не открылась или не успела (старая сборка без режимов regepf и unregepf, окно при запуске, нет входа)" -f $client.Seconds)
+    }
+    return [pscustomobject]@{
+        Done = $client.Done; Status = [string](Get-Setting $values 'status' ''); Message = $message; Values = $values
+        FormErrors = $formErrors.ToArray(); OldB64 = $savedOld; Seconds = $client.Seconds; ResultFile = $resultFile
+    }
+}
+
+function Compare-Processings {
+    # Внешние обработки temp против рабочей: изменённые в temp и новые. Те, что есть только в рабочей,
+    # не трогаются: скрипт обновления обработки из рабочей не удаляет.
+    param($TempExport, $ProdExport)
+    $prodByName = @{}
+    foreach ($item in $ProdExport.Items) { $prodByName[$item.ObjName] = $item }
+    $list = New-Object System.Collections.Generic.List[object]
+    foreach ($item in @($TempExport.Items | Sort-Object ObjName)) {
+        $prodItem = $null
+        if ($prodByName.ContainsKey($item.ObjName)) { $prodItem = $prodByName[$item.ObjName] }
+        if ($null -ne $prodItem -and $prodItem.Hash -eq $item.Hash) { continue }
+        $entry = [pscustomobject]@{
+            ObjName = $item.ObjName; Title = $item.Title; FileName = (Split-Path -Leaf $item.File); TempFile = $item.File
+            TempVersion = $item.Version; ProdVersion = ''; ProdFile = ''; Status = 'new'; Text = 'новая: в рабочей её нет'
+        }
+        if ($null -ne $prodItem) {
+            $entry.ProdVersion = $prodItem.Version
+            $entry.ProdFile = $prodItem.File
+            $entry.Status = 'changed'
+            $entry.Text = ("изменена в temp (рабочая {0}, temp {1})" -f $prodItem.Version, $item.Version)
+        }
+        $list.Add($entry)
+    }
+    return , @($list.ToArray())
+}
+
+function Get-ProcessingDump {
+    # Файл обработки -> выгрузка в файлы (для разницы в отчёте). Конфигуратор нужен любой базы: берётся temp.
+    # Не вышло - пустая строка, отчёт будет без разницы по модулям.
+    param([string]$File, [string]$Dir, [string]$Title)
+    if (-not $File -or -not (Test-Path -LiteralPath $File)) { return '' }
+    if (Test-Path -LiteralPath $Dir) { Remove-Item -LiteralPath $Dir -Recurse -Force }
+    New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+    $rootXml = Join-Path $Dir ([System.IO.Path]::GetFileNameWithoutExtension($File) + '.xml')
+    $result = Invoke-Designer -BaseName $script:TempBase -Command @('/DumpExternalDataProcessorOrReportToFiles', ('"{0}"' -f $rootXml), ('"{0}"' -f $File)) `
+        -LogName ("epfdump_{0}.log" -f (Split-Path -Leaf $Dir)) -TimeoutSec $timeoutLoadSec -Title $Title
+    if ($result.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $rootXml)) {
+        Write-RunLog ("Выгрузка {0} в файлы не получилась: {1}" -f $File, $result.Text)
+        return ''
+    }
+    return $Dir
+}
+
+function Get-ProcessingStepTitle {
+    # Имя шага записи обработки: одно и то же в плане ci.exe, в строке хода и в статистике длительностей.
+    param($Proc)
+    if ($Proc.Action -eq 'unregister') { return ("Снять из справочника {0}" -f $Proc.ObjName) }
+    return ("Записать в справочник {0}" -f $Proc.ObjName)
+}
+
+function Write-ProcessingBackup {
+    # Прежняя версия обработки (old.b64 сеанса regepf) - в before\processings\ как резервная копия этого обновления,
+    # и рядом обычным файлом, чтобы её можно было открыть или загрузить руками. Возвращает путь копии base64.
+    param($Proc, [string]$OldB64)
+    $dir = Join-Path $beforeDir 'processings'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $target = Join-Path $dir ($Proc.ObjName + '.b64')
+    Copy-Item -LiteralPath $OldB64 -Destination $target -Force
+    try {
+        $plain = Join-Path $dir ('прежняя_' + $Proc.FileName)
+        [System.IO.File]::WriteAllBytes($plain, [Convert]::FromBase64String([System.IO.File]::ReadAllText($OldB64).Trim()))
+    }
+    catch { Write-RunLog ("Прежняя версия {0} не раскодировалась: {1}" -f $Proc.ObjName, $_.Exception.Message) }
+    return $target
+}
 #endregion
 
 #region Подтянуть из рабочей
@@ -999,7 +1195,7 @@ if ($PullExtensions -or $PullProcessings) {
     }
     Write-Host ''
     Write-Line ("Положил в inbox: {0}, папка {1}." -f $picked.Count, $targetDir)
-    Write-Line 'Гейт для внешних обработок ещё не готов: в меню гейта они видны, но пока недоступны для прогона.' 'Yellow'
+    Write-Line 'Дальше: меню гейта, «Прогон с обновлением из inbox» - гейт запишет их в справочник temp и проверит.'
     exit 0
 }
 
@@ -1008,6 +1204,9 @@ if ($PullExtensions -or $PullProcessings) {
 #region Итог последнего прогона гейта
 
 $rollbackOf = ''
+# Внешние обработки этого запуска. Action: register - записать (Source - файл, SourceB64 - уже base64),
+# unregister - снять по имени объекта и ссылке (Ref).
+$selectedProcessings = @()
 if ($Rollback) {
     # Откат рабочей базы: к состоянию до выбранного обновления, из его резервных копий. Дальше - обычный путь
     # обновления (блокировки, резервные копии текущего состояния, загрузка, обновление БД, лёгкий прогон, отчёт).
@@ -1068,18 +1267,57 @@ if ($Rollback) {
             ProdPresent = $true; ProdText = ''; ProdChanged = -1; InTemp = $false
             Backup = ''; NewFile = $backupPath; Loaded = $false; OldDir = ''; NewDir = ''; RollbackDir = '' }
     }
-    if ($selected.Count -eq 0) { Write-Line 'В этом обновлении нет расширений с резервной копией: откатывать нечего.' 'Yellow'; exit 0 }
+    # Внешние обработки того обновления: прежняя версия записывается обратно, новая снимается из справочника.
+    $skippedProcessings = @()
+    foreach ($item in @(Get-JsonValue $target 'processings' @())) {
+        $objName = [string](Get-JsonValue $item 'name' '')
+        $fileName = [string](Get-JsonValue $item 'fileName' '')
+        $backup = [string](Get-JsonValue $item 'backup' '')
+        $ref = [string](Get-JsonValue $item 'ref' '')
+        $action = [string](Get-JsonValue $item 'action' 'register')
+        $entry = [pscustomobject]@{ ObjName = $objName; Title = [string](Get-JsonValue $item 'title' ''); FileName = $fileName; TempFile = ''
+            TempVersion = [string](Get-JsonValue $item 'oldVersion' ''); ProdVersion = [string](Get-JsonValue $item 'newVersion' ''); ProdFile = ''
+            Status = 'changed'; Text = 'откат'; Action = 'register'; Source = ''; SourceB64 = ''; Ref = '' }
+        if ($action -eq 'unregister') {
+            # Тот запуск снял обработку: откат записывает её снова из файла, который тогда сняли.
+            $file = [string](Get-JsonValue $item 'file' '')
+            if ($file -and (Test-Path -LiteralPath (Join-Path $target.Dir $file))) { $entry.Source = Join-Path $target.Dir $file; $selectedProcessings += $entry }
+            else { $skippedProcessings += $objName }
+            continue
+        }
+        if ($backup) {
+            $backupPath = Join-Path $target.Dir $backup
+            if (-not (Test-Path -LiteralPath $backupPath)) { throw ("нет резервной копии {0}: откат {1} невозможен" -f $backupPath, $target.runId) }
+            $entry.SourceB64 = $backupPath
+            $selectedProcessings += $entry
+        }
+        elseif ([string](Get-JsonValue $item 'isNew' '') -eq 'yes' -and $ref) {
+            $entry.Action = 'unregister'
+            $entry.Ref = $ref
+            $entry.Status = 'new'
+            $file = [string](Get-JsonValue $item 'file' '')
+            if ($file) { $entry.TempFile = Join-Path $target.Dir $file }
+            $selectedProcessings += $entry
+        }
+        else { $skippedProcessings += $objName }
+    }
+    if ($selected.Count -eq 0 -and $selectedProcessings.Count -eq 0) { Write-Line 'В этом обновлении нет ни расширений, ни обработок с резервной копией: откатывать нечего.' 'Yellow'; exit 0 }
 
-    $question = "Точно откатить {0} к состоянию до обновления {1}? Вернутся: {2}." -f $script:ProdBase, (Get-DeployLabel $target), (@($selected | ForEach-Object { $_.Name }) -join ', ')
+    $returned = @(@($selected | ForEach-Object { $_.Name }) + @($selectedProcessings | Where-Object { $_.Action -eq 'register' } | ForEach-Object { $_.ObjName }))
+    $question = "Точно откатить {0} к состоянию до обновления {1}? Вернутся: {2}." -f $script:ProdBase, (Get-DeployLabel $target), ($returned -join ', ')
+    $removed = @($selectedProcessings | Where-Object { $_.Action -eq 'unregister' } | ForEach-Object { $_.ObjName })
+    if ($removed.Count -gt 0) { $question += (" Снимутся из справочника новые обработки: {0}." -f ($removed -join ', ')) }
     if ($skippedNew.Count -gt 0) { $question += (" Новые в том обновлении ({0}) останутся: удалять их - руками." -f ($skippedNew -join ', ')) }
+    if ($skippedProcessings.Count -gt 0) { $question += (" Обработки без резервной копии ({0}) останутся как есть." -f ($skippedProcessings -join ', ')) }
     $sure = Confirm-Ui -Question $question -Yes 'Да, откатить' -No 'Отмена'
     if ($sure -ne $true) { Write-Host 'Выход, ничего не откатывал.'; exit 0 }
     $mode = 'rollback'
     $rollbackOf = [string]$target.runId
     $ciLines.Add(("Откат к состоянию до обновления {0} ({1})." -f $target.runId, (Get-DeployLabel $target)))
-    Write-RunLog ("Откат к состоянию до {0}: {1}" -f $target.runId, (@($selected | ForEach-Object { $_.Name }) -join ', '))
+    $rollbackNames = @(@($selected | ForEach-Object { $_.Name }) + @($selectedProcessings | ForEach-Object { $_.ObjName })) -join ', '
+    Write-RunLog ("Откат к состоянию до {0}: {1}" -f $target.runId, $rollbackNames)
     Write-Host ''
-    Write-Line ("Откатываю {0} к состоянию до {1}: {2}" -f $script:ProdBase, $target.runId, (@($selected | ForEach-Object { $_.Name }) -join ', ')) 'Cyan'
+    Write-Line ("Откатываю {0} к состоянию до {1}: {2}" -f $script:ProdBase, $target.runId, $rollbackNames) 'Cyan'
 }
 else {
     $lastRun = $null
@@ -1264,6 +1502,29 @@ else {
         $advice.Add([pscustomobject]@{ Kind = 'note'; Text = ("{0} в рабочую придёт впервые: после загрузки проверить у него «Безопасный режим» и «Защиту от опасных действий»" -f $entry.Name) })
     }
 
+    # Внешние обработки и отчёты: файлы из справочника обеих баз, сравнение по хешу файла. Только чтение.
+    Write-Host ''
+    Write-Host ("ВНЕШНИЕ ОБРАБОТКИ: {0} ПРОТИВ {1}" -f $script:TempBase, $script:ProdBase) -ForegroundColor Cyan
+    Write-Host '  Выгружаю обработки и отчёты справочника «Дополнительные отчёты и обработки» обеих баз (только чтение).' -ForegroundColor DarkGray
+    $processingsPending = @()
+    $tempProcExport = Export-Processings -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword -Dir (Join-Path $script:RunDir 'processings\temp')
+    $prodProcExport = Export-Processings -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword -Dir (Join-Path $script:RunDir 'processings\prod')
+    if (-not $tempProcExport.Ok) { Write-Line ("  {0}: не выгрузил - {1}" -f $script:TempBase, $tempProcExport.Error) 'Yellow' }
+    if (-not $prodProcExport.Ok) { Write-Line ("  {0}: не выгрузил - {1}" -f $script:ProdBase, $prodProcExport.Error) 'Yellow' }
+    if ($tempProcExport.Ok -and $prodProcExport.Ok) {
+        # Сравнить не удалось - обработки не предлагаются: вслепую в рабочую их не пишем.
+        $processingsPending = Compare-Processings -TempExport $tempProcExport -ProdExport $prodProcExport
+        Write-Line ("  в {0}: {1}, в {2}: {3}, изменены или новые в temp: {4}" -f $script:TempBase, $tempProcExport.Items.Count, $script:ProdBase, $prodProcExport.Items.Count, $processingsPending.Count)
+        foreach ($proc in $processingsPending) { Write-Line ("  {0} ({1}): {2}" -f $proc.ObjName, $proc.Title, $proc.Text) 'Yellow' }
+        if ($processingsPending.Count -gt 0 -and -not (Test-Path -LiteralPath $selfCheckEpf)) {
+            $advice.Add([pscustomobject]@{ Kind = 'note'; Text = ("внешние обработки записывать нечем: нет {0} (SelfCheckEpf)" -f $selfCheckEpf) })
+            $processingsPending = @()
+        }
+    }
+    else {
+        $advice.Add([pscustomobject]@{ Kind = 'note'; Text = 'внешние обработки сравнить не удалось: в этот раз они не обновляются' })
+    }
+
     Write-Host ''
     Write-Host 'ЧТО ДАЛЬШЕ' -ForegroundColor Cyan
     foreach ($item in $advice) {
@@ -1295,6 +1556,9 @@ else {
     $modeMenu = New-Object System.Collections.Generic.List[object]
     $modeMenu.Add([pscustomobject]@{ Key = '1'; Label = ("Обновить все расширения из {0} в {1} ({2}); ошибки гейта сбросятся" -f $script:TempBase, $script:ProdBase, (@($allTargets | ForEach-Object { $_.Name }) -join ', ')) })
     $modeMenu.Add([pscustomobject]@{ Key = '2'; Label = 'Обновить выбранные расширения' })
+    if ($processingsPending.Count -gt 0) {
+        $modeMenu.Add([pscustomobject]@{ Key = 'epf'; Label = ("Обновить только внешние обработки ({0}): без блокировок рабочей и обновления конфигурации БД" -f $processingsPending.Count) })
+    }
     $modeMenu.Add([pscustomobject]@{ Key = 'asis'; Label = 'Обновить как есть: ничего не загружать, только обновить конфигурацию БД (изменения уже загружены руками)' })
     $modeMenu.Add([pscustomobject]@{ Key = 'exit'; Label = 'Выход' })
     $modeNotes = @()
@@ -1303,11 +1567,14 @@ else {
     $modeIndex = Select-UiOne -Header ("Обновление {0}" -f $script:ProdBase) -Items @($modeMenu | ForEach-Object { $_.Label }) -Notes $modeNotes
     if ($modeIndex -lt 0 -or $modeMenu[$modeIndex].Key -eq 'exit') { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
     $mode = $modeMenu[$modeIndex].Key
-    if (($mode -eq '1' -or $mode -eq '2') -and $fromTemp.Count -eq 0) { Write-Host 'В temp нечего брать: выход, ничего не обновлял.'; exit 0 }
+    if (($mode -eq '1' -or $mode -eq '2') -and $fromTemp.Count -eq 0 -and $processingsPending.Count -eq 0) { Write-Host 'В temp нечего брать: выход, ничего не обновлял.'; exit 0 }
 
     $selected = @()
     if ($mode -eq '1') {
         $selected = @($allTargets)
+    }
+    elseif ($mode -eq 'epf') {
+        $selected = @()
     }
     elseif ($mode -eq 'asis') {
         # Отмечены те, что изменились в рабочей с прошлой выгрузки; если таких нет или сравнить не с чем - все.
@@ -1329,6 +1596,24 @@ else {
         $picked = Select-UiMany -Header $header -Items $labels
         if ($null -eq $picked) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
         $selected = @($picked | Sort-Object | ForEach-Object { $choices[$_] })
+    }
+
+    # Внешние обработки - отдельным списком после расширений. «Все» и «Только обработки» - отмечены все,
+    # «Выбранные» - ни одной. В «как есть» обработки не трогаются.
+    if ($mode -ne 'asis' -and $processingsPending.Count -gt 0) {
+        $procLabels = @($processingsPending | ForEach-Object { '{0} ({1})  {2}' -f $_.ObjName, $_.Title, $_.Text })
+        $procPreselected = @()
+        if ($mode -eq '1' -or $mode -eq 'epf') { $procPreselected = @(0..($processingsPending.Count - 1)) }
+        $procPicked = Select-UiMany -Header ("Какие внешние обработки записать в {0}" -f $script:ProdBase) -Items $procLabels -Preselected $procPreselected
+        if ($null -eq $procPicked) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
+        $selectedProcessings = @($procPicked | Sort-Object | ForEach-Object { $processingsPending[$_] })
+    }
+    if ($selected.Count -eq 0 -and $selectedProcessings.Count -eq 0) { Write-Host 'Ничего не выбрано: выход, ничего не обновлял.'; exit 0 }
+    foreach ($proc in $selectedProcessings) {
+        $proc | Add-Member -NotePropertyName Action -NotePropertyValue 'register' -Force
+        $proc | Add-Member -NotePropertyName Source -NotePropertyValue $proc.TempFile -Force
+        $proc | Add-Member -NotePropertyName SourceB64 -NotePropertyValue '' -Force
+        $proc | Add-Member -NotePropertyName Ref -NotePropertyValue '' -Force
     }
 
     # Что с чем сравнивает отчёт и чем откатывать. Из temp: было - рабочая, стало - temp, откат - резервная копия .cfe.
@@ -1353,7 +1638,8 @@ else {
     # Порядок - как в DeployExtensions (нижний слой первым).
     Write-Host ''
     if ($mode -eq 'asis') { Write-Line ("Обновляю конфигурацию БД {0} как есть: {1}" -f $script:ProdBase, (@($selected | ForEach-Object { $_.Name }) -join ', ')) 'Cyan' }
-    else { Write-Line ("Обновляю в {0}: {1}" -f $script:ProdBase, (@($selected | ForEach-Object { $_.Name }) -join ', ')) 'Cyan' }
+    elseif ($selected.Count -gt 0) { Write-Line ("Обновляю в {0}: {1}" -f $script:ProdBase, (@($selected | ForEach-Object { $_.Name }) -join ', ')) 'Cyan' }
+    if ($selectedProcessings.Count -gt 0) { Write-Line ("Внешние обработки в {0}: {1}" -f $script:ProdBase, (@($selectedProcessings | ForEach-Object { $_.ObjName }) -join ', ')) 'Cyan' }
 
     # Гейт красный, его нет или комплект откатили: переспросить. Да - едем, красное гейта уходит в отчёт.
     $riskAccepted = $false
@@ -1384,7 +1670,7 @@ Write-RunLog 'Подтверждено именем базы'
 
 # План обновления для ci.exe: шаги, которые пойдут, если ничего не упадёт.
 $planSteps = New-Object System.Collections.Generic.List[string]
-$planSteps.Add('Подготовка рабочей базы')
+if ($selected.Count -gt 0) { $planSteps.Add('Подготовка рабочей базы') }
 foreach ($planEntry in $selected) {
     $planSteps.Add(("Выгрузить {0} из {1}" -f $planEntry.Name, $script:ProdBase))
     if ($mode -ne 'asis' -and $mode -ne 'rollback') { $planSteps.Add(("Выгрузить {0} из {1}" -f $planEntry.Name, $script:TempBase)) }
@@ -1397,123 +1683,135 @@ if ($mode -ne 'asis') {
     foreach ($planEntry in $selected) { $planSteps.Add(("Загрузить {0} в {1}" -f $planEntry.Name, $script:ProdBase)) }
 }
 foreach ($planEntry in $selected) { $planSteps.Add(("Обновить конфигурацию БД {0}" -f $planEntry.Name)) }
-$planSteps.Add('Проверка применимости')
-$planSteps.Add('Канареечный вход')
-$planSteps.Add('Самопроверка на чтение')
+foreach ($planProc in $selectedProcessings) { $planSteps.Add((Get-ProcessingStepTitle $planProc)) }
+if ($selected.Count -gt 0) {
+    $planSteps.Add('Проверка применимости')
+    $planSteps.Add('Канареечный вход')
+    $planSteps.Add('Самопроверка на чтение')
+}
 $planSteps.Add('Статья в базу знаний')
 Send-UiPlan -StepNames $planSteps.ToArray()
 
 # Отсюда и до конца блокировки рабочей базы снимаются обязательно: в finally в конце скрипта (он выполняется
 # и при exit, и по Ctrl+C) и в trap.
-$script:ProdLocksArmed = $true
+# Только внешние обработки - монопольный доступ не нужен: блокировки не ставятся и в конце не снимаются
+# (снятие снимает и чужие блокировки), пользователи работают дальше.
+$needExclusive = ($selected.Count -gt 0)
+if ($needExclusive) { $script:ProdLocksArmed = $true }
 try {
 
-Write-Host ''
-Write-Host 'Подготовка рабочей базы:'
-$prepLink = Connect-ClusterAgent
-$prepTarget = $null
-try {
-    $prepTarget = Get-BaseInfo -Link $prepLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
-    if ([bool]$prepTarget.InfoBase.ScheduledJobsDenied) {
-        Write-Line '  блокировка регламентных заданий уже стоит; в конце обновления сниму её'
+if ($needExclusive) {
+    Write-Host ''
+    Write-Host 'Подготовка рабочей базы:'
+    $prepLink = Connect-ClusterAgent
+    $prepTarget = $null
+    try {
+        $prepTarget = Get-BaseInfo -Link $prepLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+        if ([bool]$prepTarget.InfoBase.ScheduledJobsDenied) {
+            Write-Line '  блокировка регламентных заданий уже стоит; в конце обновления сниму её'
+        }
+        else {
+            $prepTarget.InfoBase.ScheduledJobsDenied = $true
+            $prepTarget.Process.UpdateInfoBase($prepTarget.InfoBase)
+            if (-not [bool](Read-BaseInfoAgain $prepTarget $script:ProdBase).ScheduledJobsDenied) { throw 'флажок не записался' }
+            Write-Line '  поставил блокировку регламентных заданий на время обновления; в конце сниму' 'Green'
+        }
+    }
+    catch {
+        $prepTarget = $null
+        Write-Line ("  блокировку регламентных заданий поставить не смог: {0}" -f $_.Exception.Message) 'Yellow'
+        Write-Line '  без неё регламентное задание может сорвать обновление БД; блокировку сеансов тоже не поставить' 'Yellow'
+    }
+
+    # Открытый конфигуратор рабочей базы.
+    $sessions = @(Get-BaseSessions $prepLink $script:ProdBase)
+    foreach ($entry in @($sessions | Where-Object { $_.IsError })) { Write-Line ('  сеансы проверить не смог: ' + $entry.Text) 'Yellow' }
+    $designers = @($sessions | Where-Object { -not $_.IsError -and $_.IsDesigner })
+    if ($designers.Count -gt 0) {
+        Write-Line ("  открыт конфигуратор {0}: закрой его, чтобы продолжить" -f $script:ProdBase) 'Yellow'
+        foreach ($entry in $designers) { Write-Line ('    ' + $entry.Text) 'Yellow' }
+        $answer = Read-UiChoice -Header ("Открыт конфигуратор {0}. Закрой его сам - скрипт увидит и продолжит, или:" -f $script:ProdBase) `
+            -Keys @('1', '2') -Labels @('Закрыть отсюда (сеанс прерывается, несохранённые правки в нём пропадут)', 'Отмена') -CancelKey '2' -Poll {
+            $now = @(Get-BaseSessions $prepLink $script:ProdBase)
+            if (@($now | Where-Object { $_.IsError }).Count -eq 0 -and @($now | Where-Object { $_.IsDesigner }).Count -eq 0) { return 'closed' }
+            return ''
+        }
+        if ($answer -eq '2') { throw ("открыт конфигуратор {0}, отмена по ответу" -f $script:ProdBase) }
+        if ($answer -eq '1') {
+            foreach ($line in @(Stop-BaseSessions -Link $prepLink -BaseName $script:ProdBase -Designers)) { Write-Line ('  ' + $line) }
+            $left = @()
+            for ($wait = 0; $wait -lt 10; $wait++) {
+                Start-Sleep -Seconds 3
+                $left = @(Get-BaseSessions $prepLink $script:ProdBase | Where-Object { -not $_.IsError -and $_.IsDesigner })
+                if ($left.Count -eq 0) { break }
+            }
+            if ($left.Count -gt 0) { throw ("конфигуратор {0} за 30 секунд не закрылся" -f $script:ProdBase) }
+        }
+        Write-Line '  конфигуратор закрыт' 'Green'
+    }
+
+    function Set-ProdSessionLock {
+        param($Target)
+        if ($null -eq $Target) { Write-Line '  блокировку начала сеансов поставить не смог (нет входа в свойства базы): сеансы могут вернуться' 'Yellow'; return }
+        $infoBase = $Target.InfoBase
+        if ([bool]$infoBase.SessionsDenied) {
+            $existing = [string]$infoBase.PermissionCode
+            if ($existing -and $existing -ne $script:UnlockCode) {
+                $script:KeepForeignSessionLock = $true
+                throw ("в {0} уже стоит чужая блокировка сеансов с другим кодом: впиши его в UnlockCode или сними блокировку" -f $script:ProdBase)
+            }
+            Write-Line '  блокировка начала сеансов уже стоит (код тот же); в конце обновления сниму её'
+            return
+        }
+        if ([string]::IsNullOrEmpty($script:UnlockCode)) { $script:UnlockCode = '123'; Write-Line '  UnlockCode пустой: код разрешения входа на этот запуск - 123' }
+        $until = (Get-Date).AddHours($sessionLockHours)
+        $infoBase.DeniedFrom = (Get-Date).AddMinutes(-30)
+        $infoBase.DeniedTo = $until
+        $infoBase.DeniedMessage = ("Идёт обновление расширений, база заблокирована до {0}" -f $until.ToString('HH:mm'))
+        $infoBase.PermissionCode = $script:UnlockCode
+        $infoBase.SessionsDenied = $true
+        $Target.Process.UpdateInfoBase($infoBase)
+        if (-not [bool](Read-BaseInfoAgain $Target $script:ProdBase).SessionsDenied) { throw 'блокировка сеансов не записалась' }
+        $script:SessionLockCode = $script:UnlockCode
+        Write-Line ("  поставил блокировку начала сеансов до {0}; сниму в конце" -f $until.ToString('HH:mm')) 'Green'
+    }
+
+    # Другие сеансы рабочей базы. Обновлению БД нужен монопольный доступ.
+    $others = @(Get-BaseSessions $prepLink $script:ProdBase | Where-Object { -not $_.IsError -and -not $_.IsDesigner })
+    if ($others.Count -eq 0) {
+        Write-Line ("  в {0} других сеансов нет" -f $script:ProdBase) 'Green'
+        Set-ProdSessionLock $prepTarget
     }
     else {
-        $prepTarget.InfoBase.ScheduledJobsDenied = $true
-        $prepTarget.Process.UpdateInfoBase($prepTarget.InfoBase)
-        if (-not [bool](Read-BaseInfoAgain $prepTarget $script:ProdBase).ScheduledJobsDenied) { throw 'флажок не записался' }
-        Write-Line '  поставил блокировку регламентных заданий на время обновления; в конце сниму' 'Green'
-    }
-}
-catch {
-    $prepTarget = $null
-    Write-Line ("  блокировку регламентных заданий поставить не смог: {0}" -f $_.Exception.Message) 'Yellow'
-    Write-Line '  без неё регламентное задание может сорвать обновление БД; блокировку сеансов тоже не поставить' 'Yellow'
-}
-
-# Открытый конфигуратор рабочей базы.
-$sessions = @(Get-BaseSessions $prepLink $script:ProdBase)
-foreach ($entry in @($sessions | Where-Object { $_.IsError })) { Write-Line ('  сеансы проверить не смог: ' + $entry.Text) 'Yellow' }
-$designers = @($sessions | Where-Object { -not $_.IsError -and $_.IsDesigner })
-if ($designers.Count -gt 0) {
-    Write-Line ("  открыт конфигуратор {0}: закрой его, чтобы продолжить" -f $script:ProdBase) 'Yellow'
-    foreach ($entry in $designers) { Write-Line ('    ' + $entry.Text) 'Yellow' }
-    $answer = Read-UiChoice -Header ("Открыт конфигуратор {0}. Закрой его сам - скрипт увидит и продолжит, или:" -f $script:ProdBase) `
-        -Keys @('1', '2') -Labels @('Закрыть отсюда (сеанс прерывается, несохранённые правки в нём пропадут)', 'Отмена') -CancelKey '2' -Poll {
-        $now = @(Get-BaseSessions $prepLink $script:ProdBase)
-        if (@($now | Where-Object { $_.IsError }).Count -eq 0 -and @($now | Where-Object { $_.IsDesigner }).Count -eq 0) { return 'closed' }
-        return ''
-    }
-    if ($answer -eq '2') { throw ("открыт конфигуратор {0}, отмена по ответу" -f $script:ProdBase) }
-    if ($answer -eq '1') {
-        foreach ($line in @(Stop-BaseSessions -Link $prepLink -BaseName $script:ProdBase -Designers)) { Write-Line ('  ' + $line) }
-        $left = @()
-        for ($wait = 0; $wait -lt 10; $wait++) {
-            Start-Sleep -Seconds 3
-            $left = @(Get-BaseSessions $prepLink $script:ProdBase | Where-Object { -not $_.IsError -and $_.IsDesigner })
-            if ($left.Count -eq 0) { break }
+        Write-Line ("  в {0} есть сеансы: {1}" -f $script:ProdBase, $others.Count) 'Yellow'
+        foreach ($entry in $others) { Write-Line ('    ' + $entry.Text) 'Yellow' }
+        $script:LastSessionCount = $others.Count
+        $answer = Read-UiChoice -Header ("В {0} есть сеансы: {1}. Можно дождаться, пока закончатся сами, или:" -f $script:ProdBase, $others.Count) `
+            -Keys @('1', '2', '3') -CancelKey '2' -Labels @(
+            'Продолжить так (обновление БД может упереться в монопольную блокировку)',
+            'Выйти',
+            ("Поставить блокировку начала сеансов на {0} ч, завершить сеансы и продолжить" -f $sessionLockHours)) -Poll {
+            $now = @(Get-BaseSessions $prepLink $script:ProdBase)
+            if (@($now | Where-Object { $_.IsError }).Count -gt 0) { return '' }
+            if ($now.Count -eq 0) { return 'empty' }
+            if ($now.Count -ne $script:LastSessionCount) {
+                $script:LastSessionCount = $now.Count
+                Write-Host ("  сеансов осталось: {0}" -f $now.Count) -ForegroundColor DarkGray
+            }
+            return ''
         }
-        if ($left.Count -gt 0) { throw ("конфигуратор {0} за 30 секунд не закрылся" -f $script:ProdBase) }
-    }
-    Write-Line '  конфигуратор закрыт' 'Green'
-}
-
-function Set-ProdSessionLock {
-    param($Target)
-    if ($null -eq $Target) { Write-Line '  блокировку начала сеансов поставить не смог (нет входа в свойства базы): сеансы могут вернуться' 'Yellow'; return }
-    $infoBase = $Target.InfoBase
-    if ([bool]$infoBase.SessionsDenied) {
-        $existing = [string]$infoBase.PermissionCode
-        if ($existing -and $existing -ne $script:UnlockCode) {
-            $script:KeepForeignSessionLock = $true
-            throw ("в {0} уже стоит чужая блокировка сеансов с другим кодом: впиши его в UnlockCode или сними блокировку" -f $script:ProdBase)
+        if ($answer -eq '2') { throw ("в {0} есть сеансы, выход по ответу" -f $script:ProdBase) }
+        if ($answer -eq 'empty') { Write-Line '  сеансы закончились сами' 'Green'; Set-ProdSessionLock $prepTarget }
+        if ($answer -eq '3') {
+            Set-ProdSessionLock $prepTarget
+            foreach ($line in @(Stop-BaseSessions -Link $prepLink -BaseName $script:ProdBase)) { Write-Line ('  ' + $line) }
         }
-        Write-Line '  блокировка начала сеансов уже стоит (код тот же); в конце обновления сниму её'
-        return
+        if ($answer -eq '1') { Write-Line '  продолжаю с сеансами в базе' }
     }
-    if ([string]::IsNullOrEmpty($script:UnlockCode)) { $script:UnlockCode = '123'; Write-Line '  UnlockCode пустой: код разрешения входа на этот запуск - 123' }
-    $until = (Get-Date).AddHours($sessionLockHours)
-    $infoBase.DeniedFrom = (Get-Date).AddMinutes(-30)
-    $infoBase.DeniedTo = $until
-    $infoBase.DeniedMessage = ("Идёт обновление расширений, база заблокирована до {0}" -f $until.ToString('HH:mm'))
-    $infoBase.PermissionCode = $script:UnlockCode
-    $infoBase.SessionsDenied = $true
-    $Target.Process.UpdateInfoBase($infoBase)
-    if (-not [bool](Read-BaseInfoAgain $Target $script:ProdBase).SessionsDenied) { throw 'блокировка сеансов не записалась' }
-    $script:SessionLockCode = $script:UnlockCode
-    Write-Line ("  поставил блокировку начала сеансов до {0}; сниму в конце" -f $until.ToString('HH:mm')) 'Green'
-}
-
-# Другие сеансы рабочей базы. Обновлению БД нужен монопольный доступ.
-$others = @(Get-BaseSessions $prepLink $script:ProdBase | Where-Object { -not $_.IsError -and -not $_.IsDesigner })
-if ($others.Count -eq 0) {
-    Write-Line ("  в {0} других сеансов нет" -f $script:ProdBase) 'Green'
-    Set-ProdSessionLock $prepTarget
 }
 else {
-    Write-Line ("  в {0} есть сеансы: {1}" -f $script:ProdBase, $others.Count) 'Yellow'
-    foreach ($entry in $others) { Write-Line ('    ' + $entry.Text) 'Yellow' }
-    $script:LastSessionCount = $others.Count
-    $answer = Read-UiChoice -Header ("В {0} есть сеансы: {1}. Можно дождаться, пока закончатся сами, или:" -f $script:ProdBase, $others.Count) `
-        -Keys @('1', '2', '3') -CancelKey '2' -Labels @(
-        'Продолжить так (обновление БД может упереться в монопольную блокировку)',
-        'Выйти',
-        ("Поставить блокировку начала сеансов на {0} ч, завершить сеансы и продолжить" -f $sessionLockHours)) -Poll {
-        $now = @(Get-BaseSessions $prepLink $script:ProdBase)
-        if (@($now | Where-Object { $_.IsError }).Count -gt 0) { return '' }
-        if ($now.Count -eq 0) { return 'empty' }
-        if ($now.Count -ne $script:LastSessionCount) {
-            $script:LastSessionCount = $now.Count
-            Write-Host ("  сеансов осталось: {0}" -f $now.Count) -ForegroundColor DarkGray
-        }
-        return ''
-    }
-    if ($answer -eq '2') { throw ("в {0} есть сеансы, выход по ответу" -f $script:ProdBase) }
-    if ($answer -eq 'empty') { Write-Line '  сеансы закончились сами' 'Green'; Set-ProdSessionLock $prepTarget }
-    if ($answer -eq '3') {
-        Set-ProdSessionLock $prepTarget
-        foreach ($line in @(Stop-BaseSessions -Link $prepLink -BaseName $script:ProdBase)) { Write-Line ('  ' + $line) }
-    }
-    if ($answer -eq '1') { Write-Line '  продолжаю с сеансами в базе' }
+    Write-Host ''
+    Write-Line ("Только внешние обработки: блокировки {0} не нужны, пользователи работают дальше." -f $script:ProdBase)
 }
 
 #endregion
@@ -1526,11 +1824,15 @@ New-Item -ItemType Directory -Path $beforeDir, $newDir -Force | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd'
 $failed = $false
 $touched = New-Object System.Collections.Generic.List[object]
+# Внешние обработки, которые этот запуск записал в справочник рабочей или снял оттуда (для отката и deploy.json).
+$touchedProcessings = New-Object System.Collections.Generic.List[object]
 
 # Выгрузки в файлы для отчёта об изменениях и для отката «как есть». Здесь рабочая база уже заблокирована
 # нами, конфигуратору никто не мешает. Не выгрузилось - не беда: отчёт будет без разницы по объектам.
-Write-Host ''
-Write-Host 'Выгрузки для отчёта об изменениях:'
+if ($selected.Count -gt 0) {
+    Write-Host ''
+    Write-Host 'Выгрузки для отчёта об изменениях:'
+}
 $snapshotRoot = Join-Path $script:RunDir 'prod-before'
 foreach ($entry in $selected) {
     $prodTitle = "Выгрузить {0} из {1}" -f $entry.Name, $script:ProdBase
@@ -1639,9 +1941,103 @@ if (-not $failed) {
     }
 }
 
+# Внешние обработки - после расширений и обновления БД: обработкам бывают нужны объекты из расширений.
+# Пишет «Выполнить после обновления» (regepf) через БСП, как загрузка из файла в форме элемента; прежняя
+# версия до записи ложится в before\processings\ - это откат. Подключение и формы проверяются там же.
+if (-not $failed -and $selectedProcessings.Count -gt 0) {
+    Write-Host ''
+    Write-Host 'Внешние обработки:'
+    $procRoot = Join-Path $script:RunDir 'epf'
+    foreach ($proc in $selectedProcessings) {
+        $title = Get-ProcessingStepTitle $proc
+        $procDir = Join-Path $procRoot $proc.ObjName
+        $proc | Add-Member -NotePropertyName Backup -NotePropertyValue '' -Force
+        $proc | Add-Member -NotePropertyName RemovedFile -NotePropertyValue '' -Force
+        $proc | Add-Member -NotePropertyName IsNew -NotePropertyValue '' -Force
+        $proc | Add-Member -NotePropertyName OldVersion -NotePropertyValue $proc.ProdVersion -Force
+        $proc | Add-Member -NotePropertyName NewVersion -NotePropertyValue $proc.TempVersion -Force
+        $proc | Add-Member -NotePropertyName Problems -NotePropertyValue @() -Force
+
+        if ($proc.Action -eq 'unregister') {
+            # Снять новую обработку (откат). Файл того, что снимается, - в before\: откат этого отката запишет его снова.
+            if ($proc.TempFile -and (Test-Path -LiteralPath $proc.TempFile)) {
+                $removedDir = Join-Path $beforeDir 'processings'
+                New-Item -ItemType Directory -Path $removedDir -Force | Out-Null
+                $proc.RemovedFile = Join-Path $removedDir $proc.FileName
+                Copy-Item -LiteralPath $proc.TempFile -Destination $proc.RemovedFile -Force
+            }
+            $session = Invoke-ProdProcessing -Mode 'unregepf' -OutDir $procDir -Name $proc.ObjName -Ref $proc.Ref -Title $title
+            if (-not $session.Done -or $session.Status -ne 'done') {
+                Write-Line ("[FAIL] {0}: {1}" -f $title, $session.Message) 'Red'
+                $failed = $true; break
+            }
+            $touchedProcessings.Add($proc)
+            Write-Line ("[OK]   {0}: публикация «Отключена», пометка удаления" -f $title) 'Green'
+            continue
+        }
+
+        $session = Invoke-ProdProcessing -Mode 'regepf' -OutDir $procDir -File $proc.Source -TextFile $proc.SourceB64 -Name $proc.FileName -Title $title
+        $values = $session.Values
+        $proc.Ref = [string](Get-Setting $values 'ref' '')
+        if ([string](Get-Setting $values 'objversion' '')) { $proc.NewVersion = [string](Get-Setting $values 'objversion' '') }
+        if ([string](Get-Setting $values 'oldversion' '')) { $proc.OldVersion = [string](Get-Setting $values 'oldversion' '') }
+        $isNewText = [string](Get-Setting $values 'isnew' '')
+        if ($isNewText -eq '1') { $proc.IsNew = 'yes' } elseif ($isNewText -eq '0') { $proc.IsNew = 'no' }
+        if ($session.OldB64) { $proc.Backup = Write-ProcessingBackup -Proc $proc -OldB64 $session.OldB64 }
+        if (-not $session.Done) {
+            # Итога нет: записалась ли обработка, неизвестно. Прежняя версия успела сохраниться - откат возможен.
+            $touchedProcessings.Add($proc)
+            Write-Line ("[FAIL] {0}: {1}" -f $title, $session.Message) 'Red'
+            $failed = $true; break
+        }
+        if ($session.Status -ne 'done' -and -not $proc.Ref) {
+            # Не записана: справочник не менялся.
+            Write-Line ("[FAIL] {0}: не записана, {1}" -f $title, $session.Message) 'Red'
+            $failed = $true; break
+        }
+        $touchedProcessings.Add($proc)
+        $problems = New-Object System.Collections.Generic.List[string]
+        if ($session.Status -ne 'done') { $problems.Add($session.Message) }
+        if ([string](Get-Setting $values 'check' '') -eq 'error') { $problems.Add(("не подключилась после записи: {0}" -f (Get-Setting $values 'checkerror' ''))) }
+        foreach ($formError in $session.FormErrors) { $problems.Add(("форма не создаётся: {0}" -f $formError)) }
+        $proc.Problems = $problems.ToArray()
+        $what = 'обновлена'
+        if ($proc.IsNew -eq 'yes') { $what = 'добавлена новым элементом' }
+        $detail = "{0}, версия {1} -> {2}, форм {3}" -f $what, $(if ($proc.OldVersion) { $proc.OldVersion } else { '-' }), $(if ($proc.NewVersion) { $proc.NewVersion } else { '-' }), (Get-Setting $values 'forms' '?')
+        if ($problems.Count -gt 0) { Write-Line ("[WARN] {0}: {1}. {2}" -f $title, $detail, ($problems -join ' | ')) 'Yellow' }
+        else { Write-Line ("[OK]   {0}: {1}; подключается, формы создаются" -f $title, $detail) 'Green' }
+    }
+}
+
 function Invoke-ProdRollback {
     # Возвращает рабочую базу к резервным копиям: в обратном порядке; новое расширение удаляется по имени.
+    # Сначала внешние обработки (их писали последними): прежняя версия - обратно в справочник, новая снимается,
+    # снятая - записывается снова.
     $ok = $true
+    $procList = @($touchedProcessings.ToArray())
+    [array]::Reverse($procList)
+    foreach ($proc in $procList) {
+        $procDir = Join-Path (Join-Path $script:RunDir 'epf-rollback') $proc.ObjName
+        $session = $null
+        if ($proc.Action -eq 'unregister') {
+            if ($proc.RemovedFile) {
+                $session = Invoke-ProdProcessing -Mode 'regepf' -OutDir $procDir -File $proc.RemovedFile -Name $proc.FileName -Title ("Откат: записать снова {0}" -f $proc.ObjName)
+            }
+        }
+        elseif ($proc.Backup) {
+            $session = Invoke-ProdProcessing -Mode 'regepf' -OutDir $procDir -TextFile $proc.Backup -Name $proc.FileName -Title ("Откат: вернуть прежнюю {0}" -f $proc.ObjName)
+        }
+        elseif ($proc.IsNew -eq 'yes' -and $proc.Ref) {
+            $session = Invoke-ProdProcessing -Mode 'unregepf' -OutDir $procDir -Name $proc.ObjName -Ref $proc.Ref -Title ("Откат: снять новую {0}" -f $proc.ObjName)
+        }
+        if ($null -eq $session) {
+            Write-Line ("  откат {0}: откатывать не к чему (прежней версии нет, и новой она не отмечена)" -f $proc.ObjName) 'Yellow'
+            $ok = $false
+            continue
+        }
+        if ($session.Done -and $session.Status -eq 'done') { Write-Line ("  откат {0}: готово" -f $proc.ObjName) 'Green' }
+        else { Write-Line ("  откат {0} не прошёл: {1}" -f $proc.ObjName, $session.Message) 'Red'; $ok = $false }
+    }
     $list = @($touched.ToArray())
     [array]::Reverse($list)
     foreach ($entry in $list) {
@@ -1681,9 +2077,10 @@ function Invoke-ProdRollback {
 $outcome = 'updated'
 if ($failed) {
     $outcome = 'failed'
-    if ($touched.Count -gt 0) {
+    if ($touched.Count -gt 0 -or $touchedProcessings.Count -gt 0) {
         Write-Host ''
-        Write-Line ("Обновление не прошло, а в {0} уже загружено: {1}" -f $script:ProdBase, (@($touched | ForEach-Object { $_.Name }) -join ', ')) 'Red'
+        $touchedNames = @(@($touched | ForEach-Object { $_.Name }) + @($touchedProcessings | ForEach-Object { $_.ObjName })) -join ', '
+        Write-Line ("Обновление не прошло, а в {0} уже загружено: {1}" -f $script:ProdBase, $touchedNames) 'Red'
         # Без ответа дальше не идём: решение важное.
         $rollbackNow = $null
         while ($null -eq $rollbackNow) {
@@ -1702,63 +2099,6 @@ if ($failed) {
 $light = New-Object System.Collections.Generic.List[object]   # Status OK/WARN/FAIL, Name, Text
 $selfCheckErrors = New-Object System.Collections.Generic.List[string]
 
-function Invoke-ProdClient {
-    # Тонкий клиент рабочей базы с внешней обработкой; ждём файл $DoneFile не дольше $TimeoutSec.
-    param([string]$Epf, [string]$Parameter, [string]$DoneFile, [int]$TimeoutSec, [string]$Title)
-    $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword) + @(
-        '/DisableStartupDialogs', '/DisableStartupMessages', '/Execute', ('"{0}"' -f $Epf), ('/C"{0}"' -f $Parameter))
-    $argLine = $argList -join ' '
-    Write-RunLog ("> 1cv8c.exe {0}" -f (Get-MaskedLine $argLine))
-    Write-Host ("  ...  {0}: начато в {1}, жду не дольше {2} мин" -f $Title, (Get-Date -Format 'HH:mm:ss'), [int]($TimeoutSec / 60)) -ForegroundColor DarkGray
-    $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $process = Start-Process -FilePath $script:V8C -ArgumentList $argLine -PassThru
-    $null = $process.Handle
-    # Строка хода. У самопроверки - настоящая полоса по заданиям: последняя часть журнала в папке итога.
-    $outDir = Split-Path -Parent $DoneFile
-    $nextLook = 0
-    $done = -1
-    $total = 0
-    $detail = ''
-    while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec -and -not (Test-Path -LiteralPath $DoneFile) -and -not $process.HasExited) {
-        if ($watch.Elapsed.TotalSeconds -ge $nextLook) {
-            $nextLook = $watch.Elapsed.TotalSeconds + 3
-            $last = @(Get-ChildItem -LiteralPath $outDir -Filter 'p*.txt' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^p\d{6}\.txt$' } | Sort-Object Name | Select-Object -Last 1)
-            if ($last.Count -gt 0) {
-                try {
-                    $header = @{}
-                    $blocks = New-Object System.Collections.Generic.List[string]
-                    foreach ($line in [System.IO.File]::ReadAllLines($last[0].FullName, [System.Text.Encoding]::UTF8)) {
-                        $clean = $line.TrimStart([char]0xFEFF)
-                        if ($clean -eq '@@journal') { break }
-                        $position = $clean.IndexOf('=')
-                        if (-not $clean.StartsWith('@@') -or $position -le 2) { continue }
-                        if ($clean.StartsWith('@@block=')) { $blocks.Add($clean.Substring($position + 1)); continue }
-                        $header[$clean.Substring(2, $position - 2)] = $clean.Substring($position + 1)
-                    }
-                    if ($header.ContainsKey('n') -and $header.ContainsKey('total')) {
-                        $done = [int]$header['n']
-                        $total = [int]$header['total']
-                        $detail = 'задание {0} из {1}: {2}' -f ($done + 1), $total, $header['title']
-                    }
-                    # Шаги самопроверки - вторым трубопроводом в ci.exe.
-                    if ($blocks.Count -gt 0) { Send-UiSubPlan -Title $Title -Current ([string]$header['step']) -Task ([string]$header['title']) -Blocks $blocks.ToArray() }
-                }
-                catch { }
-            }
-        }
-        Write-UiProgress -Title $Title -Elapsed $watch.Elapsed.TotalSeconds -Expected (Get-StatPlan $Title) -Done $done -Total $total -Detail $detail
-        Start-Sleep -Milliseconds 250
-    }
-    Complete-UiProgress
-    $done = Test-Path -LiteralPath $DoneFile
-    if ($done) { if (-not $process.WaitForExit(60000)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } } }
-    elseif (-not $process.HasExited) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
-    $statStatus = 'TIMEOUT'
-    if ($done) { $statStatus = 'OK' }
-    Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status $statStatus -Size ([Math]::Max(0, $total))
-    return [pscustomobject]@{ Done = $done; Seconds = [int]$watch.Elapsed.TotalSeconds }
-}
-
 function Add-Light {
     param([string]$Status, [string]$Name, [string]$Text)
     $light.Add([pscustomobject]@{ Status = $Status; Name = $Name; Text = $Text })
@@ -1772,71 +2112,86 @@ if ($outcome -eq 'updated') {
     Write-Host ''
     Write-Host 'Лёгкий прогон (в базу ничего не пишется):'
 
-    # Проверка применимости расширений: только чтение, конфигуратор.
-    $result = Invoke-Designer -BaseName $script:ProdBase -Command @('/CheckCanApplyConfigurationExtensions', '-AllExtensions') `
-        -LogName 'checkcanapply.log' -TimeoutSec $timeoutLoadSec -Title 'Проверка применимости расширений'
-    $applyLines = @($result.Lines | Where-Object { $_ -and $_.Trim() })
-    if ($result.ExitCode -eq 0) { Add-Light 'OK' 'Проверка применимости' 'замечаний нет' }
-    elseif ($result.ExitCode -eq 101) { Add-Light 'WARN' 'Проверка применимости' ("замечаний {0}, первое: {1}" -f $applyLines.Count, ($applyLines | Select-Object -First 1)) }
-    else { Add-Light 'FAIL' 'Проверка применимости' ("не выполнилась: {0}" -f $result.Text) }
-
-    # Канареечный вход: применились ли расширения в сеансе.
-    if (Test-Path -LiteralPath $canaryEpf) {
-        $canaryFile = Join-Path $script:RunDir 'canary.txt'
-        $client = Invoke-ProdClient -Epf $canaryEpf -Parameter ("canary;out={0};wait=10" -f $canaryFile) -DoneFile $canaryFile -TimeoutSec $canaryTimeoutSec -Title 'Канареечный вход'
-        if (-not $client.Done) { Add-Light 'FAIL' 'Канареечный вход' ("за {0} с результата нет" -f $client.Seconds) }
-        else {
-            $content = @(Get-Content -LiteralPath $canaryFile -Encoding UTF8)
-            $notApplied = @($content | Where-Object { $_ -like 'ext=*|NOT_APPLIED' } | ForEach-Object { ($_.Substring(4) -split '\|')[0] })
-            $status = @($content | Where-Object { $_ -like 'status=*' } | Select-Object -First 1)
-            if ($status.Count -eq 0 -or ([string]$status[0]).Substring(7).Trim() -ne 'ok') { Add-Light 'FAIL' 'Канареечный вход' ($content -join ' | ') }
-            elseif ($notApplied.Count -gt 0) { Add-Light 'FAIL' 'Канареечный вход' ("не применились в сеансе: {0}" -f ($notApplied -join ', ')) }
-            else { Add-Light 'OK' 'Канареечный вход' ("вошёл за {0} с, расширения применились" -f $client.Seconds) }
+    # Внешние обработки: подключение и формы проверил сам сеанс записи (regepf); здесь - его итог.
+    if ($touchedProcessings.Count -gt 0) {
+        $procProblems = @($touchedProcessings | Where-Object { @($_.Problems).Count -gt 0 })
+        if ($procProblems.Count -gt 0) {
+            Add-Light 'FAIL' 'Внешние обработки' (@($procProblems | ForEach-Object { '{0}: {1}' -f $_.ObjName, (@($_.Problems) -join ' | ') }) -join '; ')
         }
+        else { Add-Light 'OK' 'Внешние обработки' ("записано {0}: подключаются, формы создаются" -f $touchedProcessings.Count) }
     }
-    else { Add-Light 'WARN' 'Канареечный вход' "нет обработки $canaryEpf" }
 
-    # Самопроверка только на чтение: write=0, post=0; формы - по настройке ProdSelfCheckForms.
-    if (Test-Path -LiteralPath $selfCheckEpf) {
-        $selfDir = Join-Path $script:RunDir 'selfcheck'
-        New-Item -ItemType Directory -Path $selfDir -Force | Out-Null
-        $parameter = "selfcheck;out={0};docs=3;write=0;post=0" -f $selfDir
-        if (-not $prodSelfCheckForms) { $parameter += ';forms=0' }
-        $resultFile = Join-Path $selfDir 'result.txt'
-        $client = Invoke-ProdClient -Epf $selfCheckEpf -Parameter $parameter -DoneFile $resultFile -TimeoutSec (60 * $prodSelfCheckTimeoutMin) -Title 'Самопроверка на чтение'
-        $resultTable = Read-KeyValueFile $resultFile
-        $state = [string](Get-Setting $resultTable 'status' '')
-        # Записи ОШИБКА из частей журнала.
-        $journal = New-Object System.Collections.Generic.List[string]
-        foreach ($file in @(Get-ChildItem -LiteralPath $selfDir -Filter 'p*.txt' -File | Where-Object { $_.Name -match '^p\d{6}\.txt$' } | Sort-Object Name)) {
-            $inBody = $false
-            foreach ($line in [System.IO.File]::ReadAllLines($file.FullName, [System.Text.Encoding]::UTF8)) {
-                if ($inBody) { $journal.Add($line); continue }
-                if ($line.TrimStart([char]0xFEFF) -eq '@@journal') { $inBody = $true }
+    if ($selected.Count -eq 0) {
+        # Расширения не менялись: проверка применимости, вход и самопроверка ничего нового не покажут.
+        Write-Line '  расширения не менялись: проверка применимости, канареечный вход и самопроверка не нужны' 'DarkGray'
+    }
+    else {
+        # Проверка применимости расширений: только чтение, конфигуратор.
+        $result = Invoke-Designer -BaseName $script:ProdBase -Command @('/CheckCanApplyConfigurationExtensions', '-AllExtensions') `
+            -LogName 'checkcanapply.log' -TimeoutSec $timeoutLoadSec -Title 'Проверка применимости расширений'
+        $applyLines = @($result.Lines | Where-Object { $_ -and $_.Trim() })
+        if ($result.ExitCode -eq 0) { Add-Light 'OK' 'Проверка применимости' 'замечаний нет' }
+        elseif ($result.ExitCode -eq 101) { Add-Light 'WARN' 'Проверка применимости' ("замечаний {0}, первое: {1}" -f $applyLines.Count, ($applyLines | Select-Object -First 1)) }
+        else { Add-Light 'FAIL' 'Проверка применимости' ("не выполнилась: {0}" -f $result.Text) }
+
+        # Канареечный вход: применились ли расширения в сеансе.
+        if (Test-Path -LiteralPath $canaryEpf) {
+            $canaryFile = Join-Path $script:RunDir 'canary.txt'
+            $client = Invoke-ProdClient -Epf $canaryEpf -Parameter ("canary;out={0};wait=10" -f $canaryFile) -DoneFile $canaryFile -TimeoutSec $canaryTimeoutSec -Title 'Канареечный вход'
+            if (-not $client.Done) { Add-Light 'FAIL' 'Канареечный вход' ("за {0} с результата нет" -f $client.Seconds) }
+            else {
+                $content = @(Get-Content -LiteralPath $canaryFile -Encoding UTF8)
+                $notApplied = @($content | Where-Object { $_ -like 'ext=*|NOT_APPLIED' } | ForEach-Object { ($_.Substring(4) -split '\|')[0] })
+                $status = @($content | Where-Object { $_ -like 'status=*' } | Select-Object -First 1)
+                if ($status.Count -eq 0 -or ([string]$status[0]).Substring(7).Trim() -ne 'ok') { Add-Light 'FAIL' 'Канареечный вход' ($content -join ' | ') }
+                elseif ($notApplied.Count -gt 0) { Add-Light 'FAIL' 'Канареечный вход' ("не применились в сеансе: {0}" -f ($notApplied -join ', ')) }
+                else { Add-Light 'OK' 'Канареечный вход' ("вошёл за {0} с, расширения применились" -f $client.Seconds) }
             }
         }
-        [System.IO.File]::WriteAllLines((Join-Path $script:RunDir 'selfcheck.journal.txt'), $journal.ToArray(), $Utf8Bom)
-        $current = $null
-        foreach ($line in $journal) {
-            $found = $SelfCheckLineRegex.Match($line)
-            if ($found.Success) {
-                if ($null -ne $current) { $selfCheckErrors.Add($current) }
-                $current = $null
-                if ($found.Groups[1].Value -ceq 'ОШИБКА') { $current = $found.Groups[2].Value.Trim() }
-                continue
+        else { Add-Light 'WARN' 'Канареечный вход' "нет обработки $canaryEpf" }
+
+        # Самопроверка только на чтение: write=0, post=0; формы - по настройке ProdSelfCheckForms.
+        if (Test-Path -LiteralPath $selfCheckEpf) {
+            $selfDir = Join-Path $script:RunDir 'selfcheck'
+            New-Item -ItemType Directory -Path $selfDir -Force | Out-Null
+            $parameter = "selfcheck;out={0};docs=3;write=0;post=0" -f $selfDir
+            if (-not $prodSelfCheckForms) { $parameter += ';forms=0' }
+            $resultFile = Join-Path $selfDir 'result.txt'
+            $client = Invoke-ProdClient -Epf $selfCheckEpf -Parameter $parameter -DoneFile $resultFile -TimeoutSec (60 * $prodSelfCheckTimeoutMin) -Title 'Самопроверка на чтение'
+            $resultTable = Read-KeyValueFile $resultFile
+            $state = [string](Get-Setting $resultTable 'status' '')
+            # Записи ОШИБКА из частей журнала.
+            $journal = New-Object System.Collections.Generic.List[string]
+            foreach ($file in @(Get-ChildItem -LiteralPath $selfDir -Filter 'p*.txt' -File | Where-Object { $_.Name -match '^p\d{6}\.txt$' } | Sort-Object Name)) {
+                $inBody = $false
+                foreach ($line in [System.IO.File]::ReadAllLines($file.FullName, [System.Text.Encoding]::UTF8)) {
+                    if ($inBody) { $journal.Add($line); continue }
+                    if ($line.TrimStart([char]0xFEFF) -eq '@@journal') { $inBody = $true }
+                }
             }
-            if ($null -ne $current -and $line.StartsWith($SelfCheckIndent, [System.StringComparison]::Ordinal)) { $current = $current + ' ' + $line.Trim(); continue }
-            if ($null -ne $current) { $selfCheckErrors.Add($current); $current = $null }
+            [System.IO.File]::WriteAllLines((Join-Path $script:RunDir 'selfcheck.journal.txt'), $journal.ToArray(), $Utf8Bom)
+            $current = $null
+            foreach ($line in $journal) {
+                $found = $SelfCheckLineRegex.Match($line)
+                if ($found.Success) {
+                    if ($null -ne $current) { $selfCheckErrors.Add($current) }
+                    $current = $null
+                    if ($found.Groups[1].Value -ceq 'ОШИБКА') { $current = $found.Groups[2].Value.Trim() }
+                    continue
+                }
+                if ($null -ne $current -and $line.StartsWith($SelfCheckIndent, [System.StringComparison]::Ordinal)) { $current = $current + ' ' + $line.Trim(); continue }
+                if ($null -ne $current) { $selfCheckErrors.Add($current); $current = $null }
+            }
+            if ($null -ne $current) { $selfCheckErrors.Add($current) }
+            $counts = "заданий без ошибок {0}, ошибок {1}, предупреждений {2}, пропущено {3}" -f (Get-Setting $resultTable 'ok' '?'), (Get-Setting $resultTable 'errors' '?'), (Get-Setting $resultTable 'warnings' '?'), (Get-Setting $resultTable 'skipped' '?')
+            if (-not $client.Done) { Add-Light 'FAIL' 'Самопроверка на чтение' ("не закончилась за {0} мин; журнал - selfcheck.journal.txt" -f $prodSelfCheckTimeoutMin) }
+            elseif ($state -eq 'refused') { Add-Light 'FAIL' 'Самопроверка на чтение' ("обработка отказалась: {0}. Нужна сборка с режимом «только чтение» для рабочей базы" -f (Get-Setting $resultTable 'message' '')) }
+            elseif ($state -ne 'done') { Add-Light 'FAIL' 'Самопроверка на чтение' ("итог {0}: {1}" -f $state, (Get-Setting $resultTable 'message' '')) }
+            elseif ($selfCheckErrors.Count -gt 0) { Add-Light 'WARN' 'Самопроверка на чтение' ($counts + '; ошибки перечислены в отчёте') }
+            else { Add-Light 'OK' 'Самопроверка на чтение' $counts }
         }
-        if ($null -ne $current) { $selfCheckErrors.Add($current) }
-        $counts = "заданий без ошибок {0}, ошибок {1}, предупреждений {2}, пропущено {3}" -f (Get-Setting $resultTable 'ok' '?'), (Get-Setting $resultTable 'errors' '?'), (Get-Setting $resultTable 'warnings' '?'), (Get-Setting $resultTable 'skipped' '?')
-        if (-not $client.Done) { Add-Light 'FAIL' 'Самопроверка на чтение' ("не закончилась за {0} мин; журнал - selfcheck.journal.txt" -f $prodSelfCheckTimeoutMin) }
-        elseif ($state -eq 'refused') { Add-Light 'FAIL' 'Самопроверка на чтение' ("обработка отказалась: {0}. Нужна сборка с режимом «только чтение» для рабочей базы" -f (Get-Setting $resultTable 'message' '')) }
-        elseif ($state -ne 'done') { Add-Light 'FAIL' 'Самопроверка на чтение' ("итог {0}: {1}" -f $state, (Get-Setting $resultTable 'message' '')) }
-        elseif ($selfCheckErrors.Count -gt 0) { Add-Light 'WARN' 'Самопроверка на чтение' ($counts + '; ошибки перечислены в отчёте') }
-        else { Add-Light 'OK' 'Самопроверка на чтение' $counts }
+        else { Add-Light 'WARN' 'Самопроверка на чтение' "нет обработки $selfCheckEpf" }
     }
-    else { Add-Light 'WARN' 'Самопроверка на чтение' "нет обработки $selfCheckEpf" }
 
     if (@($light | Where-Object { $_.Status -eq 'FAIL' }).Count -gt 0) {
         Write-Host ''
@@ -1950,7 +2305,9 @@ function Get-AuthorMarks {
 
 function Get-ExtensionChanges {
     # Что изменилось в расширении: объекты новые, удалённые, изменённые (по частям), процедуры модулей, пометки авторов.
-    param([string]$OldDir, [string]$NewDir)
+    # KeyPrefix - для выгрузки внешней обработки: её файлы лежат без папки вида объекта, с ним они
+    # читаются как объект «Обработка.<имя>» (модуль объекта, формы, макеты).
+    param([string]$OldDir, [string]$NewDir, [string]$KeyPrefix = '')
     $oldHashes = Get-TreeHashes $OldDir
     $newHashes = Get-TreeHashes $NewDir
     $objects = @{}
@@ -1960,12 +2317,12 @@ function Get-ExtensionChanges {
         $inOld = $oldHashes.ContainsKey($relative)
         $inNew = $newHashes.ContainsKey($relative)
         if ($inOld -and $inNew -and $oldHashes[$relative] -eq $newHashes[$relative]) { continue }
-        $key = Get-ObjectKey $relative
+        $key = Get-ObjectKey ($KeyPrefix + $relative)
         if (-not $objects.ContainsKey($key.Object)) {
             $objects[$key.Object] = [pscustomobject]@{ Name = $key.Object; Added = $false; Removed = $false; Parts = (New-Object System.Collections.Generic.List[string]) }
         }
         $object = $objects[$key.Object]
-        $isObjectFile = ($relative -match '^[^/]+/[^/]+\.xml$')
+        $isObjectFile = (($KeyPrefix + $relative) -match '^[^/]+/[^/]+\.xml$')
         if ($isObjectFile -and -not $inOld) { $object.Added = $true }
         if ($isObjectFile -and -not $inNew) { $object.Removed = $true }
         $partText = $key.Part
@@ -1996,6 +2353,7 @@ function Get-ExtensionChanges {
 
 $reportTitle = "Обновление расширений {0} от {1}" -f $script:ProdBase, (Get-Date -Format 'dd.MM.yyyy HH:mm')
 if ($mode -eq 'asis') { $reportTitle = "Обновление конфигурации БД {0} как есть от {1}" -f $script:ProdBase, (Get-Date -Format 'dd.MM.yyyy HH:mm') }
+if ($mode -eq 'epf') { $reportTitle = "Обновление внешних обработок {0} от {1}" -f $script:ProdBase, (Get-Date -Format 'dd.MM.yyyy HH:mm') }
 if ($mode -eq 'rollback') { $reportTitle = "Откат расширений {0} к состоянию до обновления {1}, от {2}" -f $script:ProdBase, $rollbackOf, (Get-Date -Format 'dd.MM.yyyy HH:mm') }
 $outcomeNames = @{ updated = 'обновлено'; failed = 'обновление не прошло'; rolledBack = 'обновление откачено'; rollbackFailed = 'откат прошёл не полностью' }
 $html = New-Object System.Text.StringBuilder
@@ -2073,6 +2431,44 @@ foreach ($entry in $selected) {
         [void]$html.Append('</ul>')
     }
 }
+# Внешние обработки: что записано и что поменялось по модулям и формам. Разница - по выгрузкам файлов
+# обработок (старая - из справочника рабочей до обновления, новая - из temp), выгружает конфигуратор temp.
+if ($touchedProcessings.Count -gt 0) {
+    [void]$html.Append('<h2>Внешние обработки</h2>')
+    foreach ($proc in $touchedProcessings) {
+        $procTitle = $proc.ObjName
+        if ($proc.Title) { $procTitle = '{0} ({1})' -f $proc.ObjName, $proc.Title }
+        [void]$html.Append(('<h3>{0}</h3>' -f (ConvertTo-Html $procTitle)))
+        if ($proc.Action -eq 'unregister') { [void]$html.Append('<p>Снята из справочника: публикация «Отключена», пометка удаления.</p>'); continue }
+        $what = 'обновлена'
+        if ($proc.IsNew -eq 'yes') { $what = 'добавлена новым элементом справочника' }
+        [void]$html.Append(('<p>{0}</p>' -f (ConvertTo-Html ('{0}, версия {1} → {2}' -f $what, $proc.OldVersion, $proc.NewVersion))))
+        if (@($proc.Problems).Count -gt 0) {
+            [void]$html.Append('<p style="color:#c0392b">После записи:</p><ul>')
+            foreach ($problem in @($proc.Problems)) { [void]$html.Append(('<li>{0}</li>' -f (ConvertTo-Html $problem))) }
+            [void]$html.Append('</ul>')
+        }
+        if ($mode -eq 'rollback') { continue }
+        $dumpRoot = Join-Path $script:RunDir 'epf-dump'
+        $newDump = Get-ProcessingDump -File $proc.Source -Dir (Join-Path $dumpRoot ($proc.ObjName + '-new')) -Title ("Выгрузить в файлы {0} из temp" -f $proc.ObjName)
+        if (-not $newDump) { [void]$html.Append('<p>Выгрузка обработки в файлы не получилась: разницы по модулям нет, см. run.log.</p>'); continue }
+        $oldDump = ''
+        if ($proc.ProdFile) { $oldDump = Get-ProcessingDump -File $proc.ProdFile -Dir (Join-Path $dumpRoot ($proc.ObjName + '-old')) -Title ("Выгрузить в файлы {0} из рабочей" -f $proc.ObjName) }
+        $changes = Get-ExtensionChanges -OldDir $oldDump -NewDir $newDump -KeyPrefix 'DataProcessors/'
+        if ($changes.Objects.Count -eq 0) { [void]$html.Append('<p>По выгрузке в файлы отличий нет: разница в самом файле (например, порядок или служебные данные).</p>') }
+        else {
+            [void]$html.Append('<ul>')
+            foreach ($object in $changes.Objects) { foreach ($part in $object.Parts) { [void]$html.Append(('<li>{0}</li>' -f (ConvertTo-Html $part))) } }
+            [void]$html.Append('</ul>')
+        }
+        if ($changes.Marks.Count -gt 0) {
+            [void]$html.Append('<p>Пометки авторов в новом коде:</p><ul>')
+            foreach ($mark in $changes.Marks) { [void]$html.Append(('<li>{0}</li>' -f (ConvertTo-Html $mark))) }
+            [void]$html.Append('</ul>')
+        }
+    }
+}
+
 if ($mode -eq 'asis') { [void]$html.Append('<p>Обозначения: + новая процедура, ~ изменена, - удалена. Отчёт собран скриптом обновления по выгрузкам расширений в файлы: старая версия - прежняя выгрузка рабочей базы, новая - рабочая база сейчас.</p>') }
 else { [void]$html.Append('<p>Обозначения: + новая процедура, ~ изменена, - удалена. Отчёт собран скриптом обновления по выгрузкам расширений в файлы: старая версия - из рабочей базы до обновления, новая - из тестовой.</p>') }
 [void]$html.Append('</body></html>')
@@ -2108,7 +2504,7 @@ if ($outcome -eq 'updated') {
     # Выгрузки рабочей базы - заново: следующее сравнение должно видеть новое состояние.
     if ($mode -ne 'asis') { foreach ($entry in $selected) { $null = Update-Mirror -BaseName $script:ProdBase -Extension $entry.Name } }
     # Хеш-суммы рабочей после обновления: следующий запуск по ним увидит ручную загрузку («как есть»).
-    Save-MirrorHashes -Names @($selected | ForEach-Object { $_.Name })
+    if ($selected.Count -gt 0) { Save-MirrorHashes -Names @($selected | ForEach-Object { $_.Name }) }
     # «Обновить все»: ошибки последнего прогона гейта сбрасываются - принимаются в эталон как известные
     # (они либо исправлены, либо неважны). Следующий прогон гейта покажет только новое.
     if ($mode -eq '1' -and $null -ne $lastRun) {
@@ -2123,6 +2519,7 @@ $summary = New-Object System.Collections.Generic.List[string]
 $summary.Add($reportTitle)
 $summary.Add(('Итог: ' + $outcomeNames[$outcome]))
 $summary.Add(('Расширения: ' + (@($selected | ForEach-Object { $_.Name }) -join ', ')))
+if ($selectedProcessings.Count -gt 0) { $summary.Add(('Внешние обработки: ' + (@($touchedProcessings | ForEach-Object { $_.ObjName }) -join ', '))) }
 foreach ($item in $light) { $summary.Add(('[{0}] {1}: {2}' -f $item.Status, $item.Name, $item.Text)) }
 $summary.Add(('Резервные копии: ' + $beforeDir))
 [System.IO.File]::WriteAllLines((Join-Path $script:RunDir 'summary.txt'), $summary.ToArray(), $Utf8Bom)
@@ -2136,6 +2533,19 @@ $recordExtensions = @(foreach ($entry in $selected) {
         $newVersion = $entry.TempVersion
         if ($mode -eq 'asis') { $newVersion = $entry.ProdVersion; $oldVersion = '' }
         [ordered]@{ name = $entry.Name; status = $entry.Status; backup = $backupRelative; oldVersion = $oldVersion; newVersion = $newVersion }
+    })
+# Внешние обработки: что записано или снято. backup - прежняя версия в base64 (откат запишет её обратно),
+# file - файл, который записан (или снят): по нему откат этого обновления снятую запишет снова.
+$recordProcessings = @(foreach ($proc in $touchedProcessings) {
+        $backupRelative = ''
+        if ($proc.Backup) { $backupRelative = 'before\processings\' + (Split-Path -Leaf $proc.Backup) }
+        $fileRelative = ''
+        if ($proc.Action -eq 'unregister' -and $proc.RemovedFile) { $fileRelative = 'before\processings\' + (Split-Path -Leaf $proc.RemovedFile) }
+        elseif ($proc.Source -and $proc.Source.StartsWith($script:RunDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) { $fileRelative = $proc.Source.Substring($script:RunDir.Length + 1) }
+        $procStatus = 'OK'
+        if (@($proc.Problems).Count -gt 0) { $procStatus = 'WARN' }
+        [ordered]@{ name = $proc.ObjName; title = $proc.Title; fileName = $proc.FileName; action = $proc.Action; isNew = $proc.IsNew; ref = $proc.Ref
+            oldVersion = $proc.OldVersion; newVersion = $proc.NewVersion; backup = $backupRelative; file = $fileRelative; status = $procStatus; problems = @($proc.Problems) }
     })
 $recordGate = $null
 if ($null -ne $lastRun) { $recordGate = [ordered]@{ run = $lastRun.Name; verdict = [string](Get-JsonValue $lastVerdict 'verdict' '') } }
@@ -2152,7 +2562,7 @@ $record = [ordered]@{
     riskAccepted = $riskAccepted
     risks        = @($gateRisks)
     extensions   = $recordExtensions
-    processings  = @()
+    processings  = $recordProcessings
     light        = @(foreach ($item in $light) { [ordered]@{ status = $item.Status; name = $item.Name; text = $item.Text } })
     article      = $articleFile
 }
@@ -2198,8 +2608,21 @@ if ($mode -eq 'rollback' -and $outcome -eq 'updated') {
                 $taken++
             }
         }
-        Write-Line 'Внешние обработки: откат их не трогал (обновление обработок скриптом ещё не сделано) - подтягивать нечего.' 'DarkGray'
-        Write-Line ("Комплект для temp: {0}, расширений {1}. Запускаю гейт." -f $kitDir, $taken) 'Cyan'
+        # Внешние обработки, возвращённые откатом, - в тот же комплект файлами: гейт запишет их в справочник temp.
+        foreach ($proc in @($touchedProcessings | Where-Object { $_.Action -eq 'register' })) {
+            $procFile = Join-Path $kitDir $proc.FileName
+            try {
+                if ($proc.SourceB64) { [System.IO.File]::WriteAllBytes($procFile, [Convert]::FromBase64String([System.IO.File]::ReadAllText($proc.SourceB64).Trim())) }
+                else { Copy-Item -LiteralPath $proc.Source -Destination $procFile -Force }
+                Write-Line ("[OK]   Внешняя обработка {0} для temp" -f $proc.ObjName) 'Green'
+                $taken++
+            }
+            catch { Write-Line ("[WARN] Внешняя обработка {0} для temp: не получилась, {1}" -f $proc.ObjName, $_.Exception.Message) 'Yellow' }
+        }
+        foreach ($proc in @($touchedProcessings | Where-Object { $_.Action -eq 'unregister' })) {
+            Write-Line ("[WARN] {0} снята из справочника рабочей; в temp её снять руками (гейт снимает только то, что записал сам)" -f $proc.ObjName) 'Yellow'
+        }
+        Write-Line ("Комплект для temp: {0}, файлов {1}. Запускаю гейт." -f $kitDir, $taken) 'Cyan'
         if ($UiChannel) { & (Join-Path $Root 'run.ps1') -Kit $kitDir -UiChannel $UiChannel } else { & (Join-Path $Root 'run.ps1') -Kit $kitDir }
     }
 }
