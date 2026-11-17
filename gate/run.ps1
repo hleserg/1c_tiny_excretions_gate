@@ -1804,8 +1804,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Password') {
     exit 0
 }
 
-if ($PSCmdlet.ParameterSetName -eq 'Accept') {
-    $acceptDir = Resolve-RootPath $AcceptBaseline
+function Invoke-AcceptBaseline {
+    # Принять замечания прогона как известные: записать их в эталон базы. Зовут ключ -AcceptBaseline
+    # и пункт меню «Принять новое последнего прогона в эталон». Ошибка - исключением.
+    param([string]$RunPath)
+    $acceptDir = $RunPath
     $verdictFile = Join-Path $acceptDir 'verdict.json'
     if (-not (Test-Path -LiteralPath $verdictFile)) { throw "Не нашёл verdict.json в $acceptDir" }
     $acceptMeta = Get-Content -LiteralPath $verdictFile -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -1872,7 +1875,13 @@ if ($PSCmdlet.ParameterSetName -eq 'Accept') {
             Write-Host ("Принято как известное: {0}" -f $acceptPair[0])
         }
     }
+    # Отметка в папке прогона: в списке прогонов он виден как принятый, второй раз его не предлагают.
+    [System.IO.File]::WriteAllLines((Join-Path $acceptDir 'accepted.txt'), [string[]]@(('time={0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))), $Utf8Bom)
     Write-Host "Эталон базы «$($acceptMeta.baseKey)» обновлён: $baselineTarget"
+}
+
+if ($PSCmdlet.ParameterSetName -eq 'Accept') {
+    Invoke-AcceptBaseline -RunPath (Resolve-RootPath $AcceptBaseline)
     exit 0
 }
 
@@ -1884,6 +1893,16 @@ $configPath = $Config
 if ([string]::IsNullOrWhiteSpace($configPath)) { $configPath = Join-Path $Root 'config.psd1' }
 if (-not (Test-Path -LiteralPath $configPath)) { throw "Нет файла настроек: $configPath" }
 $cfg = Import-PowerShellDataFile -LiteralPath $configPath
+# Настройки площадки из поставки гейта (config.site.psd1 рядом с run.ps1, его кладёт установщик и заменяет
+# при каждой установке): ключ, которого нет в config.psd1, берётся оттуда. Свой ключ в config.psd1 важнее.
+$siteConfigPath = Join-Path $Root 'config.site.psd1'
+$script:SiteSettingKeys = @()
+if (Test-Path -LiteralPath $siteConfigPath) {
+    $siteConfig = Import-PowerShellDataFile -LiteralPath $siteConfigPath
+    foreach ($siteKey in @($siteConfig.Keys)) {
+        if (-not $cfg.ContainsKey($siteKey)) { $cfg[$siteKey] = $siteConfig[$siteKey]; $script:SiteSettingKeys += [string]$siteKey }
+    }
+}
 
 $script:Server = [string](Get-Setting $cfg 'Server' '')
 $script:Base = [string](Get-Setting $cfg 'Base' '')
@@ -2106,6 +2125,68 @@ function Get-RunListText {
     return $text
 }
 
+function Get-RunNewLines {
+    # Что нового нашёл прогон: по файлу *.new.txt - имя шага и число записей.
+    param([string]$RunPath)
+    $result = @()
+    foreach ($file in @(Get-ChildItem -LiteralPath $RunPath -Filter '*.new.txt' -File | Sort-Object Name)) {
+        $count = @([System.IO.File]::ReadAllLines($file.FullName, [System.Text.Encoding]::UTF8) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+        if ($count -gt 0) { $result += ('{0}: {1}' -f ($file.Name -replace '\.new\.txt$', ''), $count) }
+    }
+    return , @($result)
+}
+
+function Get-AcceptableRun {
+    # Последний прогон этой базы, новое которого можно принять в эталон: жёлтый или красный, комплект
+    # не откатывали, ещё не принят, есть что принимать. Принимать можно только последний прогон: после него
+    # база не менялась, и его записи - её нынешнее состояние. Возвращает @{ Dir; Verdict } или $null.
+    $runsRootAccept = Resolve-RootPath ([string](Get-Setting $cfg 'RunsDir' 'runs'))
+    if (-not (Test-Path -LiteralPath $runsRootAccept)) { return $null }
+    $last = @(Get-ChildItem -LiteralPath $runsRootAccept -Directory | Where-Object { $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name -Descending | Select-Object -First 1)
+    if ($last.Count -eq 0) { return $null }
+    $verdictFile = Join-Path $last[0].FullName 'verdict.json'
+    if (-not (Test-Path -LiteralPath $verdictFile)) { return $null }
+    try { $verdict = (Get-Content -LiteralPath $verdictFile -Raw -Encoding UTF8) | ConvertFrom-Json } catch { return $null }
+    if ([string]$verdict.baseKey -ne $baseKey) { return $null }
+    if (@('YELLOW', 'RED') -notcontains [string]$verdict.verdict) { return $null }
+    $decision = $verdict.PSObject.Properties['kitDecision']
+    if ($null -ne $decision -and @('rolledBack', 'rollbackFailed') -contains [string]$decision.Value) { return $null }
+    if (Test-Path -LiteralPath (Join-Path $last[0].FullName 'accepted.txt')) { return $null }
+    $hasLogs = @(Get-ChildItem -LiteralPath $last[0].FullName -Filter 'check*.log' -File).Count -gt 0
+    if (-not $hasLogs -and -not (Test-Path -LiteralPath (Join-Path $last[0].FullName 'selfcheck-after.norm.txt'))) { return $null }
+    return [pscustomobject]@{ Dir = $last[0]; Verdict = $verdict }
+}
+
+function Invoke-AcceptFromMenu {
+    # Пункт меню: показать, что станет известным, переспросить и принять. $true - принято.
+    param($Run)
+    $runName = $Run.Dir.Name
+    $red = ([string]$Run.Verdict.verdict -eq 'RED')
+    $newLines = Get-RunNewLines -RunPath $Run.Dir.FullName
+    $more = @('Станет известным и больше не будет красить прогоны:')
+    if ($newLines.Count -gt 0) { $more += @($newLines | ForEach-Object { '  ' + $_ }) } else { $more += '  новых записей в файлах *.new.txt нет (принимается состояние базы после прогона)' }
+    $more += 'Ошибку обмена R1 и «обмен сломан до загрузки» эталон не прячет.'
+    $kind = 'warn'
+    if ($red) {
+        $kind = 'bad'
+        $more += 'Прогон КРАСНЫЙ: принимай, только если разобрал ошибки и они допустимы (например, были в базе и раньше).'
+    }
+    Show-UiTitle -Text ('Принять новое прогона {0} ({1}) в эталон' -f $runName, (Get-RunListText $Run.Verdict)) -Kind $kind -More $more
+    $yesText = 'Принять в эталон'
+    if ($red) { $yesText = 'Принять, хотя прогон красный' }
+    $sure = Confirm-Ui -Question ('Принять новое прогона {0} в эталон? Что внутри - report.txt и *.new.txt в папке прогона.' -f $runName) -Yes $yesText -No 'Не принимать'
+    if ($sure -ne $true) { Write-Host '  Не принято.'; return $false }
+    try {
+        Invoke-AcceptBaseline -RunPath $Run.Dir.FullName
+        Write-Host ('  Принято: новое прогона {0} теперь известное.' -f $runName) -ForegroundColor Green
+        return $true
+    }
+    catch {
+        Write-Host ('  Не принято: {0}' -f $_.Exception.Message) -ForegroundColor Red
+        return $false
+    }
+}
+
 function Show-RecentRuns {
     # Последние прогоны: вердикт, комплект, решение; по любому - итог, разбор, папка, файл обновления, прежние версии.
     $runsRootMenu = Resolve-RootPath ([string](Get-Setting $cfg 'RunsDir' 'runs'))
@@ -2125,7 +2206,9 @@ function Show-RecentRuns {
                 try { $verdict = (Get-Content -LiteralPath $verdictFile -Raw -Encoding UTF8) | ConvertFrom-Json } catch { $verdict = $null }
             }
             $rows += [pscustomobject]@{ Dir = $run; Verdict = $verdict }
-            $labels += ('{0}  {1}' -f $run.Name, (Get-RunListText $verdict))
+            $acceptedMark = ''
+            if (Test-Path -LiteralPath (Join-Path $run.FullName 'accepted.txt')) { $acceptedMark = ' · принят в эталон' }
+            $labels += ('{0}  {1}{2}' -f $run.Name, (Get-RunListText $verdict), $acceptedMark)
         }
         $index = Select-UiOne -Header 'Последние прогоны' -Items $labels
         if ($index -lt 0) { return }
@@ -2160,8 +2243,15 @@ function Show-RecentRuns {
             $actions.Add([pscustomobject]@{ Key = 'folder'; Label = 'Открыть папку прогона' })
             if ($updateFiles.Count -gt 0) { $actions.Add([pscustomobject]@{ Key = 'update'; Label = ('Вытащить файл обновления в inbox: ' + (@($updateFiles | ForEach-Object { Split-Path -Leaf $_ }) -join '; ')) }) }
             if ($beforeFiles.Count -gt 0) { $actions.Add([pscustomobject]@{ Key = 'before'; Label = ('Вытащить прежние версии в inbox: ' + (@($beforeFiles | ForEach-Object { Split-Path -Leaf $_ }) -join '; ')) }) }
+            $acceptable = Get-AcceptableRun
+            $canAccept = ($null -ne $acceptable -and $acceptable.Dir.FullName -eq $runPath)
+            if ($canAccept) { $actions.Add([pscustomobject]@{ Key = 'accept'; Label = 'Принять новое этого прогона в эталон (станет известным)' }) }
             $actions.Add([pscustomobject]@{ Key = 'back'; Label = 'Назад к списку' })
             $notes = @()
+            if (Test-Path -LiteralPath (Join-Path $runPath 'accepted.txt')) { $notes += 'новое этого прогона уже принято в эталон' }
+            elseif (-not $canAccept -and $null -ne $row.Verdict -and @('YELLOW', 'RED') -contains [string]$row.Verdict.verdict) {
+                $notes += 'в эталон принимается только последний прогон, комплект которого не откатывали'
+            }
             if ($updateFiles.Count -eq 0) { $notes += 'файла обновления у прогона нет' }
             $picked = Select-UiOne -Header 'Что сделать' -Items @($actions | ForEach-Object { $_.Label }) -Notes $notes
             if ($picked -lt 0 -or $actions[$picked].Key -eq 'back') { break }
@@ -2172,6 +2262,7 @@ function Show-RecentRuns {
                 }
                 'report' { Show-UiPager -Lines @([System.IO.File]::ReadAllLines($reportFile, [System.Text.Encoding]::UTF8)) -Header ('report.txt, прогон ' + $row.Dir.Name) }
                 'folder' { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $runPath) }
+                'accept' { $null = Invoke-AcceptFromMenu -Run $acceptable }
                 'update' {
                     $target = Copy-RunFiles -Sources $updateFiles -FolderName ('из_прогона_' + $row.Dir.Name)
                     Write-Host ("  Скопировал в {0}" -f $target) -ForegroundColor Green
@@ -2198,6 +2289,10 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         $menu = New-Object System.Collections.Generic.List[object]
         if ($usable.Count -gt 0) { $menu.Add([pscustomobject]@{ Key = 'kit'; Label = ("Прогон с обновлением из inbox ({0})" -f $usable.Count) }) }
         $menu.Add([pscustomobject]@{ Key = 'asis'; Label = 'Прогон на том, что есть в базе' })
+        $acceptable = Get-AcceptableRun
+        if ($null -ne $acceptable) {
+            $menu.Add([pscustomobject]@{ Key = 'accept'; Label = ('Принять новое последнего прогона в эталон ({0}, {1})' -f $acceptable.Dir.Name, (Get-RunListText $acceptable.Verdict)) })
+        }
         $menu.Add([pscustomobject]@{ Key = 'runs'; Label = 'Результаты последних прогонов' })
         $menu.Add([pscustomobject]@{ Key = 'stats'; Label = 'Статистика длительностей: план и факт' })
         $menu.Add([pscustomobject]@{ Key = 'settings'; Label = 'Настройки (config.psd1)' })
@@ -2252,6 +2347,10 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             Write-Host 'Чтобы гейт взял новые настройки, запусти его заново (в ci - Enter).'
             exit 0
         }
+        if ($choice -eq 'accept') {
+            $null = Invoke-AcceptFromMenu -Run $acceptable
+            continue
+        }
         if ($choice -eq 'stats') {
             Show-UiPager -Lines @(Get-StatReportLines) -Header 'Статистика длительностей шагов'
             continue
@@ -2298,6 +2397,7 @@ $RunDir = Join-Path $runsRoot $runId
 New-Item -ItemType Directory -Path $RunDir -Force | Out-Null
 $script:RunLogPath = Join-Path $RunDir 'run.log'
 $script:Steps = New-Object System.Collections.Generic.List[object]
+if ($script:SiteSettingKeys.Count -gt 0) { Write-RunLog ("Настройки площадки из config.site.psd1: {0}" -f ($script:SiteSettingKeys -join ', ')) }
 $baselineDir = Join-Path (Join-Path $Root 'baseline') $baseKey
 
 $adminUser = [string](Get-Setting $cfg 'AdminUser' '')
@@ -4755,8 +4855,9 @@ elseif ($anyTouched -gt 0) {
 }
 
 # После отката принимать замечания прогона незачем: в базе стоит уже не этот комплект.
-if ($decision -ne 'rolledBack' -and $decision -ne 'rollbackFailed') {
-    Write-Host ("Принять замечания прогона как известные: .\run.ps1 -AcceptBaseline `"{0}`"" -f $RunDir)
+if ($decision -ne 'rolledBack' -and $decision -ne 'rollbackFailed' -and $verdict -ne 'GREEN') {
+    if ($UiChannel) { Write-Host 'Принять новое этого прогона в эталон: Enter - в меню, пункт «Принять новое последнего прогона в эталон».' }
+    else { Write-Host ("Принять новое этого прогона в эталон: .\run.cmd без ключей - пункт меню, или .\run.ps1 -AcceptBaseline `"{0}`"" -f $RunDir) }
 }
 
 # Обновления, которые остались в базе, переносятся из inbox в папку прогона: в inbox остаётся то, что ещё

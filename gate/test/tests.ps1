@@ -914,6 +914,51 @@ $tests = @(
         }
     },
     @{
+        Name = 'gate-accept-menu'
+        Text = 'красный прогон, комплект оставлен: в меню пункт «Принять новое последнего прогона в эталон», после подтверждения новое в эталоне и пункт пропадает'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ }, @{ tasks = $errorTasks; fingerprint = 'после' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'RED' 1
+            $runDir = $r.RunDir
+            Check (@($r.Output | Where-Object { $_ -match 'пункт «Принять новое последнего прогона в эталон»' }).Count -eq 1) 'в конце прогона нет подсказки про пункт меню'
+            $m = Invoke-Script -Sandbox $sb -Answers @(
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Принять новое последнего прогона в эталон' },
+                @{ Kind = 'confirm'; Header = 'Принять новое прогона'; Yes = $true },
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
+            Check-Common $m
+            Check (Test-Path -LiteralPath (Join-Path $runDir 'accepted.txt')) 'прогон не отмечен принятым (accepted.txt)'
+            $norm = Join-Path $sb 'baseline\erp_temp_test\selfcheck.norm.txt'
+            Check ((Test-Path -LiteralPath $norm) -and ([System.IO.File]::ReadAllText($norm, $utf8) -match 'не компилируется')) 'новая ошибка не попала в эталон самопроверки'
+            $menus = @($m.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Гейт расширений') })
+            Check ($menus.Count -eq 2) ("меню показано {0} раз, ждали 2" -f $menus.Count)
+            if ($menus.Count -eq 2) {
+                Check ($menus[0].Contains('Принять новое последнего прогона')) 'в первом меню нет пункта принятия'
+                Check (-not $menus[1].Contains('Принять новое последнего прогона')) 'после принятия пункт остался в меню'
+            }
+        }
+    },
+    @{
+        Name = 'gate-site-config'
+        Text = 'настройки площадки из config.site.psd1: ключа нет в config.psd1 - берётся из поставки (R4 по подрядчику)'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            [System.IO.File]::WriteAllLines((Join-Path $sb 'config.site.psd1'), [string[]]@('@{', "    ContractorExtensions = @('Доработки')", '}'), $utf8Bom)
+            $fake = @{ selfcheck = @(@{ tasks = (New-ExchangeResultTasks 'ok') }); dumps = @{ 'Доработки' = @{ 'CommonModules/МенеджерОбменаЧерезУниверсальныйФормат/Ext/Module.bsl' = $rulesModule } } }
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
+            Check-Common $r
+            if ($r.RunDir) {
+                $lines = @([System.IO.File]::ReadAllLines((Join-Path $r.RunDir 'exchange-rules.txt'), $utf8))
+                Check (@($lines | Where-Object { $_.StartsWith('[ВНИМАНИЕ] R4 ') }).Count -gt 0) 'R4 не сработал: ContractorExtensions из config.site.psd1 не подхватился'
+                Check ([System.IO.File]::ReadAllText((Join-Path $r.RunDir 'run.log'), $utf8) -match 'config\.site\.psd1: ContractorExtensions') 'в run.log нет строки о настройках площадки'
+            }
+        }
+    },
+    @{
         Name = 'gate-metrics-slow'
         Text = 'время ключевых операций: проведение стало в 9 раз дольше истории - жёлтый; замер не попадает в снимки'
         Run = {

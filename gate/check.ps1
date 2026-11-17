@@ -16,7 +16,7 @@ foreach ($name in @('run.ps1', 'report.ps1', 'deploy.ps1', 'nightly.ps1', 'ui.ps
         Write-Host ("       строка {0}: {1}" -f $item.Extent.StartLineNumber, $item.Message)
     }
 }
-foreach ($name in @('config.psd1', 'config.example.psd1')) {
+foreach ($name in @('config.psd1', 'config.example.psd1', 'config.site.psd1')) {
     $path = Join-Path $PSScriptRoot $name
     if (-not (Test-Path -LiteralPath $path)) { continue }
     try { $null = Import-PowerShellDataFile -LiteralPath $path; Write-Host ("[OK]   {0}" -f $name) -ForegroundColor Green }

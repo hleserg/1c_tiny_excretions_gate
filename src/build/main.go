@@ -582,6 +582,15 @@ func buildGate() []entry {
 	}
 	config := readText(filepath.Join(gate, "config.example.psd1"))
 	files = append(files, entry{"ci/config.example.psd1", windowsBytes(config, true)})
+	// Настройки площадки: config/site.psd1 приватного репозитория -> ci/config.site.psd1. Гейт берёт из него
+	// ключи, которых нет в config.psd1, так что заводские настройки едут с поставкой, а не руками.
+	if private != "" {
+		p, _ := filepath.Abs(private)
+		site := filepath.Join(p, "config", "site.psd1")
+		if _, err := os.Stat(site); err == nil {
+			files = append(files, entry{"ci/config.site.psd1", windowsBytes(readText(site), true)})
+		}
+	}
 	manual := replaceCounted(readText(filepath.Join(gate, "readme.txt")), "@@ВЕРСИЯ@@", stamp, strings.Count(readText(filepath.Join(gate, "readme.txt")), "@@ВЕРСИЯ@@"), "readme.txt")
 	files = append(files, entry{"ci/readme.txt", windowsBytes(manual, true)})
 	files = append(files, entry{"ci/ci.exe", goBuild(filepath.Join(root, "src", "ci-tui"), filepath.Join(outDir, "ci.exe"), "-s -w -X main.version="+stamp)})

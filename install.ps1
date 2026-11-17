@@ -104,6 +104,20 @@ foreach ($item in @(Get-ChildItem -LiteralPath $source -Recurse -File)) {
 foreach ($dir in @('tools', 'inbox', 'secrets')) { New-Item -ItemType Directory -Path (Join-Path $Target $dir) -Force | Out-Null }
 Write-Host ("Скопировано файлов: {0} -> {1}" -f $copied, $Target) -ForegroundColor Green
 
+# Настройки площадки (config.site.psd1, есть в заводской сборке): гейт берёт из них ключи, которых нет в config.psd1.
+$sitePath = Join-Path $Target 'config.site.psd1'
+if (Test-Path -LiteralPath (Join-Path $source 'config.site.psd1')) {
+    $site = Import-PowerShellDataFile -LiteralPath $sitePath
+    Write-Host ("Настройки площадки (config.site.psd1): {0}" -f (@($site.Keys | Sort-Object) -join ', ')) -ForegroundColor Green
+    if (Test-Path -LiteralPath (Join-Path $Target 'config.psd1')) {
+        $own = Import-PowerShellDataFile -LiteralPath (Join-Path $Target 'config.psd1')
+        $shadowed = @($site.Keys | Where-Object { $own.ContainsKey($_) } | Sort-Object)
+        if ($shadowed.Count -gt 0) {
+            Write-Host ("  В config.psd1 уже есть {0} - действует значение оттуда. Чтобы брать из поставки, удали ключ из config.psd1." -f ($shadowed -join ', ')) -ForegroundColor Yellow
+        }
+    }
+}
+
 # 2. Настройки: только при первой установке.
 $configPath = Join-Path $Target 'config.psd1'
 $configFresh = $false
