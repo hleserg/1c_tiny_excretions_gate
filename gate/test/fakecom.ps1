@@ -20,6 +20,7 @@ deploy.ps1 берёт его вместо настоящего, когда за�
     },
     "sessions": [ { "id": 1, "base": "<имя базы>", "app": "1CV8C", "user": "...", "host": "..." } ],
     "failConnect": [ "<имя базы>" ]      - внешнее соединение к этой базе падает
+    "lockedConnect": [ "<имя базы>" ]    - в базе чужая блокировка начала сеансов (техработы)
   }
 
 Что умеет - то, чем пользуется deploy.ps1:
@@ -93,6 +94,7 @@ function New-FakeComConnector {
         param($Line)
         $base = [regex]::Match([string]$Line, 'Ref="([^"]+)"').Groups[1].Value
         $state = Read-FakeComState $this.StateFile
+        if ((Get-FakeComList $state 'lockedConnect') -contains $base) { throw "Начало сеанса с информационной базой запрещено. До 03:00 проводятся технологические работы" }
         if ((Get-FakeComList $state 'failConnect') -contains $base) { throw ("Ошибка при выполнении операции с информационной базой (подставной COM: соединение с {0} не разрешено сценарием)" -f $base) }
         if ($null -eq (Get-FakeComBase $state $base)) { throw ("Информационная база не обнаружена: {0}" -f $base) }
         return (New-FakeComConnection $this.StateFile $base)

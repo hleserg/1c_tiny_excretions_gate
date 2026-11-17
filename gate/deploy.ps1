@@ -688,7 +688,17 @@ function Get-ExtensionStates {
         else { $connector = New-Object -ComObject V83.COMConnector }
         $connection = $connector.Connect($Line)
         try {
-            $list = $connection.ConfigurationExtensions.Get($connection.NewObject('Structure'), $connection.ConfigurationExtensionsSource.Database)
+            # Расширения из базы данных; не вышло (источник не виден через COM) - Получить() без параметров.
+            # Каждый шаг проверяется: «пусто» говорит, на каком вызове, а не «null-valued expression».
+            if ($null -eq $connection) { throw 'внешнее соединение не вернуло объект соединения' }
+            $manager = $connection.ConfigurationExtensions
+            if ($null -eq $manager) { throw 'РасширенияКонфигурации недоступны через внешнее соединение (права пользователя на администрирование расширений?)' }
+            $list = $null
+            $source = $null
+            try { $source = $connection.ConfigurationExtensionsSource.Database } catch { $source = $null }
+            if ($null -ne $source) { try { $list = $manager.Get($connection.NewObject('Structure'), $source) } catch { $list = $null } }
+            if ($null -eq $list) { $list = $manager.Get() }
+            if ($null -eq $list) { throw 'РасширенияКонфигурации.Получить() вернул пусто' }
             for ($i = 0; $i -lt [int]$list.Count(); $i++) {
                 $extension = $list.Get($i)
                 $hash = ''
@@ -714,6 +724,28 @@ function Get-ExtensionStates {
     }
     Write-RunLog ("Расширения {0} через COM: {1}" -f $BaseName, (@($call.Result.Keys | Sort-Object) -join ', '))
     return [pscustomobject]@{ Ok = $true; Error = ''; Items = $call.Result }
+}
+
+function Test-ForeignSessionLock {
+    # Ошибка внешнего соединения - это чужая блокировка начала сеансов (техработы админов, бэкап)? Свою
+    # блокировку deploy ставит с текстом «Идёт обновление расширений» - её не считаем: с ней разберётся сам deploy.
+    param([string]$Message)
+    if (-not $Message) { return $false }
+    if ($Message -notmatch 'Начало сеанса с информационной базой запрещено|начало сеансов.*запрещено') { return $false }
+    return ($Message -notmatch 'Идёт обновление расширений')
+}
+
+function Assert-ProdOpen {
+    # Рабочая закрыта чужой блокировкой - дальше не идём: обновить её нельзя, а следующие соединения
+    # к ней только ждут таймаута.
+    param($States)
+    if ($States.Ok -or -not (Test-ForeignSessionLock $States.Error)) { return }
+    $text = ([string]$States.Error -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 2) -join ' '
+    Write-Line ("  {0} закрыта для входа: {1}" -f $script:ProdBase, $text) 'Red'
+    Write-Line '  Блокировку начала сеансов поставил не гейт (техработы, бэкап). Deploy её не снимает и в рабочую сейчас не пойдёт: запусти, когда её снимут.' 'Red'
+    Write-RunLog ("Рабочая закрыта чужой блокировкой: {0}" -f $text)
+    # Не авария, а состояние рабочей: выходим без «Остановлено», блокировок deploy к этому моменту не ставил.
+    exit 2
 }
 
 function Get-MirrorHash {
@@ -914,46 +946,58 @@ function Get-ExtensionData {
 function Export-Processings {
     # Внешние обработки и отчёты базы (справочник ДополнительныеОтчетыИОбработки, не помеченные на удаление)
     # в файлы папки Dir. Возвращает список: имя объекта, наименование, версия, файл, хеш файла.
+    # Внешнее соединение - в фоне, со строкой хода и таймаутом (ComTimeoutSec, втрое: файлов бывает много):
+    # раньше синхронный вызов вешал экран, и до кнопки остановки скрипт не доходил.
     param([string]$BaseName, [string]$User, [string]$Password, [string]$Dir)
     New-Item -ItemType Directory -Path $Dir -Force | Out-Null
-    $items = New-Object System.Collections.Generic.List[object]
-    $connector = $null
-    $connection = $null
-    try {
-        $connector = New-V8Connector
-        $connection = $connector.Connect((Get-ComConnectionLine $BaseName $User $Password))
-        $query = $connection.NewObject('Query')
-        $query.Text = 'ВЫБРАТЬ Спр.Наименование КАК Title, Спр.ИмяОбъекта КАК ObjName, Спр.Версия КАК Version, ' +
-            'ПРЕДСТАВЛЕНИЕ(Спр.Вид) КАК Kind, Спр.ХранилищеОбработки КАК Storage ' +
-            'ИЗ Справочник.ДополнительныеОтчетыИОбработки КАК Спр ГДЕ НЕ Спр.ПометкаУдаления'
-        $selection = $query.Execute().Select()
-        $sha = [System.Security.Cryptography.SHA256]::Create()
-        while ($selection.Next()) {
-            $objName = [string]$selection.ObjName
-            if (-not $objName) { continue }
-            $extension = '.epf'
-            if ([string]$selection.Kind -match 'тч[её]т') { $extension = '.erf' }
-            $file = Join-Path $Dir ($objName + $extension)
-            $data = $selection.Storage.Get()
-            if ($null -eq $data) { continue }
-            $data.Write($file)
-            if (-not (Test-Path -LiteralPath $file)) { continue }
-            $hash = [System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($file)))
-            $items.Add([pscustomobject]@{ ObjName = $objName; Title = [string]$selection.Title; Version = [string]$selection.Version; File = $file; Hash = $hash })
+    $reader = {
+        param([string]$Line, [string]$Dir, [string]$FakeScript, [string]$FakeFile)
+        if ($FakeScript) { . $FakeScript; $connector = New-FakeComConnector $FakeFile }
+        else { $connector = New-Object -ComObject V83.COMConnector }
+        $connection = $null
+        $found = New-Object System.Collections.Generic.List[object]
+        try {
+            $connection = $connector.Connect($Line)
+            $query = $connection.NewObject('Query')
+            $query.Text = 'ВЫБРАТЬ Спр.Наименование КАК Title, Спр.ИмяОбъекта КАК ObjName, Спр.Версия КАК Version, ' +
+                'ПРЕДСТАВЛЕНИЕ(Спр.Вид) КАК Kind, Спр.ХранилищеОбработки КАК Storage ' +
+                'ИЗ Справочник.ДополнительныеОтчетыИОбработки КАК Спр ГДЕ НЕ Спр.ПометкаУдаления'
+            $selection = $query.Execute().Select()
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            while ($selection.Next()) {
+                $objName = [string]$selection.ObjName
+                if (-not $objName) { continue }
+                $extension = '.epf'
+                if ([string]$selection.Kind -match 'тч[её]т') { $extension = '.erf' }
+                $file = Join-Path $Dir ($objName + $extension)
+                $data = $selection.Storage.Get()
+                if ($null -eq $data) { continue }
+                $data.Write($file)
+                if (-not (Test-Path -LiteralPath $file)) { continue }
+                $hash = [System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($file)))
+                $found.Add([pscustomobject]@{ ObjName = $objName; Title = [string]$selection.Title; Version = [string]$selection.Version; File = $file; Hash = $hash })
+            }
         }
-        return [pscustomobject]@{ Ok = $true; Error = ''; Items = $items.ToArray() }
+        finally {
+            foreach ($comObject in @($connection, $connector)) {
+                if ($null -ne $comObject -and [Runtime.InteropServices.Marshal]::IsComObject($comObject)) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($comObject) }
+            }
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
+        }
+        return , @($found.ToArray())
     }
-    catch {
-        $message = $_.Exception.Message
-        if ($Password) { $message = $message.Replace($Password, '***') }
-        return [pscustomobject]@{ Ok = $false; Error = $message; Items = $items.ToArray() }
+    $call = Invoke-UiBackground -Script $reader -Arguments @((Get-ComConnectionLine $BaseName $User $Password), $Dir, $script:FakeComScript, [string]$env:CI_FAKE_COM) `
+        -Title ("Выгрузить обработки {0}" -f $BaseName) -TimeoutSec ($comTimeoutSec * 3)
+    $message = $call.Error
+    if ($Password -and $message) { $message = $message.Replace($Password, '***') }
+    if (-not $call.Ok) {
+        if (-not $message) { $message = 'внешнее соединение ничего не вернуло' }
+        Write-RunLog ("Обработки {0} через COM не выгружены: {1}" -f $BaseName, $message)
+        return [pscustomobject]@{ Ok = $false; Error = $message; Items = @() }
     }
-    finally {
-        if ($null -ne $connection) { try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($connection) } catch { } }
-        if ($null -ne $connector) { try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($connector) } catch { } }
-        [GC]::Collect()
-        [GC]::WaitForPendingFinalizers()
-    }
+    $items = @($call.Result | Where-Object { $null -ne $_ })
+    return [pscustomobject]@{ Ok = $true; Error = ''; Items = $items }
 }
 
 function Invoke-ProdClient {
@@ -1141,6 +1185,7 @@ if ($PullExtensions -or $PullProcessings) {
         Write-Host '  Читаю расширения обеих баз через внешнее соединение (только чтение).' -ForegroundColor DarkGray
         $tempStates = Get-ExtensionStates -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
         $prodStates = Get-ExtensionStates -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+        Assert-ProdOpen $prodStates
         if (-not $prodStates.Ok) { throw ("расширения {0} не прочитал: {1}" -f $script:ProdBase, $prodStates.Error) }
         if (-not $tempStates.Ok) { Write-Line ("  {0} не прочитал ({1}): покажу все расширения рабочей" -f $script:TempBase, $tempStates.Error) 'Yellow' }
         $differ = New-Object System.Collections.Generic.List[object]
@@ -1452,6 +1497,7 @@ else {
     $tempStates = Get-ExtensionStates -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
     $prodStates = Get-ExtensionStates -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
     if (-not $tempStates.Ok) { Write-Line ("  {0}: не прочитал - {1}" -f $script:TempBase, $tempStates.Error) 'Yellow' }
+    Assert-ProdOpen $prodStates
     if (-not $prodStates.Ok) { Write-Line ("  {0}: не прочитал - {1}" -f $script:ProdBase, $prodStates.Error) 'Yellow' }
 
     $extensions = New-Object System.Collections.Generic.List[object]

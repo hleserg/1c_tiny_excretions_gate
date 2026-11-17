@@ -1251,6 +1251,21 @@ $tests = @(
         }
     },
     @{
+        Name = 'deploy-prod-locked-foreign'
+        Text = 'в рабочей чужая блокировка начала сеансов (техработы): deploy сразу останавливается с понятной причиной, обработки не выгружает'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-ComState
+            $com['lockedConnect'] = @('erp_base')
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-StatusOnly' -Com $com
+            Check-DeployCommon $r -LocksExpected $false
+            Check ($r.ExitCode -ne 0) 'deploy не остановился, хотя рабочая закрыта'
+            Check (@($r.Output | Where-Object { $_ -match 'erp_base закрыта для входа' }).Count -gt 0) 'нет понятной причины остановки'
+            Check (@($r.Output | Where-Object { $_ -match 'ВНЕШНИЕ ОБРАБОТКИ' }).Count -eq 0) 'после закрытой рабочей deploy пошёл выгружать обработки'
+        }
+    },
+    @{
         Name = 'settings-value-password'
         Text = 'настройки: значение сохраняется, пароль - файлом DPAPI, не целое число не сохраняется, умолчания дописаны'
         Run = {
