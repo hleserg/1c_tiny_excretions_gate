@@ -7,7 +7,7 @@
 // Конфигуратор (первый ключ DESIGNER): правила designer - первое подходящее (все слова match есть
 // в командной строке; times - сколько раз правило срабатывает) задаёт код возврата, текст лога /Out
 // и задержку. /DumpCfg и /DumpConfigToFiles создают файл и каталог, /LoadExternalDataProcessorOrReportFromFiles -
-// файл обработки, если код возврата 0.
+// файл обработки, /DumpExternalDataProcessorOrReportToFiles - корневой XML и модуль объекта, если код возврата 0.
 //
 // Тонкий клиент (ENTERPRISE): режим - первое слово /C. canary, selfcheck, regepf, unregepf, kbarticle
 // отвечают файлами так же, как настоящие обработки. Список ответов режима - по вызовам: первый вызов
@@ -216,6 +216,15 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 		writeUTF8(filepath.Join(dir, "Configuration.xml"), "<MetaDataObject><Configuration><Properties><Name>"+valueAfter(args, "-Extension")+"</Name></Properties></Configuration></MetaDataObject>")
 	}
 	for i, a := range args {
+		// Выгрузка внешней обработки в файлы: корневой XML и модуль объекта - текст самого файла обработки
+		// (в тестах это код на встроенном языке), чтобы отчёт об изменениях видел разницу по процедурам.
+		if strings.EqualFold(a, "/DumpExternalDataProcessorOrReportToFiles") && i+2 < len(args) {
+			root := args[i+1]
+			name := strings.TrimSuffix(filepath.Base(root), filepath.Ext(root))
+			data, _ := os.ReadFile(args[i+2])
+			writeUTF8(root, "<MetaDataObject><ExternalDataProcessor><Properties><Name>"+name+"</Name></Properties></ExternalDataProcessor></MetaDataObject>")
+			writeUTF8(filepath.Join(filepath.Dir(root), name, "Ext", "ObjectModule.bsl"), string(trimBOM(data)))
+		}
 		if strings.EqualFold(a, "/LoadExternalDataProcessorOrReportFromFiles") && i+2 < len(args) {
 			_ = os.MkdirAll(filepath.Dir(args[i+2]), 0o755)
 			_ = os.WriteFile(args[i+2], []byte("FAKEEPF "+filepath.Base(args[i+2])), 0o644)

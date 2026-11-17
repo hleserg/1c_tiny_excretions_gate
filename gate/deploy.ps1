@@ -290,7 +290,7 @@ function Connect-ClusterAgent {
     $agentAddress = [string](Get-Setting $cfg 'ClusterAgent' '')
     if (-not $agentAddress) { $agentAddress = 'tcp://' + ($script:Server -split ':')[0] }
     try {
-        $link.Connector = New-Object -ComObject V83.COMConnector
+        $link.Connector = New-V8Connector
         $link.Agent = $link.Connector.ConnectAgent($agentAddress)
     }
     catch {
@@ -482,6 +482,15 @@ $binDir = [string](Get-Setting $cfg 'V8Bin' '')
 $script:V8 = Join-Path $binDir '1cv8.exe'
 $script:V8C = Join-Path $binDir '1cv8c.exe'
 if (-not (Test-Path -LiteralPath $script:V8)) { throw "Не нашёл конфигуратор: $($script:V8)" }
+# Подставной COM - только для тестов без 1С и только с подставной 1С: с настоящим 1cv8.exe скрипт отказывается,
+# иначе подставной COM «не видел» бы сеансов и блокировок, а конфигуратор работал бы с настоящей рабочей базой.
+$script:FakeComScript = ''
+if ($env:CI_FAKE_COM) {
+    $v8Info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($script:V8)
+    if ($v8Info.CompanyName -or $v8Info.ProductName) { throw ("Задан CI_FAKE_COM (подставной COM для тестов), а {0} - настоящая 1С. Убери переменную CI_FAKE_COM." -f $script:V8) }
+    $script:FakeComScript = Join-Path $Root 'test\fakecom.ps1'
+    . $script:FakeComScript
+}
 
 $script:TempUser = [string](Get-Setting $cfg 'AdminUser' '')
 $script:TempPassword = Get-PlainPassword ([string](Get-Setting $cfg 'AdminPassFile' ''))
@@ -651,6 +660,12 @@ function Invoke-UiBackground {
     return [pscustomobject]@{ Ok = (-not $errorText); Error = $errorText; Result = $result }
 }
 
+function New-V8Connector {
+    # V83.COMConnector. В тестах без 1С (переменная CI_FAKE_COM - файл сценария) - подставной из test\fakecom.ps1.
+    if ($script:FakeComScript) { return New-FakeComConnector $env:CI_FAKE_COM }
+    return New-Object -ComObject V83.COMConnector
+}
+
 function Get-ComConnectionLine {
     param([string]$BaseName, [string]$User, [string]$Password)
     $line = 'Srvr="{0}";Ref="{1}";' -f $script:Server, $BaseName
@@ -665,9 +680,11 @@ function Get-ExtensionStates {
     # ComTimeoutSec: первое внешнее соединение к большой базе бывает долгим. Не получилось - Ok = $false.
     param([string]$BaseName, [string]$User, [string]$Password)
     $reader = {
-        param([string]$Line)
+        # FakeScript и FakeFile - подставной COM тестов (см. New-V8Connector): в фоновом потоке функций скрипта нет.
+        param([string]$Line, [string]$FakeScript, [string]$FakeFile)
         $items = @{}
-        $connector = New-Object -ComObject V83.COMConnector
+        if ($FakeScript) { . $FakeScript; $connector = New-FakeComConnector $FakeFile }
+        else { $connector = New-Object -ComObject V83.COMConnector }
         $connection = $connector.Connect($Line)
         try {
             $list = $connection.ConfigurationExtensions.Get($connection.NewObject('Structure'), $connection.ConfigurationExtensionsSource.Database)
@@ -679,12 +696,13 @@ function Get-ExtensionStates {
             }
         }
         finally {
-            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($connection)
-            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($connector)
+            foreach ($comObject in @($connection, $connector)) {
+                if ($null -ne $comObject -and [Runtime.InteropServices.Marshal]::IsComObject($comObject)) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($comObject) }
+            }
         }
         return $items
     }
-    $call = Invoke-UiBackground -Script $reader -Arguments @((Get-ComConnectionLine $BaseName $User $Password)) `
+    $call = Invoke-UiBackground -Script $reader -Arguments @((Get-ComConnectionLine $BaseName $User $Password), $script:FakeComScript, [string]$env:CI_FAKE_COM) `
         -Title ("Прочитать расширения {0}" -f $BaseName) -TimeoutSec $comTimeoutSec
     $message = $call.Error
     if ($Password -and $message) { $message = $message.Replace($Password, '***') }
@@ -869,11 +887,8 @@ function Get-ExtensionData {
     $connector = $null
     $connection = $null
     try {
-        $connector = New-Object -ComObject V83.COMConnector
-        $line = 'Srvr="{0}";Ref="{1}";' -f $script:Server, $BaseName
-        if ($User) { $line += 'Usr="{0}";' -f $User.Replace('"', '""') }
-        if ($Password) { $line += 'Pwd="{0}";' -f $Password.Replace('"', '""') }
-        $connection = $connector.Connect($line)
+        $connector = New-V8Connector
+        $connection = $connector.Connect((Get-ComConnectionLine $BaseName $User $Password))
         $list = $connection.ConfigurationExtensions.Get($connection.NewObject('Structure'), $connection.ConfigurationExtensionsSource.Database)
         for ($i = 0; $i -lt [int]$list.Count(); $i++) {
             $extension = $list.Get($i)
@@ -904,11 +919,8 @@ function Export-Processings {
     $connector = $null
     $connection = $null
     try {
-        $connector = New-Object -ComObject V83.COMConnector
-        $line = 'Srvr="{0}";Ref="{1}";' -f $script:Server, $BaseName
-        if ($User) { $line += 'Usr="{0}";' -f $User.Replace('"', '""') }
-        if ($Password) { $line += 'Pwd="{0}";' -f $Password.Replace('"', '""') }
-        $connection = $connector.Connect($line)
+        $connector = New-V8Connector
+        $connection = $connector.Connect((Get-ComConnectionLine $BaseName $User $Password))
         $query = $connection.NewObject('Query')
         $query.Text = 'ВЫБРАТЬ Спр.Наименование КАК Title, Спр.ИмяОбъекта КАК ObjName, Спр.Версия КАК Version, ' +
             'ПРЕДСТАВЛЕНИЕ(Спр.Вид) КАК Kind, Спр.ХранилищеОбработки КАК Storage ' +
