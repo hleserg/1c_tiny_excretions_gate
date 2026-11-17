@@ -658,6 +658,8 @@ $tests = @(
             }
             Start-Sleep -Seconds 2
             Remove-Item -LiteralPath (Join-Path $sb 'fake\fake1c-state.json') -Force -ErrorAction SilentlyContinue
+            # Комплект после зелёного прогона ушёл из inbox: кладём его снова.
+            $file = Add-InboxFile $sb $cfeName
             $fake = @{ selfcheck = @(@{ tasks = $coverageTasks; fingerprint = 'после' }, @{ tasks = $coverageTasks; fingerprint = 'после2' }); dumps = @{ 'Адаптация' = $coverageDumpSecond } }
             $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake $fake
             Check-Common $r; Check-Verdict $r 'YELLOW' 2
