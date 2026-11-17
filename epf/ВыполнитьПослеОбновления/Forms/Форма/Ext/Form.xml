@@ -21,16 +21,6 @@
 			<CommandName>Form.Command.ПроверитьПередОбновлением</CommandName>
 			<ExtendedTooltip name="ПроверитьПередОбновлениемРасширеннаяПодсказка" id="2"/>
 		</Button>
-		<Button name="СоздатьНастройкиВРегистре" id="3">
-			<Type>UsualButton</Type>
-			<CommandName>Form.Command.СоздатьНастройкиВРегистре</CommandName>
-			<ExtendedTooltip name="СоздатьНастройкиВРегистреРасширеннаяПодсказка" id="4"/>
-		</Button>
-		<Button name="ДописатьРасходЗаказаннойНоменклатуры" id="5">
-			<Type>UsualButton</Type>
-			<CommandName>Form.Command.ДописатьРасходЗаказаннойНоменклатуры</CommandName>
-			<ExtendedTooltip name="ДописатьРасходЗаказаннойНоменклатурыРасширеннаяПодсказка" id="6"/>
-		</Button>
 		<InputField name="НазваниеСтатьиБазыЗнаний" id="7">
 			<DataPath>НазваниеСтатьиБазыЗнаний</DataPath>
 			<AutoMaxWidth>false</AutoMaxWidth>
@@ -317,15 +307,6 @@
 			</Title>
 			<Action>ПроверитьПередОбновлением</Action>
 		</Command>
-		<Command name="СоздатьНастройкиВРегистре" id="2">
-			<Title>
-				<v8:item>
-					<v8:lang>ru</v8:lang>
-					<v8:content>Создать настройки в регистре</v8:content>
-				</v8:item>
-			</Title>
-			<Action>СоздатьНастройкиВРегистре</Action>
-		</Command>
 		<Command name="ВыполнитьТестирование" id="3">
 			<Title>
 				<v8:item>
@@ -352,15 +333,6 @@
 				</v8:item>
 			</Title>
 			<Action>СоздатьСтатьюБазыЗнаний</Action>
-		</Command>
-		<Command name="ДописатьРасходЗаказаннойНоменклатуры" id="6">
-			<Title>
-				<v8:item>
-					<v8:lang>ru</v8:lang>
-					<v8:content>Заказанная номенклатура: дописать расход по приобретениям (пишет в базу)</v8:content>
-				</v8:item>
-			</Title>
-			<Action>ДописатьРасходЗаказаннойНоменклатуры</Action>
 		</Command>
 	</Commands>
 </Form>
