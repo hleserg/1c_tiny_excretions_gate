@@ -50,7 +50,7 @@ func fail(format string, args ...any) {
 func main() {
 	flag.StringVar(&root, "root", ".", "корень репозитория")
 	flag.StringVar(&private, "private", "", "папка приватного репозитория с пакетами своей базы (packages/<Имя>)")
-	flag.StringVar(&outDir, "out", "dist", "куда класть архивы")
+	flag.StringVar(&outDir, "out", "dist", "куда класть архивы (относительный путь - от корня репозитория)")
 	flag.StringVar(&stamp, "stamp", "", "штамп версии ГГГГММДД.ЧЧММСС (пусто - текущее время UTC+3)")
 	flag.BoolVar(&skipExe, "skip-exe", false, "не собирать ci.exe и fake1c.exe (взять готовые из -out)")
 	flag.BoolVar(&check, "check", false, "только собрать обработку в памяти и проверить")

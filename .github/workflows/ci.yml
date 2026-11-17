@@ -64,7 +64,7 @@ jobs:
           $stamp = ''
           if ('${{ github.ref_type }}' -eq 'tag') { $stamp = '${{ github.ref_name }}'.TrimStart('v') }
           Push-Location src/build
-          if ($stamp) { go run . -root ../.. -out ../../dist -stamp $stamp } else { go run . -root ../.. -out ../../dist }
+          if ($stamp) { go run . -root ../.. -out dist -stamp $stamp } else { go run . -root ../.. -out dist }
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Pop-Location
           Remove-Item dist/*.exe
