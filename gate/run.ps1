@@ -1749,20 +1749,31 @@ function Invoke-MetricsStep {
 
 #endregion
 
+function Get-MaskedSnapshotLine {
+    # Строка снимка без того, что меняется само при каждом прогоне (см. SnapshotMasks).
+    param([string]$Line, [string[]]$Masks)
+    foreach ($mask in $Masks) { $Line = [regex]::Replace($Line, $mask, '*') }
+    return $Line
+}
+
 function Compare-SelfCheckSnapshots {
     # Снимки прогона против эталонных. Изменился снимок с тем же ключом - это замечание: тот же объект
     # выгрузился по-другому. Новый ключ или пропавший - только сведения: объект для снимка выбирается
     # в базе заново («последний проведённый документ») и может смениться сам по себе.
     # Разница по изменённым снимкам пишется в DiffPath: строки, которые ушли («-») и появились («+»).
+    # SnapshotMasks - регулярные выражения: что они находят в строке снимка, заменяется на «*» с обеих сторон
+    # (дата создания сообщения обмена, идентификаторы, которые 1С создаёт заново при каждом проведении).
     param($Current, [string]$ReferenceFile, [string]$DiffPath)
     $reference = Read-SelfCheckSnapshots $ReferenceFile
+    # По умолчанию - поля заголовка сообщения обмена: XML-снимок, который не разобрался (обрезан), ими не отличается.
+    $masks = @(Get-Setting $cfg 'SnapshotMasks' @('(?<=<(?:\w+:)?(?:CreationDate|MessageNo|ReceivedNo)>)[^<]*') | Where-Object { $_ })
     $changed = New-Object System.Collections.Generic.List[string]
     $added = New-Object System.Collections.Generic.List[string]
     $diff = New-Object System.Collections.Generic.List[string]
     foreach ($key in @($Current.Keys | Sort-Object)) {
         if (-not $reference.ContainsKey($key)) { $added.Add($key); continue }
-        $was = @($reference[$key])
-        $now = @($Current[$key])
+        $was = @(@($reference[$key]) | ForEach-Object { Get-MaskedSnapshotLine -Line ([string]$_) -Masks $masks })
+        $now = @(@($Current[$key]) | ForEach-Object { Get-MaskedSnapshotLine -Line ([string]$_) -Masks $masks })
         if (($was -join "`n") -ceq ($now -join "`n")) { continue }
         $changed.Add($key)
         # Разница по строкам с учётом повторов: сколько раз строка была и сколько стала.
@@ -4776,6 +4787,7 @@ elseif ($anyTouched -gt 0) {
     $actionable = @($plan | Where-Object { @('delete', 'restore', 'epfrestore', 'epfremove') -contains $_.Action })
     $aftermath = New-Object System.Collections.Generic.List[string]
     $decision = 'kept'
+    $acceptAfterDecision = $false
 
     Write-Host ''
     if ($actionable.Count -eq 0) {
@@ -4803,9 +4815,15 @@ elseif ($anyTouched -gt 0) {
             $canAsk = Test-UiCanAsk
             $answer = ''
             if ($canAsk) {
-                $keep = Confirm-Ui -Question ("Оставить комплект в {0}?" -f $baseKey) -Yes 'Оставить' -No 'Откатить'
-                if ($keep -eq $true) { $answer = '1' }
-                elseif ($keep -eq $false) { $answer = '2' }
+                # В ci.exe - кнопками внизу: чтобы решить, итог прогона над вопросом должен быть виден.
+                $acceptLabel = 'Оставить и принять новое в эталон'
+                if ($verdict -eq 'RED') { $acceptLabel = 'Оставить и принять новое в эталон (прогон КРАСНЫЙ)' }
+                $picked = Read-UiChoice -Header ("Комплект в {0}: оставить или откатить?" -f $baseKey) -Keys @('1', '2', '3') `
+                    -Labels @('Оставить', $acceptLabel, 'Откатить') -DefaultKey '1' -Dock `
+                    -Notes @('Новое этого прогона - в report.txt и *.new.txt. «Принять в эталон» - оно станет известным и больше не будет красить прогоны.')
+                if ($picked -eq '1') { $answer = '1' }
+                elseif ($picked -eq '2') { $answer = '1'; $acceptAfterDecision = $true }
+                elseif ($picked -eq '3') { $answer = '2' }
             }
             if ($answer -eq '2') {
                 $rollback = $true
@@ -4849,13 +4867,24 @@ elseif ($anyTouched -gt 0) {
             foreach ($line in $outcome.Lines) { $aftermath.Add($line) }
         }
     }
+    if ($acceptAfterDecision -and $decision -eq 'kept') {
+        try {
+            Invoke-AcceptBaseline -RunPath $RunDir
+            $aftermath.Add('Новое этого прогона принято в эталон.')
+            Write-Host 'Новое этого прогона принято в эталон.' -ForegroundColor Green
+        }
+        catch {
+            $aftermath.Add(('В эталон не принято: {0}' -f $_.Exception.Message))
+            Write-Host ('В эталон не принято: {0}' -f $_.Exception.Message) -ForegroundColor Red
+        }
+    }
     Write-RunLog ("Решение по комплекту после вердикта: {0}" -f $decision)
     Write-RunSummary -KitDecision $decision -Aftermath $aftermath.ToArray()
     Invoke-RunReport -Quiet $true
 }
 
 # После отката принимать замечания прогона незачем: в базе стоит уже не этот комплект.
-if ($decision -ne 'rolledBack' -and $decision -ne 'rollbackFailed' -and $verdict -ne 'GREEN') {
+if ($decision -ne 'rolledBack' -and $decision -ne 'rollbackFailed' -and $verdict -ne 'GREEN' -and -not (Test-Path -LiteralPath (Join-Path $RunDir 'accepted.txt'))) {
     if ($UiChannel) { Write-Host 'Принять новое этого прогона в эталон: Enter - в меню, пункт «Принять новое последнего прогона в эталон».' }
     else { Write-Host ("Принять новое этого прогона в эталон: .\run.cmd без ключей - пункт меню, или .\run.ps1 -AcceptBaseline `"{0}`"" -f $RunDir) }
 }

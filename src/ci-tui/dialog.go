@@ -37,6 +37,10 @@ func newDialog(ev uiEvent, width, height int) *dialog {
 			d.marks[i] = true
 		}
 	}
+	if ev.Kind == "one" && len(ev.Preselected) > 0 && ev.Preselected[0] >= 0 && ev.Preselected[0] < len(ev.Items) {
+		// Пункт, на котором стоит выбор сразу (обычно самый безопасный).
+		d.cursor = ev.Preselected[0]
+	}
 	if ev.Kind == "text" {
 		ti := textinput.New()
 		ti.Prompt = "› "
@@ -104,6 +108,15 @@ func (d *dialog) Update(msg tea.Msg) tea.Cmd {
 	switch d.ev.Kind {
 	case "one", "many":
 		n := len(d.ev.Items)
+		if d.docked() {
+			// Кнопки внизу - в ряд: ←→ и Tab двигают выбор (↑↓ листают журнал).
+			switch s {
+			case "left", "shift+tab":
+				s = "up"
+			case "right", "tab":
+				s = "down"
+			}
+		}
 		switch s {
 		case "up", "k":
 			if d.cursor > 0 {
@@ -411,7 +424,7 @@ func (d *dialog) isDanger(i int) bool {
 // docked - вопрос да/нет рисуется полосой внизу экрана, а не окном поверх: чтобы решить «оставить или
 // откатить», надо видеть итог прогона. Журнал при этом листается (↑↓ PgUp PgDn).
 func (d *dialog) docked() bool {
-	return d.ev.Kind == "confirm"
+	return d.ev.Kind == "confirm" || (d.ev.Kind == "one" && d.ev.Style == "dock")
 }
 
 // ViewDocked - полоса вопроса во всю ширину экрана.
@@ -428,13 +441,42 @@ func (d *dialog) ViewDocked(width int) string {
 		b.WriteString(styleDim.Width(inner).Render("Вопрос снимется сам, когда условие выполнится."))
 		b.WriteString("\n")
 	}
-	yes := nonEmpty(d.ev.Yes, "Да")
-	no := nonEmpty(d.ev.No, "Нет")
-	yb, nb := styleButton.Render(yes), styleButtonActive.Render(no)
-	if d.yes {
-		yb, nb = styleButtonActive.Render(yes), styleButton.Render(no)
+	var buttons []string
+	var help string
+	if d.ev.Kind == "one" {
+		for i, item := range d.ev.Items {
+			label := fmt.Sprintf("%d  %s", i+1, item)
+			if i == d.cursor {
+				buttons = append(buttons, styleButtonActive.Render(label))
+			} else {
+				buttons = append(buttons, styleButton.Render(label))
+			}
+		}
+		help = "←→ выбор · enter ок · цифра - сразу · ↑↓ PgUp PgDn журнал · esc отмена"
+	} else {
+		yes := nonEmpty(d.ev.Yes, "Да")
+		no := nonEmpty(d.ev.No, "Нет")
+		yb, nb := styleButton.Render(yes), styleButtonActive.Render(no)
+		if d.yes {
+			yb, nb = styleButtonActive.Render(yes), styleButton.Render(no)
+		}
+		buttons = []string{yb, nb}
+		help = "←→ выбор · enter ок · y/n · ↑↓ PgUp PgDn журнал · esc отмена"
 	}
-	help := styleHelp.Render("←→ выбор · enter ок · y/n · ↑↓ PgUp PgDn журнал · esc отмена")
-	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Center, yb, "  ", nb, "   ", help))
+	// Кнопки в ряд; не влезают в ширину - столбиком.
+	row := ""
+	for i, btn := range buttons {
+		if i > 0 {
+			row = lipgloss.JoinHorizontal(lipgloss.Center, row, "  ", btn)
+		} else {
+			row = btn
+		}
+	}
+	if lipgloss.Width(row) > inner {
+		row = lipgloss.JoinVertical(lipgloss.Left, buttons...)
+	}
+	b.WriteString(row)
+	b.WriteString("\n")
+	b.WriteString(wrapBlock(help, inner, styleHelp))
 	return styleDocked.Width(width - 2).Render(b.String())
 }

@@ -148,6 +148,9 @@ func (m *model) layout() {
 	if m.dialog != nil && m.dialog.docked() {
 		// Полоса вопроса встаёт на место строки подсказки.
 		bodyHeight -= lipgloss.Height(m.dialog.ViewDocked(m.width)) - 1
+	} else {
+		// Подсказка внизу переносится: каждая лишняя строка - у журнала.
+		bodyHeight -= lipgloss.Height(m.viewFooter()) - 1
 	}
 	if bodyHeight < 3 {
 		bodyHeight = 3
@@ -177,9 +180,15 @@ func (m *model) openNextDialog() {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	wasDocked := m.dialog != nil && m.dialog.docked()
+	wasFooter := lipgloss.Height(m.viewFooter())
 	next, cmd := m.update(msg)
 	nm := next.(model)
-	if nowDocked := nm.dialog != nil && nm.dialog.docked(); nowDocked != wasDocked {
+	nowDocked := nm.dialog != nil && nm.dialog.docked()
+	if nowDocked == wasDocked && !nowDocked && lipgloss.Height(nm.viewFooter()) != wasFooter {
+		nm.layout()
+		nm.refreshLog()
+	}
+	if nowDocked != wasDocked {
 		// Полоса вопроса появилась или ушла: журнал меняет высоту; на появлении - к концу журнала, к итогу.
 		nm.layout()
 		nm.refreshLog()
@@ -347,7 +356,11 @@ func (m *model) finishDialog() {
 	if d.local == "stop" {
 		if !d.result.Cancel && d.result.Yes && m.eng != nil && m.running {
 			if err := m.eng.requestStop(); err != nil {
-				m.notice = "не смог попросить остановку: " + err.Error()
+				// Просьба не дошла - ждать нечего: снять процесс можно сразу.
+				m.stopAsked = time.Now().Add(-time.Minute)
+				m.appendLine("Не смог попросить остановку: " + err.Error())
+				m.notice = "просьба остановиться не дошла: k - снять процесс (блокировки тогда снимать руками)"
+				m.refreshLog()
 			} else {
 				m.stopAsked = time.Now()
 				m.notice = "просьба остановиться отправлена: скрипт снимет блокировки и остановится"
@@ -359,6 +372,9 @@ func (m *model) finishDialog() {
 	if m.eng != nil {
 		if err := m.eng.answerQuestion(d.ev.ID, d.result); err != nil {
 			m.appendLine("Ответ не записался: " + err.Error())
+			m.appendLine("Скрипт ждёт ответа и сам не пойдёт дальше: q - остановить, k - снять процесс.")
+			m.stopAsked = time.Now().Add(-time.Minute)
+			m.notice = "ответ не дошёл до скрипта: q - остановить, k - снять процесс"
 		}
 	}
 	m.appendLine("  › " + describeAnswer(d))
@@ -577,16 +593,26 @@ func (m model) viewFooter() string {
 	default:
 		help = "enter снова в меню · q выход · ↑↓ журнал"
 	}
-	text := styleHelp.Render(" " + help)
+	// Строки подсказки не обрезаются: не влезает - переносится. Версия сборки - в правом нижнем углу.
+	width := max(20, m.width)
+	var lines []string
+	if help != "" {
+		lines = append(lines, strings.Split(wrapBlock(" "+help, width-1, styleHelp), "\n")...)
+	}
 	if m.notice != "" {
-		text += "  " + styleWarn.Render(m.notice)
+		lines = append(lines, strings.Split(wrapBlock(" "+m.notice, width-1, styleWarn), "\n")...)
 	}
-	// Версия сборки - в правом нижнем углу; не помещается - не показывается.
+	if len(lines) == 0 {
+		lines = []string{""}
+	}
 	ver := styleHelp.Render("ci " + version + " ")
-	if gap := m.width - lipgloss.Width(text) - lipgloss.Width(ver); gap >= 2 {
-		text += strings.Repeat(" ", gap) + ver
+	last := lines[len(lines)-1]
+	if gap := width - lipgloss.Width(last) - lipgloss.Width(ver); gap >= 2 {
+		lines[len(lines)-1] = last + strings.Repeat(" ", gap) + ver
+	} else {
+		lines = append(lines, strings.Repeat(" ", max(0, width-lipgloss.Width(ver)))+ver)
 	}
-	return text
+	return strings.Join(lines, "\n")
 }
 
 // ---------------------------------------------------------------------------------------------------------------

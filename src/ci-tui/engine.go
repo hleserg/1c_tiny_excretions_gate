@@ -166,6 +166,10 @@ func (e *engine) answerQuestion(id int, a answer) error {
 	if err != nil {
 		return err
 	}
+	// Папку канала могли удалить (чистка временных файлов): создаём заново - движок ждёт ответ по тому же пути.
+	if err := os.MkdirAll(e.channel, 0o755); err != nil {
+		return err
+	}
 	final := filepath.Join(e.channel, fmt.Sprintf("a-%d.json", id))
 	tmp := final + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
@@ -176,6 +180,9 @@ func (e *engine) answerQuestion(id int, a answer) error {
 
 // requestStop - просьба движку остановиться штатно (со снятием блокировок).
 func (e *engine) requestStop() error {
+	if err := os.MkdirAll(e.channel, 0o755); err != nil {
+		return err
+	}
 	return os.WriteFile(filepath.Join(e.channel, "stop"), []byte("stop"), 0o644)
 }
 

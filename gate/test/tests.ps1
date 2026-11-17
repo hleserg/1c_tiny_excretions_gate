@@ -548,10 +548,44 @@ $tests = @(
             $file = Add-InboxFile $sb $cfeName
             $fake = @{ selfcheck = @(@{ }, @{ tasks = $errorTasks; fingerprint = 'после' }) }
             $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake -Answers @(
-                @{ Kind = 'confirm'; Header = 'Оставить комплект'; Yes = $true })
+                @{ Kind = 'one'; Header = 'оставить или откатить'; Item = '^Оставить$' })
             Check-Common $r; Check-Verdict $r 'RED' 1
             Check-Step $r 'Самопроверка после загрузки' 'FAIL'
             Check ($null -ne $r.Verdict -and $r.Verdict.kitDecision -eq 'kept') 'комплект не оставлен, хотя ответили «Оставить»'
+        }
+    },
+    @{
+        Name = 'gate-kit-keep-accept'
+        Text = 'после вердикта кнопка «Оставить и принять новое в эталон»: комплект оставлен, новое в эталоне, прогон отмечен'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ }, @{ tasks = $errorTasks; fingerprint = 'после' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake -Answers @(
+                @{ Kind = 'one'; Header = 'оставить или откатить'; Item = '^Оставить и принять новое в эталон' })
+            Check-Common $r; Check-Verdict $r 'RED' 1
+            Check ($null -ne $r.Verdict -and $r.Verdict.kitDecision -eq 'kept') 'комплект не оставлен'
+            if ($r.RunDir) { Check (Test-Path -LiteralPath (Join-Path $r.RunDir 'accepted.txt')) 'прогон не отмечен принятым' }
+            $norm = Join-Path $sb 'baseline\erp_temp_test\selfcheck.norm.txt'
+            Check ((Test-Path -LiteralPath $norm) -and ([System.IO.File]::ReadAllText($norm, $utf8) -match 'не компилируется')) 'новая ошибка не попала в эталон'
+            $question = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('оставить или откатить') })
+            Check ($question.Count -eq 1 -and $question[0].Contains('"dock"')) 'вопрос после вердикта не помечен для показа внизу экрана'
+        }
+    },
+    @{
+        Name = 'gate-snapshot-masks'
+        Text = 'снимки отличаются только тем, что закрыто SnapshotMasks (идентификатор, дата в обрезанном XML): зелёный'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ SnapshotMasks = @('(?<=<(?:\w+:)?CreationDate>)[^<]*', '(?<=Идентификатор=)[0-9a-f-]{36}') }
+            $file = Add-InboxFile $sb $cfeName
+            $before = "Регистр | Период=1; Идентификатор=11111111-2222-3333-4444-555555555555`n<msg:CreationDate>2026-11-17T10:00:00</msg:CreationDate>"
+            $after = "Регистр | Период=1; Идентификатор=99999999-8888-7777-6666-555555555555`n<msg:CreationDate>2026-11-17T11:30:00</msg:CreationDate>"
+            $fake = @{ selfcheck = @(@{ tasks = (New-ExchangeTasks $before) }, @{ tasks = (New-ExchangeTasks $after); fingerprint = 'после' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            if ($r.RunDir) { Check (-not (Test-Path -LiteralPath (Join-Path $r.RunDir 'selfcheck-after.snapshots.diff.txt'))) 'есть разница снимков, хотя менялось только закрытое масками' }
         }
     },
     @{

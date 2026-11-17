@@ -125,9 +125,15 @@ function Request-UiAnswer {
 function Read-UiChoice {
     # Вопрос с вариантами-клавишами. Keys и Labels - параллельные массивы. Poll - как у Request-UiAnswer:
     # вернула непустое - это и есть ответ. Esc в ci.exe - CancelKey.
-    param([string]$Header, [string[]]$Keys, [string[]]$Labels, [scriptblock]$Poll = $null, [string]$CancelKey = '', [string[]]$Notes = @())
+    # Dock - в ci.exe кнопками внизу экрана, а не окном поверх (журнал над вопросом виден); DefaultKey - на каком
+    # варианте стоит выбор сразу.
+    param([string]$Header, [string[]]$Keys, [string[]]$Labels, [scriptblock]$Poll = $null, [string]$CancelKey = '', [string[]]$Notes = @(),
+        [switch]$Dock, [string]$DefaultKey = '')
     if ($script:UiChannelDir) {
-        $answer = Request-UiAnswer -Question @{ kind = 'one'; header = $Header; items = @($Labels); notes = @($Notes) } -Poll $Poll
+        $question = @{ kind = 'one'; header = $Header; items = @($Labels); notes = @($Notes) }
+        if ($Dock) { $question['style'] = 'dock' }
+        if ($DefaultKey) { $question['preselected'] = @([array]::IndexOf($Keys, $DefaultKey)) }
+        $answer = Request-UiAnswer -Question $question -Poll $Poll
         $polled = [string](Get-UiField $answer 'polled' '')
         if ($polled) { return $polled }
         if ([bool](Get-UiField $answer 'cancel' $false)) { return $CancelKey }
