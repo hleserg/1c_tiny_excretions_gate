@@ -86,8 +86,8 @@ jobs:
   bsl:
     name: BSL Language Server
     runs-on: ubuntu-latest
-    # Пока справочно: первый прогон дал 22 ошибки и 115 предупреждений по ядру, их разбор - в docs/roadmap.md.
-    continue-on-error: true
+    # Блокирующая: ошибки (severity Error) валят сборку. Намеренные места подавлены в коде комментарием
+    # BSLLS:<Диагностика>-off с пояснением рядом, отключённые целиком - в .bsl-language-server.json.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -109,7 +109,22 @@ jobs:
           set -o pipefail
           # Отчёт json BSL LS пишет в готовую папку: сам он её не создаёт.
           mkdir -p bsl-report
-          java -jar bsl-ls.jar --analyze --srcDir bsl-src --outputDir bsl-report --reporter console --reporter json | tee bsl-console.txt
+          java -jar bsl-ls.jar --analyze --srcDir bsl-src --configuration .bsl-language-server.json --outputDir bsl-report --reporter console --reporter json | tee bsl-console.txt
+      - name: Ошибки BSL LS
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          data = json.load(open('bsl-report/bsl-json.json', encoding='utf-8'))
+          errors = []
+          for info in data.get('fileinfos', []):
+              for diag in info.get('diagnostics', []):
+                  if diag.get('severity') == 'Error':
+                      errors.append('%s:%d %s %s' % (info['path'], diag['range']['start']['line'] + 1, diag['code'], diag['message']))
+          print('ошибок BSL LS: %d' % len(errors))
+          for line in errors:
+              print('  ' + line)
+          sys.exit(1 if errors else 0)
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:

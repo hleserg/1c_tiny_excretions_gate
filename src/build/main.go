@@ -317,6 +317,11 @@ func routers(hooks []hook, packs []pack, files []string, packageName string) str
 		if h.Proc {
 			kind, end = "Процедура", "КонецПроцедуры"
 		}
+		raises := !h.Proc && strings.HasPrefix(h.Default, "ВызватьИсключение")
+		if raises {
+			// Без пакета такой маршрут не возвращает, а сообщает об ошибке: BSL LS видит функцию без «Возврат».
+			b.WriteString("// BSLLS:FunctionShouldHaveReturn-off\n")
+		}
 		b.WriteString("// " + h.Doc + "\n")
 		if h.Directive != "" {
 			b.WriteString(h.Directive + "\n")
@@ -363,7 +368,11 @@ func routers(hooks []hook, packs []pack, files []string, packageName string) str
 				b.WriteString("\tВозврат " + h.Default + ";\n")
 			}
 		}
-		b.WriteString("\n" + end + "\n\n")
+		b.WriteString("\n" + end + "\n")
+		if raises {
+			b.WriteString("// BSLLS:FunctionShouldHaveReturn-on\n")
+		}
+		b.WriteString("\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
