@@ -439,7 +439,9 @@ Initialize-Ui -Channel $UiChannel
 $script:Server = [string](Get-Setting $cfg 'Server' '')
 $script:TempBase = [string](Get-Setting $cfg 'Base' '')
 $script:ProdBase = [string](Get-Setting $cfg 'ProdBase' '')
-$script:UnlockCode = [string](Get-Setting $cfg 'UnlockCode' '')
+# Код разрешения входа: один и тот же для блокировки рабочей и для всех входов (конфигуратор, внешнее соединение). Пусто - 0.
+$script:UnlockCode = [string](Get-Setting $cfg 'UnlockCode' '0')
+if ([string]::IsNullOrWhiteSpace($script:UnlockCode)) { $script:UnlockCode = '0' }
 if (-not [string]::IsNullOrEmpty([string](Get-Setting $cfg 'File' ''))) { throw 'Скрипт обновления работает только с базами кластера: в config.psd1 заполнено File.' }
 if (-not $script:Server -or -not $script:TempBase) { throw 'В config.psd1 не заполнены Server и Base.' }
 if (-not $script:ProdBase) {
@@ -672,6 +674,8 @@ function Get-ComConnectionLine {
     $line = 'Srvr="{0}";Ref="{1}";' -f $script:Server, $BaseName
     if ($User) { $line += 'Usr="{0}";' -f $User.Replace('"', '""') }
     if ($Password) { $line += 'Pwd="{0}";' -f $Password.Replace('"', '""') }
+    # Код разрешения: в базу, заблокированную самим deploy (или с тем же кодом), внешнее соединение тоже входит.
+    if ($script:UnlockCode) { $line += 'UC="{0}";' -f $script:UnlockCode.Replace('"', '""') }
     return $line
 }
 
@@ -686,7 +690,13 @@ function Get-ExtensionStates {
         $items = @{}
         if ($FakeScript) { . $FakeScript; $connector = New-FakeComConnector $FakeFile }
         else { $connector = New-Object -ComObject V83.COMConnector }
-        $connection = $connector.Connect($Line)
+        # Ошибка соединения - её текстом (блокировка сеансов, пароль), а не «null-valued expression» дальше.
+        try { $connection = $connector.Connect($Line) }
+        catch {
+            $connectError = $_.Exception
+            while ($null -ne $connectError.InnerException) { $connectError = $connectError.InnerException }
+            throw ([string]$connectError.Message)
+        }
         try {
             # Расширения из базы данных; не вышло (источник не виден через COM) - Получить() без параметров.
             # Каждый шаг проверяется: «пусто» говорит, на каком вызове, а не «null-valued expression».
@@ -726,24 +736,36 @@ function Get-ExtensionStates {
     return [pscustomobject]@{ Ok = $true; Error = ''; Items = $call.Result }
 }
 
-function Test-ForeignSessionLock {
-    # Ошибка внешнего соединения - это чужая блокировка начала сеансов (техработы админов, бэкап)? Свою
-    # блокировку deploy ставит с текстом «Идёт обновление расширений» - её не считаем: с ней разберётся сам deploy.
+function Test-SessionLockError {
+    # Ошибка входа - это блокировка начала сеансов с другим кодом разрешения (не тем, что в UnlockCode)?
     param([string]$Message)
     if (-not $Message) { return $false }
-    if ($Message -notmatch 'Начало сеанса с информационной базой запрещено|начало сеансов.*запрещено') { return $false }
-    return ($Message -notmatch 'Идёт обновление расширений')
+    return ($Message -match 'Начало сеанса с информационной базой запрещено|начало сеансов.*запрещено')
+}
+
+function Test-AuthError {
+    # Ошибка входа - пользователь или пароль не подошли?
+    param([string]$Message)
+    if (-not $Message) { return $false }
+    return ($Message -match 'не идентифицирован|Неправильное имя пользователя или пароль|не прошел аутентификацию|не прошёл аутентификацию')
 }
 
 function Assert-ProdOpen {
-    # Рабочая закрыта чужой блокировкой - дальше не идём: обновить её нельзя, а следующие соединения
-    # к ней только ждут таймаута.
+    # В рабочую не войти - дальше не идём: ни сравнить, ни обновить, а следующие соединения только ждут
+    # таймаута. Причину - понятным текстом и что поправить.
     param($States)
-    if ($States.Ok -or -not (Test-ForeignSessionLock $States.Error)) { return }
+    if ($States.Ok) { return }
     $text = ([string]$States.Error -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 2) -join ' '
-    Write-Line ("  {0} закрыта для входа: {1}" -f $script:ProdBase, $text) 'Red'
-    Write-Line '  Блокировку начала сеансов поставил не гейт (техработы, бэкап). Deploy её не снимает и в рабочую сейчас не пойдёт: запусти, когда её снимут.' 'Red'
-    Write-RunLog ("Рабочая закрыта чужой блокировкой: {0}" -f $text)
+    if (Test-SessionLockError $States.Error) {
+        Write-Line ("  {0}: стоит блокировка начала сеансов, и код разрешения у неё не тот, что в UnlockCode ({1}): {2}" -f $script:ProdBase, $script:UnlockCode, $text) 'Red'
+        Write-Line '  Если блокировку ставил ты - впиши её код в Настройки, Базы, UnlockCode и запусти снова. Или сними её в консоли кластера.' 'Red'
+    }
+    elseif (Test-AuthError $States.Error) {
+        Write-Line ("  {0}: вход не прошёл - {1}" -f $script:ProdBase, $text) 'Red'
+        Write-Line ("  Админ рабочей - Настройки, Пользователи и пароли: ProdAdminUser и ProdAdminPassFile (сейчас пользователь «{0}»). Пустые - берутся AdminUser и пароль temp." -f $script:ProdUser) 'Red'
+    }
+    else { return }
+    Write-RunLog ("В рабочую не войти: {0}" -f $text)
     # Не авария, а состояние рабочей: выходим без «Остановлено», блокировок deploy к этому моменту не ставил.
     exit 2
 }
@@ -957,7 +979,12 @@ function Export-Processings {
         $connection = $null
         $found = New-Object System.Collections.Generic.List[object]
         try {
-            $connection = $connector.Connect($Line)
+            try { $connection = $connector.Connect($Line) }
+            catch {
+                $connectError = $_.Exception
+                while ($null -ne $connectError.InnerException) { $connectError = $connectError.InnerException }
+                throw ([string]$connectError.Message)
+            }
             $query = $connection.NewObject('Query')
             $query.Text = 'ВЫБРАТЬ Спр.Наименование КАК Title, Спр.ИмяОбъекта КАК ObjName, Спр.Версия КАК Version, ' +
                 'ПРЕДСТАВЛЕНИЕ(Спр.Вид) КАК Kind, Спр.ХранилищеОбработки КАК Storage ' +
@@ -1807,6 +1834,34 @@ if ($needExclusive) {
             if ($left.Count -gt 0) { throw ("конфигуратор {0} за 30 секунд не закрылся" -f $script:ProdBase) }
         }
         Write-Line '  конфигуратор закрыт' 'Green'
+    }
+
+    # Открытый конфигуратор temp: выгрузки расширений из temp (что ставить и отчёт об изменениях) с ним падают
+    # «Ошибка блокировки информационной базы для конфигурирования». Закрыть до начала, а не узнать посреди.
+    $tempSessions = @(Get-BaseSessions $prepLink $script:TempBase)
+    foreach ($entry in @($tempSessions | Where-Object { $_.IsError })) { Write-Line ('  сеансы {0} проверить не смог: {1}' -f $script:TempBase, $entry.Text) 'Yellow' }
+    $tempDesigners = @($tempSessions | Where-Object { -not $_.IsError -and $_.IsDesigner })
+    if ($tempDesigners.Count -gt 0) {
+        Write-Line ("  открыт конфигуратор {0}: выгрузки из него с ним не пройдут" -f $script:TempBase) 'Yellow'
+        foreach ($entry in $tempDesigners) { Write-Line ('    ' + $entry.Text) 'Yellow' }
+        $answer = Read-UiChoice -Header ("Открыт конфигуратор {0}. Закрой его сам - скрипт увидит и продолжит, или:" -f $script:TempBase) `
+            -Keys @('1', '2') -Labels @('Закрыть отсюда (сеанс прерывается, несохранённые правки в нём пропадут)', 'Отмена') -CancelKey '2' -Poll {
+            $now = @(Get-BaseSessions $prepLink $script:TempBase)
+            if (@($now | Where-Object { $_.IsError }).Count -eq 0 -and @($now | Where-Object { $_.IsDesigner }).Count -eq 0) { return 'closed' }
+            return ''
+        }
+        if ($answer -eq '2') { throw ("открыт конфигуратор {0}, отмена по ответу" -f $script:TempBase) }
+        if ($answer -eq '1') {
+            foreach ($line in @(Stop-BaseSessions -Link $prepLink -BaseName $script:TempBase -Designers)) { Write-Line ('  ' + $line) }
+            $left = @()
+            for ($wait = 0; $wait -lt 10; $wait++) {
+                Start-Sleep -Seconds 3
+                $left = @(Get-BaseSessions $prepLink $script:TempBase | Where-Object { -not $_.IsError -and $_.IsDesigner })
+                if ($left.Count -eq 0) { break }
+            }
+            if ($left.Count -gt 0) { throw ("конфигуратор {0} за 30 секунд не закрылся" -f $script:TempBase) }
+        }
+        Write-Line ("  конфигуратор {0} закрыт" -f $script:TempBase) 'Green'
     }
 
     function Set-ProdSessionLock {

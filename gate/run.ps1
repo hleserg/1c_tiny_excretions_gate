@@ -1919,7 +1919,9 @@ $script:Server = [string](Get-Setting $cfg 'Server' '')
 $script:Base = [string](Get-Setting $cfg 'Base' '')
 $script:FileBase = [string](Get-Setting $cfg 'File' '')
 # Код разрешения входа (/UC): нужен, когда в базе установлена блокировка начала сеансов с кодом.
-$script:UnlockCode = [string](Get-Setting $cfg 'UnlockCode' '')
+# Код разрешения входа: один и тот же для блокировки, которую ставит гейт, и для всех входов в базу. Пусто - 0.
+$script:UnlockCode = [string](Get-Setting $cfg 'UnlockCode' '0')
+if ([string]::IsNullOrWhiteSpace($script:UnlockCode)) { $script:UnlockCode = '0' }
 
 if ([string]::IsNullOrEmpty($script:FileBase)) {
     if ([string]::IsNullOrEmpty($script:Server) -or [string]::IsNullOrEmpty($script:Base)) {

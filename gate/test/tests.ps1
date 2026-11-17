@@ -1120,6 +1120,25 @@ $tests = @(
         }
     },
     @{
+        Name = 'deploy-temp-designer-closed'
+        Text = 'обновление: открыт конфигуратор temp - вопрос до начала, ответ «закрыть» завершает только его сеанс, обновление идёт'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-ComState -Sessions @(@{ id = 7; base = 'erp_temp_test'; app = 'Designer'; user = 'Разработчик'; host = 'pc3' })
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить выбранные' },
+                @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
+                $deployRiskAnswer, $deployNameAnswer,
+                @{ Kind = 'one'; Header = 'Открыт конфигуратор erp_temp_test'; Item = '^Закрыть отсюда' })
+            Check-DeployCommon $r
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check (@($r.ComLog | Where-Object { $_ -match 'TerminateSession 7$' }).Count -eq 1) 'конфигуратор temp не закрыт'
+            Check ((Get-Calls $r @('/UpdateDBCfg', '-Extension Адаптация', 'fake\erp_base')).Count -eq 1) 'конфигурация БД рабочей не обновлена'
+            Check ((Get-Calls $r @('/UC"0"')).Count -gt 0) 'конфигуратор запускался без кода разрешения 0 (UnlockCode по умолчанию)'
+        }
+    },
+    @{
         Name = 'deploy-red-gate-cancel'
         Text = 'гейт красный, на переспрос «нет»: в рабочую ничего не грузится, блокировки не ставятся'
         Run = {
@@ -1251,8 +1270,8 @@ $tests = @(
         }
     },
     @{
-        Name = 'deploy-prod-locked-foreign'
-        Text = 'в рабочей чужая блокировка начала сеансов (техработы): deploy сразу останавливается с понятной причиной, обработки не выгружает'
+        Name = 'deploy-prod-locked-other-code'
+        Text = 'в рабочей блокировка начала сеансов с другим кодом: deploy сразу останавливается с понятной причиной, обработки не выгружает'
         Run = {
             param($Name)
             $sb = New-Sandbox $Name -Config $deployConfig
@@ -1261,7 +1280,7 @@ $tests = @(
             $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-StatusOnly' -Com $com
             Check-DeployCommon $r -LocksExpected $false
             Check ($r.ExitCode -ne 0) 'deploy не остановился, хотя рабочая закрыта'
-            Check (@($r.Output | Where-Object { $_ -match 'erp_base закрыта для входа' }).Count -gt 0) 'нет понятной причины остановки'
+            Check (@($r.Output | Where-Object { $_ -match 'блокировка начала сеансов, и код разрешения у неё не тот' }).Count -gt 0) 'нет понятной причины остановки'
             Check (@($r.Output | Where-Object { $_ -match 'ВНЕШНИЕ ОБРАБОТКИ' }).Count -eq 0) 'после закрытой рабочей deploy пошёл выгружать обработки'
         }
     },

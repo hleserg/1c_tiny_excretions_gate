@@ -45,7 +45,7 @@ $catalog = @(
     @('Базы', 'File', 'str', 'файловая база вместо Server/Base: каталог базы; пусто - серверная', ''''''),
     @('Базы', 'ProdBase', 'str', 'рабочая база для обновления (deploy)', ''''''),
     @('Базы', 'ForbiddenBases', 'ro', 'базы, куда гейт не ходит никогда: страховка, правится в файле руками'),
-    @('Базы', 'UnlockCode', 'str', 'код разрешения входа при блокировке сеансов', ''''''),
+    @('Базы', 'UnlockCode', 'str', 'код разрешения входа при блокировке сеансов (пусто - 0)', '''0'''),
     @('Пользователи и пароли', 'AdminUser', 'str', 'пользователь 1С для temp; пусто - вход под пользователем Windows', ''''''),
     @('Пользователи и пароли', 'AdminPassFile', 'pass', 'пароль AdminUser (файл, зашифрован для пользователя Windows)', ''''''),
     @('Пользователи и пароли', 'ProdAdminUser', 'str', 'пользователь 1С для рабочей; пусто - как AdminUser', ''''''),
@@ -250,6 +250,8 @@ function Edit-Setting {
         }
         default {
             $typed = Read-UiText -Prompt ($header + '. Новое значение') -Default ([string]$Current) -CancelAsNull
+            # Код разрешения входа не бывает пустым: с пустым кодом гейт сам не войдёт в базу, которую заблокировал.
+            if ($null -ne $typed -and $Key -eq 'UnlockCode' -and [string]::IsNullOrWhiteSpace($typed)) { $typed = '0' }
             if ($null -ne $typed) { $literal = ConvertTo-PsdLiteral $typed.Trim() 'str' }
         }
     }
@@ -277,7 +279,9 @@ function Show-Canary {
     $arguments = New-Object System.Collections.Generic.List[string]
     $arguments.Add('ENTERPRISE')
     $arguments.Add(('/S"{0}\{1}"' -f $cfgNow['Server'], $cfgNow['Base']))
-    if ([string]$cfgNow['UnlockCode']) { $arguments.Add(('/UC"{0}"' -f $cfgNow['UnlockCode'])) }
+    $unlockNow = [string]$cfgNow['UnlockCode']
+    if (-not $unlockNow) { $unlockNow = '0' }
+    $arguments.Add(('/UC"{0}"' -f $unlockNow))
     $user = [string]$cfgNow['AdminUser']
     if ($user) {
         $arguments.Add(('/N"{0}"' -f $user))
