@@ -243,7 +243,8 @@ function Check-Step {
 function Get-Calls {
     # Вызовы подставной 1С, в строке которых есть все слова.
     param($Result, [string[]]$Words)
-    return @($Result.Calls | Where-Object { $call = $_; @($Words | Where-Object { -not $call.Line.Contains($_) }).Count -eq 0 })
+    # Запятая: иначе PowerShell развернёт массив из одного вызова в сам вызов, и .Count под StrictMode упадёт.
+    return , @($Result.Calls | Where-Object { $call = $_; @($Words | Where-Object { -not $call.Line.Contains($_) }).Count -eq 0 })
 }
 
 function Check-Common {
