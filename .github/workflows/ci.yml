@@ -79,7 +79,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
-        run: gh release create '${{ github.ref_name }}' dist/*.zip --title '${{ github.ref_name }}' --notes "Сборка ${{ github.ref_name }}. Установка: распаковать ci-gate_*.zip и запустить install.cmd."
+        run: |
+          $notes = 'Сборка ${{ github.ref_name }}. Установка: распаковать ci-gate_*.zip и запустить install.cmd.'
+          gh release create '${{ github.ref_name }}' (Get-ChildItem dist/*.zip).FullName --title '${{ github.ref_name }}' --notes $notes
 
   bsl:
     name: BSL Language Server
