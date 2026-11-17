@@ -460,9 +460,14 @@ $tests = @(
             Check-Step $r 'Загрузить Адаптация' 'OK'
             Check-Step $r 'Записать в справочник Печать' 'OK'
             Check-Step $r 'Проверка конфигурации' 'OK'
-            $load = @(Get-Calls $r @('/LoadCfg'))
-            $reg = @(Get-Calls $r @('/Cregepf'))
-            Check ($load.Count -eq 1 -and $reg.Count -eq 1 -and [array]::IndexOf($r.Calls, $load[0]) -lt [array]::IndexOf($r.Calls, $reg[0])) 'обработка записана не после загрузки расширения'
+            # Порядок вызовов - по номерам строк журнала подставной 1С.
+            $loadAt = -1
+            $regAt = -1
+            for ($i = 0; $i -lt $r.Calls.Count; $i++) {
+                if ($loadAt -lt 0 -and $r.Calls[$i].Line.Contains('/LoadCfg')) { $loadAt = $i }
+                if ($regAt -lt 0 -and $r.Calls[$i].Line.Contains('/Cregepf')) { $regAt = $i }
+            }
+            Check ($loadAt -ge 0 -and $regAt -gt $loadAt) ("обработка записана не после загрузки расширения (загрузка - вызов {0}, запись - {1})" -f $loadAt, $regAt)
         }
     }
 )
