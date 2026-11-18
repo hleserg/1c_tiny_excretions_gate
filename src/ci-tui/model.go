@@ -326,7 +326,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.follow = m.logView.AtBottom()
 			return m, cmd
 		}
-		return m, nil
+		// Окно поверх: мышь - ему (правая кнопка в поле ввода - вставка, колесо в просмотре - прокрутка).
+		return m, m.dialog.Update(msg)
 
 	case tea.KeyMsg:
 		if m.dialog != nil && m.dialog.docked() {

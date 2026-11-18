@@ -23,12 +23,14 @@ jobs:
           go-version-file: src/ci-tui/go.mod
           cache: false
 
-      - name: go vet
+      - name: go vet и go test
         shell: pwsh
         run: |
           foreach ($m in 'ci-tui', 'fake1c', 'build') {
             Push-Location "src/$m"
             go vet ./...
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            go test ./...
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
             Pop-Location
           }

@@ -3,15 +3,21 @@ package main
 // Окна вопросов: один пункт, несколько пунктов, да/нет, текст, просмотр длинного текста.
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"syscall"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+// readClipboard - текст из буфера обмена Windows (в тестах подменяется).
+var readClipboard = clipboard.ReadAll
 
 type dialog struct {
 	ev       uiEvent
@@ -45,6 +51,8 @@ func newDialog(ev uiEvent, width, height int) *dialog {
 		ti := textinput.New()
 		ti.Prompt = "› "
 		ti.CharLimit = 500
+		// Вставка - своя (pasteClipboard): у поля она приходит отдельным сообщением, которое терялось.
+		ti.KeyMap.Paste.SetEnabled(false)
 		ti.SetValue(ev.Value)
 		ti.CursorEnd()
 		if ev.Secret {
@@ -93,6 +101,14 @@ func (d *dialog) Update(msg tea.Msg) tea.Cmd {
 	key, ok := msg.(tea.KeyMsg)
 	if !ok {
 		if d.ev.Kind == "text" {
+			// Правая кнопка мыши - вставить, как в обычной консоли: мышь у ci.exe включена
+			// (прокрутка журнала), и сама консоль по правой кнопке больше не вставляет.
+			if mouse, isMouse := msg.(tea.MouseMsg); isMouse {
+				if mouse.Button == tea.MouseButtonRight && mouse.Action == tea.MouseActionPress {
+					d.pasteClipboard()
+				}
+				return nil
+			}
 			var cmd tea.Cmd
 			d.input, cmd = d.input.Update(msg)
 			return cmd
@@ -225,7 +241,16 @@ func (d *dialog) Update(msg tea.Msg) tea.Cmd {
 			d.finish(answer{Text: d.input.Value()})
 		case "esc":
 			d.finish(answer{Cancel: true})
+		case "ctrl+v":
+			d.pasteClipboard()
 		default:
+			if key.Paste {
+				// Вставка, которую прислал сам терминал (bracketed paste).
+				d.insertText(string(key.Runes))
+				return nil
+			}
+			d.notice = ""
+			d.warning = ""
 			var cmd tea.Cmd
 			d.input, cmd = d.input.Update(msg)
 			return cmd
@@ -241,6 +266,52 @@ func (d *dialog) Update(msg tea.Msg) tea.Cmd {
 		}
 	}
 	return nil
+}
+
+// pasteClipboard - вставка из буфера обмена в поле ввода (Ctrl+V, правая кнопка мыши).
+func (d *dialog) pasteClipboard() {
+	text, err := readClipboard()
+	var errno syscall.Errno
+	if err != nil && errors.As(err, &errno) && errno == 0 {
+		// В буфере не текст (картинка, файл): библиотека отдаёт «ошибку» с кодом 0.
+		err = nil
+	}
+	if err != nil {
+		d.notice = ""
+		d.warning = "буфер обмена не прочитан: " + err.Error()
+		return
+	}
+	d.insertText(text)
+}
+
+// insertText - вставить текст в место курсора. Пробелы и переводы строк по краям отрезаются:
+// токен или пароль, скопированный со страницы, часто приходит с переводом строки в конце,
+// а с ним вход не проходит. Переводы строк внутри - пробелом, как у самого поля.
+func (d *dialog) insertText(text string) {
+	d.notice = ""
+	d.warning = ""
+	text = strings.TrimSpace(text)
+	text = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ", "\t", " ").Replace(text)
+	if text == "" {
+		d.warning = "в буфере обмена нет текста"
+		return
+	}
+	value := []rune(d.input.Value())
+	pos := min(max(0, d.input.Position()), len(value))
+	ins := []rune(text)
+	lost := 0
+	if limit := d.input.CharLimit; limit > 0 && len(value)+len(ins) > limit {
+		keep := max(0, limit-len(value))
+		lost = len(ins) - keep
+		ins = ins[:keep]
+	}
+	d.input.SetValue(string(value[:pos]) + string(ins) + string(value[pos:]))
+	d.input.SetCursor(pos + len(ins))
+	if lost > 0 {
+		d.warning = fmt.Sprintf("вставлено символов: %d, не влезло: %d (предел поля %d)", len(ins), lost, d.input.CharLimit)
+		return
+	}
+	d.notice = fmt.Sprintf("вставлено из буфера, символов: %d", len(ins))
 }
 
 func (d *dialog) selected() []int {
@@ -350,7 +421,13 @@ func (d *dialog) View() string {
 		b.WriteString("\n\n" + styleHelp.Render("←→ выбор · enter ок · y/n · esc отмена"))
 	case "text":
 		b.WriteString(d.input.View())
-		b.WriteString("\n\n" + styleHelp.Render("enter ок · esc отмена"))
+		if d.notice != "" {
+			b.WriteString("\n\n" + wrapBlock(d.notice, inner, styleAccent))
+		}
+		if d.warning != "" {
+			b.WriteString("\n\n" + wrapBlock(d.warning, inner, styleWarn))
+		}
+		b.WriteString("\n\n" + wrapBlock("enter ок · ctrl+v или правая кнопка мыши - вставить · esc отмена", inner, styleHelp))
 	case "view":
 		b.WriteString(d.view.View())
 		b.WriteString("\n" + styleHelp.Render(fmt.Sprintf("↑↓ PgUp PgDn прокрутка · %d%% · q закрыть", int(d.view.ScrollPercent()*100))))

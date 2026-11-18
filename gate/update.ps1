@@ -68,7 +68,8 @@ function Get-UpdateToken {
     }
     $encrypted = (Get-Content -LiteralPath $path -Raw).Trim()
     $credential = New-Object System.Management.Automation.PSCredential('token', (ConvertTo-SecureString -String $encrypted))
-    return $credential.GetNetworkCredential().Password
+    # Пробел или перевод строки по краям (скопировали со страницы вместе с ним) - GitHub ответит 401.
+    return $credential.GetNetworkCredential().Password.Trim()
 }
 
 #endregion
