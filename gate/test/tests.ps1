@@ -2176,6 +2176,61 @@ $tests = @(
         }
     },
     @{
+        Name = 'git-prod-processings'
+        Text = '«Снимок внешних обработок рабочей в git» (deploy.ps1 -GitProd): первый раз - ветка prod от main без расширений, обработки рабочей (только чтение: блокировок и сеансов не трогает), PROD.md, main не тронут; без изменений - «записывать нечего» без вопросов; обработку в рабочей поменяли - новый коммит в prod поверх прежнего'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $prodProcs = @(
+                @{ objName = 'Печать'; title = 'Печать актов'; version = '2'; kind = 'Печатная форма'; content = $printNew; ref = 'eeeeeeee-0000-0000-0000-000000000005' },
+                @{ objName = 'ТолькоВРабочей'; title = 'Обработка рабочей'; version = '1'; kind = 'Дополнительная обработка'; content = 'Процедура Р() КонецПроцедуры'; ref = 'ffffffff-0000-0000-0000-000000000006' })
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld)) -ProdProcessings $prodProcs
+            $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            $main = (Get-GhHead -Gh $gh -Branch 'main').Sha
+            if (-not $main) { Check $false 'первая выгрузка не создала main'; return }
+            Reset-FakeState $sb
+            $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitProd' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers @(
+                @{ Kind = 'confirm'; Header = 'Записать снимок обработок erp_base'; Yes = $true })
+            Check-DeployCommon $first -LocksExpected $false
+            Check ($first.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($first.Unexpected -join ' | '))
+            Check ((Get-GhHead -Gh $gh -Branch 'main').Sha -eq $main) 'снимок рабочей тронул main'
+            $prod = (Get-GhHead -Gh $gh -Branch 'prod').Sha
+            Check ([bool]$prod) 'нет ветки prod'
+            if ($prod) {
+                $files = Get-GhFiles -Gh $gh -Commit $prod
+                foreach ($path in @('PROD.md', 'README.md', 'processings/manifest.json', 'processings/Печать/Печать/Ext/ObjectModule.bsl', 'processings/ТолькоВРабочей/ТолькоВРабочей.xml')) {
+                    Check ($files.ContainsKey($path)) ("в prod нет {0}" -f $path)
+                }
+                Check (@($files.Keys | Where-Object { $_ -like 'extensions/*' }).Count -eq 0) 'в prod попали расширения из main'
+                # Подставная 1С выгружает модуль с BOM и CRLF.
+                $expected = [byte[]](@([byte]0xEF, [byte]0xBB, [byte]0xBF) + @($utf8.GetBytes($printNew.Replace("`n", "`r`n"))))
+                Check ($files['processings/Печать/Печать/Ext/ObjectModule.bsl'] -eq (Get-GitBlobSha $expected)) 'в prod не та Печать, что в рабочей'
+                Check ((Read-GhFakeCommit -Gh $gh -Sha $prod).Parents -contains $main) 'первый снимок prod не от main'
+            }
+            $comLog = Join-Path $sb 'fake\com.log'
+            if (Test-Path -LiteralPath $comLog) {
+                $changesInCluster = @([System.IO.File]::ReadAllLines($comLog, $utf8) | Where-Object { $_ -match 'UpdateInfoBase|TerminateSession' })
+                Check ($changesInCluster.Count -eq 0) ("снимок рабочей менял кластер: " + ($changesInCluster -join ' | '))
+            }
+            Reset-FakeState $sb
+            $same = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitProd' -Fake @{ dumps = (New-GitDumps) } -Com $com
+            Check-DeployCommon $same -LocksExpected $false
+            Check (@($same.Output | Where-Object { $_ -match 'записывать нечего' }).Count -eq 1) 'без изменений в рабочей не сказано «записывать нечего»'
+            Check ($same.Unexpected.Count -eq 0) ("без изменений были вопросы: " + ($same.Unexpected -join ' | '))
+            $prodProcs[0]['content'] = 'Процедура НоваяВРабочей() КонецПроцедуры'
+            $com2 = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld)) -ProdProcessings $prodProcs
+            Reset-FakeState $sb
+            $next = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitProd' -Fake @{ dumps = (New-GitDumps) } -Com $com2 -Answers @(
+                @{ Kind = 'confirm'; Header = 'Записать снимок обработок erp_base'; Yes = $true })
+            Check-DeployCommon $next -LocksExpected $false
+            $prod2 = (Get-GhHead -Gh $gh -Branch 'prod').Sha
+            Check ($prod2 -and $prod2 -ne $prod -and (Read-GhFakeCommit -Gh $gh -Sha $prod2).Parents -contains $prod) 'второй снимок не лёг коммитом поверх прежнего prod'
+            Check ((Get-GhHead -Gh $gh -Branch 'main').Sha -eq $main) 'второй снимок рабочей тронул main'
+        }
+    },
+    @{
         Name = 'git-import-merge'
         Text = '«Загрузить из git»: правка в temp и другая правка в main - «Слить»: правки temp веткой temp/<время>, слияние с main (в main обе), загрузка только того, чего нет в temp; конфликт (одно и то же с двух сторон) - pull request, main и temp не тронуты'
         Run = {

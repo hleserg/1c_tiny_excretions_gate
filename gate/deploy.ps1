@@ -59,6 +59,8 @@ param(
     # Репозиторий расширений (ExtensionsRepo): выгрузить temp в git или загрузить из git в temp. Рабочую не трогает.
     [switch]$GitExport,
     [switch]$GitImport,
+    # Снимок внешних обработок рабочей в ветку prod репозитория расширений (ExtensionsProdBranch). Рабочую только читает.
+    [switch]$GitProd,
     # С -GitImport: без человека (ночной прогон): правки temp - веткой и pull request, temp не трогается;
     # правок нет и main ушёл вперёд - прогон гейта с ним без вопросов (-OnNotGreen Keep).
     [switch]$GitUnattended,
@@ -632,12 +634,12 @@ Initialize-Stats -Dir (Resolve-RootPath ([string](Get-Setting $cfg 'StatsDir' 's
 $deployRoot = Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))
 $mirrorRoot = Join-Path $deployRoot 'mirror'
 $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
-$viewOnly = ($BaseState -or $CompareExtensions -or $CompareProcessings -or $GitExport -or $GitImport)
+$viewOnly = ($BaseState -or $CompareExtensions -or $CompareProcessings -or $GitExport -or $GitImport -or $GitProd)
 if ($viewOnly) {
     # Показать состояние или сравнить - не запуск обновления: своей папки запуска нет (в истории обновлений его не видно),
     # журнал - в deploy\state\run.log, каждый раз заново.
     $viewName = 'state'
-    if ($CompareExtensions) { $viewName = 'compare-ext' } elseif ($CompareProcessings) { $viewName = 'compare-epf' } elseif ($GitExport -or $GitImport) { $viewName = 'git' }
+    if ($CompareExtensions) { $viewName = 'compare-ext' } elseif ($CompareProcessings) { $viewName = 'compare-epf' } elseif ($GitExport -or $GitImport -or $GitProd) { $viewName = 'git' }
     $script:RunDir = Join-Path $deployRoot $viewName
     New-Item -ItemType Directory -Path $script:RunDir -Force | Out-Null
     $script:RunLogPath = Join-Path $script:RunDir 'run.log'
@@ -1971,49 +1973,58 @@ function Get-TempSnapshot {
     $items = @()
     $folders = @{}
     if ($WithProcessings) {
-        $epfDir = Join-Path $script:RunDir 'epf'
-        if (Test-Path -LiteralPath $epfDir) { Remove-Item -LiteralPath $epfDir -Recurse -Force }
-        $export = Export-Processings -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword -Dir $epfDir -All
-        if (-not $export.Ok) { throw ("обработки {0} не выгрузил: {1}" -f $script:TempBase, $export.Error) }
-        $items = @($export.Items)
-        $folders = Get-GitProcessingFolders $items
-        $root = Join-Path $Setup.Work 'processings'
-        New-Item -ItemType Directory -Path $root -Force | Out-Null
-        # Выгрузка в файлы - запуск конфигуратора на каждый файл. Файл тот же, что в прошлый раз (хеш, тот же
-        # конфигуратор), - выгрузка с прошлого раза: ночью и на каждой загрузке из git иначе ушли бы десятки минут.
-        $cachePath = Join-Path $Setup.Work 'processings.cache.json'
-        $cache = @{}
-        if (Test-Path -LiteralPath $cachePath) {
-            try {
-                $read = [System.IO.File]::ReadAllText($cachePath, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
-                foreach ($property in $read.PSObject.Properties) { $cache[$property.Name] = [string]$property.Value }
-            }
-            catch { Write-RunLog ("git: {0} не прочитан, обработки выгружаю заново: {1}" -f $cachePath, $_.Exception.Message) }
-        }
-        $kept = [ordered]@{}
-        $dumpedCount = 0
-        foreach ($item in @($items | Where-Object { $_.File } | Sort-Object @{ Expression = { [string]$folders[[string]$_.Ref] } })) {
-            $folder = [string]$folders[[string]$item.Ref]
-            $dir = Join-Path $root $folder
-            $key = '{0}|{1}' -f $item.Hash, $script:V8
-            if (-not ($cache.Contains($folder) -and $cache[$folder] -eq $key -and (Test-Path -LiteralPath (Join-Path $dir ($item.ObjName + '.xml'))))) {
-                $dumped = Get-ProcessingDump -File $item.File -Dir $dir -Title ("Выгрузить в файлы {0} из temp" -f $folder)
-                if (-not $dumped) { throw ("обработка {0} ({1}) не выгрузилась в файлы, см. run.log" -f $folder, $item.Title) }
-                $dumpedCount++
-            }
-            $kept[$folder] = $key
-            Add-GitSnapshotFiles -Files $files -Dir $dir -Prefix ('processings/' + $folder + '/')
-        }
-        # Папки элементов, которых в справочнике больше нет, - долой из рабочей папки: иначе попали бы в сравнение.
-        foreach ($old in @(Get-ChildItem -LiteralPath $root -Directory)) { if (-not $kept.Contains($old.Name)) { Remove-Item -LiteralPath $old.FullName -Recurse -Force } }
-        [System.IO.File]::WriteAllText($cachePath, (ConvertTo-Json -InputObject $kept), $Utf8Bom)
-        $manifest = Join-Path $root 'manifest.json'
-        [System.IO.File]::WriteAllText($manifest, (Get-GitProcessingManifest -Items $items -Folders $folders), (New-Object System.Text.UTF8Encoding($false)))
-        $files['processings/manifest.json'] = $manifest
+        $taken = Add-GitProcessingSnapshot -Files $files -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword `
+            -Root (Join-Path $Setup.Work 'processings') -EpfDir (Join-Path $script:RunDir 'epf') -Source 'temp'
+        $items = $taken.Items
+        $folders = $taken.Folders
         $prefixes.Add('processings/')
-        Write-RunLog ("git: обработок в справочнике {0}, с файлом {1}, выгружено конфигуратором {2}, остальные - с прошлого раза" -f $items.Count, $kept.Count, $dumpedCount)
     }
     return [pscustomobject]@{ Files = $files; Missing = $missing.ToArray(); Prefixes = $prefixes.ToArray(); Processings = $items; Folders = $folders }
+}
+
+function Add-GitProcessingSnapshot {
+    # Все элементы справочника обработок базы (внешнее соединение, только чтение) - выгрузкой в файлы в папку Root
+    # (конфигуратор temp) и manifest.json; в Files - пути processings/... Возвращает Items и Folders.
+    param([hashtable]$Files, [string]$BaseName, [string]$User, [string]$Password, [string]$Root, [string]$EpfDir, [string]$Source)
+    if (Test-Path -LiteralPath $EpfDir) { Remove-Item -LiteralPath $EpfDir -Recurse -Force }
+    $export = Export-Processings -BaseName $BaseName -User $User -Password $Password -Dir $EpfDir -All
+    if (-not $export.Ok) { throw ("обработки {0} не выгрузил: {1}" -f $BaseName, $export.Error) }
+    $items = @($export.Items)
+    $folders = Get-GitProcessingFolders $items
+    New-Item -ItemType Directory -Path $Root -Force | Out-Null
+    # Выгрузка в файлы - запуск конфигуратора на каждый файл. Файл тот же, что в прошлый раз (хеш, тот же
+    # конфигуратор), - выгрузка с прошлого раза: ночью и на каждой загрузке из git иначе ушли бы десятки минут.
+    $cachePath = Join-Path (Split-Path -Parent $Root) 'processings.cache.json'
+    $cache = @{}
+    if (Test-Path -LiteralPath $cachePath) {
+        try {
+            $read = [System.IO.File]::ReadAllText($cachePath, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+            foreach ($property in $read.PSObject.Properties) { $cache[$property.Name] = [string]$property.Value }
+        }
+        catch { Write-RunLog ("git: {0} не прочитан, обработки выгружаю заново: {1}" -f $cachePath, $_.Exception.Message) }
+    }
+    $kept = [ordered]@{}
+    $dumpedCount = 0
+    foreach ($item in @($items | Where-Object { $_.File } | Sort-Object @{ Expression = { [string]$folders[[string]$_.Ref] } })) {
+        $folder = [string]$folders[[string]$item.Ref]
+        $dir = Join-Path $Root $folder
+        $key = '{0}|{1}' -f $item.Hash, $script:V8
+        if (-not ($cache.Contains($folder) -and $cache[$folder] -eq $key -and (Test-Path -LiteralPath (Join-Path $dir ($item.ObjName + '.xml'))))) {
+            $dumped = Get-ProcessingDump -File $item.File -Dir $dir -Title ("Выгрузить в файлы {0} из {1}" -f $folder, $Source)
+            if (-not $dumped) { throw ("обработка {0} ({1}) из {2} не выгрузилась в файлы, см. run.log" -f $folder, $item.Title, $BaseName) }
+            $dumpedCount++
+        }
+        $kept[$folder] = $key
+        Add-GitSnapshotFiles -Files $Files -Dir $dir -Prefix ('processings/' + $folder + '/')
+    }
+    # Папки элементов, которых в справочнике больше нет, - долой из рабочей папки: иначе попали бы в сравнение.
+    foreach ($old in @(Get-ChildItem -LiteralPath $Root -Directory)) { if (-not $kept.Contains($old.Name)) { Remove-Item -LiteralPath $old.FullName -Recurse -Force } }
+    [System.IO.File]::WriteAllText($cachePath, (ConvertTo-Json -InputObject $kept), $Utf8Bom)
+    $manifest = Join-Path $Root 'manifest.json'
+    [System.IO.File]::WriteAllText($manifest, (Get-GitProcessingManifest -Items $items -Folders $folders), (New-Object System.Text.UTF8Encoding($false)))
+    $Files['processings/manifest.json'] = $manifest
+    Write-RunLog ("git: обработок {0} в справочнике {1}, с файлом {2}, выгружено конфигуратором {3}, остальные - с прошлого раза" -f $BaseName, $items.Count, $kept.Count, $dumpedCount)
+    return [pscustomobject]@{ Items = $items; Folders = $folders }
 }
 
 function Test-GitPrefix {
@@ -2411,6 +2422,63 @@ function Invoke-GitImport {
     return $runCode
 }
 
+function Get-GitProdReadme {
+    # PROD.md ветки prod: что в ней и откуда. Без даты: иначе каждый снимок был бы «с правками».
+    return (@(
+            '# Ветка prod: что стоит в рабочей базе',
+            '',
+            ('Пишет только гейт («Снимок внешних обработок рабочей в git», deploy.ps1 -GitProd). Рабочую базу {0} он только читает' -f $script:ProdBase),
+            ('(внешнее соединение, запрос к справочнику «Дополнительные отчёты и обработки»), в файлы выгружает конфигуратор тестовой базы {0}.' -f $script:TempBase),
+            'Руками и агентами здесь ничего не правят.',
+            '',
+            '- `processings/` - внешние обработки, отчёты и печатные формы рабочей базы, раскладка как в `main`; `processings/manifest.json` - что за элементом каждой папки.',
+            '- Расширений рабочей базы здесь пока нет.',
+            '',
+            'Разница с тестовой базой - сравнение веток `main...prod` на GitHub, папка `processings/`.'
+        ) -join "`n") + "`n"
+}
+
+function Invoke-GitProdSnapshot {
+    # Снимок внешних обработок рабочей в ветку prod: все элементы справочника (только чтение), выгрузка в файлы
+    # конфигуратором temp, manifest.json, PROD.md. Ветки prod нет - создаётся от main без расширений. Main не трогает.
+    param($Setup)
+    $prodBranch = [string](Get-Setting $cfg 'ExtensionsProdBranch' 'prod')
+    if ($prodBranch -eq $Setup.Branch) { throw ("ExtensionsProdBranch и ExtensionsBranch - одна ветка ({0}): снимок рабочей затёр бы то, что должно стоять в temp" -f $prodBranch) }
+    $main = Get-GhHead -Gh $Setup.Gh -Branch $Setup.Branch
+    if (-not $main.Sha) { throw ("в {0} ({1}) пусто: сначала «Выгрузить temp в git»" -f $Setup.Repo, $Setup.Branch) }
+    $prod = Get-GhHead -Gh $Setup.Gh -Branch $prodBranch
+    $base = $prod.Sha
+    if (-not $base) { $base = $main.Sha }
+    $baseFiles = Get-GhFiles -Gh $Setup.Gh -Commit $base
+    Write-Line ("Читаю внешние обработки {0} (только чтение) и выгружаю в файлы конфигуратором {1}" -f $script:ProdBase, $script:TempBase) 'Cyan'
+    $files = @{}
+    $work = Join-Path $Setup.Root 'work-prod'
+    $taken = Add-GitProcessingSnapshot -Files $files -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword `
+        -Root (Join-Path $work 'processings') -EpfDir (Join-Path $script:RunDir 'epf-prod') -Source 'рабочей'
+    $readme = Join-Path $work 'PROD.md'
+    [System.IO.File]::WriteAllText($readme, (Get-GitProdReadme), (New-Object System.Text.UTF8Encoding($false)))
+    $files['PROD.md'] = $readme
+    # Первый снимок - от main: расширений temp в ветке рабочей быть не должно.
+    $prefixes = @('processings/', 'PROD.md')
+    if (-not $prod.Sha) { $prefixes += 'extensions/' }
+    $changes = Compare-GitSnapshot -Local $files -Remote $baseFiles -Prefixes $prefixes
+    $withFile = @($taken.Items | Where-Object { $_.File }).Count
+    Write-Line ("  в справочнике {0}: элементов {1}, с файлом {2}, помечены на удаление {3}" -f $script:ProdBase, @($taken.Items).Count, $withFile, @($taken.Items | Where-Object { $_.Deleted }).Count)
+    if ($changes.Count -eq 0) {
+        Write-Line ("Обработки {0} - те же, что в ветке {1} (коммит {2}): записывать нечего." -f $script:ProdBase, $prodBranch, (Get-GitShort $base)) 'Green'
+        return
+    }
+    foreach ($line in (Get-GitChangeLines $changes)) { Write-Line ('  ' + $line) }
+    $where = 'обновить ветку {0}' -f $prodBranch
+    if (-not $prod.Sha) { $where = 'создать ветку {0} от {1} (без расширений)' -f $prodBranch, $Setup.Branch }
+    $answer = Confirm-Ui -Question ("Записать снимок обработок {0} в git: {1}?" -f $script:ProdBase, $where) -Yes 'Записать' -No 'Отмена'
+    if (-not $answer) { Write-Line 'Отмена: в git ничего не писал.'; return }
+    $sha = New-GitVerifiedCommit -Setup $Setup -Parent $base -Changes $changes -Message ("Снимок внешних обработок {0} от {1}" -f $script:ProdBase, (Get-Date).ToString('dd.MM.yyyy HH:mm'))
+    if ($prod.Sha) { Set-GhBranch -Gh $Setup.Gh -Branch $prodBranch -Sha $sha }
+    else { Set-GhBranch -Gh $Setup.Gh -Branch $prodBranch -Sha $sha -Create }
+    Write-Line ("Записал в {0} ({1}): коммит {2}. Разница с temp: https://github.com/{0}/compare/{3}...{1}" -f $Setup.Repo, $prodBranch, (Get-GitShort $sha), $Setup.Branch) 'Green'
+}
+
 function Set-GitLoaded {
     # Temp соответствует коммиту Commit; pull request с правками temp, если он уже в main, больше не ждём.
     param($Setup, $State, [string]$Commit, [string]$Run)
@@ -2424,13 +2492,19 @@ function Set-GitLoaded {
     Save-GitState $Setup $State
 }
 
-if ($GitExport -or $GitImport) {
+if ($GitExport -or $GitImport -or $GitProd) {
     if (-not $GitUnattended -and -not (Test-UiCanAsk)) { throw 'выгрузить в git и загрузить из git можно только из консоли или ci.exe (без человека - deploy.ps1 -GitImport -GitUnattended)' }
+    if ($GitUnattended -and $GitProd) { throw 'снимок рабочей в git без человека пока не делается: запусти из меню' }
     if ($GitUnattended -and $GitExport) { throw 'выгрузка в git без человека не бывает: первую выгрузку и выбор делает человек' }
     . (Join-Path $Root 'github.ps1')
     $gitSetup = Get-GitSetup
     $gitState = Read-GitState $gitSetup
     Write-Host ''
+    if ($GitProd) {
+        Write-Host ("СНИМОК ВНЕШНИХ ОБРАБОТОК {0} В GIT ({1}, ветка {2})" -f $script:ProdBase, $gitSetup.Repo, [string](Get-Setting $cfg 'ExtensionsProdBranch' 'prod')) -ForegroundColor Cyan
+        Invoke-GitProdSnapshot -Setup $gitSetup
+        exit 0
+    }
     if ($GitExport) {
         Write-Host ("ВЫГРУЗИТЬ {0} В GIT ({1}, {2})" -f $script:TempBase, $gitSetup.Repo, $gitSetup.Branch) -ForegroundColor Cyan
         Invoke-GitExport -Setup $gitSetup -State $gitState

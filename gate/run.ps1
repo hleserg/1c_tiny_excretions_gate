@@ -3888,6 +3888,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         if ($gitRepo -and (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1'))) {
             $menu.Add([pscustomobject]@{ Key = 'gitimport'; Label = ('Загрузить из git в {0} ({1})' -f $script:Base, $gitRepo) })
             $menu.Add([pscustomobject]@{ Key = 'gitexport'; Label = ('Выгрузить {0} в git: правки temp - веткой и pull request' -f $script:Base) })
+            $menu.Add([pscustomobject]@{ Key = 'gitprod'; Label = ('Снимок внешних обработок рабочей в git (ветка {0}, рабочую только читает)' -f [string](Get-Setting $cfg 'ExtensionsProdBranch' 'prod')) })
         }
         $acceptable = Get-AcceptableRun
         if ($null -ne $acceptable) {
@@ -3956,10 +3957,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             Wait-UiAcknowledge
             continue
         }
-        if ($choice -eq 'gitimport' -or $choice -eq 'gitexport') {
+        if ($choice -eq 'gitimport' -or $choice -eq 'gitexport' -or $choice -eq 'gitprod') {
             # Загрузить из git - проверка правок temp, потом обычный прогон с тем, что изменилось в main (его ведёт
-            # deploy.ps1 отдельным процессом run.ps1); выгрузить - коммит или ветка и pull request. Потом - в меню.
-            $gitArgs = @{ GitImport = ($choice -eq 'gitimport'); GitExport = ($choice -eq 'gitexport') }
+            # deploy.ps1 отдельным процессом run.ps1); выгрузить - коммит или ветка и pull request; снимок рабочей -
+            # её внешние обработки в ветку prod. Потом - в меню.
+            $gitArgs = @{ GitImport = ($choice -eq 'gitimport'); GitExport = ($choice -eq 'gitexport'); GitProd = ($choice -eq 'gitprod') }
             if ($UiChannel) { $gitArgs['UiChannel'] = $UiChannel }
             try { & (Join-Path $Root 'deploy.ps1') @gitArgs }
             catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }

@@ -153,6 +153,8 @@
     # с правами Contents и Pull requests: чтение и запись.
     # ExtensionsRepo = 'владелец/репозиторий'
     ExtensionsBranch = 'main'
+    # Снимок внешних обработок рабочей (deploy.ps1 -GitProd) - в эту ветку; пишет её только гейт.
+    ExtensionsProdBranch = 'prod'
     GitDir = 'git'
     UpdateTagPrefix = 'gate-'
 
