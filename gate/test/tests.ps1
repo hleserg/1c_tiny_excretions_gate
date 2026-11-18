@@ -2208,7 +2208,8 @@ $tests = @(
                 Check ((-not $import.ran) -and [string]$import.note -match 'pull request') ("last-import.json второй ночи: " + [string]$import.note)
             }
             else { Check $false 'нет git\ext\last-import.json' }
-            Check ((Read-GitStateFile $sb).commit -eq $merged) 'ночная выгрузка правок сдвинула state.json с main'
+            $nightState = Read-GitStateFile $sb
+            Check ($nightState.commit -ne $merged -and $nightState.commit -eq $nightState.pendingCommit -and $nightState.pendingNumber) 'после ночной выгрузки state.json не на ветке с правками temp (pending)'
         }
     },
     @{
