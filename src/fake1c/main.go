@@ -9,7 +9,7 @@
 // и задержку. /DumpCfg и /DumpConfigToFiles создают файл и каталог, /LoadExternalDataProcessorOrReportFromFiles -
 // файл обработки, /DumpExternalDataProcessorOrReportToFiles - корневой XML и модуль объекта, если код возврата 0.
 //
-// Тонкий клиент (ENTERPRISE): режим - первое слово /C. canary, selfcheck, regepf, unregepf, kbarticle
+// Тонкий клиент (ENTERPRISE): режим - первое слово /C. canary, selfcheck (с start= - с этого задания), regepf, unregepf, kbarticle
 // отвечают файлами так же, как настоящие обработки. Список ответов режима - по вызовам: первый вызов
 // берёт первый элемент, следующие - следующие, последний повторяется. RunUnitTests=<файл настроек> - как YAxUnit:
 // лог, отчёт jUnit и файл кода возврата из настроек; тесты - из сценария unittests.
@@ -387,7 +387,9 @@ func client(sc scenario, args []string, state map[string]int) int {
 		if !ok {
 			s = selfcheck{}
 		}
-		selfcheckRun(s, dirOf(p["out"]), p["known"])
+		start := 0
+		fmt.Sscanf(p["start"], "%d", &start)
+		selfcheckRun(s, dirOf(p["out"]), p["known"], start)
 	case "rununittests":
 		u, ok := pick(sc.Unittests, state, "unittests")
 		if !ok {
@@ -410,7 +412,9 @@ func client(sc scenario, args []string, state map[string]int) int {
 	return sc.ClientExit
 }
 
-func selfcheckRun(s selfcheck, dir, known string) {
+// start - как у обработки: продолжить с задания start (с нуля). Дальше конца очереди - заданий нет, только сведения
+// о базе и итог (так гейт проверяет базу перед продолжением прогона).
+func selfcheckRun(s selfcheck, dir, known string, start int) {
 	if s.NoStart {
 		return
 	}
@@ -445,6 +449,13 @@ func selfcheckRun(s selfcheck, dir, known string) {
 		tasks = []task{
 			{Key: "Окружение", Title: "Окружение и расширения", Step: "Окружение", Lines: []string{"[ОК] Обработка запущена под полными правами"}},
 			{Key: "КомпиляцияМодулей|Общий|Адаптация_ОбщийСервер", Title: "Компиляция Адаптация_ОбщийСервер", Step: "КомпиляцияМодулей", Lines: []string{"[ОК] Адаптация_ОбщийСервер компилируется"}},
+		}
+	}
+	if start > 0 {
+		if start >= len(tasks) {
+			tasks = []task{}
+		} else {
+			tasks = tasks[start:]
 		}
 	}
 	now := time.Now().Format("15:04:05")

@@ -431,7 +431,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.notice = "процесс снят. Проверь блокировки базы в консоли кластера"
 		}
 		return m, nil
-	case "enter", "r":
+	case "enter", "r", "esc":
+		// Прогон кончился: снова главное меню гейта. Esc - так же, как Enter: привычнее.
 		if !m.running {
 			m.lines = nil
 			m.steps = nil
@@ -591,7 +592,7 @@ func (m model) viewFooter() string {
 			help += " · k снять процесс"
 		}
 	default:
-		help = "enter снова в меню · q выход · ↑↓ журнал"
+		help = "enter или esc снова в меню · q выход · ↑↓ журнал"
 	}
 	// Строки подсказки не обрезаются: не влезает - переносится. Версия сборки - в правом нижнем углу.
 	width := max(20, m.width)

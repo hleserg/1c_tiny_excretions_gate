@@ -98,6 +98,15 @@ function Add-InboxFile {
     return $path
 }
 
+function Reset-FakeState {
+    # Между прогонами одной песочницы: счётчики сценария подставной 1С и журнал её вызовов - с нуля.
+    param([string]$Sandbox)
+    foreach ($name in @('fake1c-state.json', 'calls.log')) {
+        $path = Join-Path (Join-Path $Sandbox 'fake') $name
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+    }
+}
+
 #endregion
 
 #region Запуск скрипта и ответы на вопросы
@@ -1892,6 +1901,140 @@ $tests = @(
             Check ($bad.ExitCode -eq 1) ("не та сумма: код {0}, ждали 1" -f $bad.ExitCode)
             Check (@($bad.Output | Where-Object { $_ -match 'контрольная сумма' }).Count -gt 0) 'нет объяснения про контрольную сумму'
             Check (-not (Test-Path -LiteralPath $marker)) 'установщик запущен при неверной сумме'
+        }
+    },
+    @{
+        Name = 'gate-resume-selfcheck'
+        Text = 'продолжение с упавшего шага: самопроверка после загрузки упала, -Resume last - сеанс проверки базы (та же), загрузка, проверки и канарейка взяты готовыми, самопроверка заново - зелёный'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $first = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake @{ selfcheck = @(@{ }, @{ tasks = $errorTasks; fingerprint = 'после' }) }
+            Check-Common $first; Check-Verdict $first 'RED' 1
+            Check (@($first.Output | Where-Object { $_ -match 'Продолжить с упавшего шага' }).Count -eq 1) 'в конце красного прогона нет подсказки про продолжение'
+            $firstName = Split-Path -Leaf $first.RunDir
+            Reset-FakeState $sb
+            $r = Invoke-Script -Sandbox $sb -Arguments '-Resume last' -Fake @{ selfcheck = @(@{ fingerprint = 'проверка' }, @{ fingerprint = 'после2' }) }
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            Check ($r.RunDir -and $r.RunDir -ne $first.RunDir) 'продолжение не завело свою папку прогона'
+            Check ($null -ne $r.Verdict -and $null -ne $r.Verdict.resume -and $r.Verdict.resume.from -eq $firstName -and $r.Verdict.resume.start -eq 'selfcheck') 'в verdict.json нет resume (из какого прогона, с какого этапа)'
+            Check-Step $r 'Проверка базы перед продолжением' 'OK'
+            foreach ($stepName in @('Самопроверка до загрузки', 'Загрузить Адаптация', 'Проверка конфигурации', 'Канареечный вход')) {
+                $step = Get-Step $r $stepName
+                Check ($null -ne $step -and $step.from -eq $firstName) ("шаг «{0}» не взят готовым из прогона {1}" -f $stepName, $firstName)
+            }
+            $after = Get-Step $r 'Самопроверка после загрузки'
+            Check ($null -ne $after -and $after.status -eq 'OK' -and -not $after.from) 'самопроверка после загрузки не выполнена заново'
+            Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0) 'продолжение загружало комплект заново'
+            Check ((Get-Calls $r @('/DumpCfg')).Count -eq 0) 'продолжение снимало резервную копию заново'
+            Check ((Get-Calls $r @('/CheckConfig')).Count -eq 0) 'продолжение повторяло проверку конфигурации'
+            Check ((Get-Calls $r @('canary;')).Count -eq 0) 'продолжение повторяло канареечный вход'
+            Check ((Get-Calls $r @('selfcheck;', 'start=999999')).Count -eq 1) 'нет сеанса проверки базы (самопроверка без заданий)'
+            if ($r.RunDir) {
+                Check (Test-Path -LiteralPath (Join-Path $r.RunDir 'checkconfig_all.norm.txt')) 'файлы проверки конфигурации не скопированы в папку продолжения'
+                Check ([System.IO.File]::ReadAllText((Join-Path $r.RunDir 'summary.txt'), $utf8) -match ('Загрузить Адаптация \(из прогона {0}\)' -f $firstName)) 'в summary.txt нет пометки «из прогона»'
+            }
+        }
+    },
+    @{
+        Name = 'gate-resume-base-changed'
+        Text = 'продолжение: после прогона расширение в temp изменилось (другая хеш-сумма) - вопрос, «продолжить с проверок»: загрузка взята готовой, проверки, канарейка и самопроверка заново'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $first = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake @{ selfcheck = @(@{ }, @{ tasks = $errorTasks; fingerprint = 'после' }) }
+            Check-Verdict $first 'RED' 1
+            $firstName = Split-Path -Leaf $first.RunDir
+            Reset-FakeState $sb
+            $changed = @('Адаптация|1|active|hashПравка', 'Доработки|1|active|hashB')
+            $r = Invoke-Script -Sandbox $sb -Arguments '-Resume last' -Fake @{ selfcheck = @(@{ ext = $changed }, @{ ext = $changed; fingerprint = 'после2' }) } -Answers @(
+                @{ Kind = 'one'; Header = 'База изменилась после прогона'; Item = '^Продолжить с «Проверки конфигуратором»' })
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            $check = Get-Step $r 'Проверка базы перед продолжением'
+            $checkText = 'шага нет'
+            if ($null -ne $check) { $checkText = [string]$check.detail }
+            Check ($null -ne $check -and $check.status -eq 'OK' -and $checkText -match 'Адаптация: изменено') ('проверка базы не показала, что изменилось: ' + $checkText)
+            Check ($null -ne $r.Verdict -and $r.Verdict.resume.start -eq 'checks') 'начало не перенесено на проверки'
+            $load = Get-Step $r 'Загрузить Адаптация'
+            Check ($null -ne $load -and $load.from -eq $firstName) 'загрузка не взята готовой'
+            Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0) 'продолжение загружало комплект поверх правки в temp'
+            Check ((Get-Calls $r @('/CheckConfig')).Count -eq 1) 'проверка конфигурации не выполнена заново'
+            Check ((Get-Calls $r @('canary;')).Count -eq 1) 'канареечный вход не выполнен заново'
+        }
+    },
+    @{
+        Name = 'gate-resume-new-file-menu'
+        Text = 'продолжение из меню: обновление БД упало, комплект оставлен; в inbox исправленный файл - «Продолжить прогон», начать с «до» нельзя, грузится новый файл без новой резервной копии, «до» и прежние версии - из первого прогона'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $first = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake @{ designer = @(@{ match = @('/UpdateDBCfg', 'Адаптация'); exit = 1; log = 'Ошибка обновления: тест'; times = 1 }) }
+            Check-Common $first; Check-Verdict $first 'RED' 1
+            Check ($null -ne $first.Verdict -and $first.Verdict.kitDecision -eq 'kept') 'комплект первого прогона не оставлен'
+            $firstName = Split-Path -Leaf $first.RunDir
+            Reset-FakeState $sb
+            $fixedName = 'erp_temp_Адаптация_20261118_исправлено.cfe'
+            $fixed = Add-InboxFile $sb $fixedName 'fake-исправлено'
+            $r = Invoke-Script -Sandbox $sb -Answers @(
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Продолжить прогон' },
+                @{ Kind = 'one'; Header = 'с какого шага'; Item = '^Загрузка комплекта' },
+                @{ Kind = 'confirm'; Header = '^Продолжить прогон\?'; Yes = $true })
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            $menu = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('с какого шага') })
+            Check ($menu.Count -eq 1 -and $menu[0].Contains('нельзя: в базе стоит комплект')) 'в меню продолжения начать с «до» не запрещено'
+            Check ((Get-Calls $r @('/LoadCfg', $fixedName)).Count -eq 1) 'не загружен исправленный файл из inbox'
+            Check ((Get-Calls $r @('/DumpCfg')).Count -eq 0) 'резервная копия снята заново, хотя в базе уже комплект'
+            $before = Get-Step $r 'Самопроверка до загрузки'
+            Check ($null -ne $before -and $before.from -eq $firstName) 'самопроверка до загрузки не взята из первого прогона'
+            Check (-not (Test-Path -LiteralPath $fixed)) 'исправленный файл остался в inbox'
+            if ($r.RunDir) {
+                Check (Test-Path -LiteralPath (Join-Path $r.RunDir ('inbox\' + $fixedName))) 'исправленного файла нет в папке продолжения'
+                $state = [System.IO.File]::ReadAllText((Join-Path $r.RunDir 'resume.json'), $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                $backup = [string]@($state.kit.items)[0].backup
+                Check ($backup -like ('*\' + $firstName + '\before\*')) ('прежняя версия - не из первого прогона: ' + $backup)
+            }
+        }
+    },
+    @{
+        Name = 'gate-resume-canary-unverified'
+        Text = 'продолжение после упавшей канарейки: самопроверки «после» не было - проверить базу не с чем, вопрос «не меняли?», проверки взяты готовыми, канарейка и самопроверка заново; шаг проверки базы жёлтый'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $first = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake @{ canary = @(@{ status = 'fail' }) }
+            Check-Common $first; Check-Verdict $first 'RED' 1
+            Check-Step $first 'Канареечный вход' 'FAIL'
+            Reset-FakeState $sb
+            $r = Invoke-Script -Sandbox $sb -Arguments '-Resume last -OnNotGreen Keep' -Answers @(
+                @{ Kind = 'confirm'; Header = 'Проверить базу не с чем'; Yes = $true })
+            Check-Common $r; Check-Verdict $r 'YELLOW' 2
+            Check-Step $r 'Проверка базы перед продолжением' 'WARN'
+            Check-Step $r 'Канареечный вход' 'OK'
+            Check-Step $r 'Самопроверка после загрузки' 'OK'
+            Check ($null -ne $r.Verdict -and $r.Verdict.resume.start -eq 'canary') 'продолжение не с канарейки'
+            Check ((Get-Calls $r @('/CheckConfig')).Count -eq 0) 'проверка конфигурации повторялась'
+            Check ((Get-Calls $r @('start=999999')).Count -eq 0) 'был сеанс проверки базы, хотя сравнивать не с чем'
+        }
+    },
+    @{
+        Name = 'gate-resume-refused-green'
+        Text = 'после зелёного прогона продолжать нечего: -Resume last отказывается до начала прогона, новой папки нет; пункта «Продолжить прогон» в меню нет'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $first = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep'
+            Check-Verdict $first 'GREEN' 0
+            $r = Invoke-Script -Sandbox $sb -Arguments '-Resume last'
+            Check ($r.ExitCode -eq 1) ("код {0}, ждали 1" -f $r.ExitCode)
+            Check (@($r.Output | Where-Object { $_ -match 'продолжать нечего' }).Count -gt 0) 'нет объяснения, почему продолжать нельзя'
+            Check ($r.RunDir -eq $first.RunDir) 'отказ завёл новую папку прогона'
+            $m = Invoke-Script -Sandbox $sb -Answers @(@{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
+            $menus = @($m.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Гейт расширений') })
+            Check ($menus.Count -eq 1 -and -not $menus[0].Contains('Продолжить прогон')) 'в меню после зелёного прогона есть «Продолжить прогон»'
         }
     }
 )

@@ -331,6 +331,8 @@ $kitText = [string](Get-JsonProperty $meta 'kit' '')
 $steps = @(Get-JsonProperty $meta 'steps' @())
 $kitItems = @(Get-JsonProperty $meta 'kitItems' @())
 $kitDecision = [string](Get-JsonProperty $meta 'kitDecision' '')
+# Продолжение прогона с упавшего шага: шаги раньше взяты готовыми из прежних прогонов (у шага - from).
+$resumeMeta = Get-JsonProperty $meta 'resume' $null
 $script:EarlierRuns = @(Get-EarlierRuns)
 
 $referenceDir = Join-Path $RunDir 'reference'
@@ -823,6 +825,8 @@ foreach ($dir in $script:EarlierRuns) {
     if (-not (Test-Path -LiteralPath $verdictPath)) { continue }
     try { $earlier = Get-Content -LiteralPath $verdictPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
     foreach ($step in @(Get-JsonProperty $earlier 'steps' @())) {
+        # Шаг, взятый готовым из прежнего прогона, - не новый замер длительности.
+        if ([string](Get-JsonProperty $step 'from' '')) { continue }
         $seconds = [int](Get-JsonProperty $step 'seconds' 0)
         if ([string](Get-JsonProperty $step 'status' '') -ne 'OK' -or $seconds -le 0) { continue }
         $name = [string](Get-JsonProperty $step 'name' '')
@@ -834,6 +838,7 @@ $slow = New-Object System.Collections.Generic.List[string]
 foreach ($step in $steps) {
     $name = [string](Get-JsonProperty $step 'name' '')
     $seconds = [int](Get-JsonProperty $step 'seconds' 0)
+    if ([string](Get-JsonProperty $step 'from' '')) { continue }
     if (-not $history.ContainsKey($name) -or $seconds -le 120) { continue }
     $values = @($history[$name] | Sort-Object)
     if ($values.Count -lt 2) { continue }
@@ -858,6 +863,9 @@ $report = New-Object System.Collections.Generic.List[string]
 $report.Add(("РАЗБОР ПРОГОНА {0}, база {1}" -f $runId, $baseKey))
 if ($kitText) { $report.Add(('Комплект: ' + $kitText)) } else { $report.Add('Комплект: не задан, проверялась база как есть') }
 $report.Add(('Вердикт: ' + [string](Get-JsonProperty $meta 'verdict' '')))
+if ($null -ne $resumeMeta) {
+    $report.Add(("Продолжение прогона {0} с «{1}»: шаги раньше взяты готовыми из прежних прогонов (в summary.txt - «из прогона»)" -f (Get-JsonProperty $resumeMeta 'from' ''), (Get-JsonProperty $resumeMeta 'startTitle' '')))
+}
 $decisionText = @{ kept = 'оставлен в базе'; rolledBack = 'откачен'; rollbackFailed = 'откат прошёл не полностью' }
 if ($kitDecision) {
     $text = $kitDecision
