@@ -54,7 +54,7 @@ function New-Sandbox {
     param([string]$Name, [hashtable]$Config = @{})
     $dir = Join-Path $workRoot $Name
     foreach ($sub in @('bin', 'tools', 'inbox', 'fake')) { New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null }
-    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1')) {
+    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1')) {
         Copy-Item -LiteralPath (Join-Path $ciRoot $script) -Destination $dir
     }
     # Подставной COM для deploy.ps1: скрипт берёт его из test\ рядом с собой, когда задан CI_FAKE_COM.
@@ -154,6 +154,9 @@ function Invoke-Script {
     $info.EnvironmentVariables['CI_FAKE_SCENARIO'] = $scenarioFile
     $info.EnvironmentVariables['CI_FAKE_LOG'] = $callsFile
     if (Test-Path -LiteralPath $comFile) { $info.EnvironmentVariables['CI_FAKE_COM'] = $comFile }
+    # Подставной GitHub для update.ps1: папка fake-http песочницы (ответы - файлами по адресам).
+    $httpDir = Join-Path $Sandbox 'fake-http'
+    if (Test-Path -LiteralPath $httpDir) { $info.EnvironmentVariables['CI_FAKE_HTTP'] = $httpDir }
     $process = [System.Diagnostics.Process]::Start($info)
     $errorTask = $process.StandardError.ReadToEndAsync()
 
@@ -1827,6 +1830,68 @@ $tests = @(
             Check (-not $config.ContainsKey('ContractorExtensions')) 'пустой ContractorExtensions остался в config.psd1 и закрывает настройку площадки'
             Check (-not $config.ContainsKey('UnitTestAuthor')) 'умолчание UnitTestAuthor дописано поверх настройки площадки'
             Check ($config.ContainsKey('ReleaseJobsLock')) 'обычные умолчания не дописаны'
+        }
+    },
+    @{
+        Name = 'update-from-release'
+        Text = 'обновление гейта из релиза GitHub: выбор новее, скачивание по переадресации (токен только в API), сумма, установщик комплекта без вопросов, ci.exe -> ci.exe.old, код 10; не та сумма - отказ'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ UpdateRepo = 'owner/repo'; GitHubTokenPassFile = 'secrets\github.txt' }
+            New-Item -ItemType Directory -Path (Join-Path $sb 'secrets') -Force | Out-Null
+            $secret = 'tok-секрет-123'
+            [System.IO.File]::WriteAllText((Join-Path $sb 'secrets\github.txt'), (ConvertFrom-SecureString -SecureString (ConvertTo-SecureString $secret -AsPlainText -Force)))
+            [System.IO.File]::WriteAllText((Join-Path $sb 'ci.exe'), 'старый ci.exe')
+            # Комплект: install.ps1-заглушка (пишет, куда и как её позвали) и ci\run.ps1.
+            $kit = Join-Path $workRoot ($Name + '-kit')
+            New-Item -ItemType Directory -Path (Join-Path $kit 'ci') -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $kit 'install.ps1'), ('param([string]$Target, [switch]$Unattended)' + "`r`n" + '[System.IO.File]::WriteAllText((Join-Path $Target "installed-marker.txt"), ("target=" + $Target + " unattended=" + [bool]$Unattended))'), $utf8Bom)
+            [System.IO.File]::WriteAllText((Join-Path $kit 'ci\run.ps1'), '# Версия 20991231.000000.', $utf8Bom)
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = Join-Path $workRoot ($Name + '.zip')
+            if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+            [System.IO.Compression.ZipFile]::CreateFromDirectory($kit, $zip)
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            $digest = -join @($sha.ComputeHash([System.IO.File]::ReadAllBytes($zip)) | ForEach-Object { $_.ToString('x2') })
+            $http = Join-Path $sb 'fake-http'
+            New-Item -ItemType Directory -Path $http -Force | Out-Null
+            $put = {
+                param([string]$Url, $Content)
+                $file = Join-Path $http ([regex]::Replace($Url, '[^A-Za-z0-9.\-]', '_'))
+                if ($Content -is [byte[]]) { [System.IO.File]::WriteAllBytes($file, $Content) } else { [System.IO.File]::WriteAllText($file, [string]$Content, $utf8) }
+            }
+            $releases = @(
+                @{ tag_name = 'gate-20991231.000000'; draft = $false; published_at = '2099-12-31T10:00:00Z'; body = "- модульные тесты`n- обновление из GitHub"
+                    assets = @(@{ name = 'ci-gate_20991231.000000.zip'; url = 'https://api.github.com/repos/owner/repo/releases/assets/1'; size = 1000; digest = ('sha256:' + $digest) }) },
+                @{ tag_name = 'gate-20000101.000000'; draft = $false; published_at = '2000-01-01T10:00:00Z'; body = 'старый'
+                    assets = @(@{ name = 'ci-gate_20000101.000000.zip'; url = 'https://api.github.com/repos/owner/repo/releases/assets/2'; size = 1000; digest = ('sha256:' + ('0' * 64)) }) },
+                @{ tag_name = 'other-1'; draft = $false; published_at = '2099-01-01T10:00:00Z'; body = ''; assets = @() })
+            & $put 'https://api.github.com/repos/owner/repo/releases?per_page=30' (ConvertTo-Json -InputObject $releases -Depth 6)
+            & $put 'https://api.github.com/repos/owner/repo/releases/assets/1' 'REDIRECT https://objects.example.com/new.zip'
+            & $put 'https://api.github.com/repos/owner/repo/releases/assets/2' 'REDIRECT https://objects.example.com/old.zip'
+            & $put 'https://objects.example.com/new.zip' ([System.IO.File]::ReadAllBytes($zip))
+            & $put 'https://objects.example.com/old.zip' ([System.IO.File]::ReadAllBytes($zip))
+            $r = Invoke-Script -Sandbox $sb -Script 'update.ps1' -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление гейта из owner/repo'; Item = '^20991231\.000000 .*новее' },
+                @{ Kind = 'confirm'; Header = 'Поставить 20991231\.000000\?'; Yes = $true })
+            Check ($r.ExitCode -eq 10) ("код {0}, ждали 10 (поставлен): {1}" -f $r.ExitCode, (($r.Output | Select-Object -Last 5) -join ' | '))
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            $marker = Join-Path $sb 'installed-marker.txt'
+            Check ((Test-Path -LiteralPath $marker) -and ([System.IO.File]::ReadAllText($marker) -match 'unattended=True')) 'установщик комплекта не запускался без вопросов'
+            Check ((Test-Path -LiteralPath (Join-Path $sb 'ci.exe.old')) -and -not (Test-Path -LiteralPath (Join-Path $sb 'ci.exe'))) 'ci.exe не переименован в ci.exe.old'
+            $requests = [System.IO.File]::ReadAllText((Join-Path $http 'requests.log'), $utf8)
+            Check ($requests -match 'releases\?per_page=30 токен=да') 'список релизов без токена'
+            Check ($requests -match 'assets/1 токен=да accept=application/octet-stream') 'файл релиза запрошен не так'
+            Check ($requests -match 'objects\.example\.com/new\.zip токен=нет') 'токен ушёл на адрес переадресации'
+            Check (@($r.Output | Where-Object { $_ -match [regex]::Escape($secret) }).Count -eq 0) 'токен в выводе'
+            Check ([System.IO.File]::ReadAllText((Join-Path $sb 'updates\installed.txt'), $utf8) -match 'gate-20991231\.000000') 'нет записи в updates\installed.txt'
+            Check (@($r.Output | Where-Object { $_ -match 'Контрольная сумма совпала' }).Count -eq 1) 'сумма не проверялась'
+            # Старый релиз с неверной суммой - отказ, установщик не зовётся.
+            Remove-Item -LiteralPath $marker -Force
+            $bad = Invoke-Script -Sandbox $sb -Script 'update.ps1' -Arguments '-Tag gate-20000101.000000'
+            Check ($bad.ExitCode -eq 1) ("не та сумма: код {0}, ждали 1" -f $bad.ExitCode)
+            Check (@($bad.Output | Where-Object { $_ -match 'контрольная сумма' }).Count -gt 0) 'нет объяснения про контрольную сумму'
+            Check (-not (Test-Path -LiteralPath $marker)) 'установщик запущен при неверной сумме'
         }
     }
 )

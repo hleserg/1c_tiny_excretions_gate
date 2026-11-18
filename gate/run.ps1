@@ -153,6 +153,10 @@ trap {
 }
 
 $Root = $PSScriptRoot
+# Версия гейта - из заголовка этого файла (её ставит сборщик); показывается в меню у «Обновить гейт».
+$script:GateVersion = 'неизвестна'
+$gateVersionFound = [regex]::Match((@(Get-Content -LiteralPath $PSCommandPath -Encoding UTF8 -TotalCount 80) -join "`n"), 'Версия (\d{8}\.\d{6})\.')
+if ($gateVersionFound.Success) { $script:GateVersion = $gateVersionFound.Groups[1].Value }
 $Utf8Bom = New-Object System.Text.UTF8Encoding($true)
 
 # Имя базы должно быть похоже на тестовую. То же правило, что в обработке «Выполнить после обновления».
@@ -2986,6 +2990,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         if ($unitTestExtensions.Count -gt 0) { $menu.Add([pscustomobject]@{ Key = 'tests'; Label = ('Модульные тесты: список, прогон, новый тест, забрать из {0}' -f $script:Base) }) }
         $menu.Add([pscustomobject]@{ Key = 'stats'; Label = 'Статистика длительностей: план и факт' })
         $menu.Add([pscustomobject]@{ Key = 'settings'; Label = 'Настройки (config.psd1)' })
+        if ([string](Get-Setting $cfg 'UpdateRepo' '')) { $menu.Add([pscustomobject]@{ Key = 'update'; Label = ('Обновить гейт из GitHub (стоит {0})' -f $script:GateVersion) }) }
         if (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1')) {
             $menu.Add([pscustomobject]@{ Key = 'deploy'; Label = 'Обновить рабочую базу (deploy)' })
             $menu.Add([pscustomobject]@{ Key = 'basestate'; Label = 'Показать состояние баз: блокировки и сеансы' })
@@ -3051,6 +3056,19 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             try { & (Join-Path $Root 'deploy.ps1') @pullArgs }
             catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
             Wait-UiAcknowledge
+            continue
+        }
+        if ($choice -eq 'update') {
+            # update.ps1: релизы GitHub, выбрать, поставить. Код 10 - поставлен: скрипты на диске уже новые, меню - заново.
+            $updateArgs = @{}
+            if ($UiChannel) { $updateArgs['UiChannel'] = $UiChannel }
+            & (Join-Path $Root 'update.ps1') @updateArgs
+            $updateCode = $LASTEXITCODE
+            Wait-UiAcknowledge
+            if ($updateCode -eq 10) {
+                Write-Host 'Гейт обновлён: перезапусти ci (закрой окно и открой снова).' -ForegroundColor Green
+                exit 0
+            }
             continue
         }
         if ($choice -eq 'settings') {

@@ -144,6 +144,11 @@
     UnitTestTimeoutMin = 30          # предел на прогон тестов
     UnitTestAuthor     = ''          # автор новых тестов из меню «Тесты»: Фамилия И.О. (дата добавляется сама)
 
+    # Обновление гейта из релизов GitHub (readme.txt, раздел 5.20): пусто - пункта в меню нет.
+    # UpdateRepo = 'владелец/репозиторий'
+    # GitHubTokenPassFile = 'secrets\githubtoken.txt'   # токен, зашифрован DPAPI: «Настройки - Обновление гейта и git»
+    UpdateTagPrefix = 'gate-'
+
     # Папка с обновлениями для меню гейта (.\run.cmd без ключей).
     InboxDir = 'inbox'
 
