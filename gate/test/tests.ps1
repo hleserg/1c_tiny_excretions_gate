@@ -54,7 +54,7 @@ function New-Sandbox {
     param([string]$Name, [hashtable]$Config = @{})
     $dir = Join-Path $workRoot $Name
     foreach ($sub in @('bin', 'tools', 'inbox', 'fake')) { New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null }
-    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1')) {
+    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1')) {
         Copy-Item -LiteralPath (Join-Path $ciRoot $script) -Destination $dir
     }
     # Подставной COM для deploy.ps1: скрипт берёт его из test\ рядом с собой, когда задан CI_FAKE_COM.
@@ -166,6 +166,9 @@ function Invoke-Script {
     # Подставной GitHub для update.ps1: папка fake-http песочницы (ответы - файлами по адресам).
     $httpDir = Join-Path $Sandbox 'fake-http'
     if (Test-Path -LiteralPath $httpDir) { $info.EnvironmentVariables['CI_FAKE_HTTP'] = $httpDir }
+    # Подставной GitHub для репозитория расширений (github.ps1): папка fake-github песочницы.
+    $githubDir = Join-Path $Sandbox 'fake-github'
+    if (Test-Path -LiteralPath $githubDir) { $info.EnvironmentVariables['CI_FAKE_GITHUB'] = $githubDir }
     $process = [System.Diagnostics.Process]::Start($info)
     $errorTask = $process.StandardError.ReadToEndAsync()
 
@@ -477,6 +480,61 @@ function New-PrintProcessing {
     param([string]$Version, [string]$Content)
     return @{ objName = 'Печать'; title = 'Печать актов'; version = $Version; kind = 'Печатная форма'; content = $Content }
 }
+
+# Репозиторий расширений (раздел 5.23): подставной GitHub - папка fake-github песочницы, читается и
+# заполняется теми же функциями github.ps1.
+. (Join-Path $ciRoot 'github.ps1')
+
+function New-GitSandbox {
+    param([string]$Name)
+    $config = $deployConfig.Clone()
+    $config['ExtensionsRepo'] = 'owner/ext'
+    $config['GitHubTokenPassFile'] = 'secrets\github.txt'
+    $sb = New-Sandbox $Name -Config $config
+    New-Item -ItemType Directory -Path (Join-Path $sb 'secrets') -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $sb 'secrets\github.txt'), (ConvertFrom-SecureString -SecureString (ConvertTo-SecureString 'tok-git' -AsPlainText -Force)))
+    New-Item -ItemType Directory -Path (Join-Path $sb 'fake-github') -Force | Out-Null
+    return $sb
+}
+
+function Get-FakeGh {
+    param([string]$Sandbox)
+    $env:CI_FAKE_GITHUB = Join-Path $Sandbox 'fake-github'
+    try { return New-GhContext -Repo 'owner/ext' -Token '' } finally { Remove-Item -Path 'env:CI_FAKE_GITHUB' }
+}
+
+function Read-GitStateFile {
+    param([string]$Sandbox)
+    return ([System.IO.File]::ReadAllText((Join-Path $Sandbox 'git\ext\state.json'), $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json)
+}
+
+function New-GitDumps {
+    # Выгрузки подставной 1С: модуль Адаптации и модуль Доработок.
+    param([string]$Adapt = 'Процедура Старая() КонецПроцедуры', [string]$Extra = 'Процедура Д() КонецПроцедуры')
+    return @{ 'Адаптация' = @{ 'CommonModules/АГБ_Общий/Ext/Module.bsl' = $Adapt }; 'Доработки' = @{ 'CommonModules/Д/Ext/Module.bsl' = $Extra } }
+}
+
+$gitBootstrapAnswers = @(
+    @{ Kind = 'many'; Header = 'Первая выгрузка в owner/ext'; Indexes = @(0, 1) },
+    @{ Kind = 'confirm'; Header = 'Вести в git и внешние обработки'; Yes = $true },
+    @{ Kind = 'many'; Header = 'Какие внешние обработки'; Indexes = @(0) },
+    @{ Kind = 'confirm'; Header = 'первым коммитом'; Yes = $true })
+
+# Заглушка run.ps1 для «Загрузить из git»: записывает, с каким комплектом её позвали, и итог прогона - всё загрузилось.
+$gitRunStub = @'
+param([string]$Kit = '', [string]$KitSource = '', [string]$Config = '', [string]$UiChannel = '')
+$dir = Join-Path $PSScriptRoot ('runs\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+New-Item -ItemType Directory -Path $dir -Force | Out-Null
+$lines = @(('Kit=' + $Kit), ('KitSource=' + $KitSource))
+foreach ($sub in @(Get-ChildItem -LiteralPath $Kit -Directory | Sort-Object Name)) { $lines += ('dir=' + $sub.Name) }
+foreach ($file in @(Get-ChildItem -LiteralPath $Kit -Recurse -File)) { $lines += ('file=' + $file.FullName.Substring($Kit.TrimEnd('\').Length + 1).Replace('\', '/')) }
+[System.IO.File]::WriteAllLines((Join-Path $dir 'stub.txt'), [string[]]$lines, (New-Object System.Text.UTF8Encoding($true)))
+$items = @(Get-ChildItem -LiteralPath $Kit -Directory | ForEach-Object { @{ name = $_.Name; loadTried = $true; touched = $true } })
+$verdict = @{ verdict = 'GREEN'; kitDecision = ''; kitItems = $items; kitProcessings = @() }
+[System.IO.File]::WriteAllText((Join-Path $dir 'verdict.json'), (ConvertTo-Json -InputObject $verdict -Depth 4), (New-Object System.Text.UTF8Encoding($true)))
+Write-Host 'заглушка гейта: прогон записан'
+exit 0
+'@
 
 # Ответы обычного обновления: гейта нет (переспрос «хотя прогонов гейта нет»), имя рабочей базы.
 $deployRiskAnswer = @{ Kind = 'confirm'; Header = 'хотя прогонов гейта нет'; Yes = $true }
@@ -1924,6 +1982,89 @@ $tests = @(
                 Check ($body -match 'run\.log') 'в событии нет конца run.log'
                 if ($r.RunDir) { Check ([string]$crashEvents[0].run -eq (Split-Path -Leaf $r.RunDir)) 'crash не того прогона' }
             }
+        }
+    },
+    @{
+        Name = 'git-export'
+        Text = '«Выгрузить temp в git»: первый раз - выбор расширений и обработок, первый коммит в main (без ConfigDumpInfo.xml, с .gitattributes), state.json; без правок - «выгружать нечего»; правка в temp - ветка temp/<время> и pull request, main не тронут'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers $gitBootstrapAnswers
+            Check-DeployCommon $r -LocksExpected $false
+            Check ($r.ExitCode -eq 0) ("код {0}, ждали 0: {1}" -f $r.ExitCode, (($r.Output | Select-Object -Last 3) -join ' | '))
+            $head = (Get-GhHead -Gh $gh -Branch 'main').Sha
+            Check ([bool]$head) 'main не создан'
+            if ($head) {
+                $files = Get-GhFiles -Gh $gh -Commit $head
+                foreach ($path in @('README.md', '.gitattributes', 'extensions/Адаптация/Configuration.xml', 'extensions/Адаптация/CommonModules/АГБ_Общий/Ext/Module.bsl',
+                        'extensions/Доработки/Configuration.xml', 'processings/Печать/Печать.xml', 'processings/Печать/Печать/Ext/ObjectModule.bsl')) {
+                    Check ($files.ContainsKey($path)) ("в main нет {0}" -f $path)
+                }
+                Check (@($files.Keys | Where-Object { $_ -match 'ConfigDumpInfo' }).Count -eq 0) 'ConfigDumpInfo.xml попал в git'
+                Check ((Read-GitStateFile $sb).commit -eq $head) 'state.json: temp не на main после первой выгрузки'
+            }
+            Reset-FakeState $sb
+            $same = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = (New-GitDumps) } -Com $com
+            Check-DeployCommon $same -LocksExpected $false
+            Check (@($same.Output | Where-Object { $_ -match 'выгружать нечего' }).Count -eq 1) 'без правок не сказано «выгружать нечего»'
+            Reset-FakeState $sb
+            $pr = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = (New-GitDumps -Adapt 'Процедура Новая() КонецПроцедуры') } -Com $com -Answers @(
+                @{ Kind = 'confirm'; Header = 'веткой temp/'; Yes = $true })
+            Check-DeployCommon $pr -LocksExpected $false
+            Check ((Get-GhHead -Gh $gh -Branch 'main').Sha -eq $head) 'выгрузка правок двинула main'
+            $pulls = Join-Path $sb 'fake-github\pulls.txt'
+            Check ((Test-Path -LiteralPath $pulls) -and ([System.IO.File]::ReadAllText($pulls, $utf8) -match "1`ttemp/\d{8}-\d{6}`tmain`t")) 'нет pull request из temp/<время> в main'
+            $state = Read-GitStateFile $sb
+            Check ([int]$state.pendingNumber -eq 1 -and $state.commit -and $state.commit -ne $head) 'state.json: нет неслитого pull request с правками temp'
+            if ($state.commit -and $head) {
+                $path = 'extensions/Адаптация/CommonModules/АГБ_Общий/Ext/Module.bsl'
+                Check ((Get-GhFiles -Gh $gh -Commit $state.commit)[$path] -ne (Get-GhFiles -Gh $gh -Commit $head)[$path]) 'в ветке temp правки нет'
+            }
+        }
+    },
+    @{
+        Name = 'git-import'
+        Text = '«Загрузить из git»: temp правили после загрузки - вопрос, «Отмена» ничего не трогает; правок нет - прогон гейта только с тем, что изменилось в main (-KitSource с коммитом), после прогона state.json - на main'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
+            $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            $head = (Get-GhHead -Gh $gh -Branch 'main').Sha
+            Check ([bool]$head) 'первая выгрузка не создала main'
+            if (-not $head) { return }
+            # В main слили правку Доработок (как после pull request агента).
+            $change = [pscustomobject]@{ Path = 'extensions/Доработки/CommonModules/Д/Ext/Module.bsl'; Bytes = $utf8.GetBytes('Процедура Д2() КонецПроцедуры') }
+            $merged = New-GhCommit -Gh $gh -Parent $head -Changes @($change) -Message 'слитый pull request'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $merged
+            [System.IO.File]::WriteAllText((Join-Path $sb 'run.ps1'), $gitRunStub, $utf8Bom)
+            Reset-FakeState $sb
+            $drift = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{ dumps = (New-GitDumps -Adapt 'Процедура ПравкаВTemp() КонецПроцедуры') } -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'правки после прошлой загрузки'; Item = '^Отмена' })
+            Check-DeployCommon $drift -LocksExpected $false
+            Check (@($drift.Output | Where-Object { $_ -match 'есть правки, которых нет в git' }).Count -eq 1) 'правки temp не замечены'
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'runs'))) 'после «Отмена» гейт запускался'
+            Check ((Read-GitStateFile $sb).commit -eq $head) 'после «Отмена» state.json поменялся'
+            Reset-FakeState $sb
+            $load = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers @(
+                @{ Kind = 'confirm'; Header = 'Загрузить в erp_temp_test из main'; Yes = $true })
+            Check-DeployCommon $load -LocksExpected $false
+            Check ($load.ExitCode -eq 0) ("код {0}, ждали 0: {1}" -f $load.ExitCode, (($load.Output | Select-Object -Last 3) -join ' | '))
+            $stubFile = @(Get-ChildItem -LiteralPath (Join-Path $sb 'runs') -Recurse -Filter 'stub.txt' -ErrorAction SilentlyContinue)
+            Check ($stubFile.Count -eq 1) 'гейт не запускался'
+            if ($stubFile.Count -eq 1) {
+                $stub = [System.IO.File]::ReadAllText($stubFile[0].FullName, $utf8)
+                Check ($stub -match ('KitSource=git owner/ext@' + $merged.Substring(0, 7))) 'в -KitSource нет коммита main'
+                Check ($stub -match 'dir=Доработки' -and $stub -notmatch 'dir=Адаптация' -and $stub -notmatch 'dir=Печать') ("в комплекте не только изменившееся: " + $stub)
+                Check ($stub -match 'file=Доработки/Configuration\.xml' -and $stub -match 'file=Доработки/CommonModules/Д/Ext/Module\.bsl') 'в комплекте нет выгрузки Доработок целиком'
+            }
+            Check ((Read-GitStateFile $sb).commit -eq $merged) 'после прогона state.json не на main'
+            Check (@($load.Output | Where-Object { $_ -match 'теперь на main' }).Count -eq 1) 'не сказано, что temp на main'
         }
     },
     @{

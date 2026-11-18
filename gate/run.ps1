@@ -114,6 +114,11 @@ param(
     [Parameter(ParameterSetName = 'Run')]
     [string]$FromStep = '',
 
+    # Откуда комплект, строкой в итог прогона (summary.txt, verdict.json): «Загрузить из git» передаёт
+    # репозиторий и коммит.
+    [Parameter(ParameterSetName = 'Run')]
+    [string]$KitSource = '',
+
     # Папка канала интерфейса ci.exe: его задаёт сам ci.exe, руками не нужен.
     [Parameter(ParameterSetName = 'Run')]
     [string]$UiChannel = '',
@@ -3874,6 +3879,12 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         $resumeDir = Get-ResumeTargetDir
         $resumeLabel = Get-ResumeMenuLabel $resumeDir
         if ($resumeLabel) { $menu.Add([pscustomobject]@{ Key = 'resume'; Label = $resumeLabel }) }
+        # Расширения и обработки через git (deploy.ps1 -GitImport/-GitExport, раздел 5.23).
+        $gitRepo = [string](Get-Setting $cfg 'ExtensionsRepo' '')
+        if ($gitRepo -and (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1'))) {
+            $menu.Add([pscustomobject]@{ Key = 'gitimport'; Label = ('Загрузить из git в {0} ({1})' -f $script:Base, $gitRepo) })
+            $menu.Add([pscustomobject]@{ Key = 'gitexport'; Label = ('Выгрузить {0} в git: правки temp - веткой и pull request' -f $script:Base) })
+        }
         $acceptable = Get-AcceptableRun
         if ($null -ne $acceptable) {
             $menu.Add([pscustomobject]@{ Key = 'accept'; Label = ('Принять новое последнего прогона в эталон ({0}, {1})' -f $acceptable.Dir.Name, (Get-RunListText $acceptable.Verdict)) })
@@ -3937,6 +3948,16 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             try {
                 if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -BaseState -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') -BaseState }
             }
+            catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+            Wait-UiAcknowledge
+            continue
+        }
+        if ($choice -eq 'gitimport' -or $choice -eq 'gitexport') {
+            # Загрузить из git - проверка правок temp, потом обычный прогон с тем, что изменилось в main (его ведёт
+            # deploy.ps1 отдельным процессом run.ps1); выгрузить - коммит или ветка и pull request. Потом - в меню.
+            $gitArgs = @{ GitImport = ($choice -eq 'gitimport'); GitExport = ($choice -eq 'gitexport') }
+            if ($UiChannel) { $gitArgs['UiChannel'] = $UiChannel }
+            try { & (Join-Path $Root 'deploy.ps1') @gitArgs }
             catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
             Wait-UiAcknowledge
             continue
@@ -6558,8 +6579,9 @@ function Write-RunSummary {
         runId       = $runId
         baseKey     = $baseKey
         kit         = $Kit
-        kitItems    = @($kitItems | ForEach-Object { [pscustomobject]@{ name = $_.Name; kind = $_.Kind; version = $_.Version; source = $_.Source; label = $_.Label; path = $_.Path; wasInBase = $_.WasInBase } })
-        kitProcessings = @($kitProcessings | ForEach-Object { [pscustomobject]@{ name = $_.Name; kind = $_.Kind; fileName = $_.FileName; isReport = $_.IsReport; path = $_.Path; file = $_.File; objectName = $_.ObjectName; ref = $_.Ref; isNew = $_.IsNew; oldVersion = $_.OldVersion; newVersion = $_.NewVersion; oldB64 = $_.OldB64; oldFile = $_.OldFile; touched = $_.Touched } })
+        kitItems    = @($kitItems | ForEach-Object { [pscustomobject]@{ name = $_.Name; kind = $_.Kind; version = $_.Version; source = $_.Source; label = $_.Label; path = $_.Path; wasInBase = $_.WasInBase; loadTried = [bool]$_.LoadTried; touched = [bool]$_.Touched } })
+        kitSource   = $KitSource
+        kitProcessings = @($kitProcessings | ForEach-Object { [pscustomobject]@{ name = $_.Name; kind = $_.Kind; fileName = $_.FileName; isReport = $_.IsReport; path = $_.Path; file = $_.File; objectName = $_.ObjectName; ref = $_.Ref; isNew = $_.IsNew; oldVersion = $_.OldVersion; newVersion = $_.NewVersion; oldB64 = $_.OldB64; oldFile = $_.OldFile; touched = $_.Touched; tried = [bool]$_.Tried } })
         verdict     = $verdict
         failed      = $failed.Count
         warned      = $warned.Count
@@ -6576,6 +6598,7 @@ function Write-RunSummary {
     $text = New-Object System.Collections.Generic.List[string]
     $text.Add(("Прогон {0}, база {1}" -f $runId, $baseKey))
     $text.Add(("Комплект: {0}" -f $Kit))
+    if ($KitSource) { $text.Add(("Откуда комплект: {0}" -f $KitSource)) }
     $text.Add(("Вердикт: {0}" -f $verdict))
     if ($null -ne $resumeInfo) { $text.Add(("Продолжение прогона {0} с «{1}»: шаги раньше взяты из прежних прогонов готовыми (помечены «из прогона»)" -f $resumeInfo.from, $resumeInfo.startTitle)) }
     $text.Add('')

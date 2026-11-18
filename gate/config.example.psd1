@@ -149,6 +149,11 @@
     # GitHubTokenPassFile = 'secrets\githubtoken.txt'   # токен, зашифрован DPAPI: «Настройки - Обновление гейта и git»
     # Итог каждого прогона - в GitHub (раздел 5.22): событие gate-run в этот репозиторий, нужен Contents: write.
     # RunReportRepo = 'владелец/репозиторий'
+    # Расширения и обработки через git (раздел 5.23): «Загрузить из git», «Выгрузить temp в git». Токен - тот же,
+    # с правами Contents и Pull requests: чтение и запись.
+    # ExtensionsRepo = 'владелец/репозиторий'
+    ExtensionsBranch = 'main'
+    GitDir = 'git'
     UpdateTagPrefix = 'gate-'
 
     # Папка с обновлениями для меню гейта (.\run.cmd без ключей).
