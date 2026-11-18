@@ -992,17 +992,24 @@ function Export-Processings {
             $selection = $query.Execute().Select()
             $sha = [System.Security.Cryptography.SHA256]::Create()
             while ($selection.Next()) {
-                $objName = [string]$selection.ObjName
+                # Поля - по номеру (Получить(Индекс)) в порядке запроса: обращение по псевдониму через COM на
+                # рабочей дало «The property 'ObjName' cannot be found».
+                $title = [string]$selection.Get(0)
+                $objName = [string]$selection.Get(1)
+                $version = [string]$selection.Get(2)
+                $kind = [string]$selection.Get(3)
                 if (-not $objName) { continue }
                 $extension = '.epf'
-                if ([string]$selection.Kind -match 'тч[её]т') { $extension = '.erf' }
+                if ($kind -match 'тч[её]т') { $extension = '.erf' }
                 $file = Join-Path $Dir ($objName + $extension)
-                $data = $selection.Storage.Get()
+                $storage = $selection.Get(4)
+                if ($null -eq $storage) { continue }
+                $data = $storage.Get()
                 if ($null -eq $data) { continue }
                 $data.Write($file)
                 if (-not (Test-Path -LiteralPath $file)) { continue }
                 $hash = [System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($file)))
-                $found.Add([pscustomobject]@{ ObjName = $objName; Title = [string]$selection.Title; Version = [string]$selection.Version; File = $file; Hash = $hash })
+                $found.Add([pscustomobject]@{ ObjName = $objName; Title = $title; Version = $version; File = $file; Hash = $hash })
             }
         }
         finally {
@@ -1976,6 +1983,10 @@ foreach ($entry in $selected) {
         }
     }
     $dump = Update-Mirror -BaseName $script:ProdBase -Extension $entry.Name
+    # Выгрузка рабочей - точный ответ, есть ли расширение в ней. Сравнение через COM могло не пройти
+    # (Status = unknown), и тогда без этого резервной копии перед загрузкой не делалось бы - отката не было бы.
+    if ($dump.Ok) { $entry.ProdPresent = $true }
+    elseif ($dump.Absent) { $entry.ProdPresent = $false }
     if ($dump.Ok) { Write-Line ("[OK]   {0}" -f $prodTitle) 'Green' }
     elseif ($dump.Absent) { Write-Line ("[OK]   {0}: в рабочей его нет" -f $prodTitle) 'Green' }
     else { Write-Line ("[WARN] {0}: {1}" -f $prodTitle, $dump.Detail) 'Yellow' }
@@ -2001,6 +2012,12 @@ if ($mode -eq 'asis') {
     Write-Line '  загрузки нет: обновляю конфигурацию БД тем, что уже загружено в рабочую'
 }
 foreach ($entry in @($selected | Where-Object { $mode -ne 'asis' })) {
+    if (-not $entry.ProdPresent -and $entry.Status -eq 'unknown' -and $mode -ne 'rollback') {
+        # Есть ли расширение в рабочей - неизвестно (ни COM, ни выгрузка не ответили). Грузить без резервной
+        # копии нельзя: откатить будет не к чему.
+        Write-Line ("[FAIL] Резервная копия {0}: неизвестно, есть ли оно в рабочей (сравнение и выгрузка не прошли) - без копии не гружу" -f $entry.Name) 'Red'
+        $failed = $true; break
+    }
     if ($entry.ProdPresent) {
         $backup = Join-Path $beforeDir ("{0}_{1}_{2}.cfe" -f $script:ProdBase, $entry.Name, $stamp)
         $result = Invoke-Designer -BaseName $script:ProdBase -Command @('/DumpCfg', ('"{0}"' -f $backup), '-Extension', $entry.Name) `
@@ -2256,7 +2273,10 @@ if ($outcome -eq 'updated') {
         $result = Invoke-Designer -BaseName $script:ProdBase -Command @('/CheckCanApplyConfigurationExtensions', '-AllExtensions') `
             -LogName 'checkcanapply.log' -TimeoutSec $timeoutLoadSec -Title 'Проверка применимости расширений'
         $applyLines = @($result.Lines | Where-Object { $_ -and $_.Trim() })
-        if ($result.ExitCode -eq 0) { Add-Light 'OK' 'Проверка применимости' 'замечаний нет' }
+        # Код 0 ещё не «замечаний нет»: на рабочей 18.11 конфигуратор вернул 0 и написал в журнал, что у
+        # расширения не найдены методы из аннотаций. Смотрим и на строки журнала.
+        if ($result.ExitCode -eq 0 -and $applyLines.Count -eq 0) { Add-Light 'OK' 'Проверка применимости' 'замечаний нет' }
+        elseif ($result.ExitCode -eq 0) { Add-Light 'WARN' 'Проверка применимости' ("замечаний {0} (код 0), первое: {1}" -f $applyLines.Count, ($applyLines | Select-Object -First 1)) }
         elseif ($result.ExitCode -eq 101) { Add-Light 'WARN' 'Проверка применимости' ("замечаний {0}, первое: {1}" -f $applyLines.Count, ($applyLines | Select-Object -First 1)) }
         else { Add-Light 'FAIL' 'Проверка применимости' ("не выполнилась: {0}" -f $result.Text) }
 

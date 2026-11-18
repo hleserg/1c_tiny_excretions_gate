@@ -1179,6 +1179,43 @@ $tests = @(
         }
     },
     @{
+        Name = 'deploy-compare-failed-backup'
+        Text = 'сравнить через COM с рабочей не удалось: есть ли расширение в рабочей - по её выгрузке, резервная копия делается, откат грузит её'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-ComState
+            $com['failConnect'] = @('erp_base')
+            $fake = @{ designer = @(@{ match = @('/UpdateDBCfg', 'erp_base'); exit = 1; log = 'Ошибка обновления: тест'; times = 1 }) }
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Fake $fake -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить все' },
+                $deployRiskAnswer, $deployNameAnswer,
+                @{ Kind = 'confirm'; Header = 'Откатить\?'; Yes = $true })
+            Check (-not $r.TimedOut) 'не уложился во время'
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            Check (@($r.Output | Where-Object { $_ -match '^Остановлено: |ParserError' }).Count -eq 0) 'скрипт упал'
+            $backups = (Get-Calls $r @('/DumpCfg', 'fake\erp_base', '\before\erp_base_Адаптация_'))
+            Check ($backups.Count -eq 1) ("резервных копий Адаптация из рабочей {0}, ждали 1" -f $backups.Count)
+            $loads = (Get-Calls $r @('/LoadCfg', '-Extension Адаптация', 'fake\erp_base'))
+            Check ($loads.Count -eq 2) ("загрузок Адаптация в рабочую {0}, ждали 2 (новая и резервная копия)" -f $loads.Count)
+            if ($loads.Count -eq 2) { Check ($loads[1].Line.Contains('\before\erp_base_Адаптация_')) 'откат грузил не резервную копию' }
+        }
+    },
+    @{
+        Name = 'deploy-canapply-code0-remarks'
+        Text = 'проверка применимости вернула 0, но в журнале замечания: лёгкий прогон не пишет «замечаний нет»'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $fake = @{ designer = @(@{ match = @('/CheckCanApplyConfigurationExtensions', 'erp_base'); exit = 0; log = 'БазаЗнаний (1.0): Не найден метод "Тест", указанный в аннотации метода "БЗ_Тест".' }) }
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Fake $fake -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить все' },
+                $deployRiskAnswer, $deployNameAnswer)
+            Check-DeployCommon $r
+            Check (@($r.Output | Where-Object { $_ -match 'Проверка применимости' -and $_ -match 'замечаний 1 \(код 0\)' }).Count -gt 0) 'замечание проверки применимости при коде 0 не показано'
+        }
+    },
+    @{
         Name = 'deploy-epf-only'
         Text = 'только внешние обработки: новая обработка записана, блокировок нет, чужая блокировка регламентных заданий не снята'
         Run = {

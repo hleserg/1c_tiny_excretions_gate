@@ -209,6 +209,12 @@ function New-FakeComConnection {
                     $this.Storage = $storage
                     return $true
                 }
+                # Получить(Индекс): поля в порядке запроса - Наименование, ИмяОбъекта, Версия, Вид, Хранилище.
+                $selection | Add-Member -MemberType ScriptMethod -Name Get -Value {
+                    param([int]$Index)
+                    switch ($Index) { 0 { return $this.Title } 1 { return $this.ObjName } 2 { return $this.Version } 3 { return $this.Kind } 4 { return $this.Storage } }
+                    return $null
+                }
                 return $selection
             }
             return $result
