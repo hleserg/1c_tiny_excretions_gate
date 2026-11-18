@@ -1,0 +1,59 @@
+# Итоги прогонов гейта (readme.txt гейта, раздел 5.22). Гейт шлёт событие repository_dispatch «gate-run»
+# (publish.ps1), этот workflow пишет комментарий в issue «Прогоны гейта» от имени бота GitHub Actions и упоминает
+# владельца репозитория - так приходит уведомление: о своих же действиях GitHub человека не уведомляет, а гейт
+# ходит с его токеном.
+# Положить в .github/workflows/ того репозитория, который указан в настройке гейта RunReportRepo.
+# Один прогон - один комментарий (вердикт, потом решение по комплекту дописываются в него же); остановка
+# и обрыв прогона - новым комментарием, чтобы пришло уведомление.
+name: Прогоны гейта
+run-name: ${{ github.event.client_payload.title }}
+
+on:
+  repository_dispatch:
+    types: [gate-run]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: gate-runs
+  cancel-in-progress: false
+
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Комментарий в issue «Прогоны гейта»
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          RUN_ID: ${{ github.event.client_payload.run }}
+          STAGE: ${{ github.event.client_payload.stage }}
+          BODY: ${{ github.event.client_payload.body }}
+        run: |
+          set -euo pipefail
+          # Данные события - только через переменные окружения, не подстановкой в текст скрипта.
+          if ! [[ "$RUN_ID" =~ ^[0-9]{8}-[0-9]{6}$ ]]; then echo "не тот номер прогона: $RUN_ID"; exit 1; fi
+          case "$STAGE" in verdict|final|crash|broken) ;; *) echo "не тот этап: $STAGE"; exit 1 ;; esac
+          label=gate-runs
+          gh label create "$label" --repo "$REPO" --color 5A56E0 --description "Итоги прогонов гейта" 2>/dev/null || true
+          issue=$(gh issue list --repo "$REPO" --label "$label" --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ -z "$issue" ]; then
+            url=$(gh issue create --repo "$REPO" --title "Прогоны гейта" --label "$label" \
+              --body "Сюда гейт пишет итог каждого прогона (readme.txt гейта, раздел 5.22). Комментарии пишет бот, владелец репозитория получает уведомление.")
+            issue=${url##*/}
+          fi
+          marker="<!-- gate-run:${RUN_ID} -->"
+          { printf '%s\n' "$marker"; printf '%s\n' "$BODY"; printf '\n@%s\n' "$OWNER"; } > body.md
+          existing=""
+          if [ "$STAGE" = verdict ] || [ "$STAGE" = final ]; then
+            existing=$(gh api --paginate "repos/$REPO/issues/$issue/comments" --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | tail -n 1)
+          fi
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -F body=@body.md > /dev/null
+            echo "дописан комментарий $existing в issue #$issue"
+          else
+            gh issue comment "$issue" --repo "$REPO" --body-file body.md
+          fi

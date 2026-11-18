@@ -54,7 +54,7 @@ function New-Sandbox {
     param([string]$Name, [hashtable]$Config = @{})
     $dir = Join-Path $workRoot $Name
     foreach ($sub in @('bin', 'tools', 'inbox', 'fake')) { New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null }
-    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1')) {
+    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1')) {
         Copy-Item -LiteralPath (Join-Path $ciRoot $script) -Destination $dir
     }
     # Подставной COM для deploy.ps1: скрипт берёт его из test\ рядом с собой, когда задан CI_FAKE_COM.
@@ -1839,6 +1839,91 @@ $tests = @(
             Check (-not $config.ContainsKey('ContractorExtensions')) 'пустой ContractorExtensions остался в config.psd1 и закрывает настройку площадки'
             Check (-not $config.ContainsKey('UnitTestAuthor')) 'умолчание UnitTestAuthor дописано поверх настройки площадки'
             Check ($config.ContainsKey('ReleaseJobsLock')) 'обычные умолчания не дописаны'
+        }
+    },
+    @{
+        Name = 'gate-publish-run-report'
+        Text = 'итог прогона в GitHub (RunReportRepo): зелёный - событие gate-run «final» с итогом, токен только в заголовке; нет связи - прогон не портится, итог уходит при следующем запуске'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ RunReportRepo = 'owner/repo'; GitHubTokenPassFile = 'secrets\github.txt' }
+            New-Item -ItemType Directory -Path (Join-Path $sb 'secrets') -Force | Out-Null
+            $secret = 'tok-секрет-456'
+            [System.IO.File]::WriteAllText((Join-Path $sb 'secrets\github.txt'), (ConvertFrom-SecureString -SecureString (ConvertTo-SecureString $secret -AsPlainText -Force)))
+            $http = Join-Path $sb 'fake-http'
+            New-Item -ItemType Directory -Path $http -Force | Out-Null
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep'
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            $sent = @(Get-ChildItem -LiteralPath $http -Filter 'dispatch-*.json' | Sort-Object Name)
+            Check ($sent.Count -eq 1) ("событий {0}, ждали 1" -f $sent.Count)
+            if ($sent.Count -ge 1) {
+                $raw = [System.IO.File]::ReadAllText($sent[0].FullName, $utf8)
+                $dispatchEvent = $raw | ConvertFrom-Json
+                Check ($dispatchEvent.event_type -eq 'gate-run') ("событие {0}, ждали gate-run" -f $dispatchEvent.event_type)
+                Check ($dispatchEvent.client_payload.stage -eq 'final' -and $dispatchEvent.client_payload.verdict -eq 'GREEN') ("этап {0}, вердикт {1}" -f $dispatchEvent.client_payload.stage, $dispatchEvent.client_payload.verdict)
+                if ($r.RunDir) { Check ($dispatchEvent.client_payload.run -eq (Split-Path -Leaf $r.RunDir)) 'в событии не тот прогон' }
+                Check (([string]$dispatchEvent.client_payload.body) -match 'ЗЕЛЁНЫЙ' -and ([string]$dispatchEvent.client_payload.body) -match 'summary\.txt' -and ([string]$dispatchEvent.client_payload.body) -match 'Самопроверка') 'в тексте нет вердикта или итога'
+                Check (-not $raw.Contains($secret)) 'токен в теле события'
+            }
+            $requests = [System.IO.File]::ReadAllText((Join-Path $http 'requests.log'), $utf8)
+            Check ($requests -match 'POST https://api\.github\.com/repos/owner/repo/dispatches токен=да') 'событие ушло не туда или без токена'
+            Check (@($r.Output | Where-Object { $_ -match [regex]::Escape($secret) }).Count -eq 0) 'токен в выводе'
+            if ($r.RunDir) {
+                $state = [System.IO.File]::ReadAllText((Join-Path $r.RunDir 'publish.json'), $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check ($state.sent -eq 'final') 'publish.json: не отмечено, что итог ушёл'
+            }
+            # Нет связи: прогон тот же зелёный, итог не ушёл - и уходит при следующем запуске.
+            [System.IO.File]::WriteAllText((Join-Path $http 'dispatch-fail.txt'), 'x')
+            Reset-FakeState $sb
+            $offline = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep'
+            Check-Common $offline; Check-Verdict $offline 'GREEN' 0
+            Check (@($offline.Output | Where-Object { $_ -match 'в GitHub не ушёл' }).Count -gt 0) 'не сказано, что итог не ушёл'
+            Remove-Item -LiteralPath (Join-Path $http 'dispatch-fail.txt') -Force
+            Reset-FakeState $sb
+            $next = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep'
+            Check-Common $next
+            $runsSent = @(Get-ChildItem -LiteralPath $http -Filter 'dispatch-*.json' | ForEach-Object { [string](([System.IO.File]::ReadAllText($_.FullName, $utf8) | ConvertFrom-Json).client_payload.run) })
+            if ($offline.RunDir) { Check ($runsSent -contains (Split-Path -Leaf $offline.RunDir)) 'итог прогона без связи не ушёл при следующем запуске' }
+            if ($next.RunDir) { Check ($runsSent -contains (Split-Path -Leaf $next.RunDir)) 'итог следующего прогона не ушёл' }
+        }
+    },
+    @{
+        Name = 'gate-publish-crash-broken'
+        Text = 'итог в GitHub при любом исходе: прогон остановлен (отмена на вопросе) - событие «crash» с причиной и шагами; прогон оборвался (процесса нет, итог не ушёл) - при следующем запуске событие «broken»'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ RunReportRepo = 'owner/repo'; GitHubTokenPassFile = 'secrets\github.txt' }
+            New-Item -ItemType Directory -Path (Join-Path $sb 'secrets') -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $sb 'secrets\github.txt'), (ConvertFrom-SecureString -SecureString (ConvertTo-SecureString 'tok-789' -AsPlainText -Force)))
+            $http = Join-Path $sb 'fake-http'
+            New-Item -ItemType Directory -Path $http -Force | Out-Null
+            # Прогон, который оборвался после вердикта: процесса с таким номером и временем старта нет.
+            $broken = Join-Path $sb 'runs\20000101-000000'
+            New-Item -ItemType Directory -Path $broken -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $broken 'pid.txt'), '999999|2000-01-01T00:00:00.0000000+03:00')
+            [System.IO.File]::WriteAllText((Join-Path $broken 'publish.json'), '{"wanted":"verdict","sent":"verdict","message":""}')
+            [System.IO.File]::WriteAllText((Join-Path $broken 'run.log'), "00:00:01 загрузка`r`n", $utf8Bom)
+            # Прогон без pid.txt (до включения отправки) - его не трогаем.
+            New-Item -ItemType Directory -Path (Join-Path $sb 'runs\19990101-000000') -Force | Out-Null
+            $file = Add-InboxFile $sb $cfeName
+            $busy = 'Ошибка блокировки информационной базы для конфигурирования. С этой информационной базой уже работает конфигуратор: компьютер: pc1, сеанс: 5'
+            $fake = @{ designer = @(@{ match = @('/LoadCfg', 'Адаптация'); exit = 1; log = $busy; times = 1 }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake -Answers @(
+                @{ Kind = 'one'; Header = 'Открыт конфигуратор'; Item = '^Отмена' })
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            Check ($r.ExitCode -ne 0) 'прогон не завершился после отмены'
+            $events = @(Get-ChildItem -LiteralPath $http -Filter 'dispatch-*.json' | Sort-Object Name | ForEach-Object { ([System.IO.File]::ReadAllText($_.FullName, $utf8) | ConvertFrom-Json).client_payload })
+            $brokenEvents = @($events | Where-Object { [string]$_.run -eq '20000101-000000' })
+            Check ($brokenEvents.Count -eq 1 -and [string]$brokenEvents[0].stage -eq 'broken' -and ([string]$brokenEvents[0].body) -match 'ОБОРВАЛСЯ') 'оборвавшийся прогон не ушёл как «broken»'
+            Check (@($events | Where-Object { [string]$_.run -eq '19990101-000000' }).Count -eq 0) 'ушёл прогон без pid.txt (до включения отправки)'
+            $crashEvents = @($events | Where-Object { [string]$_.stage -eq 'crash' })
+            Check ($crashEvents.Count -eq 1) ("событий crash {0}, ждали 1" -f $crashEvents.Count)
+            if ($crashEvents.Count -eq 1) {
+                $body = [string]$crashEvents[0].body
+                Check ($body -match 'ОСТАНОВЛЕН' -and $body -match 'Причина:.*отменено пользователем') 'в событии нет причины остановки'
+                Check ($body -match 'run\.log') 'в событии нет конца run.log'
+                if ($r.RunDir) { Check ([string]$crashEvents[0].run -eq (Split-Path -Leaf $r.RunDir)) 'crash не того прогона' }
+            }
         }
     },
     @{

@@ -117,6 +117,11 @@ $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $
 $exitCode = $LASTEXITCODE
 $ErrorActionPreference = 'Stop'
 [System.IO.File]::WriteAllLines($logFile, [string[]]@($output | ForEach-Object { [string]$_ }), $utf8Bom)
+# Прогон оборвался (упал процесс, его сняли) - итог в GitHub отправит publish.ps1 -Pending, если отправка включена.
+$publishScript = Join-Path $Root 'publish.ps1'
+if (Test-Path -LiteralPath $publishScript) {
+    try { & $publishScript -Pending } catch { Write-Host ("Итог прогона в GitHub не ушёл: {0}" -f $_.Exception.Message) }
+}
 
 $runId = ''
 $verdict = 'NONE'

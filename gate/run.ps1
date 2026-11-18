@@ -148,6 +148,8 @@ $script:BackgroundCheck = $null
 $script:RunPlanExpected = [ordered]@{}
 # Регулярное выражение замечаний проверки конфигурации по модулям тестовых расширений (Get-UtCheckIgnorePattern).
 $script:UtCheckIgnore = ''
+# Итог прогона в GitHub (publish.ps1, настройка RunReportRepo): папка прогона, когда она есть и отправка включена.
+$script:PublishRunDir = ''
 
 # Скрипт остановился: причина одной строкой. Место в скрипте показывается только для неожиданной
 # ошибки. У остановки по throw с текстом оно ничего не объясняет; отличить её можно по тому,
@@ -163,6 +165,8 @@ trap {
     if ($script:SessionLockSet -or ($script:JobsLockSet -and $script:JobsLockRelease)) {
         try { Clear-TestBaseLocks } catch { Write-Host ("Блокировки снять не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Yellow }
     }
+    # Итог остановленного прогона - в GitHub: причина, шаги, что успели, конец run.log.
+    if ($script:PublishRunDir) { Invoke-RunPublish -Stage 'crash' -Message $_.Exception.Message }
     exit 1
 }
 
@@ -195,6 +199,22 @@ function Write-RunLog {
     param([string]$Text)
     $stamp = Get-Date -Format 'HH:mm:ss'
     [System.IO.File]::AppendAllText($script:RunLogPath, ("{0} {1}`r`n" -f $stamp, $Text), $Utf8Bom)
+}
+
+function Invoke-RunPublish {
+    # Итог прогона - в GitHub (publish.ps1, настройка RunReportRepo, раздел 5.22). Сбой отправки прогон не портит.
+    # Pending - отправить то, что не ушло раньше: прогон оборвался или не было связи.
+    param([string]$Stage = 'final', [string]$Message = '', [switch]$Pending)
+    try {
+        if ($null -eq (Get-Variable -Name cfg -Scope Script -ErrorAction SilentlyContinue)) { return }
+        if (-not [string](Get-Setting $cfg 'RunReportRepo' '')) { return }
+        $publishScript = Join-Path $Root 'publish.ps1'
+        if (-not (Test-Path -LiteralPath $publishScript)) { return }
+        if ($Pending) { & $publishScript -Pending -Config $configPath; return }
+        if (-not $script:PublishRunDir) { return }
+        & $publishScript -RunDir $script:PublishRunDir -Stage $Stage -Message $Message -Config $configPath
+    }
+    catch { Write-Host ("Итог прогона в GitHub не ушёл: {0}" -f $_.Exception.Message) -ForegroundColor Yellow }
 }
 
 function Get-PlainPassword {
@@ -3834,6 +3854,9 @@ function Show-UtMenu {
 
 #endregion
 
+# Итоги прежних прогонов, которые не ушли в GitHub (прогон оборвался, не было связи), - до всего остального.
+if (-not $Tests) { Invoke-RunPublish -Pending }
+
 # Меню - при запуске без ключей (ключ -UiChannel от ci.exe не в счёт).
 $menuKeys = @($PSBoundParameters.Keys | Where-Object { $_ -ne 'UiChannel' })
 if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-UiCanAsk)) {
@@ -4056,6 +4079,12 @@ if (-not $Tests) {
         referenceSnapshotDir = ''; exchangeBefore = ''; metricsBeforeSaved = $false; accepted = $false
     }
     if ($null -ne $script:ResumeRequest) { Initialize-Resume -Request $script:ResumeRequest }
+    # Итог в GitHub: какой процесс ведёт прогон - чтобы потом отличить живой прогон от оборвавшегося.
+    if ([string](Get-Setting $cfg 'RunReportRepo' '')) {
+        $selfProcess = Get-Process -Id $PID
+        [System.IO.File]::WriteAllText((Join-Path $RunDir 'pid.txt'), ('{0}|{1}' -f $PID, $selfProcess.StartTime.ToString('o')), $Utf8Bom)
+        $script:PublishRunDir = $RunDir
+    }
 }
 if ($script:SiteSettingKeys.Count -gt 0) { Write-RunLog ("Настройки площадки из config.site.psd1: {0}" -f ($script:SiteSettingKeys -join ', ')) }
 $baselineDir = Join-Path (Join-Path $Root 'baseline') $baseKey
@@ -6707,6 +6736,8 @@ elseif ($anyTouched -gt 0) {
             $canAsk = Test-UiCanAsk
             $answer = ''
             if ($canAsk) {
+                # Вопрос может ждать сколько угодно: вердикт уходит в GitHub сразу, решение допишется потом.
+                Invoke-RunPublish -Stage 'verdict'
                 # В ci.exe - кнопками внизу: чтобы решить, итог прогона над вопросом должен быть виден.
                 $acceptLabel = 'Оставить и принять новое в эталон'
                 if ($verdict -eq 'RED') { $acceptLabel = 'Оставить и принять новое в эталон (прогон КРАСНЫЙ)' }
@@ -6818,6 +6849,7 @@ if ($decision -ne 'rolledBack' -and $decision -ne 'rollbackFailed') {
 }
 
 Clear-TestBaseLocks
+Invoke-RunPublish -Stage 'final'
 
 exit $exitCode
 
