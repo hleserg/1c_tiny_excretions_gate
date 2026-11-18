@@ -1977,6 +1977,10 @@ function New-GitTempBranch {
     param($Setup, $State, [string]$Base, $Changes)
     $stamp = Get-Date
     $branchName = 'temp/' + $stamp.ToString('yyyyMMdd-HHmmss')
+    # Такая ветка уже есть (две выгрузки в одну секунду) - с номером.
+    for ($suffix = 2; (Get-GhHead -Gh $Setup.Gh -Branch $branchName).Sha -and $suffix -lt 20; $suffix++) {
+        $branchName = 'temp/{0}-{1}' -f $stamp.ToString('yyyyMMdd-HHmmss'), $suffix
+    }
     $lines = Get-GitChangeLines $Changes
     $sha = New-GitVerifiedCommit -Setup $Setup -Parent $Base -Changes $Changes -Message ("Правки {0} от {1}" -f $script:TempBase, $stamp.ToString('dd.MM.yyyy HH:mm'))
     Set-GhBranch -Gh $Setup.Gh -Branch $branchName -Sha $sha -Create
@@ -2031,7 +2035,8 @@ function Invoke-GitExport {
     Write-Line ("Выгружаю из {0} в файлы: расширения {1}; обработки {2}" -f $script:TempBase, (Get-NonEmpty (@($tracked.Extensions) -join ', ') 'нет'), (Get-NonEmpty (@($tracked.Processings) -join ', ') 'нет')) 'Cyan'
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -Processings $tracked.Processings
     foreach ($item in $snapshot.Missing) { Write-Line ("  в {0} нет: {1} - в git остаётся как есть" -f $script:TempBase, $item) 'Yellow' }
-    $changes = @(Compare-GitSnapshot -Local $snapshot.Files -Remote $baseFiles -Prefixes $snapshot.Prefixes)
+    # Без @(): функция возвращает массив запятой, @() завернул бы его ещё раз.
+    $changes = Compare-GitSnapshot -Local $snapshot.Files -Remote $baseFiles -Prefixes $snapshot.Prefixes
     if ($changes.Count -eq 0) {
         Write-Line ("{0} совпадает с git (коммит {1}): выгружать нечего." -f $script:TempBase, (Get-GitShort $base)) 'Green'
         if (-not [string]$State['commit'] -and $base) { $State['commit'] = $base; $State['how'] = 'export'; Save-GitState $Setup $State }
@@ -2087,7 +2092,7 @@ function Invoke-GitImport {
     $tracked = Get-GitFolders $knownFiles
     Write-Line ("Проверяю, не правили ли {0} после прошлой загрузки: выгружаю и сравниваю с коммитом {1}" -f $script:TempBase, $knownName) 'Cyan'
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -Processings $tracked.Processings
-    $drift = @(Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes)
+    $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes
     if ($drift.Count -gt 0) {
         Write-Line ("В {0} есть правки, которых нет в git (коммит {1}):" -f $script:TempBase, $knownName) 'Yellow'
         foreach ($line in (Get-GitChangeLines $drift)) { Write-Line ('  ' + $line) 'Yellow' }
