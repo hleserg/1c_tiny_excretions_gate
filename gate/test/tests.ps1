@@ -2129,7 +2129,9 @@ $tests = @(
             }
             Check (@($files.Keys | Where-Object { $_ -like 'processings/Пустая*' }).Count -eq 0) 'у элемента без файла появилась папка'
             if ($files.ContainsKey('processings/manifest.json')) {
-                $manifest = @([System.IO.File]::ReadAllText((Join-Path $sb ('fake-github\blobs\' + $files['processings/manifest.json'])), $utf8) | ConvertFrom-Json)
+                # ConvertFrom-Json в PowerShell 5.1 отдаёт массив JSON одним объектом: @() вокруг конвейера завернул бы его ещё раз.
+                $parsed = [System.IO.File]::ReadAllText((Join-Path $sb ('fake-github\blobs\' + $files['processings/manifest.json'])), $utf8) | ConvertFrom-Json
+                $manifest = @($parsed | ForEach-Object { $_ })
                 $byRef = @{}
                 foreach ($entry in $manifest) { $byRef[[string]$entry.ref] = $entry }
                 Check ($manifest.Count -eq 4) ("в manifest.json элементов {0}, ждали 4" -f $manifest.Count)
