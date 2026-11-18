@@ -18,3 +18,4 @@
 # Собранные обработки
 *.epf
 *.erf
+src/ci-tui/citui
