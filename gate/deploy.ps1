@@ -1089,12 +1089,15 @@ function Get-ExtensionData {
 function Export-Processings {
     # Внешние обработки и отчёты базы (справочник ДополнительныеОтчетыИОбработки, не помеченные на удаление)
     # в файлы папки Dir. Возвращает список: имя объекта, наименование, версия, файл, хеш файла.
+    # All (для git, раздел 5.23) - все элементы с именем объекта, и помеченные на удаление, каждый файл - в папке
+    # своей ссылки; ещё вид, пометка удаления, публикация, безопасный режим, ссылка, назначение; элемент без файла -
+    # с File = ''.
     # Внешнее соединение - в фоне, со строкой хода и таймаутом (ComTimeoutSec, втрое: файлов бывает много):
     # раньше синхронный вызов вешал экран, и до кнопки остановки скрипт не доходил.
-    param([string]$BaseName, [string]$User, [string]$Password, [string]$Dir)
+    param([string]$BaseName, [string]$User, [string]$Password, [string]$Dir, [switch]$All)
     New-Item -ItemType Directory -Path $Dir -Force | Out-Null
     $reader = {
-        param([string]$Line, [string]$Dir, [string]$FakeScript, [string]$FakeFile)
+        param([string]$Line, [string]$Dir, [string]$FakeScript, [string]$FakeFile, [bool]$All)
         if ($FakeScript) { . $FakeScript; $connector = New-FakeComConnector $FakeFile }
         else { $connector = New-Object -ComObject V83.COMConnector }
         $connection = $null
@@ -1110,6 +1113,12 @@ function Export-Processings {
             $query.Text = 'ВЫБРАТЬ Спр.Наименование КАК Title, Спр.ИмяОбъекта КАК ObjName, Спр.Версия КАК Version, ' +
                 'ПРЕДСТАВЛЕНИЕ(Спр.Вид) КАК Kind, Спр.ХранилищеОбработки КАК Storage ' +
                 'ИЗ Справочник.ДополнительныеОтчетыИОбработки КАК Спр ГДЕ НЕ Спр.ПометкаУдаления'
+            if ($All) {
+                $query.Text = 'ВЫБРАТЬ Спр.Наименование КАК Title, Спр.ИмяОбъекта КАК ObjName, Спр.Версия КАК Version, ' +
+                    'ПРЕДСТАВЛЕНИЕ(Спр.Вид) КАК Kind, Спр.ХранилищеОбработки КАК Storage, Спр.ПометкаУдаления КАК Deleted, ' +
+                    'ПРЕДСТАВЛЕНИЕ(Спр.Публикация) КАК Use, Спр.БезопасныйРежим КАК SafeMode, Спр.Ссылка КАК Ref ' +
+                    'ИЗ Справочник.ДополнительныеОтчетыИОбработки КАК Спр'
+            }
             $selection = $query.Execute().Select()
             $sha = [System.Security.Cryptography.SHA256]::Create()
             while ($selection.Next()) {
@@ -1123,6 +1132,20 @@ function Export-Processings {
                 $extension = '.epf'
                 if ($kind -match 'тч[её]т') { $extension = '.erf' }
                 $file = Join-Path $Dir ($objName + $extension)
+                $entry = $null
+                if ($All) {
+                    $refId = [string]$connection.String($selection.Get(8).UUID())
+                    $entry = [pscustomobject]@{
+                        ObjName = $objName; Title = $title; Version = $version; File = ''; Hash = ''; Kind = $kind
+                        Deleted = [bool]$selection.Get(5); Use = [string]$selection.Get(6); SafeMode = [bool]$selection.Get(7); Ref = $refId
+                        Targets = @(); TargetsError = ''
+                    }
+                    $found.Add($entry)
+                    # Имена объектов у элементов справочника бывают одинаковые: каждый файл - в папке своей ссылки.
+                    $refDir = Join-Path $Dir $refId
+                    New-Item -ItemType Directory -Path $refDir -Force | Out-Null
+                    $file = Join-Path $refDir ($objName + $extension)
+                }
                 $storage = $selection.Get(4)
                 if ($null -eq $storage) { continue }
                 $data = $storage.Get()
@@ -1130,7 +1153,31 @@ function Export-Processings {
                 $data.Write($file)
                 if (-not (Test-Path -LiteralPath $file)) { continue }
                 $hash = [System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($file)))
-                $found.Add([pscustomobject]@{ ObjName = $objName; Title = $title; Version = $version; File = $file; Hash = $hash })
+                if ($All) { $entry.File = $file; $entry.Hash = $hash }
+                else { $found.Add([pscustomobject]@{ ObjName = $objName; Title = $title; Version = $version; File = $file; Hash = $hash }) }
+            }
+            if ($All -and $found.Count -gt 0) {
+                # Назначение (для каких объектов) - отдельным запросом: не прочиталось - остальное всё равно нужно.
+                $targets = @{}
+                $targetsError = ''
+                try {
+                    $targetQuery = $connection.NewObject('Query')
+                    $targetQuery.Text = 'ВЫБРАТЬ Назн.Ссылка КАК Ref, Назн.ОбъектНазначения.ПолноеИмя КАК Target ' +
+                        'ИЗ Справочник.ДополнительныеОтчетыИОбработки.Назначение КАК Назн'
+                    $targetSelection = $targetQuery.Execute().Select()
+                    while ($targetSelection.Next()) {
+                        $refId = [string]$connection.String($targetSelection.Get(0).UUID())
+                        $target = [string]$targetSelection.Get(1)
+                        if (-not $target) { continue }
+                        if (-not $targets.ContainsKey($refId)) { $targets[$refId] = New-Object System.Collections.Generic.List[string] }
+                        if (-not $targets[$refId].Contains($target)) { $targets[$refId].Add($target) }
+                    }
+                }
+                catch { $targetsError = [string]$_.Exception.Message }
+                foreach ($entry in $found) {
+                    if ($targetsError) { $entry.TargetsError = $targetsError }
+                    elseif ($targets.ContainsKey($entry.Ref)) { $entry.Targets = @($targets[$entry.Ref] | Sort-Object) }
+                }
             }
         }
         finally {
@@ -1142,7 +1189,7 @@ function Export-Processings {
         }
         return , @($found.ToArray())
     }
-    $call = Invoke-UiBackground -Script $reader -Arguments @((Get-ComConnectionLine $BaseName $User $Password), $Dir, $script:FakeComScript, [string]$env:CI_FAKE_COM) `
+    $call = Invoke-UiBackground -Script $reader -Arguments @((Get-ComConnectionLine $BaseName $User $Password), $Dir, $script:FakeComScript, [string]$env:CI_FAKE_COM, [bool]$All) `
         -Title ("Выгрузить обработки {0}" -f $BaseName) -TimeoutSec ($comTimeoutSec * 3)
     $message = $call.Error
     if ($Password -and $message) { $message = $message.Replace($Password, '***') }
@@ -1820,17 +1867,79 @@ function Get-GitShort {
 }
 
 function Get-GitFolders {
-    # Что ведётся в git: имена папок extensions/<имя> и processings/<имя> среди путей файлов.
+    # Что ведётся в git: имена папок extensions/<имя> и processings/<имя> среди путей файлов. HasProcessings - в git
+    # есть processings/ (папки или manifest.json): тогда ведутся все элементы справочника обработок.
     param([hashtable]$Files)
     $extensions = New-Object System.Collections.Generic.List[string]
     $processings = New-Object System.Collections.Generic.List[string]
+    $hasProcessings = $false
     foreach ($path in @($Files.Keys)) {
         $parts = ([string]$path).Split('/')
+        if ($parts[0] -eq 'processings' -and $parts.Count -ge 2) { $hasProcessings = $true }
         if ($parts.Count -lt 3) { continue }
         if ($parts[0] -eq 'extensions' -and -not $extensions.Contains($parts[1])) { $extensions.Add($parts[1]) }
         elseif ($parts[0] -eq 'processings' -and -not $processings.Contains($parts[1])) { $processings.Add($parts[1]) }
     }
-    return [pscustomobject]@{ Extensions = @($extensions | Sort-Object); Processings = @($processings | Sort-Object) }
+    return [pscustomobject]@{ Extensions = @($extensions | Sort-Object); Processings = @($processings | Sort-Object); HasProcessings = $hasProcessings }
+}
+
+function Get-GitProcessingFolders {
+    # Папка в processings/ для каждого элемента справочника обработок (ссылка -> папка). Основной элемент имени
+    # объекта - тот, в который пишет загрузка (не помечен на удаление, используемый - первым, режим regepf), - в папке
+    # <имя объекта>; остальные с тем же именем - в <имя объекта>~<8 знаков ссылки>, их «Загрузить из git» не грузит.
+    param($Items)
+    $folders = @{}
+    foreach ($group in @($Items | Group-Object ObjName)) {
+        $ordered = @($group.Group | Sort-Object @{ Expression = { [int][bool]$_.Deleted } }, @{ Expression = { if ([string]$_.Use -eq 'Используется') { 0 } else { 1 } } }, @{ Expression = { [string]$_.Ref } })
+        for ($index = 0; $index -lt $ordered.Count; $index++) {
+            $item = $ordered[$index]
+            if ($index -eq 0 -and -not $item.Deleted) { $folders[[string]$item.Ref] = [string]$item.ObjName }
+            else { $folders[[string]$item.Ref] = '{0}~{1}' -f $item.ObjName, ([string]$item.Ref).Substring(0, [Math]::Min(8, ([string]$item.Ref).Length)) }
+        }
+    }
+    return $folders
+}
+
+function Get-GitProcessingManifest {
+    # processings/manifest.json: что за элемент справочника за каждой папкой. Пишет гейт при выгрузке из temp; при
+    # загрузке из git не читается, правкой temp не считается (версия и хеш меняются от самой загрузки).
+    param($Items, [hashtable]$Folders)
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('[')
+    $sorted = @($Items | Sort-Object @{ Expression = { [string]$Folders[[string]$_.Ref] } })
+    for ($index = 0; $index -lt $sorted.Count; $index++) {
+        $item = $sorted[$index]
+        $folder = 'null'
+        $file = 'null'
+        $hash = 'null'
+        if ($item.File) {
+            $folder = ConvertTo-GhJsonString ([string]$Folders[[string]$item.Ref])
+            $file = ConvertTo-GhJsonString (Split-Path -Leaf $item.File)
+            $hash = ConvertTo-GhJsonString ('sha256:' + ([string]$item.Hash).Replace('-', '').ToLowerInvariant())
+        }
+        $targets = '[' + ((@($item.Targets) | Where-Object { $_ } | ForEach-Object { ConvertTo-GhJsonString ([string]$_) }) -join ', ') + ']'
+        $fields = New-Object System.Collections.Generic.List[string]
+        $fields.Add(('"folder": ' + $folder))
+        $fields.Add(('"objectName": ' + (ConvertTo-GhJsonString ([string]$item.ObjName))))
+        $fields.Add(('"title": ' + (ConvertTo-GhJsonString ([string]$item.Title))))
+        $fields.Add(('"kind": ' + (ConvertTo-GhJsonString ([string]$item.Kind))))
+        $fields.Add(('"version": ' + (ConvertTo-GhJsonString ([string]$item.Version))))
+        $fields.Add(('"use": ' + (ConvertTo-GhJsonString ([string]$item.Use))))
+        $fields.Add(('"safeMode": ' + ([string][bool]$item.SafeMode).ToLowerInvariant()))
+        $fields.Add(('"deleted": ' + ([string][bool]$item.Deleted).ToLowerInvariant()))
+        $fields.Add(('"ref": ' + (ConvertTo-GhJsonString ([string]$item.Ref))))
+        $fields.Add(('"file": ' + $file))
+        $fields.Add(('"fileHash": ' + $hash))
+        if ($item.TargetsError) { $fields.Add(('"targets": null')); $fields.Add(('"targetsError": ' + (ConvertTo-GhJsonString ([string]$item.TargetsError)))) }
+        else { $fields.Add(('"targets": ' + $targets)) }
+        $tail = ''
+        if ($index -lt $sorted.Count - 1) { $tail = ',' }
+        $lines.Add('  {')
+        $lines.Add(('    ' + ($fields -join (",`n    "))))
+        $lines.Add(('  }' + $tail))
+    }
+    $lines.Add(']')
+    return ($lines -join "`n") + "`n"
 }
 
 function Add-GitSnapshotFiles {
@@ -1845,9 +1954,10 @@ function Add-GitSnapshotFiles {
 }
 
 function Get-TempSnapshot {
-    # Выгрузить из temp расширения и обработки, которые ведутся в git, в рабочую папку git\<репозиторий>\work.
-    # Files: путь в репозитории -> файл на диске; Missing: чего в temp нет; Prefixes: папки, что выгрузились.
-    param($Setup, [string[]]$Extensions, [string[]]$Processings)
+    # Выгрузить из temp расширения, которые ведутся в git, и (WithProcessings) все элементы справочника обработок
+    # в рабочую папку git\<репозиторий>\work. Files: путь в репозитории -> файл на диске; Missing: чего в temp нет;
+    # Prefixes: что выгрузилось (у обработок - вся processings/); Processings и Folders - элементы справочника и их папки.
+    param($Setup, [string[]]$Extensions, [switch]$WithProcessings)
     $files = @{}
     $missing = New-Object System.Collections.Generic.List[string]
     $prefixes = New-Object System.Collections.Generic.List[string]
@@ -1858,23 +1968,52 @@ function Get-TempSnapshot {
         Add-GitSnapshotFiles -Files $files -Dir $dump.Dir -Prefix ('extensions/' + $name + '/')
         $prefixes.Add(('extensions/' + $name + '/'))
     }
-    if (@($Processings).Count -gt 0) {
+    $items = @()
+    $folders = @{}
+    if ($WithProcessings) {
         $epfDir = Join-Path $script:RunDir 'epf'
         if (Test-Path -LiteralPath $epfDir) { Remove-Item -LiteralPath $epfDir -Recurse -Force }
-        $export = Export-Processings -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword -Dir $epfDir
+        $export = Export-Processings -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword -Dir $epfDir -All
         if (-not $export.Ok) { throw ("обработки {0} не выгрузил: {1}" -f $script:TempBase, $export.Error) }
-        $byName = @{}
-        foreach ($item in @($export.Items)) { $byName[[string]$item.ObjName] = $item }
-        foreach ($name in @($Processings)) {
-            if (-not $byName.ContainsKey($name)) { $missing.Add(('обработка ' + $name)); continue }
-            $dir = Join-Path (Join-Path $Setup.Work 'processings') $name
-            $dumped = Get-ProcessingDump -File $byName[$name].File -Dir $dir -Title ("Выгрузить в файлы {0} из temp" -f $name)
-            if (-not $dumped) { throw ("обработка {0} не выгрузилась в файлы, см. run.log" -f $name) }
-            Add-GitSnapshotFiles -Files $files -Dir $dir -Prefix ('processings/' + $name + '/')
-            $prefixes.Add(('processings/' + $name + '/'))
+        $items = @($export.Items)
+        $folders = Get-GitProcessingFolders $items
+        $root = Join-Path $Setup.Work 'processings'
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        # Выгрузка в файлы - запуск конфигуратора на каждый файл. Файл тот же, что в прошлый раз (хеш, тот же
+        # конфигуратор), - выгрузка с прошлого раза: ночью и на каждой загрузке из git иначе ушли бы десятки минут.
+        $cachePath = Join-Path $Setup.Work 'processings.cache.json'
+        $cache = @{}
+        if (Test-Path -LiteralPath $cachePath) {
+            try {
+                $read = [System.IO.File]::ReadAllText($cachePath, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                foreach ($property in $read.PSObject.Properties) { $cache[$property.Name] = [string]$property.Value }
+            }
+            catch { Write-RunLog ("git: {0} не прочитан, обработки выгружаю заново: {1}" -f $cachePath, $_.Exception.Message) }
         }
+        $kept = [ordered]@{}
+        $dumpedCount = 0
+        foreach ($item in @($items | Where-Object { $_.File } | Sort-Object @{ Expression = { [string]$folders[[string]$_.Ref] } })) {
+            $folder = [string]$folders[[string]$item.Ref]
+            $dir = Join-Path $root $folder
+            $key = '{0}|{1}' -f $item.Hash, $script:V8
+            if (-not ($cache.Contains($folder) -and $cache[$folder] -eq $key -and (Test-Path -LiteralPath (Join-Path $dir ($item.ObjName + '.xml'))))) {
+                $dumped = Get-ProcessingDump -File $item.File -Dir $dir -Title ("Выгрузить в файлы {0} из temp" -f $folder)
+                if (-not $dumped) { throw ("обработка {0} ({1}) не выгрузилась в файлы, см. run.log" -f $folder, $item.Title) }
+                $dumpedCount++
+            }
+            $kept[$folder] = $key
+            Add-GitSnapshotFiles -Files $files -Dir $dir -Prefix ('processings/' + $folder + '/')
+        }
+        # Папки элементов, которых в справочнике больше нет, - долой из рабочей папки: иначе попали бы в сравнение.
+        foreach ($old in @(Get-ChildItem -LiteralPath $root -Directory)) { if (-not $kept.Contains($old.Name)) { Remove-Item -LiteralPath $old.FullName -Recurse -Force } }
+        [System.IO.File]::WriteAllText($cachePath, (ConvertTo-Json -InputObject $kept), $Utf8Bom)
+        $manifest = Join-Path $root 'manifest.json'
+        [System.IO.File]::WriteAllText($manifest, (Get-GitProcessingManifest -Items $items -Folders $folders), (New-Object System.Text.UTF8Encoding($false)))
+        $files['processings/manifest.json'] = $manifest
+        $prefixes.Add('processings/')
+        Write-RunLog ("git: обработок в справочнике {0}, с файлом {1}, выгружено конфигуратором {2}, остальные - с прошлого раза" -f $items.Count, $kept.Count, $dumpedCount)
     }
-    return [pscustomobject]@{ Files = $files; Missing = $missing.ToArray(); Prefixes = $prefixes.ToArray() }
+    return [pscustomobject]@{ Files = $files; Missing = $missing.ToArray(); Prefixes = $prefixes.ToArray(); Processings = $items; Folders = $folders }
 }
 
 function Test-GitPrefix {
@@ -1885,15 +2024,15 @@ function Test-GitPrefix {
 
 function Compare-GitSnapshot {
     # Чем выгрузка temp отличается от файлов коммита - только в выгрузившихся папках. Path, Kind (add, change,
-    # delete), File (файл на диске), Sha (git-хеш файла).
-    param([hashtable]$Local, [hashtable]$Remote, [string[]]$Prefixes)
+    # delete), File (файл на диске), Sha (git-хеш файла). Ignore - пути, которые не сравниваются.
+    param([hashtable]$Local, [hashtable]$Remote, [string[]]$Prefixes, [string[]]$Ignore = @())
     $changes = New-Object System.Collections.Generic.List[object]
-    foreach ($path in @($Local.Keys | Sort-Object)) {
+    foreach ($path in @($Local.Keys | Where-Object { @($Ignore) -notcontains $_ } | Sort-Object)) {
         $sha = Get-GitBlobSha ([System.IO.File]::ReadAllBytes($Local[$path]))
         if (-not $Remote.ContainsKey($path)) { $changes.Add([pscustomobject]@{ Path = $path; Kind = 'add'; File = $Local[$path]; Sha = $sha }) }
         elseif ([string]$Remote[$path] -ne $sha) { $changes.Add([pscustomobject]@{ Path = $path; Kind = 'change'; File = $Local[$path]; Sha = $sha }) }
     }
-    foreach ($path in @($Remote.Keys | Sort-Object)) {
+    foreach ($path in @($Remote.Keys | Where-Object { @($Ignore) -notcontains $_ } | Sort-Object)) {
         if ($Local.ContainsKey($path) -or -not (Test-GitPrefix $path $Prefixes)) { continue }
         $changes.Add([pscustomobject]@{ Path = $path; Kind = 'delete'; File = ''; Sha = '' })
     }
@@ -1936,7 +2075,12 @@ function Get-GitReadme {
             'Репозиторий ведёт гейт расширений: что стоит в тестовой базе - здесь, и обратно.',
             '',
             '- `extensions/<имя>/` - расширение конфигурации, выгрузка в файлы (конфигуратор, «Выгрузить конфигурацию в файлы»).',
-            '- `processings/<имя>/` - внешняя обработка или отчёт, выгрузка в файлы.',
+            '- `processings/<имя>/` - внешняя обработка, отчёт или печатная форма из справочника «Дополнительные отчёты и обработки», выгрузка в файлы.',
+            '  Ведутся все элементы справочника, и помеченные на удаление. У нескольких элементов с одним именем объекта основной (тот, в который',
+            '  пишет загрузка: не помечен на удаление, используемый - первым) - в `processings/<имя>/`, остальные - в `processings/<имя>~<8 знаков ссылки>/`:',
+            '  их гейт в базу не грузит.',
+            '- `processings/manifest.json` - что за элемент за каждой папкой: наименование, вид, версия, публикация, безопасный режим, пометка удаления,',
+            '  ссылка, хеш файла, назначение. Пишет гейт при выгрузке из тестовой базы; руками его править незачем - при загрузке он не читается.',
             '- `ConfigDumpInfo.xml` не хранится: конфигуратор меняет его при каждой выгрузке.',
             '',
             '`main` - то, что должно стоять в тестовой базе. Правки - веткой и pull request. В тестовую базу main загружает гейт',
@@ -1948,8 +2092,8 @@ function Get-GitReadme {
 }
 
 function Select-GitTracked {
-    # Первая выгрузка: что вести в git. Расширения - из Extensions (тестовые не берутся), обработки - из справочника
-    # temp, отмечает человек. $null - отмена.
+    # Первая выгрузка: что вести в git. Расширения - из Extensions (тестовые не берутся), отмечает человек; обработки -
+    # да или нет: если да, то все элементы справочника temp. $null - отмена.
     param($Setup)
     $candidates = @(@(Get-Setting $cfg 'Extensions' @()) | Where-Object { $_ } | ForEach-Object { [string]$_ } |
             Where-Object { $name = $_; @($unitOnly | Where-Object { [string]$_ -ieq $name }).Count -eq 0 })
@@ -1958,21 +2102,18 @@ function Select-GitTracked {
         -Notes @('Вендорские и чужие расширения можно не брать: их обновления приходят файлами .cfe.')
     if ($null -eq $picked) { return $null }
     $extensions = @($picked | ForEach-Object { $candidates[$_] })
-    $processings = @()
+    $withProcessings = $false
     $epfDir = Join-Path $script:RunDir 'epf-list'
-    $export = Export-Processings -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword -Dir $epfDir
+    $export = Export-Processings -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword -Dir $epfDir -All
     if (-not $export.Ok) { throw ("обработки {0} не прочитал: {1}" -f $script:TempBase, $export.Error) }
-    $items = @($export.Items | Sort-Object ObjName)
+    $items = @($export.Items)
     if ($items.Count -gt 0) {
-        $want = Confirm-Ui -Question ("Вести в git и внешние обработки и отчёты {0}? В справочнике их {1}: отметишь свои." -f $script:TempBase, $items.Count) -Yes 'Да, выбрать' -No 'Нет, только расширения'
+        $deleted = @($items | Where-Object { $_.Deleted }).Count
+        $want = Confirm-Ui -Question ("Вести в git и внешние обработки, отчёты и печатные формы {0}? Все элементы справочника: {1}, из них помечены на удаление {2}. По папке на элемент и processings/manifest.json." -f $script:TempBase, $items.Count, $deleted) -Yes 'Да, все' -No 'Нет, только расширения'
         if ($null -eq $want) { return $null }
-        if ($want) {
-            $labels = @($items | ForEach-Object { '{0} ({1})' -f $_.ObjName, $_.Title })
-            $chosen = Select-UiMany -Header 'Какие внешние обработки и отчёты вести в git' -Items $labels
-            if ($null -ne $chosen) { $processings = @($chosen | ForEach-Object { [string]$items[$_].ObjName }) }
-        }
+        $withProcessings = [bool]$want
     }
-    return [pscustomobject]@{ Extensions = $extensions; Processings = $processings }
+    return [pscustomobject]@{ Extensions = $extensions; Processings = @(); HasProcessings = $withProcessings }
 }
 
 function New-GitTempBranch {
@@ -2049,13 +2190,15 @@ function Invoke-GitExport {
         $baseFiles = Get-GhFiles -Gh $Setup.Gh -Commit $base
     }
     $tracked = Get-GitFolders $baseFiles
-    $bootstrap = (@($tracked.Extensions).Count + @($tracked.Processings).Count) -eq 0
+    $bootstrap = (@($tracked.Extensions).Count -eq 0) -and -not $tracked.HasProcessings
     if ($bootstrap) {
         $tracked = Select-GitTracked $Setup
         if ($null -eq $tracked) { Write-Line 'Отмена: ничего не выгружал.'; return }
     }
-    Write-Line ("Выгружаю из {0} в файлы: расширения {1}; обработки {2}" -f $script:TempBase, (Get-NonEmpty (@($tracked.Extensions) -join ', ') 'нет'), (Get-NonEmpty (@($tracked.Processings) -join ', ') 'нет')) 'Cyan'
-    $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -Processings $tracked.Processings
+    $processingsText = 'нет'
+    if ($tracked.HasProcessings) { $processingsText = 'все из справочника' }
+    Write-Line ("Выгружаю из {0} в файлы: расширения {1}; обработки {2}" -f $script:TempBase, (Get-NonEmpty (@($tracked.Extensions) -join ', ') 'нет'), $processingsText) 'Cyan'
+    $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$tracked.HasProcessings
     foreach ($item in $snapshot.Missing) { Write-Line ("  в {0} нет: {1} - в git остаётся как есть" -f $script:TempBase, $item) 'Yellow' }
     # Без @(): функция возвращает массив запятой, @() завернул бы его ещё раз.
     $changes = Compare-GitSnapshot -Local $snapshot.Files -Remote $baseFiles -Prefixes $snapshot.Prefixes
@@ -2073,7 +2216,7 @@ function Invoke-GitExport {
         $attributes = Join-Path $Setup.Root '.gitattributes'
         [System.IO.File]::WriteAllText($attributes, "* -text`n", (New-Object System.Text.UTF8Encoding($false)))
         $changes += [pscustomobject]@{ Path = '.gitattributes'; Kind = 'add'; File = $attributes; Sha = (Get-GitBlobSha ([System.IO.File]::ReadAllBytes($attributes))) }
-        $what = @(@($tracked.Extensions) + @($tracked.Processings)) -join ', '
+        $what = @(@($tracked.Extensions) + @($(if ($tracked.HasProcessings) { 'внешние обработки' }))) -join ', '
         $sha = New-GitVerifiedCommit -Setup $Setup -Parent $parent -Changes $changes -Message ("Выгрузка {0} в git: {1}" -f $script:TempBase, $what)
         Set-GhBranch -Gh $Setup.Gh -Branch $Setup.Branch -Sha $sha
         $State['commit'] = $sha
@@ -2122,9 +2265,13 @@ function Invoke-GitImport {
     $knownName = Get-GitShort $known
     if (-not $known) { $knownName = ('{0} ({1})' -f $Setup.Branch, (Get-GitShort $head.Sha)) }
     $tracked = Get-GitFolders $knownFiles
+    $withProcessings = $tracked.HasProcessings -or (Get-GitFolders $headFiles).HasProcessings
     Write-Line ("Проверяю, не правили ли {0} после прошлой загрузки: выгружаю и сравниваю с коммитом {1}" -f $script:TempBase, $knownName) 'Cyan'
-    $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -Processings $tracked.Processings
-    $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes
+    $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$withProcessings
+    # manifest.json правкой temp не считается: версия и хеш обработки меняются от самой загрузки из git. В ветку с
+    # правками он идёт, если правки есть.
+    $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes -Ignore @('processings/manifest.json')
+    if ($drift.Count -gt 0) { $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes }
     if ($drift.Count -gt 0) {
         Write-Line ("В {0} есть правки, которых нет в git (коммит {1}):" -f $script:TempBase, $knownName) 'Yellow'
         foreach ($line in (Get-GitChangeLines $drift)) { Write-Line ('  ' + $line) 'Yellow' }
@@ -2182,7 +2329,11 @@ function Invoke-GitImport {
     }
     foreach ($name in @($headTracked.Processings)) {
         $prefix = 'processings/' + $name + '/'
-        if ((Get-GitFolderPrint $headFiles $prefix) -ne (Get-GitFolderPrint $localShas $prefix)) { $toLoad.Add([pscustomobject]@{ Kind = 'processing'; Name = $name; Prefix = $prefix }) }
+        if ((Get-GitFolderPrint $headFiles $prefix) -eq (Get-GitFolderPrint $localShas $prefix)) { continue }
+        # <имя>~<ссылка> - не основной элемент с этим именем объекта (помечен на удаление или не используется):
+        # загрузка писала бы в основной.
+        if ($name.Contains('~')) { Write-Line ("  {0}: в {1} не такая, как в {2}, но это не основной элемент справочника с этим именем - не гружу" -f $prefix.TrimEnd('/'), $Setup.Branch, $script:TempBase) 'Yellow'; continue }
+        $toLoad.Add([pscustomobject]@{ Kind = 'processing'; Name = $name; Prefix = $prefix })
     }
     foreach ($name in @($tracked.Extensions | Where-Object { @($headTracked.Extensions) -notcontains $_ })) { Write-Line ("  в {0} больше нет расширения {1}: из {2} не убираю" -f $Setup.Branch, $name, $script:TempBase) 'Yellow' }
     foreach ($name in @($tracked.Processings | Where-Object { @($headTracked.Processings) -notcontains $_ })) { Write-Line ("  в {0} больше нет обработки {1}: из {2} не убираю" -f $Setup.Branch, $name, $script:TempBase) 'Yellow' }

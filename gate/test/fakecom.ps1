@@ -15,7 +15,8 @@ deploy.ps1 берёт его вместо настоящего, когда за�
       "<имя базы>": {
         "scheduledJobsDenied": false, "sessionsDenied": false, "permissionCode": "", "deniedMessage": "",
         "extensions": [ { "name": "...", "version": "...", "hash": "..." } ],
-        "processings": [ { "objName": "...", "title": "...", "version": "...", "kind": "...", "content": "..." } ]
+        "processings": [ { "objName": "...", "title": "...", "version": "...", "kind": "...", "content": "...",
+                           "deleted": false, "use": "Используется", "safeMode": true, "ref": "<УИД>", "targets": [ "Документ.X" ] } ]
       }
     },
     "sessions": [ { "id": 1, "base": "<имя базы>", "app": "1CV8C", "user": "...", "host": "..." } ],
@@ -28,7 +29,8 @@ deploy.ps1 берёт его вместо настоящего, когда за�
   рабочий процесс: ConnectWorkingProcess, AuthenticateAdmin, AddAuthentication, GetInfoBases, UpdateInfoBase;
   внешнее соединение: Connect, ConfigurationExtensions.Get, ConfigurationExtensionsSource, Base64String,
   расширение.GetData().Write, NewObject('Query') - запрос к справочнику обработок (Execute, Select, Next,
-  Storage.Get().Write).
+  Storage.Get().Write; с «НЕ Спр.ПометкаУдаления» в тексте - без помеченных; ссылка.UUID(), String) и к его табличной
+  части Назначение (в тексте «.Назначение»). Нет ref у обработки - УИД из её номера; нет content - файла нет.
 #>
 
 if (-not ('FakeComList' -as [type])) {
@@ -185,34 +187,79 @@ function New-FakeComConnection {
     }
     $connection.ConfigurationExtensions = $extensions
     $connection | Add-Member -MemberType ScriptMethod -Name Base64String -Value { param($Value) return [string]$Value }
+    $connection | Add-Member -MemberType ScriptMethod -Name String -Value { param($Value) return [string]$Value }
     $connection | Add-Member -MemberType ScriptMethod -Name NewObject -Value {
         param($TypeName)
         if ([string]$TypeName -ne 'Query') { return [pscustomobject]@{ TypeName = [string]$TypeName } }
         $query = [pscustomobject]@{ StateFile = $this.StateFile; Base = $this.Base; Text = '' }
         $query | Add-Member -MemberType ScriptMethod -Name Execute -Value {
-            # Запрос один - к справочнику обработок, его текст не разбирается.
+            # Запросы к справочнику обработок: из текста смотрится только отбор помеченных и табличная часть Назначение.
             $state = Read-FakeComState $this.StateFile
-            $rows = Get-FakeComList (Get-FakeComBase $state $this.Base) 'processings'
+            $all = Get-FakeComList (Get-FakeComBase $state $this.Base) 'processings'
+            $numbered = New-Object System.Collections.Generic.List[object]
+            for ($index = 0; $index -lt @($all).Count; $index++) {
+                $row = @($all)[$index]
+                $ref = ('00000000-0000-0000-0000-{0:d12}' -f ($index + 1))
+                if ($null -ne $row.PSObject.Properties['ref'] -and $row.ref) { $ref = [string]$row.ref }
+                $numbered.Add([pscustomobject]@{ Row = $row; Ref = $ref })
+            }
+            if ([string]$this.Text -match '\.Назначение') {
+                $targetRows = New-Object System.Collections.Generic.List[object]
+                foreach ($entry in $numbered) {
+                    if ($null -eq $entry.Row.PSObject.Properties['targets']) { continue }
+                    foreach ($target in @($entry.Row.targets)) { $targetRows.Add([pscustomobject]@{ Ref = $entry.Ref; Target = [string]$target }) }
+                }
+                $targetResult = [pscustomobject]@{ Rows = $targetRows.ToArray() }
+                $targetResult | Add-Member -MemberType ScriptMethod -Name Select -Value {
+                    $targetSelection = [pscustomobject]@{ Rows = $this.Rows; Index = -1 }
+                    $targetSelection | Add-Member -MemberType ScriptMethod -Name Next -Value { $this.Index++; return ($this.Index -lt @($this.Rows).Count) }
+                    $targetSelection | Add-Member -MemberType ScriptMethod -Name Get -Value {
+                        param([int]$Index)
+                        $row = @($this.Rows)[$this.Index]
+                        if ($Index -eq 0) { $refObject = [pscustomobject]@{ Id = $row.Ref }; $refObject | Add-Member -MemberType ScriptMethod -Name UUID -Value { return $this.Id }; return $refObject }
+                        return $row.Target
+                    }
+                    return $targetSelection
+                }
+                return $targetResult
+            }
+            $skipDeleted = [string]$this.Text -match 'НЕ Спр\.ПометкаУдаления'
+            $rows = @($numbered | Where-Object { -not ($skipDeleted -and $null -ne $_.Row.PSObject.Properties['deleted'] -and [bool]$_.Row.deleted) })
             $result = [pscustomobject]@{ Rows = $rows }
             $result | Add-Member -MemberType ScriptMethod -Name Select -Value {
-                $selection = [pscustomobject]@{ Rows = $this.Rows; Index = -1; Title = ''; ObjName = ''; Version = ''; Kind = ''; Storage = $null }
+                $selection = [pscustomobject]@{ Rows = $this.Rows; Index = -1; Title = ''; ObjName = ''; Version = ''; Kind = ''; Storage = $null; Deleted = $false; Use = ''; SafeMode = $false; Ref = $null }
                 $selection | Add-Member -MemberType ScriptMethod -Name Next -Value {
                     $this.Index++
                     if ($this.Index -ge @($this.Rows).Count) { return $false }
-                    $row = @($this.Rows)[$this.Index]
+                    $entry = @($this.Rows)[$this.Index]
+                    $row = $entry.Row
                     $this.Title = [string]$row.title
                     $this.ObjName = [string]$row.objName
                     $this.Version = [string]$row.version
                     $this.Kind = [string]$row.kind
-                    $storage = [pscustomobject]@{ Content = [string]$row.content }
-                    $storage | Add-Member -MemberType ScriptMethod -Name Get -Value { return (New-FakeComData ([System.Text.Encoding]::UTF8.GetBytes($this.Content))) }
-                    $this.Storage = $storage
+                    $this.Deleted = ($null -ne $row.PSObject.Properties['deleted'] -and [bool]$row.deleted)
+                    $this.Use = 'Используется'
+                    if ($null -ne $row.PSObject.Properties['use'] -and $row.use) { $this.Use = [string]$row.use }
+                    $this.SafeMode = ($null -eq $row.PSObject.Properties['safeMode'] -or [bool]$row.safeMode)
+                    $refObject = [pscustomobject]@{ Id = $entry.Ref }
+                    $refObject | Add-Member -MemberType ScriptMethod -Name UUID -Value { return $this.Id }
+                    $this.Ref = $refObject
+                    $this.Storage = $null
+                    if ($null -ne $row.PSObject.Properties['content'] -and $null -ne $row.content) {
+                        $storage = [pscustomobject]@{ Content = [string]$row.content }
+                        $storage | Add-Member -MemberType ScriptMethod -Name Get -Value { return (New-FakeComData ([System.Text.Encoding]::UTF8.GetBytes($this.Content))) }
+                        $this.Storage = $storage
+                    }
                     return $true
                 }
-                # Получить(Индекс): поля в порядке запроса - Наименование, ИмяОбъекта, Версия, Вид, Хранилище.
+                # Получить(Индекс): поля в порядке запроса - Наименование, ИмяОбъекта, Версия, Вид, Хранилище,
+                # ПометкаУдаления, Публикация, БезопасныйРежим, Ссылка.
                 $selection | Add-Member -MemberType ScriptMethod -Name Get -Value {
                     param([int]$Index)
-                    switch ($Index) { 0 { return $this.Title } 1 { return $this.ObjName } 2 { return $this.Version } 3 { return $this.Kind } 4 { return $this.Storage } }
+                    switch ($Index) {
+                        0 { return $this.Title } 1 { return $this.ObjName } 2 { return $this.Version } 3 { return $this.Kind } 4 { return $this.Storage }
+                        5 { return $this.Deleted } 6 { return $this.Use } 7 { return $this.SafeMode } 8 { return $this.Ref }
+                    }
                     return $null
                 }
                 return $selection

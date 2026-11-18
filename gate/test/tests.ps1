@@ -517,7 +517,6 @@ function New-GitDumps {
 $gitBootstrapAnswers = @(
     @{ Kind = 'many'; Header = 'Первая выгрузка в owner/ext'; Indexes = @(0, 1) },
     @{ Kind = 'confirm'; Header = 'Вести в git и внешние обработки'; Yes = $true },
-    @{ Kind = 'many'; Header = 'Какие внешние обработки'; Indexes = @(0) },
     @{ Kind = 'confirm'; Header = 'первым коммитом'; Yes = $true })
 
 # Заглушка run.ps1 для «Загрузить из git»: записывает, с каким комплектом её позвали, и итог прогона - всё загрузилось.
@@ -2025,7 +2024,7 @@ $tests = @(
     },
     @{
         Name = 'git-export'
-        Text = '«Выгрузить temp в git»: первый раз - выбор расширений и обработок, первый коммит в main (без ConfigDumpInfo.xml, с .gitattributes), state.json; без правок - «выгружать нечего»; правка в temp - ветка temp/<время> и pull request, main не тронут'
+        Text = '«Выгрузить temp в git»: первый раз - выбор расширений, обработки да или нет, первый коммит в main (без ConfigDumpInfo.xml, с .gitattributes), state.json; без правок - «выгружать нечего»; правка в temp - ветка temp/<время> и pull request, main не тронут'
         Run = {
             param($Name)
             $sb = New-GitSandbox $Name
@@ -2039,7 +2038,7 @@ $tests = @(
             if ($head) {
                 $files = Get-GhFiles -Gh $gh -Commit $head
                 foreach ($path in @('README.md', '.gitattributes', 'extensions/Адаптация/Configuration.xml', 'extensions/Адаптация/CommonModules/АГБ_Общий/Ext/Module.bsl',
-                        'extensions/Доработки/Configuration.xml', 'processings/Печать/Печать.xml', 'processings/Печать/Печать/Ext/ObjectModule.bsl')) {
+                        'extensions/Доработки/Configuration.xml', 'processings/Печать/Печать.xml', 'processings/Печать/Печать/Ext/ObjectModule.bsl', 'processings/manifest.json')) {
                     Check ($files.ContainsKey($path)) ("в main нет {0}" -f $path)
                 }
                 Check (@($files.Keys | Where-Object { $_ -match 'ConfigDumpInfo' }).Count -eq 0) 'ConfigDumpInfo.xml попал в git'
@@ -2104,6 +2103,74 @@ $tests = @(
             }
             Check ((Read-GitStateFile $sb).commit -eq $merged) 'после прогона state.json не на main'
             Check (@($load.Output | Where-Object { $_ -match 'теперь на main' }).Count -eq 1) 'не сказано, что temp на main'
+        }
+    },
+    @{
+        Name = 'git-processings-all'
+        Text = 'обработки в git - все элементы справочника: два элемента с одним именем объекта - основной в <имя>/, помеченный на удаление в <имя>~<ссылка>/, элемент без файла - только в manifest.json (вид, публикация, безопасный режим, пометка, ссылка, хеш, назначение); повторная выгрузка - без конфигуратора; загрузка: правка в <имя>~<ссылка> не грузится, другой manifest в temp - не правка temp'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $procs = @(
+                @{ objName = 'Печать'; title = 'Печать актов'; version = '2'; kind = 'Печатная форма'; content = $printOld; ref = 'bbbbbbbb-0000-0000-0000-000000000002'; targets = @('Документ.Акт', 'Документ.Акт') },
+                @{ objName = 'Печать'; title = 'Печать актов (старая)'; version = '1'; kind = 'Печатная форма'; content = 'Процедура Старая() КонецПроцедуры'; deleted = $true; use = 'Отключена'; ref = 'aaaaaaaa-0000-0000-0000-000000000001' },
+                @{ objName = 'Отчет'; title = 'Отчёт по складу'; version = '1'; kind = 'Дополнительный отчет'; content = 'Процедура О() КонецПроцедуры'; use = 'Отключена'; safeMode = $false; ref = 'cccccccc-0000-0000-0000-000000000003' },
+                @{ objName = 'Пустая'; title = 'Без файла'; version = '1'; kind = 'Дополнительная обработка'; ref = 'dddddddd-0000-0000-0000-000000000004' })
+            $com = New-ComState -TempProcessings $procs
+            $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            Check ($boot.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($boot.Unexpected -join ' | '))
+            $head = (Get-GhHead -Gh $gh -Branch 'main').Sha
+            if (-not $head) { Check $false 'первая выгрузка не создала main'; return }
+            $files = Get-GhFiles -Gh $gh -Commit $head
+            foreach ($path in @('processings/Печать/Печать.xml', 'processings/Печать/Печать/Ext/ObjectModule.bsl', 'processings/Печать~aaaaaaaa/Печать.xml', 'processings/Отчет/Отчет.xml', 'processings/manifest.json')) {
+                Check ($files.ContainsKey($path)) ("в main нет {0}" -f $path)
+            }
+            Check (@($files.Keys | Where-Object { $_ -like 'processings/Пустая*' }).Count -eq 0) 'у элемента без файла появилась папка'
+            if ($files.ContainsKey('processings/manifest.json')) {
+                $manifest = @([System.IO.File]::ReadAllText((Join-Path $sb ('fake-github\blobs\' + $files['processings/manifest.json'])), $utf8) | ConvertFrom-Json)
+                $byRef = @{}
+                foreach ($entry in $manifest) { $byRef[[string]$entry.ref] = $entry }
+                Check ($manifest.Count -eq 4) ("в manifest.json элементов {0}, ждали 4" -f $manifest.Count)
+                $main = $byRef['bbbbbbbb-0000-0000-0000-000000000002']
+                Check ($null -ne $main -and $main.folder -eq 'Печать' -and -not $main.deleted -and $main.use -eq 'Используется' -and $main.kind -eq 'Печатная форма' -and $main.fileHash -match '^sha256:[0-9a-f]{64}$' -and (@($main.targets) -join ',') -eq 'Документ.Акт') 'manifest.json: основной элемент Печать описан не так'
+                $old = $byRef['aaaaaaaa-0000-0000-0000-000000000001']
+                Check ($null -ne $old -and $old.folder -eq 'Печать~aaaaaaaa' -and $old.deleted -and $old.use -eq 'Отключена') 'manifest.json: помеченный на удаление элемент описан не так'
+                $report = $byRef['cccccccc-0000-0000-0000-000000000003']
+                Check ($null -ne $report -and $report.folder -eq 'Отчет' -and $report.file -eq 'Отчет.erf' -and $report.safeMode -eq $false) 'manifest.json: отчёт описан не так'
+                $empty = $byRef['dddddddd-0000-0000-0000-000000000004']
+                Check ($null -ne $empty -and $null -eq $empty.folder -and $null -eq $empty.file) 'manifest.json: элемент без файла описан не так'
+            }
+            # Повторная выгрузка без правок: файлы те же - конфигуратор обработки не выгружает.
+            Reset-FakeState $sb
+            $same = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = (New-GitDumps) } -Com $com
+            Check-DeployCommon $same -LocksExpected $false
+            Check (@($same.Output | Where-Object { $_ -match 'выгружать нечего' }).Count -eq 1) 'без правок не сказано «выгружать нечего»'
+            $calls = Join-Path $sb 'fake\calls.log'
+            $dumpCalls = 0
+            if (Test-Path -LiteralPath $calls) { $dumpCalls = @([System.IO.File]::ReadAllLines($calls, $utf8) | Where-Object { $_ -match 'DumpExternalDataProcessorOrReportToFiles' }).Count }
+            Check ($dumpCalls -eq 0) ("повторная выгрузка без правок звала конфигуратор для обработок {0} раз" -f $dumpCalls)
+            # В main правят и основную Печать, и помеченную на удаление; в temp поменялось только наименование (manifest).
+            $changed = New-GhCommit -Gh $gh -Parent $head -Changes @(
+                [pscustomobject]@{ Path = 'processings/Печать/Печать/Ext/ObjectModule.bsl'; Bytes = $utf8.GetBytes('Процедура Печать2() КонецПроцедуры') },
+                [pscustomobject]@{ Path = 'processings/Печать~aaaaaaaa/Печать/Ext/ObjectModule.bsl'; Bytes = $utf8.GetBytes('Процедура СтараяПравка() КонецПроцедуры') }) -Message 'pull request агента'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $changed
+            $procs[0]['title'] = 'Печать актов, новое наименование'
+            $com2 = New-ComState -TempProcessings $procs
+            [System.IO.File]::WriteAllText((Join-Path $sb 'run.ps1'), $gitRunStub, $utf8Bom)
+            Reset-FakeState $sb
+            $imp = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{ dumps = (New-GitDumps) } -Com $com2 -Answers @(
+                @{ Kind = 'confirm'; Header = 'Загрузить в erp_temp_test из main'; Yes = $true })
+            Check-DeployCommon $imp -LocksExpected $false
+            Check ($imp.Unexpected.Count -eq 0) ("при загрузке неожиданные вопросы (manifest.json - правка temp?): " + ($imp.Unexpected -join ' | '))
+            Check (@($imp.Output | Where-Object { $_ -match 'Печать~aaaaaaaa.*не основной элемент' }).Count -eq 1) 'не сказано, что правка не основного элемента не грузится'
+            $stubs = @(Get-ChildItem -LiteralPath (Join-Path $sb 'runs') -Recurse -Filter 'stub.txt' -ErrorAction SilentlyContinue)
+            Check ($stubs.Count -eq 1) 'загрузки не было'
+            if ($stubs.Count -eq 1) {
+                $text = [System.IO.File]::ReadAllText($stubs[0].FullName, $utf8)
+                Check ($text -match '(?m)^dir=Печать\s*$' -and $text -notmatch 'dir=[^\r\n]*~' -and $text -notmatch 'dir=Отчет') ("в комплекте не только основная Печать: " + $text)
+            }
         }
     },
     @{
