@@ -2540,12 +2540,19 @@ function Resolve-TestDesignerBusy {
         return $true
     }
     if (-not (Test-UiCanAsk)) { return $false }
-    $link = Connect-TestBaseAgent
-    $designers = @(Get-TestBaseSessions $link | Where-Object { -not $_.IsError -and $_.IsDesigner })
+    # Сеансы - через агент сервера; файловая база или агент не ответил - без списка и без «закрыть отсюда».
+    $link = $null
+    $designers = @()
+    try {
+        $link = Connect-TestBaseAgent
+        $designers = @(Get-TestBaseSessions $link | Where-Object { -not $_.IsError -and $_.IsDesigner })
+    }
+    catch { $link = $null; Write-Host ("  сеансы базы не прочитал: {0}" -f $_.Exception.Message) -ForegroundColor Yellow }
     Write-Host ("  {0}: открыт конфигуратор {1} - дальше нельзя, пока он открыт" -f $Title, $script:Base) -ForegroundColor Yellow
     foreach ($entry in $designers) { Write-Host ('    ' + $entry.Text) -ForegroundColor Yellow }
     $answer = Read-UiChoice -Header ("Открыт конфигуратор {0}: «{1}» не может идти дальше. Закрой его сам - гейт увидит и продолжит, или:" -f $script:Base, $Title) `
         -Keys @('1', '2') -Labels @('Закрыть отсюда (сеанс прерывается, несохранённые правки в нём пропадут)', 'Отмена (прогон завершится)') -CancelKey '2' -Poll {
+        if ($null -eq $link) { return '' }
         $nowSessions = @(Get-TestBaseSessions $link)
         if (@($nowSessions | Where-Object { $_.IsError }).Count -eq 0 -and @($nowSessions | Where-Object { $_.IsDesigner }).Count -eq 0) { return 'closed' }
         return ''
@@ -2554,7 +2561,7 @@ function Resolve-TestDesignerBusy {
         Write-RunLog ("Отменено пользователем: открыт конфигуратор {0} ({1})" -f $script:Base, $Title)
         throw ("отменено пользователем: открыт конфигуратор {0}, «{1}» не выполнено" -f $script:Base, $Title)
     }
-    if ($answer -eq '1') {
+    if ($answer -eq '1' -and $null -ne $link) {
         foreach ($line in @(Stop-TestBaseSessions -Link $link -Designers)) { Write-Host ('  ' + $line) }
         for ($wait = 0; $wait -lt 10; $wait++) {
             Start-Sleep -Seconds 3
