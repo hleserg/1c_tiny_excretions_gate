@@ -2690,7 +2690,7 @@ if ($failed) {
         # Без ответа дальше не идём: решение важное.
         $rollbackNow = $null
         while ($null -eq $rollbackNow) {
-            $rollbackNow = Confirm-Ui -Question 'Откатить? (к резервным копиям, а при «как есть» - к прежней выгрузке рабочей; Нет - оставить как есть)' -Yes 'Откатить' -No 'Оставить'
+            $rollbackNow = Confirm-Ui -Question 'Откатить? (к резервным копиям, а при «как есть» - к прежней выгрузке рабочей; Нет - оставить как есть)' -Yes 'Откатить' -No 'Оставить' -DangerYes
         }
         if ($rollbackNow) {
             if (Invoke-ProdRollback) { $outcome = 'rolledBack' } else { $outcome = 'rollbackFailed' }

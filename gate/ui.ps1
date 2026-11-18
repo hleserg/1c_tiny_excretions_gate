@@ -126,12 +126,14 @@ function Read-UiChoice {
     # Вопрос с вариантами-клавишами. Keys и Labels - параллельные массивы. Poll - как у Request-UiAnswer:
     # вернула непустое - это и есть ответ. Esc в ci.exe - CancelKey.
     # Dock - в ci.exe кнопками внизу экрана, а не окном поверх (журнал над вопросом виден); DefaultKey - на каком
-    # варианте стоит выбор сразу.
+    # варианте стоит выбор сразу. Danger - номера опасных вариантов (откат): в ci.exe щелчок мышью по ним
+    # срабатывает только со второго раза.
     param([string]$Header, [string[]]$Keys, [string[]]$Labels, [scriptblock]$Poll = $null, [string]$CancelKey = '', [string[]]$Notes = @(),
-        [switch]$Dock, [string]$DefaultKey = '')
+        [switch]$Dock, [string]$DefaultKey = '', [int[]]$Danger = @())
     if ($script:UiChannelDir) {
         $question = @{ kind = 'one'; header = $Header; items = @($Labels); notes = @($Notes) }
         if ($Dock) { $question['style'] = 'dock' }
+        if ($Danger.Count -gt 0) { $question['danger'] = @($Danger) }
         if ($DefaultKey) { $question['preselected'] = @([array]::IndexOf($Keys, $DefaultKey)) }
         $answer = Request-UiAnswer -Question $question -Poll $Poll
         $polled = [string](Get-UiField $answer 'polled' '')
@@ -193,6 +195,18 @@ function Show-UiTitle {
     foreach ($line in $More) { if ($line) { Write-Host ('  ' + $line) } }
 }
 
+function Get-UiKeyIndex {
+    # Номер пункта по нажатой клавише (1-9, потом a-z); -1 - не клавиша пункта. В русской раскладке
+    # буква берётся по самой клавише (ф - это a), как в ci.exe.
+    param([System.ConsoleKeyInfo]$KeyInfo)
+    $index = [array]::IndexOf($script:UiKeys, ([string]$KeyInfo.KeyChar).ToLowerInvariant())
+    if ($index -lt 0) {
+        $keyName = ([string]$KeyInfo.Key).ToLowerInvariant()
+        if ($keyName.Length -eq 1) { $index = [array]::IndexOf($script:UiKeys, $keyName) }
+    }
+    return $index
+}
+
 function Select-UiOne {
     # Один пункт из списка. Возвращает номер пункта (с нуля) или -1, если выбор отменили (Esc, 0).
     # Danger - номера опасных пунктов (откат рабочей): в ci.exe они в красной рамке с ▲!, в консоли - красные, с «!!!».
@@ -217,10 +231,10 @@ function Select-UiOne {
     Write-Host '    0 - отмена'
     Write-Host -NoNewline '  Выбор: '
     while ($true) {
-        $typed = ([string]([Console]::ReadKey($true)).KeyChar).ToLowerInvariant()
-        if ($typed -eq '0') { Write-Host '0'; return -1 }
-        $index = [array]::IndexOf($script:UiKeys, $typed)
-        if ($index -ge 0 -and $index -lt $shown) { Write-Host $typed; return $index }
+        $keyInfo = [Console]::ReadKey($true)
+        if ([string]$keyInfo.KeyChar -eq '0') { Write-Host '0'; return -1 }
+        $index = Get-UiKeyIndex $keyInfo
+        if ($index -ge 0 -and $index -lt $shown) { Write-Host $script:UiKeys[$index]; return $index }
     }
 }
 
@@ -258,9 +272,8 @@ function Select-UiMany {
             Write-Host '  Ничего не отмечено.' -ForegroundColor Yellow
             continue
         }
-        $typed = ([string]$key.KeyChar).ToLowerInvariant()
-        if ($typed -eq '0') { return $null }
-        $index = [array]::IndexOf($script:UiKeys, $typed)
+        if ([string]$key.KeyChar -eq '0') { return $null }
+        $index = Get-UiKeyIndex $key
         if ($index -lt 0 -or $index -ge $shown) { continue }
         if ($marks.Contains($index)) { $null = $marks.Remove($index); continue }
         if ($Groups.Count -eq $Items.Count -and $Groups[$index]) {
@@ -294,9 +307,12 @@ function Wait-UiAcknowledge {
 
 function Confirm-Ui {
     # Да или нет. Возвращает $true, $false или $null (отмена: Esc в ci.exe).
-    param([string]$Question, [string]$Yes = 'Да', [string]$No = 'Нет')
+    # DangerYes - «да» опасно (откат): в ci.exe щелчок мышью по нему срабатывает только со второго раза.
+    param([string]$Question, [string]$Yes = 'Да', [string]$No = 'Нет', [switch]$DangerYes)
     if ($script:UiChannelDir) {
-        $answer = Request-UiAnswer -Question @{ kind = 'confirm'; header = $Question; yes = $Yes; no = $No }
+        $question = @{ kind = 'confirm'; header = $Question; yes = $Yes; no = $No }
+        if ($DangerYes) { $question['danger'] = @(0) }
+        $answer = Request-UiAnswer -Question $question
         if ([bool](Get-UiField $answer 'cancel' $false)) { return $null }
         return [bool](Get-UiField $answer 'yes' $false)
     }

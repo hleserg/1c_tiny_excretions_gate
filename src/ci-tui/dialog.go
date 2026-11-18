@@ -5,7 +5,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"syscall"
 
@@ -34,10 +33,55 @@ type dialog struct {
 	height   int
 	finished bool
 	result   answer
+	// Где пункты и кнопки по последней отрисовке (для мыши): строки и столбцы внутри окна.
+	hits     []hitArea
+	dockHits []hitArea
+	boxW     int
+	boxH     int
+	// armed - опасный пункт, по которому уже щёлкнули один раз (второй щелчок - выбор); -1 - нет.
+	armed int
+}
+
+// hitArea - место пункта или кнопки: строки [y0, y1), столбцы [x0, x1); x1 = 0 - вся ширина.
+type hitArea struct {
+	y0, y1 int
+	x0, x1 int
+	index  int
+}
+
+// hotkeys - клавиши пунктов списка: 1-9, потом a-z, как в консоли без ci.exe.
+const hotkeys = "123456789abcdefghijklmnopqrstuvwxyz"
+
+// ruToLat - русская раскладка: буква на той же клавише, что латинская (ф - это a).
+var ruToLat = map[rune]rune{
+	'й': 'q', 'ц': 'w', 'у': 'e', 'к': 'r', 'е': 't', 'н': 'y', 'г': 'u', 'ш': 'i', 'щ': 'o', 'з': 'p',
+	'ф': 'a', 'ы': 's', 'в': 'd', 'а': 'f', 'п': 'g', 'р': 'h', 'о': 'j', 'л': 'k', 'д': 'l',
+	'я': 'z', 'ч': 'x', 'с': 'c', 'м': 'v', 'и': 'b', 'т': 'n', 'ь': 'm',
+}
+
+// hotkeyLabel - клавиша пункта i; "" - у пункта клавиши нет (дальше 35-го).
+func hotkeyLabel(i int) string {
+	if i < 0 || i >= len(hotkeys) {
+		return ""
+	}
+	return string(hotkeys[i])
+}
+
+// hotkeyIndex - номер пункта по нажатой клавише в любой раскладке; -1 - не клавиша пункта.
+func hotkeyIndex(s string) int {
+	r := []rune(strings.ToLower(s))
+	if len(r) != 1 {
+		return -1
+	}
+	c := r[0]
+	if lat, ok := ruToLat[c]; ok {
+		c = lat
+	}
+	return strings.IndexRune(hotkeys, c)
 }
 
 func newDialog(ev uiEvent, width, height int) *dialog {
-	d := &dialog{ev: ev, marks: map[int]bool{}, yes: true}
+	d := &dialog{ev: ev, marks: map[int]bool{}, yes: true, armed: -1}
 	for _, i := range ev.Preselected {
 		if i >= 0 && i < len(ev.Items) && len(d.clashing(i)) == 0 {
 			d.marks[i] = true
@@ -98,17 +142,12 @@ func (d *dialog) finish(a answer) {
 }
 
 func (d *dialog) Update(msg tea.Msg) tea.Cmd {
+	if mouse, isMouse := msg.(tea.MouseMsg); isMouse {
+		return d.mouse(mouse)
+	}
 	key, ok := msg.(tea.KeyMsg)
 	if !ok {
 		if d.ev.Kind == "text" {
-			// Правая кнопка мыши - вставить, как в обычной консоли: мышь у ci.exe включена
-			// (прокрутка журнала), и сама консоль по правой кнопке больше не вставляет.
-			if mouse, isMouse := msg.(tea.MouseMsg); isMouse {
-				if mouse.Button == tea.MouseButtonRight && mouse.Action == tea.MouseActionPress {
-					d.pasteClipboard()
-				}
-				return nil
-			}
 			var cmd tea.Cmd
 			d.input, cmd = d.input.Update(msg)
 			return cmd
@@ -133,14 +172,31 @@ func (d *dialog) Update(msg tea.Msg) tea.Cmd {
 				s = "down"
 			}
 		}
+		if d.ev.Kind == "one" {
+			// Цифрой или буквой (1-9, a-z, в русской раскладке - те же клавиши) - сразу выбрать пункт.
+			if k := hotkeyIndex(s); k >= 0 && k < n {
+				d.cursor = k
+				d.finish(answer{Index: k})
+				return nil
+			}
+		}
+		if d.ev.Kind == "many" {
+			// j/k - только в отметках: в выборе одного буквы - клавиши пунктов.
+			switch s {
+			case "k":
+				s = "up"
+			case "j":
+				s = "down"
+			}
+		}
 		switch s {
-		case "up", "k":
+		case "up":
 			if d.cursor > 0 {
 				d.cursor--
 			} else {
 				d.cursor = n - 1
 			}
-		case "down", "j":
+		case "down":
 			if d.cursor < n-1 {
 				d.cursor++
 			} else {
@@ -158,22 +214,7 @@ func (d *dialog) Update(msg tea.Msg) tea.Cmd {
 			d.finish(answer{Cancel: true})
 		case " ", "x":
 			if d.ev.Kind == "many" {
-				d.warning = ""
-				d.notice = ""
-				if d.marks[d.cursor] {
-					d.marks[d.cursor] = false
-					break
-				}
-				// Одно расширение - одно обновление: отметка снимается с того, что грузит то же расширение.
-				var off []string
-				for _, j := range d.clashing(d.cursor) {
-					d.marks[j] = false
-					off = append(off, shortLabel(d.ev.Items[j]))
-				}
-				d.marks[d.cursor] = true
-				if len(off) > 0 {
-					d.notice = "снято: " + strings.Join(off, ", ") + " - у расширения одно обновление"
-				}
+				d.toggle(d.cursor)
 			}
 		case "a":
 			if d.ev.Kind == "many" {
@@ -203,14 +244,6 @@ func (d *dialog) Update(msg tea.Msg) tea.Cmd {
 					d.warning = "ничего не отмечено: пробел ставит отметку"
 				} else {
 					d.finish(answer{Indexes: sel, Index: -1})
-				}
-			}
-		default:
-			// Цифрой - сразу выбрать пункт (в списке из одного выбора).
-			if d.ev.Kind == "one" {
-				if k, err := strconv.Atoi(s); err == nil && k >= 1 && k <= n && k <= 9 {
-					d.cursor = k - 1
-					d.finish(answer{Index: d.cursor})
 				}
 			}
 		}
@@ -264,6 +297,105 @@ func (d *dialog) Update(msg tea.Msg) tea.Cmd {
 			d.view, cmd = d.view.Update(msg)
 			return cmd
 		}
+	}
+	return nil
+}
+
+// toggle - поставить или снять отметку пункта i (пробел, щелчок мышью).
+func (d *dialog) toggle(i int) {
+	d.warning = ""
+	d.notice = ""
+	if d.marks[i] {
+		d.marks[i] = false
+		return
+	}
+	// Одно расширение - одно обновление: отметка снимается с того, что грузит то же расширение.
+	var off []string
+	for _, j := range d.clashing(i) {
+		d.marks[j] = false
+		off = append(off, shortLabel(d.ev.Items[j]))
+	}
+	d.marks[i] = true
+	if len(off) > 0 {
+		d.notice = "снято: " + strings.Join(off, ", ") + " - у расширения одно обновление"
+	}
+}
+
+// mouse - мышь в окне вопроса. Координаты уже внутри окна (их пересчитывает model).
+// Щелчок по пункту - выбрать (в отметках - отметить), по кнопке - нажать; колесо - выбор вверх-вниз;
+// в поле ввода правая кнопка - вставить; в просмотре колесо листает.
+func (d *dialog) mouse(msg tea.MouseMsg) tea.Cmd {
+	switch d.ev.Kind {
+	case "text":
+		// Мышь у ci.exe включена (прокрутка журнала), и сама консоль по правой кнопке больше не вставляет.
+		if msg.Button == tea.MouseButtonRight && msg.Action == tea.MouseActionPress {
+			d.pasteClipboard()
+		}
+		return nil
+	case "view":
+		var cmd tea.Cmd
+		d.view, cmd = d.view.Update(msg)
+		return cmd
+	}
+	if msg.Action != tea.MouseActionPress {
+		return nil
+	}
+	switch msg.Button {
+	case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
+		if d.docked() {
+			return nil
+		}
+		k := tea.KeyMsg{Type: tea.KeyDown}
+		if msg.Button == tea.MouseButtonWheelUp {
+			k = tea.KeyMsg{Type: tea.KeyUp}
+		}
+		return d.Update(k)
+	case tea.MouseButtonLeft:
+	default:
+		return nil
+	}
+	hits := d.hits
+	// Пункт - во всю ширину окна, но не правее его рамки.
+	right := d.boxW - styleDialog.GetHorizontalFrameSize()
+	if d.docked() {
+		hits = d.dockHits
+		right = 0
+	}
+	i := -1
+	for _, h := range hits {
+		x1 := h.x1
+		if x1 == 0 {
+			x1 = right
+		}
+		if msg.Y >= h.y0 && msg.Y < h.y1 && msg.X >= h.x0 && msg.X < x1 {
+			i = h.index
+			break
+		}
+	}
+	if i < 0 {
+		return nil
+	}
+	if d.ev.Kind != "many" && d.isDanger(i) && d.armed != i {
+		// Откат щелчком - только со второго раза: первый щелчок мог просто сделать окно активным.
+		d.armed = i
+		d.cursor = i
+		if d.ev.Kind == "confirm" {
+			d.yes = i == 0
+		}
+		d.notice = ""
+		d.warning = "это откат: щёлкни по нему ещё раз или нажми Enter"
+		return nil
+	}
+	switch d.ev.Kind {
+	case "one":
+		d.cursor = i
+		d.finish(answer{Index: i})
+	case "many":
+		d.cursor = i
+		d.toggle(i)
+	case "confirm":
+		d.yes = i == 0
+		d.finish(answer{Yes: d.yes})
 	}
 	return nil
 }
@@ -345,6 +477,7 @@ func (d *dialog) View() string {
 
 	switch d.ev.Kind {
 	case "one", "many":
+		d.hits = d.hits[:0]
 		rows := d.visibleRows()
 		end := min(len(d.ev.Items), d.offset+rows)
 		if d.offset > 0 {
@@ -358,9 +491,10 @@ func (d *dialog) View() string {
 				} else {
 					mark = "[ ] "
 				}
-			} else if i < 9 {
-				mark = styleDim.Render(fmt.Sprintf("%d ", i+1))
+			} else if k := hotkeyLabel(i); k != "" {
+				mark = styleDim.Render(k + " ")
 			}
+			top := strings.Count(b.String(), "\n")
 			text := d.ev.Items[i]
 			if d.isDanger(i) {
 				// Опасный пункт (откат рабочей) - красная рамка с ▲!, под курсором - залит красным.
@@ -376,6 +510,7 @@ func (d *dialog) View() string {
 					}
 					b.WriteString(p + l + "\n")
 				}
+				d.hits = append(d.hits, hitArea{y0: top, y1: top + len(lines), index: i})
 				continue
 			}
 			st := lipgloss.NewStyle()
@@ -389,7 +524,9 @@ func (d *dialog) View() string {
 				prefix = styleCursor.Render("› ") + mark
 				st = styleSelected
 			}
-			b.WriteString(hang(prefix, text, inner, st) + "\n")
+			row := hang(prefix, text, inner, st)
+			b.WriteString(row + "\n")
+			d.hits = append(d.hits, hitArea{y0: top, y1: top + lipgloss.Height(row), index: i})
 		}
 		if end < len(d.ev.Items) {
 			b.WriteString(styleDim.Render(fmt.Sprintf("  ↓ ещё %d", len(d.ev.Items)-end)) + "\n")
@@ -402,9 +539,9 @@ func (d *dialog) View() string {
 		}
 		b.WriteString("\n")
 		if d.ev.Kind == "one" {
-			b.WriteString(styleHelp.Render("↑↓ выбор · enter ок · цифра - сразу · esc отмена"))
+			b.WriteString(wrapBlock("↑↓ выбор · enter ок · цифра или буква, щелчок мышью - сразу · esc отмена", inner, styleHelp))
 		} else {
-			b.WriteString(styleHelp.Render("↑↓ выбор · пробел отметить · a все · enter дальше · esc отмена"))
+			b.WriteString(wrapBlock("↑↓ выбор · пробел или щелчок - отметить · a все · enter дальше · esc отмена", inner, styleHelp))
 		}
 	case "confirm":
 		yes := nonEmpty(d.ev.Yes, "Да")
@@ -432,7 +569,9 @@ func (d *dialog) View() string {
 		b.WriteString(d.view.View())
 		b.WriteString("\n" + styleHelp.Render(fmt.Sprintf("↑↓ PgUp PgDn прокрутка · %d%% · q закрыть", int(d.view.ScrollPercent()*100))))
 	}
-	return styleDialog.Render(b.String())
+	out := styleDialog.Render(b.String())
+	d.boxW, d.boxH = lipgloss.Width(out), lipgloss.Height(out)
+	return out
 }
 
 func nonEmpty(s, def string) string {
@@ -522,14 +661,17 @@ func (d *dialog) ViewDocked(width int) string {
 	var help string
 	if d.ev.Kind == "one" {
 		for i, item := range d.ev.Items {
-			label := fmt.Sprintf("%d  %s", i+1, item)
+			label := item
+			if k := hotkeyLabel(i); k != "" {
+				label = k + "  " + item
+			}
 			if i == d.cursor {
 				buttons = append(buttons, styleButtonActive.Render(label))
 			} else {
 				buttons = append(buttons, styleButton.Render(label))
 			}
 		}
-		help = "←→ выбор · enter ок · цифра - сразу · ↑↓ PgUp PgDn журнал · esc отмена"
+		help = "←→ выбор · enter ок · цифра, щелчок мышью - сразу · ↑↓ PgUp PgDn журнал · esc отмена"
 	} else {
 		yes := nonEmpty(d.ev.Yes, "Да")
 		no := nonEmpty(d.ev.No, "Нет")
@@ -538,22 +680,39 @@ func (d *dialog) ViewDocked(width int) string {
 			yb, nb = styleButtonActive.Render(yes), styleButton.Render(no)
 		}
 		buttons = []string{yb, nb}
-		help = "←→ выбор · enter ок · y/n · ↑↓ PgUp PgDn журнал · esc отмена"
+		help = "←→ выбор · enter ок · y/n, щелчок мышью · ↑↓ PgUp PgDn журнал · esc отмена"
 	}
-	// Кнопки в ряд; не влезают в ширину - столбиком.
+	// Кнопки в ряд; не влезают в ширину - столбиком. Места кнопок - для щелчка мышью.
+	top := strings.Count(b.String(), "\n")
+	d.dockHits = d.dockHits[:0]
 	row := ""
+	x := 0
 	for i, btn := range buttons {
 		if i > 0 {
 			row = lipgloss.JoinHorizontal(lipgloss.Center, row, "  ", btn)
+			x += 2
 		} else {
 			row = btn
 		}
+		w := lipgloss.Width(btn)
+		d.dockHits = append(d.dockHits, hitArea{y0: top, y1: top + lipgloss.Height(btn), x0: x, x1: x + w, index: i})
+		x += w
 	}
 	if lipgloss.Width(row) > inner {
 		row = lipgloss.JoinVertical(lipgloss.Left, buttons...)
+		d.dockHits = d.dockHits[:0]
+		y := top
+		for i, btn := range buttons {
+			h := lipgloss.Height(btn)
+			d.dockHits = append(d.dockHits, hitArea{y0: y, y1: y + h, x0: 0, x1: lipgloss.Width(btn), index: i})
+			y += h
+		}
 	}
 	b.WriteString(row)
 	b.WriteString("\n")
+	if d.warning != "" {
+		b.WriteString(wrapBlock(d.warning, inner, styleWarn) + "\n")
+	}
 	b.WriteString(wrapBlock(help, inner, styleHelp))
 	return styleDocked.Width(width - 2).Render(b.String())
 }

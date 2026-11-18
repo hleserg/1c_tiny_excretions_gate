@@ -320,14 +320,18 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmd1, cmd2)
 
 	case tea.MouseMsg:
+		if m.dialog != nil && m.dialog.docked() && msg.Button == tea.MouseButtonLeft {
+			// Полоса вопроса внизу: щелчок - по её кнопкам; колесо остаётся журналу.
+			return m.dialogMouse(m.dockedMouse(msg))
+		}
 		if m.dialog == nil || m.dialog.docked() {
 			var cmd tea.Cmd
 			m.logView, cmd = m.logView.Update(msg)
 			m.follow = m.logView.AtBottom()
 			return m, cmd
 		}
-		// Окно поверх: мышь - ему (правая кнопка в поле ввода - вставка, колесо в просмотре - прокрутка).
-		return m, m.dialog.Update(msg)
+		// Окно поверх: мышь - ему (щелчок по пункту, колесо, правая кнопка в поле ввода - вставка).
+		return m.dialogMouse(m.overlayMouse(msg))
 
 	case tea.KeyMsg:
 		if m.dialog != nil && m.dialog.docked() {
@@ -349,6 +353,48 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 	}
 	return m, nil
+}
+
+// dialogMouse - мышь окну вопроса; щелчок мог закончить вопрос, как Enter.
+func (m model) dialogMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	cmd := m.dialog.Update(msg)
+	if m.dialog.finished {
+		m.finishDialog()
+	}
+	return m, cmd
+}
+
+// centerOffset - отступ блока по центру, как у lipgloss.Place (Center). Блок выше окна: Bubble Tea
+// срезает лишние строки сверху - отступ отрицательный (для столбцов вызывающий берёт не меньше нуля).
+func centerOffset(total, size int) int {
+	gap := total - size
+	if gap < 0 {
+		return gap
+	}
+	return gap / 2
+}
+
+// overlayMouse - координаты мыши внутри окна вопроса посреди экрана (без рамки и полей).
+func (m model) overlayMouse(msg tea.MouseMsg) tea.MouseMsg {
+	d := m.dialog
+	msg.X -= max(0, centerOffset(m.width, d.boxW)) + styleDialog.GetBorderLeftSize() + styleDialog.GetPaddingLeft()
+	msg.Y -= centerOffset(m.height, d.boxH) + styleDialog.GetBorderTopSize() + styleDialog.GetPaddingTop()
+	return msg
+}
+
+// dockedMouse - координаты мыши внутри полосы вопроса внизу (без рамки и полей).
+func (m model) dockedMouse(msg tea.MouseMsg) tea.MouseMsg {
+	var panel string
+	if m.prog != nil {
+		panel = m.viewProgress()
+	}
+	top := lipgloss.Height(lipgloss.JoinVertical(lipgloss.Left, m.viewHeader(), m.viewBody(), panel))
+	if total := top + lipgloss.Height(m.dialog.ViewDocked(m.width)); total > m.height {
+		top -= total - m.height
+	}
+	msg.X -= styleDocked.GetBorderLeftSize() + styleDocked.GetPaddingLeft()
+	msg.Y -= top + styleDocked.GetBorderTopSize() + styleDocked.GetPaddingTop()
+	return msg
 }
 
 func (m *model) finishDialog() {
@@ -404,6 +450,10 @@ func describeAnswer(d *dialog) string {
 		}
 		return nonEmpty(d.ev.No, "Нет")
 	case "text":
+		if d.ev.Secret {
+			// Пароль и токен в журнал не пишутся - ни сами, ни их длина.
+			return "введено: ***"
+		}
 		return "введено: " + d.result.Text
 	case "view":
 		return "просмотр закрыт"
