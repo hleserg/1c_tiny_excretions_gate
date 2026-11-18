@@ -241,7 +241,7 @@ function Get-UtCatalog {
         $scenarios = $null
         if ($byName.ContainsKey('исполняемыесценарии')) { $scenarios = $byName['исполняемыесценарии'] }
         $registered = @()
-        if ($null -ne $scenarios) { $registered = @(Get-UtRegistrations ($lines[$scenarios.BodyFrom..$scenarios.BodyTo])) }
+        if ($null -ne $scenarios) { $registered = Get-UtRegistrations ($lines[$scenarios.BodyFrom..$scenarios.BodyTo]) }
         $moduleTests = New-Object System.Collections.Generic.List[object]
         if ($null -eq $scenarios) {
             # Модуль без ИсполняемыеСценарии - не тестовый (служебный общий модуль тестов): замечание, только если в нём есть шапки @Тест.
@@ -759,7 +759,8 @@ function Set-UtDisabled {
     if (-not (Test-Path -LiteralPath $path)) { throw ("в файлах нет модуля {0}" -f $Module) }
     $lines = New-Object System.Collections.Generic.List[string]
     foreach ($line in (Get-UtText $path).Split("`n")) { $lines.Add($line) }
-    $target = @(Get-UtMethods $lines.ToArray() | Where-Object { $_.Name -ieq $Method })
+    $methods = Get-UtMethods $lines.ToArray()
+    $target = @($methods | Where-Object { $_.Name -ieq $Method })
     if ($target.Count -eq 0) { throw ("в {0} нет метода {1}" -f $Module, $Method) }
     $procedureIndex = $target[0].Line - 1
     $first = $procedureIndex - $target[0].Comment.Count

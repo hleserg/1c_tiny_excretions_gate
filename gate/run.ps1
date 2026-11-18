@@ -2623,7 +2623,8 @@ function Invoke-UtStep {
     # Filter - один тест «Модуль.Метод» (кнопка «Прогнать этот тест»): эталон тогда не трогается.
     param([string]$StepName = 'Модульные тесты', [string]$Filter = '')
     $outDir = Join-Path $RunDir 'unittests'
-    $catalogs = @(Get-UtCatalogs)
+    # Функции Get-Ut..., которые возвращают «, массив», - без @(): иначе массив в массиве.
+    $catalogs = Get-UtCatalogs
     if ($catalogs.Count -eq 0) {
         # Выгрузки тестовых расширений нет: в базе их нет (и файлов тоже) или выгрузка не удалась (об этом - свой шаг выше).
         Add-StepResult -Name $StepName -Status 'WARN' -Detail ("в {0} нет тестовых расширений {1} (или они не выгрузились): тесты не прогнаны. Файлы тестов - {2}\<имя>" -f $baseKey, ($unitTestExtensions -join ', '), $unitTestsDir)
@@ -2666,7 +2667,7 @@ function Invoke-UtStep {
         return
     }
     $results = @()
-    try { $results = @(Read-UtJUnit $session.Junit) }
+    try { $results = Read-UtJUnit $session.Junit }
     catch {
         Add-StepResult -Name $StepName -Status 'FAIL' -Detail ("отчёт jUnit не разобрался: {0}" -f $_.Exception.Message) -Log $session.Junit -Seconds $session.Seconds
         return
@@ -2852,7 +2853,7 @@ function New-UtFromMenu {
     $moduleName = ''
     $subsystem = ''
     if ($index -eq $modules.Count) {
-        $subsystems = @(Get-UtSubsystemList $source)
+        $subsystems = Get-UtSubsystemList $source
         if ($subsystems.Count -eq 0) { Write-Host '  В файлах тестов нет подсистем.' -ForegroundColor Yellow; return }
         $subIndex = Select-UiOne -Header 'Подсистема нового модуля тестов' -Items @($subsystems | ForEach-Object { '{0} - {1}' -f $_.Path, $_.Synonym })
         if ($subIndex -lt 0) { return }

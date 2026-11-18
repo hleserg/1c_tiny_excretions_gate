@@ -1647,7 +1647,7 @@ $tests = @(
                     '<testcase name="Вычитание" classname="ОМ_Пример.Вычитание" context="Сервер" time="0.1"><failure message="ожидали 2, а было 3"/></testcase>' +
                     '<testcase name="Вычитание" classname="ОМ_Пример.Вычитание" context="Сервер" time="0.1"/>' +
                     '</testsuite><testsuite classname="ОМ_Сломан" context="Сервер" name="ОМ_Сломан [Сервер]"><error message="модуль не компилируется"/></testsuite></testsuites>'), $utf8)
-            $results = @(Read-UtJUnit $junit)
+            $results = Read-UtJUnit $junit
             $keys = @($results | ForEach-Object { '{0}={1}' -f $_.Key, $_.Status })
             foreach ($expected in @('ОМ_Пример.Сложение [Сервер]=OK', 'ОМ_Пример.Вычитание [Сервер]=FAIL', 'ОМ_Пример.Вычитание [Сервер] #2=OK', 'ОМ_Сломан [Сервер] набор=ERROR')) {
                 Check ($keys -contains $expected) ("в разборе jUnit нет {0}: {1}" -f $expected, ($keys -join ', '))
