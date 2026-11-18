@@ -10,7 +10,8 @@
 
 Подставной GitHub для тестов: переменная CI_FAKE_GITHUB - папка, репозиторий в ней файлами: refs.json (ветка ->
 коммит), commits\<хеш>.txt (родитель, сообщение, строки «путь<TAB>хеш блоба»), blobs\<хеш>, pulls.txt
-(номер, ветка, куда, заголовок), pulls\<номер>.md; каждое действие - строкой в requests.log.
+(номер, ветка, куда, заголовок), pulls\<номер>.md; каждое действие - строкой в requests.log. Слияние
+(Merge-GhBranch) - трёхстороннее по файлам от общего предка, как у git.
 Версия 00000000.000000.
 #>
 
@@ -178,7 +179,25 @@ function Read-GhFakeCommit {
         $parts = $lines[$i].Split("`t")
         if ($parts.Count -eq 2) { $files[$parts[0]] = $parts[1] }
     }
-    return [pscustomobject]@{ Parent = $lines[0]; Message = $lines[1]; Files = $files }
+    $parents = @($lines[0].Split(' ') | Where-Object { $_ })
+    $first = ''
+    if ($parents.Count -gt 0) { $first = $parents[0] }
+    return [pscustomobject]@{ Parent = $first; Parents = $parents; Message = $lines[1]; Files = $files }
+}
+
+function Get-GhFakeAncestors {
+    # Все предки коммита (и он сам) по обоим родителям: хеш -> расстояние.
+    param($Gh, [string]$Sha)
+    $seen = @{}
+    $queue = New-Object System.Collections.Generic.Queue[object]
+    $queue.Enqueue(@($Sha, 0))
+    while ($queue.Count -gt 0) {
+        $item = $queue.Dequeue()
+        if (-not $item[0] -or $seen.ContainsKey($item[0])) { continue }
+        $seen[$item[0]] = $item[1]
+        foreach ($parent in (Read-GhFakeCommit $Gh $item[0]).Parents) { $queue.Enqueue(@($parent, ($item[1] + 1))) }
+    }
+    return $seen
 }
 
 function New-GhFakeCommit {
@@ -390,11 +409,7 @@ function Test-GhContains {
             if (-not $refs.ContainsKey($Branch)) { return $false }
             $current = $refs[$Branch]
         }
-        while ($current) {
-            if ($current -eq $Commit) { return $true }
-            $current = (Read-GhFakeCommit $Gh $current).Parent
-        }
-        return $false
+        return (Get-GhFakeAncestors $Gh $current).ContainsKey($Commit)
     }
     $target = $Head
     if (-not $target) { $target = $Branch }
@@ -423,6 +438,52 @@ function Get-GhBlobBytes {
         return , $memory.ToArray()
     }
     finally { $response.Close() }
+}
+
+function Merge-GhBranch {
+    # Слить ветку Head в Base на стороне GitHub (POST merges). Status: merged (Sha - коммит слияния, Base уже на нём),
+    # same (Head уже в Base), conflict (не слилось без человека - Base не тронут).
+    param($Gh, [string]$Base, [string]$Head, [string]$Message)
+    if ($Gh.FakeDir) {
+        $refs = Read-GhFakeRefs $Gh
+        $ours = $refs[$Base]
+        $theirs = $refs[$Head]
+        Write-GhFakeLog $Gh ("merge {0} <- {1}" -f $Base, $Head)
+        $oursAncestors = Get-GhFakeAncestors $Gh $ours
+        if ($oursAncestors.ContainsKey($theirs)) { return [pscustomobject]@{ Status = 'same'; Sha = $ours } }
+        $theirsAncestors = Get-GhFakeAncestors $Gh $theirs
+        if ($theirsAncestors.ContainsKey($ours)) {
+            $refs[$Base] = $theirs
+            Save-GhFakeRefs $Gh $refs
+            return [pscustomobject]@{ Status = 'merged'; Sha = $theirs }
+        }
+        # Трёхстороннее слияние по файлам от ближайшего общего предка.
+        $common = @($oursAncestors.Keys | Where-Object { $theirsAncestors.ContainsKey($_) } | Sort-Object { $oursAncestors[$_] + $theirsAncestors[$_] } | Select-Object -First 1)
+        $baseFiles = @{}
+        if ($common.Count -gt 0) { $baseFiles = (Read-GhFakeCommit $Gh $common[0]).Files }
+        $oursFiles = (Read-GhFakeCommit $Gh $ours).Files
+        $theirsFiles = (Read-GhFakeCommit $Gh $theirs).Files
+        $result = @{}
+        foreach ($path in @(@($baseFiles.Keys) + @($oursFiles.Keys) + @($theirsFiles.Keys) | Sort-Object -Unique)) {
+            $b = $baseFiles[$path]; $o = $oursFiles[$path]; $t = $theirsFiles[$path]
+            if ($o -eq $t) { $pick = $o }
+            elseif ($o -eq $b) { $pick = $t }
+            elseif ($t -eq $b) { $pick = $o }
+            else { Write-GhFakeLog $Gh ("conflict {0}" -f $path); return [pscustomobject]@{ Status = 'conflict'; Sha = '' } }
+            if ($pick) { $result[$path] = $pick }
+        }
+        $sha = New-GhFakeCommit -Gh $Gh -Parent ($ours + ' ' + $theirs) -Message $Message -Files $result
+        $refs[$Base] = $sha
+        Save-GhFakeRefs $Gh $refs
+        return [pscustomobject]@{ Status = 'merged'; Sha = $sha }
+    }
+    $body = '{"base":' + (ConvertTo-GhJsonString $Base) + ',"head":' + (ConvertTo-GhJsonString $Head) + ',"commit_message":' + (ConvertTo-GhJsonString $Message) + '}'
+    $answer = Invoke-GhApi -Gh $Gh -Method 'POST' -Path ('/repos/{0}/merges' -f $Gh.Repo) -Body $body -AllowStatus @(204, 409)
+    if ($answer.Status -eq 204) { return [pscustomobject]@{ Status = 'same'; Sha = '' } }
+    if ($answer.Status -eq 409) { return [pscustomobject]@{ Status = 'conflict'; Sha = '' } }
+    $sha = Get-GhJsonValue $answer.Text 'sha'
+    if ($sha -notmatch '^[0-9a-f]{40}$') { throw 'GitHub: не понял ответ на слияние' }
+    return [pscustomobject]@{ Status = 'merged'; Sha = $sha }
 }
 
 function Save-GhFiles {

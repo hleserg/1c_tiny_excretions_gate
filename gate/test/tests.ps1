@@ -522,14 +522,17 @@ $gitBootstrapAnswers = @(
 
 # Заглушка run.ps1 для «Загрузить из git»: записывает, с каким комплектом её позвали, и итог прогона - всё загрузилось.
 $gitRunStub = @'
-param([string]$Kit = '', [string]$KitSource = '', [string]$Config = '', [string]$UiChannel = '')
+param([string]$Kit = '', [string]$KitSource = '', [string]$Config = '', [string]$UiChannel = '', [string]$OnNotGreen = '', [string]$OnSessions = '')
 $dir = Join-Path $PSScriptRoot ('runs\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Path $dir -Force | Out-Null
-$lines = @(('Kit=' + $Kit), ('KitSource=' + $KitSource))
-foreach ($sub in @(Get-ChildItem -LiteralPath $Kit -Directory | Sort-Object Name)) { $lines += ('dir=' + $sub.Name) }
-foreach ($file in @(Get-ChildItem -LiteralPath $Kit -Recurse -File)) { $lines += ('file=' + $file.FullName.Substring($Kit.TrimEnd('\').Length + 1).Replace('\', '/')) }
+$lines = @(('Kit=' + $Kit), ('KitSource=' + $KitSource), ('OnNotGreen=' + $OnNotGreen), ('OnSessions=' + $OnSessions))
+$items = @()
+if ($Kit) {
+    foreach ($sub in @(Get-ChildItem -LiteralPath $Kit -Directory | Sort-Object Name)) { $lines += ('dir=' + $sub.Name) }
+    foreach ($file in @(Get-ChildItem -LiteralPath $Kit -Recurse -File)) { $lines += ('file=' + $file.FullName.Substring($Kit.TrimEnd('\').Length + 1).Replace('\', '/')) }
+    $items = @(Get-ChildItem -LiteralPath $Kit -Directory | ForEach-Object { @{ name = $_.Name; loadTried = $true; touched = $true } })
+}
 [System.IO.File]::WriteAllLines((Join-Path $dir 'stub.txt'), [string[]]$lines, (New-Object System.Text.UTF8Encoding($true)))
-$items = @(Get-ChildItem -LiteralPath $Kit -Directory | ForEach-Object { @{ name = $_.Name; loadTried = $true; touched = $true } })
 $verdict = @{ verdict = 'GREEN'; kitDecision = ''; kitItems = $items; kitProcessings = @() }
 [System.IO.File]::WriteAllText((Join-Path $dir 'verdict.json'), (ConvertTo-Json -InputObject $verdict -Depth 4), (New-Object System.Text.UTF8Encoding($true)))
 Write-Host 'заглушка гейта: прогон записан'
@@ -2101,6 +2104,111 @@ $tests = @(
             }
             Check ((Read-GitStateFile $sb).commit -eq $merged) 'после прогона state.json не на main'
             Check (@($load.Output | Where-Object { $_ -match 'теперь на main' }).Count -eq 1) 'не сказано, что temp на main'
+        }
+    },
+    @{
+        Name = 'git-import-merge'
+        Text = '«Загрузить из git»: правка в temp и другая правка в main - «Слить»: правки temp веткой temp/<время>, слияние с main (в main обе), загрузка только того, чего нет в temp; конфликт (одно и то же с двух сторон) - pull request, main и temp не тронуты'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
+            $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            $head = (Get-GhHead -Gh $gh -Branch 'main').Sha
+            if (-not $head) { Check $false 'первая выгрузка не создала main'; return }
+            $adaptPath = 'extensions/Адаптация/CommonModules/АГБ_Общий/Ext/Module.bsl'
+            $extraPath = 'extensions/Доработки/CommonModules/Д/Ext/Module.bsl'
+            $merged = New-GhCommit -Gh $gh -Parent $head -Changes @([pscustomobject]@{ Path = $extraPath; Bytes = $utf8.GetBytes('Процедура Д2() КонецПроцедуры') }) -Message 'pull request агента'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $merged
+            [System.IO.File]::WriteAllText((Join-Path $sb 'run.ps1'), $gitRunStub, $utf8Bom)
+            Reset-FakeState $sb
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{ dumps = (New-GitDumps -Adapt 'Процедура ПравкаВTemp() КонецПроцедуры') } -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'правки после прошлой загрузки'; Item = '^Слить' },
+                @{ Kind = 'confirm'; Header = 'Загрузить в erp_temp_test из main'; Yes = $true })
+            Check-DeployCommon $r -LocksExpected $false
+            $main = (Get-GhHead -Gh $gh -Branch 'main').Sha
+            $files = Get-GhFiles -Gh $gh -Commit $main
+            $before = Get-GhFiles -Gh $gh -Commit $head
+            Check ($files[$adaptPath] -ne $before[$adaptPath]) 'правка temp не попала в main'
+            Check ($files[$extraPath] -eq (Get-GitBlobSha ($utf8.GetBytes('Процедура Д2() КонецПроцедуры')))) 'после слияния в main нет правки агента'
+            $stub = @(Get-ChildItem -LiteralPath (Join-Path $sb 'runs') -Recurse -Filter 'stub.txt' -ErrorAction SilentlyContinue)
+            Check ($stub.Count -eq 1) 'после слияния гейт не запускался'
+            if ($stub.Count -eq 1) {
+                $text = [System.IO.File]::ReadAllText($stub[0].FullName, $utf8)
+                Check ($text -match 'dir=Доработки' -and $text -notmatch 'dir=Адаптация') ("грузилось не только то, чего нет в temp: " + $text)
+            }
+            Check ((Read-GitStateFile $sb).commit -eq $main) 'после слияния и прогона state.json не на main'
+            # Конфликт: одно и то же место правят и в temp, и в main.
+            $other = New-GhCommit -Gh $gh -Parent $main -Changes @([pscustomobject]@{ Path = $adaptPath; Bytes = $utf8.GetBytes('Процедура ИзMain() КонецПроцедуры') }) -Message 'ещё pull request'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $other
+            Reset-FakeState $sb
+            $c = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{ dumps = (New-GitDumps -Adapt 'Процедура ДругаяПравкаВTemp() КонецПроцедуры' -Extra 'Процедура Д2() КонецПроцедуры') } -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'правки после прошлой загрузки'; Item = '^Слить' })
+            Check-DeployCommon $c -LocksExpected $false
+            Check ((Get-GhHead -Gh $gh -Branch 'main').Sha -eq $other) 'при конфликте main тронут'
+            Check (@(Get-ChildItem -LiteralPath (Join-Path $sb 'runs') -Recurse -Filter 'stub.txt').Count -eq 1) 'при конфликте гейт запускался'
+            $pulls = [System.IO.File]::ReadAllText((Join-Path $sb 'fake-github\pulls.txt'), $utf8)
+            Check ($pulls -match 'конфликт') 'при конфликте нет pull request'
+            Check (@($c.Output | Where-Object { $_ -match 'слить без человека нельзя' }).Count -eq 1) 'не сказано про конфликт'
+        }
+    },
+    @{
+        Name = 'git-nightly'
+        Text = 'ночной прогон с ExtensionsRepo: сначала «Загрузить из git» без человека - main ушёл вперёд, правок temp нет - прогон гейта с ним без вопросов (-OnNotGreen Keep), он и есть ночной (второго «как есть» нет), итог в nightly\last.json; следующей ночью temp правили - ветка и pull request «выгружено ночью», main не тронут и не грузится, прогон «как есть»'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
+            $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            $head = (Get-GhHead -Gh $gh -Branch 'main').Sha
+            if (-not $head) { Check $false 'первая выгрузка не создала main'; return }
+            $merged = New-GhCommit -Gh $gh -Parent $head -Changes @([pscustomobject]@{ Path = 'extensions/Доработки/CommonModules/Д/Ext/Module.bsl'; Bytes = $utf8.GetBytes('Процедура Д2() КонецПроцедуры') }) -Message 'pull request агента'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $merged
+            [System.IO.File]::WriteAllText((Join-Path $sb 'run.ps1'), $gitRunStub, $utf8Bom)
+            Reset-FakeState $sb
+            $r = Invoke-Script -Sandbox $sb -Script 'nightly.ps1' -Fake @{ dumps = (New-GitDumps) } -Com $com
+            Check (-not $r.TimedOut) 'ночной прогон не уложился'
+            Check ($r.Unexpected.Count -eq 0) ("ночью были вопросы: " + ($r.Unexpected -join ' | '))
+            $runs = @(Get-ChildItem -LiteralPath (Join-Path $sb 'runs') -Directory -ErrorAction SilentlyContinue)
+            Check ($runs.Count -eq 1) ("прогонов {0}, ждали один (из git, без второго «как есть»)" -f $runs.Count)
+            if ($runs.Count -ge 1) {
+                $stub = [System.IO.File]::ReadAllText((Join-Path $runs[0].FullName 'stub.txt'), $utf8)
+                Check ($stub -match 'dir=Доработки' -and $stub -match ('KitSource=git owner/ext@' + $merged.Substring(0, 7))) ("ночью гейт загружал не то: " + $stub)
+                Check ($stub -match 'OnNotGreen=Keep' -and $stub -match 'OnSessions=Continue') ("ночной прогон из git не без вопросов: " + $stub)
+            }
+            $lastFile = Join-Path $sb 'nightly\last.json'
+            Check (Test-Path -LiteralPath $lastFile) 'нет nightly\last.json'
+            if ((Test-Path -LiteralPath $lastFile) -and $runs.Count -ge 1) {
+                $last = [System.IO.File]::ReadAllText($lastFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check ($last.runId -eq $runs[0].Name -and $last.verdict -eq 'GREEN') ("ночной итог: прогон {0}, вердикт {1}" -f $last.runId, $last.verdict)
+            }
+            Check ((Read-GitStateFile $sb).commit -eq $merged) 'после ночного прогона state.json не на main'
+            # Следующая ночь: temp правили руками - правки веткой и pull request, main не трогается и не грузится, прогон «как есть».
+            Start-Sleep -Seconds 1
+            Reset-FakeState $sb
+            $n2 = Invoke-Script -Sandbox $sb -Script 'nightly.ps1' -Fake @{ dumps = (New-GitDumps -Adapt 'Процедура НочнаяПравка() КонецПроцедуры' -Extra 'Процедура Д2() КонецПроцедуры') } -Com $com
+            Check (-not $n2.TimedOut) 'вторая ночь не уложилась'
+            Check ($n2.Unexpected.Count -eq 0) ("второй ночью были вопросы: " + ($n2.Unexpected -join ' | '))
+            Check ((Get-GhHead -Gh $gh -Branch 'main').Sha -eq $merged) 'ночью main тронут'
+            $pullsFile = Join-Path $sb 'fake-github\pulls.txt'
+            Check ((Test-Path -LiteralPath $pullsFile) -and ([System.IO.File]::ReadAllText($pullsFile, $utf8) -match 'выгружено ночью')) 'ночные правки temp не ушли pull request'
+            $runs2 = @(Get-ChildItem -LiteralPath (Join-Path $sb 'runs') -Directory | Sort-Object Name)
+            Check ($runs2.Count -eq 2) ("прогонов после второй ночи {0}, ждали два" -f $runs2.Count)
+            if ($runs2.Count -eq 2) {
+                $stub2 = [System.IO.File]::ReadAllText((Join-Path $runs2[1].FullName 'stub.txt'), $utf8)
+                Check ($stub2 -match '(?m)^Kit=\s*$' -and $stub2 -notmatch 'dir=') ("второй ночью грузился комплект, ждали «как есть»: " + $stub2)
+            }
+            $importFile = Join-Path $sb 'git\ext\last-import.json'
+            if (Test-Path -LiteralPath $importFile) {
+                $import = [System.IO.File]::ReadAllText($importFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check ((-not $import.ran) -and [string]$import.note -match 'pull request') ("last-import.json второй ночи: " + [string]$import.note)
+            }
+            else { Check $false 'нет git\ext\last-import.json' }
+            Check ((Read-GitStateFile $sb).commit -eq $merged) 'ночная выгрузка правок сдвинула state.json с main'
         }
     },
     @{

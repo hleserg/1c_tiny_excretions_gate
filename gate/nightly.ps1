@@ -16,6 +16,9 @@
 
     .\nightly.ps1
         Сам ночной прогон: run.ps1 «как есть» без вопросов (-OnNotGreen Keep -OnSessions Continue).
+        Задан репозиторий расширений (ExtensionsRepo) - сначала «Загрузить из git» без человека (deploy.ps1
+        -GitImport -GitUnattended, раздел 5.23): правки temp уходят веткой и pull request, temp не трогается;
+        правок нет, а main ушёл вперёд - прогон гейта с ним, он и есть ночной. Иначе - «как есть».
         Вывод - в nightly\<время>.log, итог - в nightly\last.json и строкой в nightly\history.txt.
         Утром итог виден в меню гейта (ci, .\run.cmd).
 #>
@@ -40,6 +43,19 @@ $utf8Bom = New-Object System.Text.UTF8Encoding($true)
 $cfg = @{}
 $configPath = Join-Path $Root 'config.psd1'
 if (Test-Path -LiteralPath $configPath) { $cfg = Import-PowerShellDataFile -LiteralPath $configPath }
+# Настройки площадки (config.site.psd1) - как в run.ps1: ключа нет в config.psd1 или он там пустой - оттуда.
+$siteConfigPath = Join-Path $Root 'config.site.psd1'
+if (Test-Path -LiteralPath $siteConfigPath) {
+    $siteConfig = Import-PowerShellDataFile -LiteralPath $siteConfigPath
+    foreach ($siteKey in @($siteConfig.Keys)) {
+        $ownEmpty = $false
+        if ($cfg.ContainsKey($siteKey)) {
+            $own = $cfg[$siteKey]
+            $ownEmpty = ($null -eq $own) -or (($own -is [array]) -and @($own).Count -eq 0) -or (($own -is [string]) -and $own -eq '')
+        }
+        if (-not $cfg.ContainsKey($siteKey) -or $ownEmpty) { $cfg[$siteKey] = $siteConfig[$siteKey] }
+    }
+}
 
 function Get-NightlySetting {
     param([string]$Key, $Default)
@@ -112,10 +128,37 @@ if (Test-Path -LiteralPath $runsRoot) { foreach ($dir in @(Get-ChildItem -Litera
 
 # Отдельный процесс: у run.ps1 свои trap и exit, ночной скрипт должен дожить до итога.
 # Строки stderr при 2>&1 в PowerShell 5.1 становятся ошибками: при Stop они прервали бы ночной скрипт.
-$ErrorActionPreference = 'Continue'
-$output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'run.ps1') -OnNotGreen Keep -OnSessions Continue 2>&1
-$exitCode = $LASTEXITCODE
-$ErrorActionPreference = 'Stop'
+$output = @()
+$exitCode = 0
+$gitRan = $false
+$extensionsRepo = [string](Get-NightlySetting 'ExtensionsRepo' '')
+if ($extensionsRepo -and (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1')) -and (Test-Path -LiteralPath (Join-Path $Root 'github.ps1'))) {
+    # Сначала - «Загрузить из git» без человека. Его итог - git\<репозиторий>\last-import.json: был ли прогон гейта.
+    $gitDirSetting = [string](Get-NightlySetting 'GitDir' 'git')
+    $gitRoot = $gitDirSetting
+    if (-not [System.IO.Path]::IsPathRooted($gitRoot)) { $gitRoot = Join-Path $Root $gitRoot }
+    $importFile = Join-Path (Join-Path $gitRoot ($extensionsRepo.Split('/')[-1])) 'last-import.json'
+    if (Test-Path -LiteralPath $importFile) { Remove-Item -LiteralPath $importFile -Force }
+    $ErrorActionPreference = 'Continue'
+    $output += @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'deploy.ps1') -GitImport -GitUnattended 2>&1)
+    $exitCode = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    if (Test-Path -LiteralPath $importFile) {
+        try {
+            $import = [System.IO.File]::ReadAllText($importFile, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+            $gitRan = [bool]$import.ran
+            $output += ('Загрузка из git: {0}' -f [string]$import.note)
+        }
+        catch { $output += ('Итог загрузки из git не прочитан: {0}' -f $_.Exception.Message) }
+    }
+    else { $output += 'Загрузка из git не дошла до итога (см. вывод выше): ночной прогон - «как есть».' }
+}
+if (-not $gitRan) {
+    $ErrorActionPreference = 'Continue'
+    $output += @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'run.ps1') -OnNotGreen Keep -OnSessions Continue 2>&1)
+    $exitCode = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+}
 [System.IO.File]::WriteAllLines($logFile, [string[]]@($output | ForEach-Object { [string]$_ }), $utf8Bom)
 # Прогон оборвался (упал процесс, его сняли) - итог в GitHub отправит publish.ps1 -Pending, если отправка включена.
 $publishScript = Join-Path $Root 'publish.ps1'
