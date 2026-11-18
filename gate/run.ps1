@@ -2285,6 +2285,10 @@ function Show-RecentRuns {
                     Write-Host ("  Скопировал в {0}" -f $target) -ForegroundColor Green
                 }
             }
+            # Действие что-то вывело (не окно просмотра и не папка) - сначала посмотреть, потом снова карточка.
+            if (@('accept', 'update', 'before') -contains $actions[$picked].Key -or ($actions[$picked].Key -eq 'summary' -and -not (Test-Path -LiteralPath $summaryFile))) {
+                Wait-UiAcknowledge -Label 'Вернуться к прогону'
+            }
         }
     }
 }
@@ -2355,6 +2359,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             if ($UiChannel) { $compareArgs['UiChannel'] = $UiChannel }
             try { & (Join-Path $Root 'deploy.ps1') @compareArgs }
             catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+            Wait-UiAcknowledge
             continue
         }
         if ($choice -eq 'basestate') {
@@ -2363,6 +2368,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
                 if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -BaseState -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') -BaseState }
             }
             catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+            Wait-UiAcknowledge
             continue
         }
         if ($choice -eq 'pullext' -or $choice -eq 'pullepf') {
@@ -2371,6 +2377,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             if ($UiChannel) { $pullArgs['UiChannel'] = $UiChannel }
             try { & (Join-Path $Root 'deploy.ps1') @pullArgs }
             catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+            Wait-UiAcknowledge
             continue
         }
         if ($choice -eq 'settings') {
@@ -2381,6 +2388,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         }
         if ($choice -eq 'accept') {
             $null = Invoke-AcceptFromMenu -Run $acceptable
+            Wait-UiAcknowledge
             continue
         }
         if ($choice -eq 'stats') {

@@ -962,6 +962,7 @@ $tests = @(
             $m = Invoke-Script -Sandbox $sb -Answers @(
                 @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Принять новое последнего прогона в эталон' },
                 @{ Kind = 'confirm'; Header = 'Принять новое прогона'; Yes = $true },
+                @{ Kind = 'one'; Header = 'Посмотрел'; Item = '^Вернуться в меню' },
                 @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
             Check-Common $m
             Check (Test-Path -LiteralPath (Join-Path $runDir 'accepted.txt')) 'прогон не отмечен принятым (accepted.txt)'
@@ -1314,6 +1315,25 @@ $tests = @(
             Check ($text -match 'Печать \(Печать актов\): отличается, temp 2, рабочая 1') 'нет строки об отличающейся обработке'
             Check ($text -match '\+ НоваяПроцедура') 'нет новой процедуры в разнице обработки'
             Check ((Get-Calls $r @('ENTERPRISE', 'regepf')).Count -eq 0) 'сравнение записывало обработку'
+        }
+    },
+    @{
+        Name = 'menu-result-wait'
+        Text = 'меню гейта: после «Показать состояние баз» меню не открывается само - сначала кнопка «Вернуться в меню»'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $r = Invoke-Script -Sandbox $sb -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Показать состояние баз' },
+                @{ Kind = 'one'; Header = 'Посмотрел'; Item = '^Вернуться в меню' },
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            Check ($r.UnusedAnswers -eq 0) ("тест ждал вопросов, а их не было: {0}" -f $r.UnusedAnswers)
+            $order = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and ($_.Contains('Гейт расширений') -or $_.Contains('Посмотрел')) } | ForEach-Object { if ($_.Contains('Посмотрел')) { 'ждать' } else { 'меню' } })
+            Check (($order -join ',') -eq 'меню,ждать,меню') ("порядок: {0}, ждали меню,ждать,меню" -f ($order -join ','))
+            $stateLine = [array]::IndexOf(@($r.Output), @($r.Output | Where-Object { $_ -match 'СОСТОЯНИЕ БАЗ' } | Select-Object -First 1)[0])
+            $waitLine = [array]::IndexOf(@($r.Output), @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Посмотрел') } | Select-Object -First 1)[0])
+            Check ($stateLine -ge 0 -and $waitLine -gt $stateLine) 'кнопка «Вернуться в меню» не после вывода состояния'
         }
     },
     @{

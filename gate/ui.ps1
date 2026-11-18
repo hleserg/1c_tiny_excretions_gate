@@ -277,6 +277,21 @@ function Select-UiMany {
     }
 }
 
+function Wait-UiAcknowledge {
+    # Результат действия выведен - ждать, пока человек его посмотрит, и только потом снова меню. Общее правило:
+    # после вывода меню не открывается само. В ci.exe - кнопка внизу экрана (журнал над ней листается),
+    # в консоли - любая клавиша. Без человека (ночной запуск) - не ждать.
+    param([string]$Label = 'Вернуться в меню')
+    if (-not (Test-UiCanAsk)) { return }
+    if ($script:UiChannelDir) {
+        $null = Read-UiChoice -Header 'Результат - выше, журнал листается. Посмотрел?' -Keys @('1') -Labels @($Label) -CancelKey '1' -Dock
+        return
+    }
+    Write-Host ''
+    Write-Host ('  -- любая клавиша: {0} --' -f $Label.ToLower()) -ForegroundColor DarkGray
+    $null = [Console]::ReadKey($true)
+}
+
 function Confirm-Ui {
     # Да или нет. Возвращает $true, $false или $null (отмена: Esc в ci.exe).
     param([string]$Question, [string]$Yes = 'Да', [string]$No = 'Нет')
