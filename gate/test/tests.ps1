@@ -959,6 +959,42 @@ $tests = @(
         }
     },
     @{
+        Name = 'gate-exchange-asis-broken'
+        Text = 'обмены: прогон «как есть» (комплекта нет), выгрузка упала - красный, но в начале разбора не «сломан комплектом», а «не выгружается, сломано не им»'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $fake = @{ selfcheck = @(@{ tasks = (New-ExchangeResultTasks 'fail') }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
+            Check-Common $r
+            Check-Step $r 'Обмены: до и после' 'FAIL'
+            if ($r.RunDir) {
+                $reportText = [System.IO.File]::ReadAllText((Join-Path $r.RunDir 'report.txt'), $utf8)
+                $top = $reportText.Substring(0, [Math]::Max(0, $reportText.IndexOf('КОРОТКО')))
+                Check ($top.Contains('ОБМЕН НЕ ВЫГРУЖАЕТСЯ (комплекта не было')) ("в начале разбора нет строки «не выгружается, сломано не им»: {0}" -f $top)
+                Check (-not $top.Contains('СЛОМАН КОМПЛЕКТОМ')) 'без комплекта написано «сломан комплектом»'
+            }
+        }
+    },
+    @{
+        Name = 'gate-canapply-engine-ignored'
+        Text = 'проверка применимости: замечание движка тестов (UnitTestEngine, «YAXUNIT: Не найден метод ...») не в счёт - его нет в рабочей; замечание своего расширения - в счёт'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $engineLine = 'YAXUNIT: Не найден метод "ErrorDisplayProcessing", указанный в аннотации метода "ЮТErrorDisplayProcessing".'
+            $fake = @{ designer = @(@{ match = @('/CheckCanApplyConfigurationExtensions'); exit = 0; log = $engineLine }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            Check-Step $r 'Проверка применимости' 'OK'
+            $own = @{ designer = @(@{ match = @('/CheckCanApplyConfigurationExtensions'); exit = 0; log = ($engineLine + "`r`n" + 'Адаптация: Не найден метод "ПриЗаписи", указанный в аннотации метода "АГБ_ПриЗаписи".') }) }
+            Reset-FakeState $sb
+            $r2 = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $own
+            Check-Common $r2
+            Check-Step $r2 'Проверка применимости' 'FAIL'
+        }
+    },
+    @{
         Name = 'gate-exchange-kit-still-broken'
         Text = 'обмены: выгрузка падает и до, и после загрузки - жёлтый «обмен сломан ещё до загрузки комплекта», в эталоне не прячется'
         Run = {

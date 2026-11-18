@@ -657,6 +657,9 @@ if (Test-Path -LiteralPath $snapshotDiffFile) {
 # Обмены: итоги пробной выгрузки «после» против «до» или эталона. Строки идут ещё и в самое начало разбора:
 # сломанный обмен останавливает весь обмен узла, и это не прячется в эталоне.
 $exchangeTop = New-Object System.Collections.Generic.List[string]
+# Комплекта не было (прогон «как есть») - сломал не он: так и написать, а не «сломан комплектом».
+$exchangeHeadline = 'ОБМЕН СЛОМАН КОМПЛЕКТОМ: '
+if (@($kitItems).Count + @(Get-JsonProperty $meta 'kitProcessings' @()).Count -eq 0) { $exchangeHeadline = 'ОБМЕН НЕ ВЫГРУЖАЕТСЯ (комплекта не было - сломано не им, скорее всего так и в рабочей): ' }
 $exchangeCompareFile = Join-Path $RunDir 'exchange-compare.txt'
 if (Test-Path -LiteralPath $exchangeCompareFile) {
     $exchangeLines = @([System.IO.File]::ReadAllLines($exchangeCompareFile, [System.Text.Encoding]::UTF8) | ForEach-Object { $_.TrimStart([char]0xFEFF) } | Where-Object { $_ })
@@ -669,7 +672,7 @@ if (Test-Path -LiteralPath $exchangeCompareFile) {
             $text = $line
             if ($parts.Count -ge 2) { $text = $parts[1] }
             $body.Add(("  [{0}] {1}" -f $kind, (Format-Short $text 600)))
-            if ($kind -eq 'ОШИБКА') { $summary.Add(('[КРАСН] Обмены: ' + (Format-Short $text 220))); $exchangeTop.Add(('ОБМЕН СЛОМАН КОМПЛЕКТОМ: ' + (Format-Short $text 300))) }
+            if ($kind -eq 'ОШИБКА') { $summary.Add(('[КРАСН] Обмены: ' + (Format-Short $text 220))); $exchangeTop.Add(($exchangeHeadline + (Format-Short $text 300))) }
             elseif ($kind -eq 'ВНИМАНИЕ') { $summary.Add(('[ЖЁЛТ] Обмены: ' + (Format-Short $text 220))); $exchangeTop.Add(('ОБМЕН: ' + (Format-Short $text 300))) }
             else { $summary.Add(('[ИНФО] Обмены: ' + (Format-Short $text 220))) }
         }

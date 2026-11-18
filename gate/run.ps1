@@ -3613,6 +3613,10 @@ function Get-UtCheckIgnorePattern {
     $parts = New-Object System.Collections.Generic.List[string]
     if ($names.Count -gt 0) { $parts.Add(('(ОбщийМодуль|CommonModule)\.({0})\.' -f ($names.ToArray() -join '|'))) }
     foreach ($extension in $unitTestExtensions) { $parts.Add(('^\{{?\[?{0}\b' -f [regex]::Escape($extension))) }
+    # Сам движок тестов (UnitTestEngine): живёт только в тестовой базе, в рабочую не уходит. Его замечания
+    # («YAXUNIT: Не найден метод ...» в проверке применимости - перехват обработчика, которого нет в конфигурации) не в счёт.
+    $engine = [string](Get-Setting $cfg 'UnitTestEngine' 'YAXUNIT')
+    if ($engine) { $parts.Add(('^\{{?\[?{0}\b' -f [regex]::Escape($engine))) }
     if ($parts.Count -eq 0) { return '' }
     return ('(' + ($parts.ToArray() -join ')|(') + ')')
 }
@@ -6181,8 +6185,9 @@ if (-not $loadReused) {
 $script:StepPhase = 'testsload'
 if ($runUnitTests -and $proceed -and -not $processingOnly -and -not $script:StopRun) {
     Invoke-UtPrepare
-    $script:UtCheckIgnore = Get-UtCheckIgnorePattern
 }
+# Замечания тестовых расширений и движка тестов - не в счёт, и когда тесты не гоняются: в базе они всё равно стоят.
+$script:UtCheckIgnore = Get-UtCheckIgnorePattern
 
 # 4. Проверки конфигуратором.
 $script:StepPhase = 'checks'
