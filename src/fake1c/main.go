@@ -11,7 +11,12 @@
 //
 // Тонкий клиент (ENTERPRISE): режим - первое слово /C. canary, selfcheck, regepf, unregepf, kbarticle
 // отвечают файлами так же, как настоящие обработки. Список ответов режима - по вызовам: первый вызов
-// берёт первый элемент, следующие - следующие, последний повторяется.
+// берёт первый элемент, следующие - следующие, последний повторяется. RunUnitTests=<файл настроек> - как YAxUnit:
+// лог, отчёт jUnit и файл кода возврата из настроек; тесты - из сценария unittests.
+//
+// Загрузка расширения из файлов (/LoadConfigFromFiles <папка> -Extension <имя>) запоминает папку в каталоге журнала
+// (ext\<имя>); выгрузка этого расширения (/DumpConfigToFiles) отдаёт потом её файлы - как настоящая база. Расширения
+// из списка absent до загрузки «нет в базе»: их выгрузка - код 1 и «не найдено».
 package main
 
 import (
@@ -77,6 +82,23 @@ type processing struct {
 	NoResult   bool     `json:"noresult"`
 }
 
+type unitCase struct {
+	Module  string `json:"module"`
+	Method  string `json:"method"`
+	Context string `json:"context"`
+	Name    string `json:"name"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
+
+type unitRun struct {
+	Cases       []unitCase        `json:"cases"`
+	SuiteErrors map[string]string `json:"suiteErrors"`
+	NoStart     bool              `json:"nostart"`
+	Exited      bool              `json:"exited"`
+	Code        string            `json:"code"`
+}
+
 type scenario struct {
 	Designer  []designerRule `json:"designer"`
 	Canary    []canary       `json:"canary"`
@@ -87,6 +109,9 @@ type scenario struct {
 	// Выгрузка расширения в файлы (/DumpConfigToFiles): расширение -> путь файла от корня выгрузки -> текст.
 	Dumps      map[string]map[string]string `json:"dumps"`
 	ClientExit int                          `json:"clientExit"`
+	Unittests  []unitRun                    `json:"unittests"`
+	// Расширения, которых в базе нет, пока их не загрузят из файлов.
+	Absent []string `json:"absent"`
 }
 
 var logDir string
@@ -230,9 +255,36 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 		_ = os.MkdirAll(filepath.Dir(file), 0o755)
 		_ = os.WriteFile(file, []byte("FAKECFE "+valueAfter(args, "-Extension")), 0o644)
 	}
+	if dir := valueAfter(args, "/LoadConfigFromFiles"); dir != "" && logDir != "" {
+		ext := valueAfter(args, "-Extension")
+		store := filepath.Join(logDir, "ext", ext)
+		_ = os.RemoveAll(store)
+		copyTree(dir, store)
+	}
 	if dir := valueAfter(args, "/DumpConfigToFiles"); dir != "" {
 		ext := valueAfter(args, "-Extension")
+		store := ""
+		if logDir != "" {
+			store = filepath.Join(logDir, "ext", ext)
+		}
+		loaded := false
+		if store != "" {
+			if _, err := os.Stat(store); err == nil {
+				loaded = true
+			}
+		}
+		for _, a := range sc.Absent {
+			if a == ext && !loaded {
+				if out := valueAfter(args, "/Out"); out != "" {
+					writeUTF8(out, "Расширение конфигурации "+ext+" не найдено")
+				}
+				return 1
+			}
+		}
 		writeUTF8(filepath.Join(dir, "Configuration.xml"), "<MetaDataObject><Configuration><Properties><Name>"+ext+"</Name></Properties></Configuration></MetaDataObject>")
+		if loaded {
+			copyTree(store, dir)
+		}
 		writeUTF8(filepath.Join(dir, "ConfigDumpInfo.xml"), "<ConfigDumpInfo/>")
 		files := sc.Dumps[ext]
 		// "<расширение>@<база>" - выгрузка именно этой базы (сравнение temp и рабочей); нет такой - общая.
@@ -261,7 +313,8 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 	return 0
 }
 
-// Параметры /C: «режим;ключ=значение;...». Аргумент приходит как /C<текст>.
+// Параметры /C: «режим;ключ=значение;...». Аргумент приходит как /C<текст>. «RunUnitTests=<файл>» - режим
+// rununittests, файл - в параметре config.
 func launch(args []string) (string, map[string]string) {
 	params := map[string]string{}
 	mode := ""
@@ -271,6 +324,12 @@ func launch(args []string) (string, map[string]string) {
 				part = strings.TrimSpace(part)
 				if n == 0 {
 					mode = strings.ToLower(part)
+					if strings.HasPrefix(mode, "rununittests") {
+						mode = "rununittests"
+						if p := strings.Index(part, "="); p > 0 {
+							params["config"] = part[p+1:]
+						}
+					}
 					continue
 				}
 				if p := strings.Index(part, "="); p > 0 {
@@ -329,6 +388,12 @@ func client(sc scenario, args []string, state map[string]int) int {
 			s = selfcheck{}
 		}
 		selfcheckRun(s, dirOf(p["out"]), p["known"])
+	case "rununittests":
+		u, ok := pick(sc.Unittests, state, "unittests")
+		if !ok {
+			u = unitRun{Cases: []unitCase{{Module: "ОМ_Пример", Method: "Тест", Status: "ok"}}}
+		}
+		unitRun1(u, p["config"])
 	case "regepf", "unregepf", "kbarticle":
 		list := sc.Regepf
 		if mode == "unregepf" {
@@ -513,4 +578,119 @@ func infobaseName(args []string) string {
 		}
 	}
 	return ""
+}
+
+// copyTree - копия папки с подпапками (файлы как есть).
+func copyTree(from, to string) {
+	_ = filepath.Walk(from, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		rel, _ := filepath.Rel(from, path)
+		target := filepath.Join(to, rel)
+		if info.IsDir() {
+			_ = os.MkdirAll(target, 0o755)
+			return nil
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr == nil {
+			_ = os.MkdirAll(filepath.Dir(target), 0o755)
+			_ = os.WriteFile(target, data, 0o644)
+		}
+		return nil
+	})
+}
+
+// unitRun1 - как YAxUnit по файлу настроек: лог (начало работы), отчёт jUnit, код возврата 0 или 1.
+func unitRun1(u unitRun, configPath string) {
+	if u.NoStart {
+		return
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+	var cfg struct {
+		ReportPath string `json:"reportPath"`
+		ExitCode   string `json:"exitCode"`
+		Logging    struct {
+			File string `json:"file"`
+		} `json:"logging"`
+	}
+	if json.Unmarshal(trimBOM(data), &cfg) != nil {
+		return
+	}
+	if cfg.Logging.File != "" {
+		writeUTF8(cfg.Logging.File, "------\n01.01.2026 00:00:00 [Клиент][Информация]: Инициализация")
+	}
+	if u.Exited {
+		return
+	}
+	esc := func(t string) string {
+		t = strings.ReplaceAll(t, "&", "&amp;")
+		t = strings.ReplaceAll(t, "<", "&lt;")
+		t = strings.ReplaceAll(t, ">", "&gt;")
+		return strings.ReplaceAll(t, "\"", "&quot;")
+	}
+	modules := []string{}
+	byModule := map[string][]unitCase{}
+	for _, c := range u.Cases {
+		if c.Context == "" {
+			c.Context = "Сервер"
+		}
+		if _, ok := byModule[c.Module]; !ok {
+			modules = append(modules, c.Module)
+		}
+		byModule[c.Module] = append(byModule[c.Module], c)
+	}
+	for m := range u.SuiteErrors {
+		if _, ok := byModule[m]; !ok {
+			modules = append(modules, m)
+			byModule[m] = nil
+		}
+	}
+	failed := false
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?><testsuites>`)
+	for i, m := range modules {
+		b.WriteString(fmt.Sprintf(`<testsuite id="%d" name="%s [Сервер]" classname="%s" context="Сервер" package="tests">`, i, esc(m), esc(m)))
+		if text, ok := u.SuiteErrors[m]; ok {
+			failed = true
+			b.WriteString(fmt.Sprintf(`<error message="%s"/>`, esc(text)))
+		}
+		for _, c := range byModule[m] {
+			name := c.Name
+			if name == "" {
+				name = c.Method
+			}
+			b.WriteString(fmt.Sprintf(`<testcase name="%s" classname="%s.%s" time="0.01" context="%s">`, esc(name), esc(c.Module), esc(c.Method), esc(c.Context)))
+			switch c.Status {
+			case "fail":
+				failed = true
+				b.WriteString(fmt.Sprintf(`<failure message="%s"/>`, esc(c.Message)))
+			case "error":
+				failed = true
+				b.WriteString(fmt.Sprintf(`<error message="%s">стек</error>`, esc(c.Message)))
+			case "skip":
+				b.WriteString(fmt.Sprintf(`<skipped message="%s"/>`, esc(c.Message)))
+			}
+			b.WriteString(`</testcase>`)
+		}
+		b.WriteString(`</testsuite>`)
+	}
+	b.WriteString(`</testsuites>`)
+	if cfg.ReportPath != "" {
+		_ = os.MkdirAll(filepath.Dir(cfg.ReportPath), 0o755)
+		_ = os.WriteFile(cfg.ReportPath, []byte(b.String()), 0o644)
+	}
+	code := u.Code
+	if code == "" {
+		code = "0"
+		if failed {
+			code = "1"
+		}
+	}
+	if cfg.ExitCode != "" {
+		_ = os.WriteFile(cfg.ExitCode, []byte(code), 0o644)
+	}
 }

@@ -90,7 +90,21 @@ if (-not $Target) { $Target = Read-Answer 'Папка установки' 'C:\ci
 $Target = [System.IO.Path]::GetFullPath($Target)
 New-Item -ItemType Directory -Path $Target -Force | Out-Null
 # Своё: не затирается никогда. Остальное в папке установки - файлы гейта, их заменяет новая версия.
-$keep = @('config.psd1', 'config.psd1.bak', 'runs', 'baseline', 'stats', 'inbox', 'secrets', 'deploy', 'kit', 'nightly')
+$keep = @('config.psd1', 'config.psd1.bak', 'runs', 'baseline', 'stats', 'inbox', 'secrets', 'deploy', 'kit', 'nightly', 'state', 'out', 'tests-runs')
+# Файлы тестовых расширений (tests\<имя>) из поставки заменяют прежние целиком: удалённый в поставке модуль не должен
+# остаться. Прежняя папка (могла быть забрана из temp и ещё не отправлена) - в tests\.old\<имя>_<время>.
+$kitTests = Join-Path $source 'tests'
+if (Test-Path -LiteralPath $kitTests) {
+    foreach ($testDir in @(Get-ChildItem -LiteralPath $kitTests -Directory)) {
+        $current = Join-Path (Join-Path $Target 'tests') $testDir.Name
+        if (-not (Test-Path -LiteralPath $current)) { continue }
+        $oldRoot = Join-Path (Join-Path $Target 'tests') '.old'
+        New-Item -ItemType Directory -Path $oldRoot -Force | Out-Null
+        $saved = Join-Path $oldRoot ('{0}_{1}' -f $testDir.Name, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        Move-Item -LiteralPath $current -Destination $saved -Force
+        Write-Host ("Прежние файлы тестов {0} - в {1}" -f $testDir.Name, $saved) -ForegroundColor DarkGray
+    }
+}
 $copied = 0
 foreach ($item in @(Get-ChildItem -LiteralPath $source -Recurse -File)) {
     $relative = $item.FullName.Substring($source.Length + 1)

@@ -554,8 +554,8 @@ func goBuild(dir, out, ldflags string) []byte {
 func buildGate() []entry {
 	gate := filepath.Join(root, "gate")
 	version := "Версия " + placeholder + "."
-	scripts := []string{"run.ps1", "deploy.ps1", "nightly.ps1", "report.ps1", "settings.ps1", "stats.ps1", "ui.ps1", "check.ps1", "test/tests.ps1", "test/fakecom.ps1"}
-	stamped := map[string]bool{"run.ps1": true, "deploy.ps1": true, "nightly.ps1": true, "report.ps1": true, "settings.ps1": true, "stats.ps1": true, "test/tests.ps1": true, "test/fakecom.ps1": true}
+	scripts := []string{"run.ps1", "deploy.ps1", "nightly.ps1", "report.ps1", "settings.ps1", "stats.ps1", "ui.ps1", "unittests.ps1", "unittests-cli.ps1", "check.ps1", "test/tests.ps1", "test/fakecom.ps1"}
+	stamped := map[string]bool{"run.ps1": true, "deploy.ps1": true, "nightly.ps1": true, "report.ps1": true, "settings.ps1": true, "stats.ps1": true, "unittests-cli.ps1": true, "test/tests.ps1": true, "test/fakecom.ps1": true}
 	var files []entry
 	texts := map[string]string{}
 	for _, s := range scripts {
@@ -590,6 +590,9 @@ func buildGate() []entry {
 		if _, err := os.Stat(site); err == nil {
 			files = append(files, entry{"ci/config.site.psd1", windowsBytes(readText(site), true)})
 		}
+		// Тестовые расширения YAxUnit площадки: tests/yaxunit/<имя> (выгрузка в файлы) -> ci/tests/<имя>. Гейт грузит
+		// их только в тестовую базу (UnitTestExtensions), в рабочую они не уходят.
+		files = append(files, unitTestFiles(filepath.Join(p, "tests", "yaxunit"))...)
 	}
 	manual := replaceCounted(readText(filepath.Join(gate, "readme.txt")), "@@ВЕРСИЯ@@", stamp, strings.Count(readText(filepath.Join(gate, "readme.txt")), "@@ВЕРСИЯ@@"), "readme.txt")
 	files = append(files, entry{"ci/readme.txt", windowsBytes(manual, true)})
@@ -608,7 +611,7 @@ func buildGate() []entry {
 func clashCheck(texts map[string]string) {
 	vars := map[string]bool{}
 	re := regexp.MustCompile(`\$script:([A-Za-z_][A-Za-z0-9_]*)`)
-	for _, s := range []string{"ui.ps1", "stats.ps1"} {
+	for _, s := range []string{"ui.ps1", "stats.ps1", "unittests.ps1"} {
 		for _, m := range re.FindAllStringSubmatch(texts[s], -1) {
 			vars[strings.ToLower(m[1])] = true
 		}
@@ -631,8 +634,51 @@ func clashCheck(texts map[string]string) {
 		}
 		for n := range names {
 			if vars[n] {
-				fail("%s: имя $%s совпадает с переменной ui.ps1/stats.ps1", s, n)
+				fail("%s: имя $%s совпадает с переменной ui.ps1/stats.ps1/unittests.ps1", s, n)
 			}
 		}
 	}
+}
+
+// unitTestFiles - выгрузки тестовых расширений из папки площадки: каждая подпапка с Configuration.xml -> ci/tests/<имя>.
+// Тексты (.xml, .bsl) - UTF-8 с BOM и CRLF, как пишет конфигуратор; XML проверяется на разбор.
+func unitTestFiles(dir string) []entry {
+	var files []entry
+	subs, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	for _, sub := range subs {
+		if !sub.IsDir() {
+			continue
+		}
+		base := filepath.Join(dir, sub.Name())
+		if _, err := os.Stat(filepath.Join(base, "Configuration.xml")); err != nil {
+			fail("tests/yaxunit/%s: нет Configuration.xml - это не выгрузка расширения", sub.Name())
+		}
+		_ = filepath.Walk(base, func(path string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil || info.IsDir() {
+				return nil
+			}
+			rel, _ := filepath.Rel(dir, path)
+			name := "ci/tests/" + filepath.ToSlash(rel)
+			ext := strings.ToLower(filepath.Ext(path))
+			if ext == ".xml" || ext == ".bsl" {
+				text := readText(path)
+				data := windowsBytes(text, true)
+				if ext == ".xml" {
+					checkXML(name, data)
+				}
+				files = append(files, entry{name, data})
+				return nil
+			}
+			data, readErr := os.ReadFile(path)
+			if readErr != nil {
+				fail("%s: %v", path, readErr)
+			}
+			files = append(files, entry{name, data})
+			return nil
+		})
+	}
+	return files
 }

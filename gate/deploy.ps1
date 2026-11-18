@@ -487,7 +487,27 @@ function Clear-ProdLocks {
 $configPath = $Config
 if ([string]::IsNullOrWhiteSpace($configPath)) { $configPath = Join-Path $Root 'config.psd1' }
 if (-not (Test-Path -LiteralPath $configPath)) { throw "Нет файла настроек: $configPath" }
-$cfg = Import-PowerShellDataFile -LiteralPath $configPath
+
+function Read-DeployConfig {
+    # config.psd1 и настройки площадки (config.site.psd1 из поставки) - так же, как в run.ps1: ключа нет в config.psd1
+    # или он там пустой (@() или '') - берётся из config.site.psd1.
+    $read = Import-PowerShellDataFile -LiteralPath $configPath
+    $sitePath = Join-Path $Root 'config.site.psd1'
+    if (Test-Path -LiteralPath $sitePath) {
+        $site = Import-PowerShellDataFile -LiteralPath $sitePath
+        foreach ($siteKey in @($site.Keys)) {
+            $ownEmpty = $false
+            if ($read.ContainsKey($siteKey)) {
+                $own = $read[$siteKey]
+                $ownEmpty = ($null -eq $own) -or (($own -is [array]) -and @($own).Count -eq 0) -or (($own -is [string]) -and $own -eq '')
+            }
+            if (-not $read.ContainsKey($siteKey) -or $ownEmpty) { $read[$siteKey] = $site[$siteKey] }
+        }
+    }
+    return $read
+}
+
+$cfg = Read-DeployConfig
 
 # Меню и вопросы (ui.ps1): из ci.exe их рисует ci.exe, без него - консоль. Нужны уже здесь: если в настройках
 # чего-то не хватает, скрипт спрашивает и записывает в config.psd1.
@@ -524,7 +544,7 @@ if (-not $script:ProdBase) {
             Write-Host ("Рабочая база {0} записана в config.psd1 (ProdBase) и добавлена в ForbiddenBases: гейт её не тронет." -f $script:ProdBase) -ForegroundColor Green
         }
         else { Write-Host ("Рабочая база {0} записана в config.psd1 (ProdBase)." -f $script:ProdBase) -ForegroundColor Green }
-        $cfg = Import-PowerShellDataFile -LiteralPath $configPath
+        $cfg = Read-DeployConfig
     }
 }
 
@@ -566,6 +586,13 @@ $script:ProdPassword = Get-PlainPassword $prodPassFile
 $deployExtensions = @(Get-Setting $cfg 'DeployExtensions' @() | Where-Object { $_ })
 if ($deployExtensions.Count -eq 0) { $deployExtensions = @(Get-Setting $cfg 'Extensions' @() | Where-Object { $_ }) }
 if ($deployExtensions.Count -eq 0) { throw 'В config.psd1 пустые DeployExtensions и Extensions: нечего обновлять.' }
+# Тестовые расширения и движок тестов живут только в тестовой базе: в рабочую они не уходят никогда.
+$unitOnly = @(@(Get-Setting $cfg 'UnitTestExtensions' @() | Where-Object { $_ }) + @([string](Get-Setting $cfg 'UnitTestEngine' 'YAXUNIT')) | Where-Object { $_ })
+foreach ($name in $deployExtensions) {
+    if (@($unitOnly | Where-Object { [string]$_ -ieq [string]$name }).Count -gt 0) {
+        throw ("{0} - тестовое расширение (UnitTestExtensions или UnitTestEngine), а стоит в DeployExtensions/Extensions config.psd1: в рабочую тесты не уходят. Убери его оттуда." -f $name)
+    }
+}
 $deniedFrom = [int](Get-Setting $cfg 'DeployDeniedFrom' 22)
 $deniedTo = [int](Get-Setting $cfg 'DeployDeniedTo' 2)
 $sessionLockHours = [int](Get-Setting $cfg 'SessionLockHours' 2)

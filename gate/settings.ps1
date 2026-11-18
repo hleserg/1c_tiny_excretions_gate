@@ -91,6 +91,12 @@ $catalog = @(
     @('Самопроверка', 'SelfCheckStallMin', 'int', 'нет новых заданий дольше - перезапуск, минут', '20'),
     @('Самопроверка', 'SelfCheckRestarts', 'int', 'сколько раз перезапускать за прогон', '2'),
     @('Самопроверка', 'SelfCheckTimeoutMin', 'int', 'предел на один сеанс обработки, минут', '120'),
+    @('Модульные тесты', 'UnitTestExtensions', 'list', 'тестовые расширения YAxUnit: грузятся из файлов UnitTestsDir\<имя> только в temp, в рабочую не уходят', '@()'),
+    @('Модульные тесты', 'RunUnitTests', 'bool', 'шаг «Модульные тесты» в прогоне гейта', '$true'),
+    @('Модульные тесты', 'UnitTestEngine', 'str', 'расширение движка YAxUnit в temp (ставится руками)', '''YAXUNIT'''),
+    @('Модульные тесты', 'UnitTestsDir', 'str', 'папка с файлами тестовых расширений', '''tests'''),
+    @('Модульные тесты', 'UnitTestTimeoutMin', 'int', 'предел на прогон модульных тестов, минут', '30'),
+    @('Модульные тесты', 'UnitTestAuthor', 'str', 'автор новых тестов из меню: Фамилия И.О. (дата добавляется сама)', ''''''),
     @('Обновление рабочей', 'DeployExtensions', 'list', 'расширения для обновления рабочей; пусто - как Extensions', '@()'),
     @('Обновление рабочей', 'DeployDeniedFrom', 'int', 'с этого часа рабочую не обновлять', '22'),
     @('Обновление рабочей', 'DeployDeniedTo', 'int', 'до этого часа рабочую не обновлять', '2'),
@@ -176,6 +182,29 @@ function Set-ConfigValue {
         $script:SettingsBackupDone = $true
     }
     $previous = [System.IO.File]::ReadAllBytes($configPath)
+    [System.IO.File]::WriteAllText($configPath, $text, (New-Object System.Text.UTF8Encoding($true)))
+    try { $null = Read-SettingsConfig }
+    catch {
+        [System.IO.File]::WriteAllBytes($configPath, $previous)
+        throw ("после правки config.psd1 не читается, вернул прежний: {0}" -f $_.Exception.Message)
+    }
+}
+
+function Remove-ConfigValue {
+    # Убирает из config.psd1 строку настройки (значение в одну строку). Нет такой - ничего не делает.
+    param([string]$Key)
+    $text = [System.IO.File]::ReadAllText($configPath)
+    $valuePattern = '(?:''(?:[^'']|'''')*''|\$(?:true|false)|-?\d+|@\([^()\r\n]*\))'
+    $pattern = '(?m)^[ \t]*' + [regex]::Escape($Key) + '[ \t]*=[ \t]*' + $valuePattern + '[ \t]*\r?\n'
+    $found = [regex]::Matches($text, $pattern)
+    if ($found.Count -eq 0) { return }
+    if ($found.Count -gt 1) { throw "в config.psd1 настройка $Key встречается $($found.Count) раза: поправь файл руками" }
+    if (-not $script:SettingsBackupDone) {
+        Copy-Item -LiteralPath $configPath -Destination ($configPath + '.bak') -Force
+        $script:SettingsBackupDone = $true
+    }
+    $previous = [System.IO.File]::ReadAllBytes($configPath)
+    $text = $text.Remove($found[0].Index, $found[0].Length)
     [System.IO.File]::WriteAllText($configPath, $text, (New-Object System.Text.UTF8Encoding($true)))
     try { $null = Read-SettingsConfig }
     catch {
@@ -326,11 +355,34 @@ function Show-Canary {
     }
 }
 
-# Чего нет в config.psd1 - дописать со значением по умолчанию: в меню у каждой настройки видно, что стоит на деле.
+# Настройки площадки (config.site.psd1 из заводской поставки): ключ, которого нет в config.psd1, гейт берёт оттуда.
+# Значение по умолчанию такой ключ в config.psd1 закрыло бы - его не дописываем. Пустое значение, которое туда уже
+# дописала прежняя версия настроек (@() или ''), убираем: иначе настройка площадки не действует.
+$siteConfig = @{}
+$siteConfigPath = Join-Path $Root 'config.site.psd1'
+if (Test-Path -LiteralPath $siteConfigPath) {
+    try { $siteConfig = Import-PowerShellDataFile -LiteralPath $siteConfigPath }
+    catch { Write-Host ("  config.site.psd1 не читается: {0}" -f $_.Exception.Message) -ForegroundColor Yellow; $siteConfig = @{} }
+}
 $cfgStart = Read-SettingsConfig
+$freed = @()
+foreach ($siteKey in @($siteConfig.Keys)) {
+    if (-not $cfgStart.ContainsKey($siteKey)) { continue }
+    $own = $cfgStart[$siteKey]
+    $isEmpty = ($null -eq $own) -or (($own -is [array]) -and @($own).Count -eq 0) -or (($own -is [string]) -and $own -eq '')
+    if (-not $isEmpty) { continue }
+    try { Remove-ConfigValue -Key ([string]$siteKey); $freed += [string]$siteKey }
+    catch { Write-Host ("  {0}: пустое значение из config.psd1 не убрал - {1}" -f $siteKey, $_.Exception.Message) -ForegroundColor Yellow }
+}
+if ($freed.Count -gt 0) {
+    Show-UiTitle -Text ("Убрал из config.psd1 пустые значения, закрывавшие настройки площадки (config.site.psd1): {0}" -f ($freed -join ', ')) -Kind 'info'
+    $cfgStart = Read-SettingsConfig
+}
+
+# Чего нет в config.psd1 - дописать со значением по умолчанию: в меню у каждой настройки видно, что стоит на деле.
 $added = @()
 foreach ($row in $catalog) {
-    if ($row.Count -lt 5 -or $cfgStart.ContainsKey($row[1])) { continue }
+    if ($row.Count -lt 5 -or $cfgStart.ContainsKey($row[1]) -or $siteConfig.ContainsKey($row[1])) { continue }
     try { Set-ConfigValue -Key $row[1] -Literal $row[4]; $added += $row[1] }
     catch { Write-Host ("  {0}: умолчание не дописал - {1}" -f $row[1], $_.Exception.Message) -ForegroundColor Yellow }
 }
@@ -351,7 +403,9 @@ while ($true) {
         $labels = @($rows | ForEach-Object {
                 $value = $null
                 if ($cfg.ContainsKey($_[1])) { $value = $cfg[$_[1]] }
-                "{0} = {1}  - {2}" -f $_[1], (Format-SettingValue $value $_[2]), $_[3]
+                $shown = Format-SettingValue $value $_[2]
+                if ($null -eq $value -and $siteConfig.ContainsKey($_[1])) { $shown = '{0} (из config.site.psd1)' -f (Format-SettingValue $siteConfig[$_[1]] $_[2]) }
+                "{0} = {1}  - {2}" -f $_[1], $shown, $_[3]
             })
         $index = Select-UiOne -Header ("Настройки, {0}: что поменять" -f $group) -Items (@($labels) + @('Назад'))
         if ($index -lt 0 -or $index -ge $rows.Count) { break }

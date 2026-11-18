@@ -90,6 +90,16 @@ param(
     [Parameter(ParameterSetName = 'Run')]
     [switch]$ReleaseJobsLock,
 
+    # Служебный запуск для модульных тестов (меню «Тесты»): Run - прогнать тесты, Take - забрать тесты из тестовой
+    # базы в файлы, Load - загрузить тесты из файлов в тестовую базу. Без комплекта, проверок и вердикта гейта.
+    [Parameter(ParameterSetName = 'Run')]
+    [ValidateSet('Run', 'Take', 'Load')]
+    [string]$Tests = '',
+
+    # Один тест «Модуль.Метод» для -Tests Run.
+    [Parameter(ParameterSetName = 'Run')]
+    [string]$TestFilter = '',
+
     # Папка канала интерфейса ci.exe: его задаёт сам ci.exe, руками не нужен.
     [Parameter(ParameterSetName = 'Run')]
     [string]$UiChannel = '',
@@ -122,6 +132,8 @@ $script:JobsLockRelease = $false
 # (для оценки, сколько осталось всего прогона).
 $script:BackgroundCheck = $null
 $script:RunPlanExpected = [ordered]@{}
+# Регулярное выражение замечаний проверки конфигурации по модулям тестовых расширений (Get-UtCheckIgnorePattern).
+$script:UtCheckIgnore = ''
 
 # Скрипт остановился: причина одной строкой. Место в скрипте показывается только для неожиданной
 # ошибки. У остановки по throw с текстом оно ничего не объясняет; отличить её можно по тому,
@@ -1834,8 +1846,14 @@ function Invoke-AcceptBaseline {
     }
     $logFiles = @(Get-ChildItem -LiteralPath $acceptDir -Filter 'check*.log' -File)
     $acceptSelfCheck = Join-Path $acceptDir 'selfcheck-after.norm.txt'
-    if ($logFiles.Count -eq 0 -and -not (Test-Path -LiteralPath $acceptSelfCheck)) {
-        throw "В $acceptDir нет ни логов проверок (check*.log), ни записей самопроверки (selfcheck-after.norm.txt): принимать нечего."
+    $acceptUnit = Join-Path $acceptDir 'unittests.txt'
+    if ($logFiles.Count -eq 0 -and -not (Test-Path -LiteralPath $acceptSelfCheck) -and -not (Test-Path -LiteralPath $acceptUnit)) {
+        throw "В $acceptDir нет ни логов проверок (check*.log), ни записей самопроверки (selfcheck-after.norm.txt), ни результатов модульных тестов (unittests.txt): принимать нечего."
+    }
+    if (Test-Path -LiteralPath $acceptUnit) {
+        # Результаты модульных тестов того прогона: его падения становятся известными.
+        Copy-Item -LiteralPath $acceptUnit -Destination (Join-Path $baselineTarget 'unittests.txt') -Force
+        Write-Host 'Принято как известное: результаты модульных тестов'
     }
     foreach ($file in $logFiles) {
         $acceptLines = @(Read-V8Log $file.FullName)
@@ -1905,13 +1923,19 @@ if ([string]::IsNullOrWhiteSpace($configPath)) { $configPath = Join-Path $Root '
 if (-not (Test-Path -LiteralPath $configPath)) { throw "Нет файла настроек: $configPath" }
 $cfg = Import-PowerShellDataFile -LiteralPath $configPath
 # Настройки площадки из поставки гейта (config.site.psd1 рядом с run.ps1, его кладёт установщик и заменяет
-# при каждой установке): ключ, которого нет в config.psd1, берётся оттуда. Свой ключ в config.psd1 важнее.
+# при каждой установке): ключ, которого нет в config.psd1, берётся оттуда. Свой ключ в config.psd1 важнее, но пустой
+# (@() или '') настройку площадки не закрывает: такие пустые строки дописывали config.example.psd1 и прежние настройки.
 $siteConfigPath = Join-Path $Root 'config.site.psd1'
 $script:SiteSettingKeys = @()
 if (Test-Path -LiteralPath $siteConfigPath) {
     $siteConfig = Import-PowerShellDataFile -LiteralPath $siteConfigPath
     foreach ($siteKey in @($siteConfig.Keys)) {
-        if (-not $cfg.ContainsKey($siteKey)) { $cfg[$siteKey] = $siteConfig[$siteKey]; $script:SiteSettingKeys += [string]$siteKey }
+        $ownEmpty = $false
+        if ($cfg.ContainsKey($siteKey)) {
+            $own = $cfg[$siteKey]
+            $ownEmpty = ($null -eq $own) -or (($own -is [array]) -and @($own).Count -eq 0) -or (($own -is [string]) -and $own -eq '')
+        }
+        if (-not $cfg.ContainsKey($siteKey) -or $ownEmpty) { $cfg[$siteKey] = $siteConfig[$siteKey]; $script:SiteSettingKeys += [string]$siteKey }
     }
 }
 
@@ -1949,6 +1973,23 @@ $v8c = Join-Path $binDir '1cv8c.exe'
 if (-not (Test-Path -LiteralPath $v8)) { throw "Не нашёл конфигуратор: $v8. Поправь V8Bin в config.psd1." }
 
 $knownExtensions = @(Get-Setting $cfg 'Extensions' @() | Where-Object { $_ })
+
+# Модульные тесты YAxUnit (unittests.ps1). Тестовые расширения (UnitTestExtensions) грузятся из файлов UnitTestsDir\<имя>
+# только в тестовую базу и только ради их тестов: комплектом они не грузятся и в рабочую не уходят. Движок (UnitTestEngine,
+# расширение YAxUnit) ставится в тестовую базу руками.
+. (Join-Path $Root 'unittests.ps1')
+$unitTestExtensions = @(Get-Setting $cfg 'UnitTestExtensions' @() | Where-Object { $_ } | ForEach-Object { [string]$_ })
+$unitTestEngine = [string](Get-Setting $cfg 'UnitTestEngine' 'YAXUNIT')
+$unitTestsDir = Resolve-RootPath ([string](Get-Setting $cfg 'UnitTestsDir' 'tests'))
+$unitStateDir = Resolve-RootPath ([string](Get-Setting $cfg 'UnitTestStateDir' 'state\unittests'))
+$unitTestAuthor = [string](Get-Setting $cfg 'UnitTestAuthor' '')
+$unitTestTimeoutSec = 60 * [int](Get-Setting $cfg 'UnitTestTimeoutMin' 30)
+$runUnitTests = ([bool](Get-Setting $cfg 'RunUnitTests' $true) -and $unitTestExtensions.Count -gt 0)
+foreach ($unitName in $unitTestExtensions) {
+    if (@($knownExtensions) -contains $unitName -or @(Get-Setting $cfg 'DeployExtensions' @()) -contains $unitName -or $unitName -ieq $unitTestEngine) {
+        throw ("Тестовое расширение {0} есть в Extensions или DeployExtensions config.psd1 (или совпадает с движком UnitTestEngine): тесты не грузятся комплектом и не уходят в рабочую. Оставь его только в UnitTestExtensions." -f $unitName)
+    }
+}
 
 # Меню запуска без ключей: прогон на том, что есть, или прогон с обновлением из inbox.
 # Обновления в inbox - каждое расширение (файл .cfe, каталог выгрузки, архив .zip) и каждая внешняя обработка
@@ -2293,6 +2334,638 @@ function Show-RecentRuns {
     }
 }
 
+#region Модульные тесты YAxUnit
+
+# Тестовые расширения (UnitTestExtensions) - только в тестовой базе. Источник - папка UnitTestsDir\<имя> (выгрузка
+# в файлы: из комплекта гейта или забранная из temp). Состояние - state\unittests\<имя>.state.txt: хеш файлов,
+# которые грузились последними (sourcehash), и хеш выгрузки temp сразу после загрузки (temphash). Хеш выгрузки
+# temp не тот - тесты правили в конфигураторе temp; гейт их тогда сам не затирает.
+
+function Get-UtStatePath {
+    param([string]$Extension)
+    return (Join-Path $unitStateDir ($Extension + '.state.txt'))
+}
+
+function Save-UtState {
+    param([string]$Extension, [hashtable]$Values)
+    New-Item -ItemType Directory -Path $unitStateDir -Force | Out-Null
+    $lines = @($Values.Keys | Sort-Object | ForEach-Object { '{0}={1}' -f $_, $Values[$_] })
+    [System.IO.File]::WriteAllLines((Get-UtStatePath $Extension), [string[]]$lines, $Utf8Bom)
+}
+
+function Get-UtTempDir {
+    # Выгрузка тестового расширения из тестовой базы: по ней каталог тестов, хеш и «Забрать тесты из temp».
+    param([string]$Extension)
+    return (Join-Path (Join-Path $unitStateDir $Extension) 'temp')
+}
+
+function Invoke-UtDump {
+    # Выгрузить тестовое расширение тестовой базы в файлы, папка - заново целиком. Missing - расширения в базе нет.
+    param([string]$Extension, [string]$Dir, [string]$LogName)
+    if (Test-Path -LiteralPath $Dir) { Remove-Item -LiteralPath $Dir -Recurse -Force }
+    New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+    $result = Invoke-Designer -Command @('/DumpConfigToFiles', ('"{0}"' -f $Dir), '-Extension', $Extension) -LogName $LogName `
+        -TimeoutSec $timeoutLoadSec -Title ("Выгрузить {0} из {1}" -f $Extension, $baseKey)
+    $text = (@($result.Lines | Where-Object { $_ }) -join ' ')
+    $ok = ($result.ExitCode -eq 0 -and (Test-Path -LiteralPath (Join-Path $Dir 'Configuration.xml')))
+    $missing = (-not $ok -and -not $result.TimedOut -and $text -match 'не найден')
+    if (-not $ok) { Remove-Item -LiteralPath $Dir -Recurse -Force -ErrorAction SilentlyContinue }
+    return [pscustomobject]@{ Ok = $ok; Missing = $missing; Text = $text; Result = $result }
+}
+
+function New-UtZip {
+    # Архив папки: имена в UTF-8 и с «/» (так их понимает любой распаковщик).
+    param([string]$Dir, [string]$ZipPath)
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    New-Item -ItemType Directory -Path (Split-Path -Parent $ZipPath) -Force | Out-Null
+    if (Test-Path -LiteralPath $ZipPath) { Remove-Item -LiteralPath $ZipPath -Force }
+    $rootFull = (Resolve-Path -LiteralPath $Dir).ProviderPath.TrimEnd('\')
+    $prefix = Split-Path -Leaf $rootFull
+    $archive = [System.IO.Compression.ZipFile]::Open($ZipPath, [System.IO.Compression.ZipArchiveMode]::Create, [System.Text.Encoding]::UTF8)
+    try {
+        foreach ($file in @(Get-ChildItem -LiteralPath $rootFull -Recurse -File)) {
+            $entryName = $prefix + '/' + $file.FullName.Substring($rootFull.Length + 1).Replace('\', '/')
+            $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, $entryName)
+        }
+    }
+    finally { $archive.Dispose() }
+    return $ZipPath
+}
+
+function Invoke-UtTake {
+    # «Забрать тесты из temp»: выгрузка temp становится папкой UnitTestsDir\<имя> (прежняя - в UnitTestsDir\.old),
+    # архив для отправки - в out\. Состояние: файлы и temp совпадают, отметка taken - когда забрали.
+    param([string]$Extension, [string]$DumpDir)
+    $source = Join-Path $unitTestsDir $Extension
+    if (Test-Path -LiteralPath $source) {
+        $oldRoot = Join-Path $unitTestsDir '.old'
+        New-Item -ItemType Directory -Path $oldRoot -Force | Out-Null
+        Move-Item -LiteralPath $source -Destination (Join-Path $oldRoot ('{0}_{1}' -f $Extension, $runId)) -Force
+    }
+    New-Item -ItemType Directory -Path $unitTestsDir -Force | Out-Null
+    Copy-Item -LiteralPath $DumpDir -Destination $source -Recurse -Force
+    $zip = New-UtZip -Dir $source -ZipPath (Join-Path (Resolve-RootPath 'out') ('{0}_{1}.zip' -f $Extension, $runId))
+    $state = Read-KeyValueFile (Get-UtStatePath $Extension)
+    $state['sourcehash'] = Get-UtDirHash $source
+    $state['temphash'] = Get-UtDirHash $DumpDir
+    $state['taken'] = $runId
+    $state['takenzip'] = $zip
+    Save-UtState -Extension $Extension -Values $state
+    Write-RunLog ("Тесты {0} забраны из {1} в {2}, архив {3}" -f $Extension, $baseKey, $source, $zip)
+    return $zip
+}
+
+function Invoke-UtLoad {
+    # Загрузить тестовое расширение из файлов в тестовую базу, обновить конфигурацию БД и снять выгрузку temp.
+    # Шаг «Тесты: загрузить <имя>» - жёлтый, если не вышло: на сам комплект это не влияет.
+    param([string]$Extension, [string]$Source, [string]$SourceHash)
+    $stepName = 'Тесты: загрузить {0}' -f $Extension
+    $result = Invoke-Designer -Command @('/LoadConfigFromFiles', ('"{0}"' -f $Source), '-Extension', $Extension) -LogName ("ut_load_{0}.log" -f $Extension) `
+        -TimeoutSec $timeoutLoadSec -Title ("Загрузить {0} из файлов" -f $Extension)
+    if ($result.ExitCode -ne 0) {
+        $why = 'таймаут, процесс снят'
+        if (-not $result.TimedOut) { $why = 'код {0}: {1}' -f $result.ExitCode, (Get-LogTail $result.Lines) }
+        Add-StepResult -Name $stepName -Status 'WARN' -Detail ("не загрузилось из {0}: {1}. Тесты прогоняются как есть в {2}" -f $Source, $why, $baseKey) -Log $result.Log -Seconds $result.Seconds
+        return $false
+    }
+    $update = Invoke-Designer -Command @('/UpdateDBCfg', '-Extension', $Extension) -LogName ("ut_update_{0}.log" -f $Extension) `
+        -TimeoutSec $timeoutUpdateSec -Title ("Обновить конфигурацию БД {0}" -f $Extension)
+    if ($update.ExitCode -ne 0) {
+        $why = 'таймаут, процесс снят'
+        if (-not $update.TimedOut) { $why = 'код {0}: {1}' -f $update.ExitCode, (Get-LogTail $update.Lines) }
+        if (($update.Lines -join ' ').Contains('исключительной блокировки')) { $why += '. Обновлению нужен монопольный доступ: в базе есть другие сеансы' }
+        Add-StepResult -Name $stepName -Status 'WARN' -Detail ("загрузилось, но конфигурация БД не обновилась: {0}" -f $why) -Log $update.Log -Seconds ($result.Seconds + $update.Seconds)
+        return $false
+    }
+    $dumpDir = Get-UtTempDir $Extension
+    $dump = Invoke-UtDump -Extension $Extension -Dir $dumpDir -LogName ("ut_dump_{0}_after.log" -f $Extension)
+    $state = @{ sourcehash = $SourceHash; loaded = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); run = $runId; temphash = '' }
+    if ($dump.Ok) { $state['temphash'] = Get-UtDirHash $dumpDir }
+    Save-UtState -Extension $Extension -Values $state
+    $detail = 'из {0}, {1} с' -f $Source, ($result.Seconds + $update.Seconds)
+    if (-not $dump.Ok) { $detail += ('; выгрузить обратно не вышло ({0}): правки в конфигураторе temp гейт заметить не сможет' -f $dump.Text) }
+    Add-StepResult -Name $stepName -Status 'OK' -Detail $detail -Log $result.Log -Seconds ($result.Seconds + $update.Seconds)
+    return $true
+}
+
+function Test-UtSourceChanged {
+    # Для плана прогона: файлы тестов изменились с прошлой загрузки (или ещё не грузились).
+    param([string]$Extension)
+    $hash = Get-UtDirHash (Join-Path $unitTestsDir $Extension)
+    if (-not $hash) { return $false }
+    return ($hash -ne [string](Get-Setting (Read-KeyValueFile (Get-UtStatePath $Extension)) 'sourcehash' ''))
+}
+
+function Invoke-UtPrepare {
+    # Перед проверками конфигуратором: тестовые расширения в temp - из файлов (если файлы новые) или как есть.
+    # Правили в конфигураторе temp, а файлы новые - вопрос: не загружать / загрузить из файлов / забрать temp в файлы.
+    # Без человека - не загружать. Force - кнопка «Загрузить тесты в temp»: грузить, даже если файлы не менялись.
+    param([bool]$Force = $false)
+    foreach ($extension in $unitTestExtensions) {
+        $source = Join-Path $unitTestsDir $extension
+        $sourceHash = Get-UtDirHash $source
+        $state = Read-KeyValueFile (Get-UtStatePath $extension)
+        $knownTemp = [string](Get-Setting $state 'temphash' '')
+        $knownSource = [string](Get-Setting $state 'sourcehash' '')
+        $taken = [string](Get-Setting $state 'taken' '')
+        $dumpDir = Get-UtTempDir $extension
+        $dump = Invoke-UtDump -Extension $extension -Dir $dumpDir -LogName ("ut_dump_{0}.log" -f $extension)
+        if (-not $dump.Ok -and -not $dump.Missing) {
+            Add-StepResult -Name ('Тесты: выгрузить {0}' -f $extension) -Status 'WARN' -Detail ("не выгрузилось из {0}: {1}. Тесты не загружаются, каталога тестов нет" -f $baseKey, $dump.Text) -Log $dump.Result.Log -Seconds $dump.Result.Seconds
+            continue
+        }
+        $tempHash = ''
+        if ($dump.Ok) { $tempHash = Get-UtDirHash $dumpDir }
+        if (-not $sourceHash) {
+            if ($dump.Missing) { Write-RunLog ("Тестов {0} нет ни в {1}, ни в файлах ({2})" -f $extension, $baseKey, $source) }
+            else { Write-RunLog ("Тесты {0}: файлов {1} нет, прогоняются как есть в {2}; забрать в файлы - меню «Тесты»" -f $extension, $source, $baseKey) }
+            continue
+        }
+        $edited = ($dump.Ok -and $knownTemp -and $tempHash -ne $knownTemp)
+        if (-not $Force -and -not $dump.Missing -and $sourceHash -eq $knownSource) {
+            if ($edited) { Write-RunLog ("Тесты {0}: в {1} правлены в конфигураторе после загрузки - прогоняются как есть; не забудь «Забрать тесты из temp»" -f $extension, $baseKey) }
+            continue
+        }
+        $conflict = ''
+        if ($edited) { $conflict = 'в {0} тесты правили в конфигураторе после загрузки, а файлы тестов другие' -f $baseKey }
+        elseif ($dump.Ok -and -not $knownTemp) { $conflict = 'в {0} уже есть {1}, а гейт его не грузил (создано в конфигураторе?)' -f $baseKey, $extension }
+        elseif ($taken -and $sourceHash -ne $knownSource -and -not $Force) {
+            $conflict = 'тесты забирались из {0} ({1}, архив {2}), а в файлах теперь другие: если архив ещё не отправлен в репозиторий, правки из temp пропадут' -f $baseKey, $taken, [string](Get-Setting $state 'takenzip' '')
+        }
+        if ($conflict) {
+            # Копия того, что сейчас в temp, - в папке прогона: что бы ни выбрали, правки не теряются.
+            $backup = Join-Path $RunDir ('unittests\{0}-temp-before' -f $extension)
+            New-Item -ItemType Directory -Path (Split-Path -Parent $backup) -Force | Out-Null
+            Copy-Item -LiteralPath $dumpDir -Destination $backup -Recurse -Force
+            $answer = '1'
+            if (Test-UiCanAsk) {
+                $answer = Read-UiChoice -Header ("Тесты {0}: {1}" -f $extension, $conflict) -Keys @('1', '2', '3') -Labels @(
+                    ('Не загружать: тесты прогоняются как в {0}' -f $baseKey),
+                    ('Загрузить из файлов {0}: правки в {1} заменятся (их копия - в папке прогона)' -f $source, $baseKey),
+                    ('Забрать тесты из {0} в файлы и не загружать (архив для отправки - в out)' -f $baseKey)) -CancelKey '1' `
+                    -Notes @(('копия тестов из {0}: {1}' -f $baseKey, $backup))
+            }
+            Write-RunLog ("Тесты {0}: {1}; ответ {2}" -f $extension, $conflict, $answer)
+            if ($answer -eq '1') {
+                Add-StepResult -Name ('Тесты: загрузить {0}' -f $extension) -Status 'WARN' -Detail ("не загружено: {0}. Тесты прогоняются как в {1}; копия - {2}" -f $conflict, $baseKey, $backup)
+                continue
+            }
+            if ($answer -eq '3') {
+                $zip = Invoke-UtTake -Extension $extension -DumpDir $dumpDir
+                Add-StepResult -Name ('Тесты: загрузить {0}' -f $extension) -Status 'OK' -Detail ("не загружено: тесты забраны из {0} в {1}, архив для отправки {2}" -f $baseKey, $source, $zip)
+                continue
+            }
+        }
+        $null = Invoke-UtLoad -Extension $extension -Source $source -SourceHash $sourceHash
+    }
+}
+
+function Get-UtCatalogs {
+    # Каталоги тестов по выгрузкам temp (Get-UtTempDir), в папку прогона: unittests-<имя>.catalog.txt и .json.
+    $all = New-Object System.Collections.Generic.List[object]
+    foreach ($extension in $unitTestExtensions) {
+        $dir = Get-UtTempDir $extension
+        if (-not (Test-Path -LiteralPath (Join-Path $dir 'Configuration.xml'))) { continue }
+        try {
+            $catalog = Get-UtCatalog -Dir $dir -Extension $extension
+            Write-UtCatalog -Catalog $catalog -Dir $RunDir -Prefix ('unittests-' + $extension)
+            $all.Add($catalog)
+        }
+        catch { Write-RunLog ("Каталог тестов {0} не собрался: {1}" -f $extension, $_.Exception.Message) }
+    }
+    return , $all.ToArray()
+}
+
+function Test-UtEngineMissing {
+    # Движка нет в базе: канарейка этого прогона перечислила расширения сеанса, а его среди них нет. Не знаем - $false.
+    foreach ($file in @(Get-ChildItem -LiteralPath $RunDir -Filter 'canary_*.txt' -File -ErrorAction SilentlyContinue)) {
+        $lines = @(Get-Content -LiteralPath $file.FullName -Encoding UTF8 | Where-Object { $_ -like 'ext=*' })
+        if ($lines.Count -eq 0) { continue }
+        $names = @($lines | ForEach-Object { ($_.Substring(4) -split '\|')[0].Trim() })
+        return (@($names | Where-Object { $_ -ieq $unitTestEngine }).Count -eq 0)
+    }
+    return $false
+}
+
+function Invoke-UtSession {
+    # Сеанс YAxUnit: тонкий клиент с /C"RunUnitTests=<файл настроек>". Итог - файл кода возврата (exitcode.txt)
+    # и отчёт jUnit. Начало работы движка - появился его лог. State: done, exited, nostart, timeout.
+    param([string]$OutDir, [string[]]$Tests = @(), [string]$Title)
+    New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+    $junit = Join-Path $OutDir 'junit.xml'
+    $exitFile = Join-Path $OutDir 'exitcode.txt'
+    $logFile = Join-Path $OutDir 'yaxunit.log'
+    $filter = [ordered]@{ extensions = @($unitTestExtensions) }
+    if (@($Tests).Count -gt 0) { $filter['tests'] = @($Tests) }
+    $settings = [ordered]@{
+        filter = $filter; reportFormat = 'jUnit'; reportPath = $junit; closeAfterTests = $true; showReport = $false
+        exitCode = $exitFile; logging = [ordered]@{ file = $logFile; level = 'info' }
+    }
+    $configFile = Join-Path $OutDir 'yaxunit.json'
+    [System.IO.File]::WriteAllText($configFile, (ConvertTo-Json -InputObject $settings -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    if ($configFile -match '[;"]') { throw 'в пути к папке прогона не должно быть точки с запятой и кавычек' }
+    $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -User $adminUser -Password $adminPassword) + @(
+        '/DisableStartupDialogs', '/DisableStartupMessages', ('/C"RunUnitTests={0}"' -f $configFile))
+    $argLine = $argList -join ' '
+    Write-RunLog ("> 1cv8c.exe {0}" -f ([regex]::Replace([regex]::Replace($argLine, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"')))
+    $expected = Get-ExpectedStepSeconds $Title
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $process = Start-Process -FilePath $v8c -ArgumentList $argLine -PassThru
+    $null = $process.Handle
+    $state = ''
+    $detail = 'клиент запускается'
+    while ($true) {
+        if (Test-Path -LiteralPath $exitFile) { $state = 'done'; break }
+        if ($process.HasExited) {
+            Start-Sleep -Seconds 2
+            if (Test-Path -LiteralPath $exitFile) { $state = 'done' } else { $state = 'exited' }
+            break
+        }
+        $started = Test-Path -LiteralPath $logFile
+        if (-not $started -and $watch.Elapsed.TotalSeconds -ge $selfCheckStartTimeoutSec) { $state = 'nostart'; break }
+        if ($watch.Elapsed.TotalSeconds -ge $unitTestTimeoutSec) { $state = 'timeout'; break }
+        if ($started) {
+            $detail = 'тесты идут'
+            try {
+                $last = @(Get-Content -LiteralPath $logFile -Encoding UTF8 -Tail 1 -ErrorAction Stop)
+                if ($last.Count -gt 0 -and $last[0]) { $detail = ($last[0] -replace '^\S+\s+\S+\s+', '').Trim() }
+            }
+            catch { }
+        }
+        Write-UiProgress -Title $Title -Elapsed $watch.Elapsed.TotalSeconds -Expected $expected -Detail $detail
+        Start-Sleep -Milliseconds 500
+    }
+    Complete-UiProgress
+    $windows = @()
+    if ($state -eq 'done') {
+        # Код возврата записан, отчёт - перед ним; клиент закрывается сам.
+        if (-not $process.WaitForExit(60000)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
+    }
+    elseif (-not $process.HasExited) {
+        $windows = @(Save-ProcessWindows -ProcessId $process.Id -FilePrefix (Join-Path $OutDir 'client'))
+        try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { }
+    }
+    $code = ''
+    if (Test-Path -LiteralPath $exitFile) { $code = ([System.IO.File]::ReadAllText($exitFile, [System.Text.Encoding]::UTF8)).Trim().TrimStart([char]0xFEFF) }
+    $statStatus = 'FAIL'
+    if ($state -eq 'done') { $statStatus = 'OK' }
+    Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status $statStatus
+    $exitCode = ''
+    if ($process.HasExited) { $exitCode = $process.ExitCode }
+    return [pscustomobject]@{ State = $state; Seconds = [int]$watch.Elapsed.TotalSeconds; Code = $code; Junit = $junit; Log = $logFile
+        Windows = $windows; ExitCode = $exitCode }
+}
+
+function Invoke-UtStep {
+    # Шаг «Модульные тесты»: каталог тестов (замечания к описаниям), прогон YAxUnit, сравнение с эталоном.
+    # Новое падение - красный; замечания к описаниям - жёлтый; известные падения (есть в эталоне) - не новое.
+    # Filter - один тест «Модуль.Метод» (кнопка «Прогнать этот тест»): эталон тогда не трогается.
+    param([string]$StepName = 'Модульные тесты', [string]$Filter = '')
+    $outDir = Join-Path $RunDir 'unittests'
+    $catalogs = @(Get-UtCatalogs)
+    if ($catalogs.Count -eq 0) {
+        # Выгрузки тестовых расширений нет: в базе их нет (и файлов тоже) или выгрузка не удалась (об этом - свой шаг выше).
+        Add-StepResult -Name $StepName -Status 'WARN' -Detail ("в {0} нет тестовых расширений {1} (или они не выгрузились): тесты не прогнаны. Файлы тестов - {2}\<имя>" -f $baseKey, ($unitTestExtensions -join ', '), $unitTestsDir)
+        return
+    }
+    $known = New-Object System.Collections.Generic.List[object]
+    $problems = 0
+    foreach ($catalog in $catalogs) {
+        foreach ($test in @($catalog.Tests)) { $known.Add($test) }
+        $problems += @($catalog.Problems).Count
+    }
+    $disabled = @($known | Where-Object { $_.Disabled })
+    $whitelist = @()
+    if ($Filter) { $whitelist = @($Filter) }
+    elseif ($disabled.Count -gt 0) { $whitelist = @($known | Where-Object { -not $_.Disabled -and $_.Registered } | ForEach-Object { $_.Key }) }
+    if (($Filter -or $disabled.Count -gt 0) -and $whitelist.Count -eq 0) {
+        Add-StepResult -Name $StepName -Status 'OK' -Detail ("запускать нечего: все тесты выключены (@Выключен), выключено {0}" -f $disabled.Count)
+        return
+    }
+    $session = Invoke-UtSession -OutDir $outDir -Tests $whitelist -Title $StepName
+    if ($session.State -ne 'done') {
+        $windowsText = ''
+        if (@($session.Windows).Count -gt 0) { $windowsText = '. Окна клиента: ' + (@($session.Windows) -join '; ') }
+        switch ($session.State) {
+            'nostart' {
+                if (Test-UtEngineMissing) {
+                    Add-StepResult -Name $StepName -Status 'WARN' -Detail ("в {0} нет расширения {1} (движок YAxUnit ставится руками, см. readme.txt): тесты не прогнаны" -f $baseKey, $unitTestEngine) -Seconds $session.Seconds
+                    return
+                }
+                $text = 'за {0} с YAxUnit не начал работу (нет его лога): нет расширения {1} в {2}, окно при входе или параметр запуска не дошёл{3}' -f $session.Seconds, $unitTestEngine, $baseKey, $windowsText
+            }
+            'exited' { $text = 'клиент закрылся без итога YAxUnit (код {0}); лог движка - unittests\yaxunit.log' -f $session.ExitCode }
+            default { $text = 'за {0} с итога нет, клиент снят (таймаут UnitTestTimeoutMin){1}' -f $session.Seconds, $windowsText }
+        }
+        Add-StepResult -Name $StepName -Status 'FAIL' -Detail $text -Log $session.Log -Seconds $session.Seconds
+        return
+    }
+    if (-not (Test-Path -LiteralPath $session.Junit)) {
+        Add-StepResult -Name $StepName -Status 'FAIL' -Detail ("YAxUnit закончил (код {0}), а отчёта jUnit нет: {1}" -f $session.Code, $session.Junit) -Log $session.Log -Seconds $session.Seconds
+        return
+    }
+    $results = @()
+    try { $results = @(Read-UtJUnit $session.Junit) }
+    catch {
+        Add-StepResult -Name $StepName -Status 'FAIL' -Detail ("отчёт jUnit не разобрался: {0}" -f $_.Exception.Message) -Log $session.Junit -Seconds $session.Seconds
+        return
+    }
+    $resultFile = Join-Path $RunDir 'unittests.txt'
+    [System.IO.File]::WriteAllLines($resultFile, [string[]]@($results | ForEach-Object { Format-UtResultLine $_ }), $Utf8Bom)
+    $comparison = Compare-UtResults -Current $results -BaselineFile $unitBaselineFile
+    $failed = @($results | Where-Object { Test-UtFailed $_.Status })
+    $passed = @($results | Where-Object { $_.Status -eq 'OK' }).Count
+    $skippedCount = @($results | Where-Object { $_.Status -eq 'SKIP' }).Count
+    $detail = 'тестов {0}: прошло {1}, упало {2}' -f $results.Count, $passed, $failed.Count
+    if ($failed.Count -gt 0) { $detail += (' (новых {0}, известных {1})' -f @($comparison.NewFailed).Count, @($comparison.KnownFailed).Count) }
+    if ($skippedCount -gt 0) { $detail += (', пропущено {0}' -f $skippedCount) }
+    if ($disabled.Count -gt 0 -and -not $Filter) { $detail += (', выключено {0}' -f $disabled.Count) }
+    if (@($comparison.Fixed).Count -gt 0) { $detail += (', починились {0}' -f @($comparison.Fixed).Count) }
+    if (@($comparison.Gone).Count -gt 0 -and -not $Filter) { $detail += (', пропало из эталона {0}' -f @($comparison.Gone).Count) }
+    if (-not $comparison.HasBaseline) { $detail += '; эталона тестов не было' }
+    if ($problems -gt 0) { $detail += ('; замечаний к описаниям тестов {0} (unittests-*.catalog.txt)' -f $problems) }
+    $detail += ('; {0} с' -f $session.Seconds)
+    $status = 'OK'
+    if (@($comparison.NewFailed).Count -gt 0) {
+        $status = 'FAIL'
+        $newLines = @($comparison.NewFailed | ForEach-Object { Format-UtResultLine $_ })
+        [System.IO.File]::WriteAllLines((Join-Path $RunDir 'unittests.new.txt'), [string[]]$newLines, $Utf8Bom)
+        $sample = (@($comparison.NewFailed | Select-Object -First 3 | ForEach-Object {
+                    $message = [string]$_.Message
+                    if ($message.Length -gt 160) { $message = $message.Substring(0, 160) + '...' }
+                    '{0}: {1}' -f $_.Key, $message
+                }) -join ' | ')
+        $detail += ('. Новые падения в unittests.new.txt: {0}' -f $sample)
+    }
+    elseif ($problems -gt 0) { $status = 'WARN' }
+    # Эталон двигается сам, когда новых падений нет (как у самопроверки); прогон одного теста эталон не трогает.
+    if ($status -ne 'FAIL' -and -not $Filter) {
+        New-Item -ItemType Directory -Path $baselineDir -Force | Out-Null
+        Copy-Item -LiteralPath $resultFile -Destination $unitBaselineFile -Force
+    }
+    Add-StepResult -Name $StepName -Status $status -Detail $detail -Log $session.Junit -Seconds $session.Seconds
+}
+
+function Get-UtCheckIgnorePattern {
+    # Замечания проверки конфигурации по модулям тестовых расширений в сравнение не идут: тестовое расширение не видит
+    # движок YAxUnit (другое расширение) и модули других расширений, конфигуратор пишет «Переменная не определена»
+    # на каждый тест. Модуль теста, который не компилируется, видно в шаге «Модульные тесты».
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($extension in $unitTestExtensions) {
+        $modules = Join-Path (Get-UtTempDir $extension) 'CommonModules'
+        if (-not (Test-Path -LiteralPath $modules)) { continue }
+        foreach ($file in @(Get-ChildItem -LiteralPath $modules -Filter '*.xml' -File)) { $names.Add([regex]::Escape($file.BaseName)) }
+    }
+    $parts = New-Object System.Collections.Generic.List[string]
+    if ($names.Count -gt 0) { $parts.Add(('(ОбщийМодуль|CommonModule)\.({0})\.' -f ($names.ToArray() -join '|'))) }
+    foreach ($extension in $unitTestExtensions) { $parts.Add(('^\{{?\[?{0}\b' -f [regex]::Escape($extension))) }
+    if ($parts.Count -eq 0) { return '' }
+    return ('(' + ($parts.ToArray() -join ')|(') + ')')
+}
+
+function Get-UtLastResults {
+    # Последний результат каждого теста «Модуль.Метод»: из unittests.txt прогонов гейта и прогонов тестов, свежие поверх старых.
+    $files = New-Object System.Collections.Generic.List[object]
+    foreach ($root in @((Resolve-RootPath ([string](Get-Setting $cfg 'RunsDir' 'runs'))), (Resolve-RootPath 'tests-runs'))) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        foreach ($dir in @(Get-ChildItem -LiteralPath $root -Directory | Sort-Object Name -Descending | Select-Object -First 30)) {
+            $file = Join-Path $dir.FullName 'unittests.txt'
+            if (Test-Path -LiteralPath $file) { $files.Add([pscustomobject]@{ Path = $file; Run = $dir.Name; Time = (Get-Item -LiteralPath $file).LastWriteTime }) }
+        }
+    }
+    $map = @{}
+    foreach ($entry in @($files.ToArray() | Sort-Object Time)) {
+        foreach ($line in [System.IO.File]::ReadAllLines($entry.Path, [System.Text.Encoding]::UTF8)) {
+            $parts = ([string]$line).TrimStart([char]0xFEFF).Split("`t")
+            if ($parts.Length -lt 2) { continue }
+            $key = $parts[1] -replace '\s*\[.*$', ''
+            $message = ''
+            if ($parts.Length -gt 2) { $message = $parts[2] }
+            $map[$key] = [pscustomobject]@{ Status = $parts[0]; Run = $entry.Run; Message = $message }
+        }
+    }
+    return $map
+}
+
+function Get-UtMenuCatalog {
+    # Каталог для меню: по выгрузке temp (что сейчас в базе), а если её нет - по файлам tests\<имя>.
+    param([string]$Extension)
+    $tempDir = Get-UtTempDir $Extension
+    $source = Join-Path $unitTestsDir $Extension
+    foreach ($candidate in @(@($tempDir, ('выгрузка {0}' -f $baseKey)), @($source, ('файлы {0}' -f $source)))) {
+        if (Test-Path -LiteralPath (Join-Path $candidate[0] 'Configuration.xml')) {
+            $catalog = Get-UtCatalog -Dir $candidate[0] -Extension $Extension
+            return [pscustomobject]@{ Catalog = $catalog; From = $candidate[1] }
+        }
+    }
+    return $null
+}
+
+function Invoke-UtChild {
+    # Служебный запуск гейта для тестов (run.ps1 -Tests ...) - тем же каналом ci.exe; потом посмотреть итог.
+    param([string]$Mode, [string]$Filter = '')
+    $childArgs = @{ Tests = $Mode }
+    if ($Filter) { $childArgs['TestFilter'] = $Filter }
+    if ($UiChannel) { $childArgs['UiChannel'] = $UiChannel }
+    try { & (Join-Path $Root 'run.ps1') @childArgs }
+    catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+    Wait-UiAcknowledge -Label 'Вернуться к тестам'
+}
+
+function Show-UtCard {
+    # Карточка теста: описание из шапки, последний результат; прогнать один, выключить/включить, открыть файл.
+    param($Test, [string]$Extension, $Results)
+    while ($true) {
+        $notes = New-Object System.Collections.Generic.List[string]
+        $notes.Add(('Тест: {0}' -f $Test.Key))
+        if ($Test.Subsystem) { $notes.Add(('Подсистема: {0}' -f $Test.Subsystem)) }
+        foreach ($pair in @(@('Проверяет', $Test.Checks), @('Как', $Test.How), @('Зачем', $Test.Why), @('Автор', $Test.Author))) {
+            if ($pair[1]) { $notes.Add(('{0}: {1}' -f $pair[0], ($pair[1] -replace "`n", ' '))) } else { $notes.Add(('{0}: (не описано)' -f $pair[0])) }
+        }
+        if (@($Test.Tags).Count -gt 0) { $notes.Add(('Теги: {0}' -f (@($Test.Tags) -join ', '))) }
+        if ($Test.Disabled) { $notes.Add(('ВЫКЛЮЧЕН: {0}' -f $Test.Disabled)) }
+        if ($Results.ContainsKey($Test.Key)) {
+            $last = $Results[$Test.Key]
+            $text = 'Последний результат: {0} (прогон {1})' -f $last.Status, $last.Run
+            if ($last.Message) { $text += (': ' + $last.Message) }
+            $notes.Add($text)
+        }
+        else { $notes.Add('Последний результат: тест ещё не запускался') }
+        foreach ($problem in @($Test.Problems)) { $notes.Add(('Замечание: {0}' -f $problem)) }
+        $actions = New-Object System.Collections.Generic.List[object]
+        $actions.Add([pscustomobject]@{ Key = 'run'; Label = ('Прогнать только этот тест в {0}' -f $baseKey) })
+        if ($Test.Disabled) { $actions.Add([pscustomobject]@{ Key = 'enable'; Label = 'Включить (убрать @Выключен в файлах)' }) }
+        else { $actions.Add([pscustomobject]@{ Key = 'disable'; Label = 'Выключить с причиной (@Выключен в файлах)' }) }
+        $actions.Add([pscustomobject]@{ Key = 'open'; Label = ('Открыть файл модуля ({0}, строка {1})' -f $Test.File, $Test.Line) })
+        $actions.Add([pscustomobject]@{ Key = 'back'; Label = 'Назад к списку' })
+        $picked = Select-UiOne -Header $Test.Presentation -Items @($actions | ForEach-Object { $_.Label }) -Notes $notes.ToArray()
+        if ($picked -lt 0 -or $actions[$picked].Key -eq 'back') { return }
+        $source = Join-Path $unitTestsDir $Extension
+        switch ($actions[$picked].Key) {
+            'run' { Invoke-UtChild -Mode 'Run' -Filter $Test.Key; return }
+            'open' {
+                $file = Join-Path $source ($Test.File.Replace('/', '\'))
+                if (-not (Test-Path -LiteralPath $file)) { $file = Join-Path (Get-UtTempDir $Extension) ($Test.File.Replace('/', '\')) }
+                if (Test-Path -LiteralPath $file) { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"{0}"' -f $file) }
+                else { Write-Host ("  Файла нет: {0}" -f $file) -ForegroundColor Yellow; Wait-UiAcknowledge -Label 'Вернуться к тесту' }
+            }
+            'disable' {
+                $reason = Read-UiText -Prompt ('Почему выключаем {0} (попадёт в шапку теста)' -f $Test.Key) -CancelAsNull
+                if (-not $reason) { continue }
+                $mark = $reason
+                if ($unitTestAuthor) { $mark = '{0} ({1} {2:yyyyMMdd})' -f $reason, $unitTestAuthor, (Get-Date) }
+                try {
+                    $path = Set-UtDisabled -Dir $source -Module $Test.Module -Method $Test.Method -Reason $mark
+                    $Test.Disabled = $mark
+                    Write-Host ("  Выключен в {0}. В {1} - после загрузки тестов (следующий прогон загрузит сам, или «Загрузить тесты в temp»)." -f $path, $baseKey) -ForegroundColor Green
+                }
+                catch { Write-Host ("  Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+                Wait-UiAcknowledge -Label 'Вернуться к тесту'
+            }
+            'enable' {
+                try {
+                    $path = Set-UtDisabled -Dir $source -Module $Test.Module -Method $Test.Method -Reason ''
+                    $Test.Disabled = ''
+                    Write-Host ("  Включен в {0}. В {1} - после загрузки тестов." -f $path, $baseKey) -ForegroundColor Green
+                }
+                catch { Write-Host ("  Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+                Wait-UiAcknowledge -Label 'Вернуться к тесту'
+            }
+        }
+    }
+}
+
+function New-UtFromMenu {
+    # «Новый тест по шаблону»: модуль (есть или новый в подсистеме), имя, описание - шапка и регистрация в файлах.
+    param([string]$Extension)
+    $source = Join-Path $unitTestsDir $Extension
+    if (-not (Test-Path -LiteralPath (Join-Path $source 'Configuration.xml'))) {
+        Write-Host ("  Файлов тестов нет ({0}): сначала «Забрать тесты из temp» или поставь комплект с тестами." -f $source) -ForegroundColor Yellow
+        return
+    }
+    $catalog = Get-UtCatalog -Dir $source -Extension $Extension
+    $modules = @($catalog.Modules | Where-Object { -not $_.Helper } | Sort-Object Name)
+    $labels = @($modules | ForEach-Object { '{0} ({1}, тестов {2})' -f $_.Name, $_.Subsystem, $_.Tests }) + @('Новый модуль тестов')
+    $index = Select-UiOne -Header ('Новый тест {0}: в какой модуль' -f $Extension) -Items $labels -Notes @('Модуль тестов - по соглашению YAxUnit: ОМ_<общий модуль>, Док_<документ>_МО, Спр_<справочник>_ММ и т.п.')
+    if ($index -lt 0) { return }
+    $moduleName = ''
+    $subsystem = ''
+    if ($index -eq $modules.Count) {
+        $subsystems = @(Get-UtSubsystemList $source)
+        if ($subsystems.Count -eq 0) { Write-Host '  В файлах тестов нет подсистем.' -ForegroundColor Yellow; return }
+        $subIndex = Select-UiOne -Header 'Подсистема нового модуля тестов' -Items @($subsystems | ForEach-Object { '{0} - {1}' -f $_.Path, $_.Synonym })
+        if ($subIndex -lt 0) { return }
+        $subsystem = $subsystems[$subIndex].Path
+        $moduleName = Read-UiText -Prompt 'Имя модуля тестов (ОМ_<общий модуль>, Док_<документ>_МО ...)' -CancelAsNull
+        if (-not $moduleName) { return }
+    }
+    else { $moduleName = $modules[$index].Name }
+    $method = Read-UiText -Prompt 'Имя процедуры теста (латиница не нужна: ПлановаяДатаНеВВыходной)' -CancelAsNull
+    if (-not $method) { return }
+    $presentation = Read-UiText -Prompt '@Тест - что проверяет тест, одной фразой (это же имя теста в отчёте)' -CancelAsNull
+    if (-not $presentation) { return }
+    $checks = Read-UiText -Prompt '@Проверяет - объект и метод (CommonModule.Имя.Метод, Document.Имя.ОбработкаПроведения)' -CancelAsNull
+    if (-not $checks) { return }
+    $how = [string](Read-UiText -Prompt '@Как - как проверяем: данные, вызов, что сравниваем (можно потом в файле)')
+    $why = [string](Read-UiText -Prompt '@Зачем - какая ошибка была, какое требование, номер ТЗ (можно потом в файле)')
+    $tags = [string](Read-UiText -Prompt '@Теги через запятую (необязательно)')
+    $author = $unitTestAuthor
+    if (-not $author) { $author = [string](Read-UiText -Prompt '@Автор - Фамилия И.О. (дата добавится сама)') }
+    $author = ('{0} {1:yyyyMMdd}' -f $author, (Get-Date)).Trim()
+    if (-not $how) { $how = 'ОПИСАТЬ' }
+    if (-not $why) { $why = 'ОПИСАТЬ' }
+    try {
+        if ($subsystem) { $path = New-UtModule -Dir $source -Name $moduleName -Subsystem $subsystem -Method $method -Presentation $presentation -Checks $checks -How $how -Why $why -Author $author -Tags $tags }
+        else { $path = Add-UtTest -Dir $source -Module $moduleName -Method $method -Presentation $presentation -Checks $checks -How $how -Why $why -Author $author -Tags $tags }
+        Write-Host ("  Тест-заготовка в {0}: допиши тело (там проверка-заглушка «Истина - это истина»). В {1} - после загрузки тестов." -f $path, $baseKey) -ForegroundColor Green
+        if ($how -eq 'ОПИСАТЬ' -or $why -eq 'ОПИСАТЬ') { Write-Host '  В шапке стоит «ОПИСАТЬ»: допиши @Как и @Зачем.' -ForegroundColor Yellow }
+    }
+    catch { Write-Host ("  Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+}
+
+function Show-UtMenu {
+    # Меню «Тесты»: список с описаниями и последними результатами, прогон, новый тест, проверка описаний,
+    # забрать из temp в файлы, загрузить из файлов в temp.
+    while ($true) {
+        $notes = New-Object System.Collections.Generic.List[string]
+        foreach ($extension in $unitTestExtensions) {
+            $source = Join-Path $unitTestsDir $extension
+            $state = Read-KeyValueFile (Get-UtStatePath $extension)
+            $line = '{0}: файлы {1}' -f $extension, $source
+            if (-not (Test-Path -LiteralPath (Join-Path $source 'Configuration.xml'))) { $line += ' (нет)' }
+            $loaded = [string](Get-Setting $state 'loaded' '')
+            if ($loaded) { $line += ('; в {0} загружены {1}' -f $baseKey, $loaded) } else { $line += ('; гейт в {0} их ещё не грузил' -f $baseKey) }
+            $taken = [string](Get-Setting $state 'taken' '')
+            if ($taken) { $line += ('; забраны из {0} {1}' -f $baseKey, $taken) }
+            $notes.Add($line)
+        }
+        $notes.Add(('Движок: расширение {0} в {1} ставится руками (см. readme.txt, раздел про модульные тесты).' -f $unitTestEngine, $baseKey))
+        $items = @(
+            [pscustomobject]@{ Key = 'list'; Label = 'Список тестов: описание, последний результат, прогнать один' },
+            [pscustomobject]@{ Key = 'run'; Label = ('Прогнать все тесты в {0} (без комплекта и проверок)' -f $baseKey) },
+            [pscustomobject]@{ Key = 'new'; Label = 'Новый тест по шаблону (в файлах)' },
+            [pscustomobject]@{ Key = 'check'; Label = 'Проверить описания тестов в файлах' },
+            [pscustomobject]@{ Key = 'take'; Label = ('Забрать тесты из {0} в файлы (после правки в конфигураторе)' -f $baseKey) },
+            [pscustomobject]@{ Key = 'load'; Label = ('Загрузить тесты из файлов в {0}' -f $baseKey) },
+            [pscustomobject]@{ Key = 'back'; Label = 'Назад' })
+        $picked = Select-UiOne -Header 'Модульные тесты (YAxUnit)' -Items @($items | ForEach-Object { $_.Label }) -Notes $notes.ToArray()
+        if ($picked -lt 0 -or $items[$picked].Key -eq 'back') { return }
+        switch ($items[$picked].Key) {
+            'run' { Invoke-UtChild -Mode 'Run' }
+            'take' { Invoke-UtChild -Mode 'Take' }
+            'load' { Invoke-UtChild -Mode 'Load' }
+            'new' {
+                foreach ($extension in $unitTestExtensions) { New-UtFromMenu -Extension $extension }
+                Wait-UiAcknowledge -Label 'Вернуться к тестам'
+            }
+            'check' {
+                $lines = New-Object System.Collections.Generic.List[string]
+                foreach ($extension in $unitTestExtensions) {
+                    $source = Join-Path $unitTestsDir $extension
+                    if (-not (Test-Path -LiteralPath (Join-Path $source 'Configuration.xml'))) { $lines.Add(('{0}: файлов нет ({1})' -f $extension, $source)); continue }
+                    $catalog = Get-UtCatalog -Dir $source -Extension $extension
+                    $lines.Add(('{0}: тестов {1}, замечаний к описаниям {2}' -f $extension, @($catalog.Tests).Count, @($catalog.Problems).Count))
+                    foreach ($problem in @($catalog.Problems)) { $lines.Add(('  ' + (Format-UtProblem $problem))) }
+                }
+                Show-UiPager -Lines $lines.ToArray() -Header 'Описания тестов в файлах'
+            }
+            'list' {
+                $results = Get-UtLastResults
+                while ($true) {
+                    $entries = New-Object System.Collections.Generic.List[object]
+                    $from = @()
+                    foreach ($extension in $unitTestExtensions) {
+                        $found = Get-UtMenuCatalog -Extension $extension
+                        if ($null -eq $found) { continue }
+                        $from += ('{0}: {1}' -f $extension, $found.From)
+                        foreach ($test in @($found.Catalog.Tests | Sort-Object Subsystem, Key)) { $entries.Add([pscustomobject]@{ Test = $test; Extension = $extension }) }
+                    }
+                    if ($entries.Count -eq 0) {
+                        Write-Host '  Тестов нет: ни выгрузки temp, ни файлов. Сначала прогон гейта или «Забрать тесты из temp».' -ForegroundColor Yellow
+                        Wait-UiAcknowledge -Label 'Вернуться к тестам'
+                        break
+                    }
+                    $labels = @($entries | ForEach-Object {
+                            $mark = '  -  '
+                            if ($results.ContainsKey($_.Test.Key)) { $mark = '[{0}]' -f $results[$_.Test.Key].Status }
+                            if ($_.Test.Disabled) { $mark = '[ВЫКЛ]' }
+                            $warn = ''
+                            if (@($_.Test.Problems).Count -gt 0) { $warn = ' ! описание' }
+                            '{0} {1} - {2}{3}' -f $mark, $_.Test.Key, $_.Test.Presentation, $warn
+                        })
+                    $index = Select-UiOne -Header ('Тесты ({0})' -f $entries.Count) -Items $labels -Notes (@('Каталог: ' + ($from -join '; ')) + @('Статус - последний результат из прогонов; «! описание» - замечания к шапке'))
+                    if ($index -lt 0) { break }
+                    Show-UtCard -Test $entries[$index].Test -Extension $entries[$index].Extension -Results $results
+                    $results = Get-UtLastResults
+                }
+            }
+        }
+    }
+}
+
+#endregion
+
 # Меню - при запуске без ключей (ключ -UiChannel от ci.exe не в счёт).
 $menuKeys = @($PSBoundParameters.Keys | Where-Object { $_ -ne 'UiChannel' })
 if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-UiCanAsk)) {
@@ -2311,6 +2984,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             $menu.Add([pscustomobject]@{ Key = 'accept'; Label = ('Принять новое последнего прогона в эталон ({0}, {1})' -f $acceptable.Dir.Name, (Get-RunListText $acceptable.Verdict)) })
         }
         $menu.Add([pscustomobject]@{ Key = 'runs'; Label = 'Результаты последних прогонов' })
+        if ($unitTestExtensions.Count -gt 0) { $menu.Add([pscustomobject]@{ Key = 'tests'; Label = ('Модульные тесты: список, прогон, новый тест, забрать из {0}' -f $script:Base) }) }
         $menu.Add([pscustomobject]@{ Key = 'stats'; Label = 'Статистика длительностей: план и факт' })
         $menu.Add([pscustomobject]@{ Key = 'settings'; Label = 'Настройки (config.psd1)' })
         if (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1')) {
@@ -2395,6 +3069,10 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             Show-UiPager -Lines @(Get-StatReportLines) -Header 'Статистика длительностей шагов'
             continue
         }
+        if ($choice -eq 'tests') {
+            Show-UtMenu
+            continue
+        }
         if ($choice -ne 'runs') { break }
         Show-RecentRuns
     }
@@ -2434,11 +3112,14 @@ $timeoutCheckSec = 60 * [int](Get-Setting $cfg 'TimeoutCheckMin' 120)
 $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
 $runsRoot = Resolve-RootPath ([string](Get-Setting $cfg 'RunsDir' 'runs'))
 $RunDir = Join-Path $runsRoot $runId
+# Служебные запуски для тестов (-Tests) - в tests-runs: в список прогонов гейта и в эталон они не попадают.
+if ($Tests) { $RunDir = Join-Path (Resolve-RootPath 'tests-runs') ('{0}-{1}' -f $runId, $Tests.ToLowerInvariant()) }
 New-Item -ItemType Directory -Path $RunDir -Force | Out-Null
 $script:RunLogPath = Join-Path $RunDir 'run.log'
 $script:Steps = New-Object System.Collections.Generic.List[object]
 if ($script:SiteSettingKeys.Count -gt 0) { Write-RunLog ("Настройки площадки из config.site.psd1: {0}" -f ($script:SiteSettingKeys -join ', ')) }
 $baselineDir = Join-Path (Join-Path $Root 'baseline') $baseKey
+$unitBaselineFile = Join-Path $baselineDir 'unittests.txt'
 
 $adminUser = [string](Get-Setting $cfg 'AdminUser' '')
 $adminPassword = Get-PlainPassword ([string](Get-Setting $cfg 'AdminPassFile' ''))
@@ -2712,6 +3393,14 @@ function Add-CheckStep {
     if ($Blocking) { $badStatus = 'FAIL' }
 
     $records = @(ConvertTo-CheckRecords $Result.Lines)
+    # Замечания по модулям тестовых расширений (Get-UtCheckIgnorePattern) - не в счёт: их видно в шаге «Модульные тесты».
+    $utIgnored = 0
+    if ($script:UtCheckIgnore) {
+        $kept = @($records | Where-Object { $_ -notmatch $script:UtCheckIgnore })
+        $utIgnored = $records.Count - $kept.Count
+        $records = $kept
+        if ($utIgnored -gt 0) { Write-RunLog ("{0}: замечаний по модулям тестовых расширений не в счёт: {1}" -f $Name, $utIgnored) }
+    }
     [System.IO.File]::WriteAllLines((Join-Path $RunDir ($FileKey + '.norm.txt')), [string[]]$records, $Utf8Bom)
 
     if ($Result.TimedOut) {
@@ -3900,6 +4589,47 @@ else {
 
 #endregion
 
+#region Служебные запуски для модульных тестов
+
+# Меню «Тесты» (ключ -Tests): только тестовые расширения, без комплекта, подготовки базы, проверок и вердикта гейта.
+if ($Tests) {
+    if ($unitTestExtensions.Count -eq 0) { throw 'модульных тестов нет: в config.psd1 пустой UnitTestExtensions' }
+    $serviceFailed = 0
+    if ($Tests -eq 'Take') {
+        foreach ($extension in $unitTestExtensions) {
+            $dumpDir = Get-UtTempDir $extension
+            $dump = Invoke-UtDump -Extension $extension -Dir $dumpDir -LogName ("ut_dump_{0}.log" -f $extension)
+            if (-not $dump.Ok) {
+                $serviceFailed++
+                $why = $dump.Text
+                if ($dump.Missing) { $why = 'в базе его нет' }
+                Write-Host ("Тесты {0} из {1} не выгрузились: {2}" -f $extension, $baseKey, $why) -ForegroundColor Red
+                continue
+            }
+            $zip = Invoke-UtTake -Extension $extension -DumpDir $dumpDir
+            $taken = Get-UtCatalog -Dir (Join-Path $unitTestsDir $extension) -Extension $extension
+            Write-Host ("Тесты {0} забраны из {1} в {2}: тестов {3}, замечаний к описаниям {4}." -f $extension, $baseKey, (Join-Path $unitTestsDir $extension), @($taken.Tests).Count, @($taken.Problems).Count) -ForegroundColor Green
+            foreach ($problem in @($taken.Problems | Select-Object -First 10)) { Write-Host ('  ' + (Format-UtProblem $problem)) -ForegroundColor Yellow }
+            Write-Host ("Архив для отправки в репозиторий площадки: {0}" -f $zip) -ForegroundColor Green
+        }
+    }
+    else {
+        Invoke-UtPrepare -Force ($Tests -eq 'Load')
+        if ($Tests -eq 'Run') {
+            $runStepName = 'Модульные тесты'
+            if ($TestFilter) { $runStepName = 'Модульный тест {0}' -f $TestFilter }
+            Invoke-UtStep -StepName $runStepName -Filter $TestFilter
+        }
+        $serviceFailed = @($script:Steps | Where-Object { $_.status -eq 'FAIL' }).Count
+        if ($script:Steps.Count -eq 0) { Write-Host 'Загружать нечего: файлы тестов не менялись или их нет (подробности - run.log).' }
+    }
+    Write-Host ("Папка запуска: {0}" -f $RunDir)
+    if ($serviceFailed -gt 0) { exit 1 }
+    exit 0
+}
+
+#endregion
+
 #region Шаги
 
 # Размеры того, что грузится: от них зависит длительность загрузки и обновления (stats.ps1).
@@ -3931,6 +4661,9 @@ foreach ($proc in $kitProcessings) {
     if ($proc.Kind -eq 'epfdir') { $planSteps.Add(("Собрать {0} из файлов" -f $proc.Name)) }
     $planSteps.Add(("Записать в справочник {0}" -f $proc.Name))
 }
+if ($runUnitTests -and -not $processingOnly) {
+    foreach ($unitName in $unitTestExtensions) { if (Test-UtSourceChanged $unitName) { $planSteps.Add(('Тесты: загрузить {0}' -f $unitName)) } }
+}
 if ($processingOnly) { $planSteps.Add('Проверки конфигуратором, канарейка, самопроверка') }
 elseif (-not $SkipChecks) {
     $planKeys = @('all')
@@ -3958,6 +4691,7 @@ elseif ($runSelfCheck -or $SkipSelfCheck) {
     if ($kitItems.Count -gt 0) { $planSteps.Add('Самопроверка после загрузки') } else { $planSteps.Add('Самопроверка') }
     if ($runCoverage -and -not $SkipSelfCheck) { $planSteps.Add('Карта покрытия') }
 }
+if ($runUnitTests -and -not $processingOnly) { $planSteps.Add('Модульные тесты') }
 # Параллельная проверка конфигурации кончается последней - перед вердиктом.
 if ($parallelCheckConfig -and -not $processingOnly -and -not $SkipChecks) {
     foreach ($planKey in @(@($checkOnly | ForEach-Object { [string]$_ }) + @('all') | Select-Object -First 1)) { $planSteps.Add(("Проверка конфигурации ({0})" -f $planKey)) }
@@ -4396,6 +5130,13 @@ foreach ($proc in $kitProcessings) {
     }
 }
 
+# 3б. Тестовые расширения (модульные тесты YAxUnit): из файлов в тестовую базу, если файлы новые, - до проверок,
+# пока конфигуратор свободен. Комплект не прошёл или он только из внешних обработок - тесты не нужны.
+if ($runUnitTests -and $proceed -and -not $processingOnly -and -not $script:StopRun) {
+    Invoke-UtPrepare
+    $script:UtCheckIgnore = Get-UtCheckIgnorePattern
+}
+
 # 4. Проверки конфигуратором.
 if ($processingOnly) {
     # Один шаг вместо трёх пропусков: пропуск красит вердикт в жёлтый, а здесь проверять нечего.
@@ -4704,6 +5445,15 @@ else {
 }
 
 #endregion
+
+# 7. Модульные тесты YAxUnit: после самопроверки, пока проверка конфигурации ещё идёт параллельно.
+if ($runUnitTests -and -not $processingOnly) {
+    $canaryBroken = (@($script:Steps | Where-Object { $_.name -like 'Канареечный вход*' -and $_.status -eq 'FAIL' }).Count -gt 0)
+    if (-not $proceed) { Add-StepResult -Name 'Модульные тесты' -Status 'SKIP' -Detail 'пропущено: загрузка не прошла' }
+    elseif ($script:StopRun) { Add-StepResult -Name 'Модульные тесты' -Status 'SKIP' -Detail 'пропущено: прогон остановлен' }
+    elseif ($canaryBroken) { Add-StepResult -Name 'Модульные тесты' -Status 'SKIP' -Detail 'пропущено: канареечный вход не прошёл, сеанс не запускается' }
+    else { Invoke-UtStep }
+}
 
 # Проверка конфигурации, которая шла параллельно: дождаться и оценить, как обычно.
 if ($null -ne $script:BackgroundCheck) { Complete-BackgroundCheck }

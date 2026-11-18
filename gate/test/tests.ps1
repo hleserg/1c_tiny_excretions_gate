@@ -54,7 +54,7 @@ function New-Sandbox {
     param([string]$Name, [hashtable]$Config = @{})
     $dir = Join-Path $workRoot $Name
     foreach ($sub in @('bin', 'tools', 'inbox', 'fake')) { New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null }
-    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1')) {
+    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1')) {
         Copy-Item -LiteralPath (Join-Path $ciRoot $script) -Destination $dir
     }
     # Подставной COM для deploy.ps1: скрипт берёт его из test\ рядом с собой, когда задан CI_FAKE_COM.
@@ -374,6 +374,65 @@ $coverageDumpSecond = @{
     'Documents/РеализацияТоваровУслуг/Ext/ObjectModule.bsl' = "&Вместо(`"ПередЗаписью`")`nПроцедура Адаптация_ПередЗаписью(Отказ, РежимЗаписи, РежимПроведения)`nКонецПроцедуры"
     'ScheduledJobs/Адаптация_Чистка.xml' = '<MetaDataObject><ScheduledJob><Properties><Name>Адаптация_Чистка</Name><MethodName>CommonModule.Адаптация_Сервер.Чистка</MethodName></Properties></ScheduledJob></MetaDataObject>'
 }
+
+# Модульные тесты YAxUnit: выгрузка тестового расширения «Тесты» в файлах (папка tests\Тесты песочницы или любая).
+$unitModuleClean = @(
+    '#Область СлужебныйПрограммныйИнтерфейс', '',
+    'Процедура ИсполняемыеСценарии() Экспорт', '',
+    '	ЮТТесты',
+    '		.ДобавитьТест("Сложение", "Сложение двух чисел", "быстрый")',
+    '		.ДобавитьТест("Вычитание", "Вычитание");', '',
+    'КонецПроцедуры', '',
+    '#КонецОбласти', '',
+    '#Область Тесты', '',
+    '// @Тест Сложение двух чисел',
+    '// @Проверяет CommonModule.Пример.Сложить',
+    '// @Как складываем 2 и 2,',
+    '//   сравниваем с 4',
+    '// @Зачем арифметика должна работать',
+    '// @Автор Тестов А.Б. 20261118',
+    '// @Теги быстрый',
+    'Процедура Сложение() Экспорт',
+    '	ЮТест.ОжидаетЧто(2 + 2).Равно(4); // «//» в строке "http://x" - не комментарий',
+    'КонецПроцедуры', '',
+    '// @Тест Вычитание',
+    '// @Проверяет CommonModule.Пример.Вычесть',
+    '// @Как вычитаем',
+    '// @Зачем чтобы было',
+    '// @Автор Тестов А.Б. 20261118',
+    'Процедура Вычитание() Экспорт',
+    '	ЮТест.ОжидаетЧто(4 - 2).Равно(2);',
+    'КонецПроцедуры', '',
+    '#КонецОбласти') -join "`r`n"
+
+function Add-UnitTestSource {
+    # Выгрузка расширения «Тесты» в файлах: подсистема Тесты_Общие, модуль ОМ_Пример. Dir - корень (tests песочницы).
+    param([string]$Dir, [string]$Module = $unitModuleClean)
+    $root = Join-Path $Dir 'Тесты'
+    $ns = 'xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xr="http://v8.1c.ru/8.3/xcf/readable" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="2.20"'
+    $files = @{
+        'Configuration.xml' = ('<?xml version="1.0" encoding="UTF-8"?>' + "`r`n" + '<MetaDataObject ' + $ns + '>' + "`r`n" + '	<Configuration uuid="00000000-0000-0000-0000-000000000001">' + "`r`n" +
+            '		<Properties>' + "`r`n" + '			<Name>Тесты</Name>' + "`r`n" + '		</Properties>' + "`r`n" + '		<ChildObjects>' + "`r`n" + '			<Language>Русский</Language>' + "`r`n" +
+            '			<Subsystem>Тесты_Общие</Subsystem>' + "`r`n" + '			<CommonModule>ОМ_Пример</CommonModule>' + "`r`n" + '		</ChildObjects>' + "`r`n" + '	</Configuration>' + "`r`n" + '</MetaDataObject>')
+        'Subsystems\Тесты_Общие.xml' = ('<?xml version="1.0" encoding="UTF-8"?>' + "`r`n" + '<MetaDataObject ' + $ns + '>' + "`r`n" + '	<Subsystem uuid="00000000-0000-0000-0000-000000000002">' + "`r`n" +
+            '		<Properties>' + "`r`n" + '			<Name>Тесты_Общие</Name>' + "`r`n" + '			<Synonym><v8:item><v8:lang>ru</v8:lang><v8:content>Общие</v8:content></v8:item></Synonym>' + "`r`n" +
+            '			<Content>' + "`r`n" + '				<xr:Item xsi:type="xr:MDObjectRef">CommonModule.ОМ_Пример</xr:Item>' + "`r`n" + '			</Content>' + "`r`n" +
+            '		</Properties>' + "`r`n" + '		<ChildObjects/>' + "`r`n" + '	</Subsystem>' + "`r`n" + '</MetaDataObject>')
+        'CommonModules\ОМ_Пример.xml' = ('<?xml version="1.0" encoding="UTF-8"?>' + "`r`n" + '<MetaDataObject ' + $ns + '><CommonModule uuid="00000000-0000-0000-0000-000000000003"><Properties><Name>ОМ_Пример</Name><Server>true</Server></Properties></CommonModule></MetaDataObject>')
+        'CommonModules\ОМ_Пример\Ext\Module.bsl' = $Module
+    }
+    foreach ($relative in $files.Keys) {
+        $path = Join-Path $root $relative
+        New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
+        [System.IO.File]::WriteAllText($path, $files[$relative], $utf8Bom)
+    }
+    return $root
+}
+
+# Ответы YAxUnit подставной 1С: оба теста модуля ОМ_Пример прошли / Вычитание упало.
+$unitAllOk = @{ cases = @(@{ module = 'ОМ_Пример'; method = 'Сложение'; name = 'Сложение двух чисел'; status = 'ok' }, @{ module = 'ОМ_Пример'; method = 'Вычитание'; name = 'Вычитание'; status = 'ok' }) }
+$unitMinusFails = @{ cases = @(@{ module = 'ОМ_Пример'; method = 'Сложение'; name = 'Сложение двух чисел'; status = 'ok' }, @{ module = 'ОМ_Пример'; method = 'Вычитание'; name = 'Вычитание'; status = 'fail'; message = 'ожидали 2, а было 3' }) }
+$unitConfig = @{ UnitTestExtensions = @('Тесты') }
 
 # deploy.ps1: базы кластера (подставной COM), рабочая - erp_base, запретных часов нет.
 $deployConfig = @{ File = ''; Server = 'fake'; Base = 'erp_temp_test'; ProdBase = 'erp_base'; DeployDeniedFrom = 0; DeployDeniedTo = 0; ComTimeoutSec = 60 }
@@ -1535,6 +1594,239 @@ $tests = @(
             }
             else { Check $false ("нет файла пароля {0}" -f $passPath) }
             Check (-not ([System.IO.File]::ReadAllText((Join-Path $sb 'config.psd1'), $utf8).Contains('тест-пароль'))) 'пароль попал в config.psd1'
+        }
+    },
+    @{
+        Name = 'unit-catalog'
+        Text = 'модульные тесты без 1С: каталог и замечания к шапкам, jUnit, сравнение с эталоном, заготовки, выключение, хеш папки'
+        Run = {
+            param($Name)
+            . (Join-Path $ciRoot 'unittests.ps1')
+            $dir = Join-Path $workRoot $Name
+            $bad = $unitModuleClean.Replace('// @Зачем чтобы было' + "`r`n", '').Replace('"Вычитание");', '"Вычитать");') + "`r`n`r`n// @Тест Без регистрации`r`nПроцедура БезРегистрации() Экспорт`r`nКонецПроцедуры`r`n"
+            $root = Add-UnitTestSource -Dir $dir -Module $bad
+            $catalog = Get-UtCatalog -Dir $root
+            Check ($catalog.Extension -eq 'Тесты') ("имя расширения {0}" -f $catalog.Extension)
+            Check (@($catalog.Tests).Count -eq 3) ("тестов {0}, ждали 3" -f @($catalog.Tests).Count)
+            $plus = @($catalog.Tests | Where-Object { $_.Method -eq 'Сложение' })[0]
+            Check ($plus.Subsystem -eq 'Тесты_Общие' -and $plus.SubsystemName -eq 'Общие') ("подсистема {0} / {1}" -f $plus.Subsystem, $plus.SubsystemName)
+            Check ($plus.How -eq "складываем 2 и 2,`nсравниваем с 4") ("@Как с продолжением: «{0}»" -f $plus.How)
+            Check (@($plus.Tags) -contains 'быстрый' -and @($plus.Problems).Count -eq 0) ("Сложение: теги {0}, замечания {1}" -f (@($plus.Tags) -join ','), (@($plus.Problems) -join ' | '))
+            $kinds = @($catalog.Problems | ForEach-Object { '{0}:{1}' -f $_.Method, $_.Kind })
+            foreach ($expected in @('Вычитание:field', 'Вычитание:presentation', 'БезРегистрации:notregistered', 'БезРегистрации:field')) {
+                Check ($kinds -contains $expected) ("нет замечания {0}: {1}" -f $expected, ($kinds -join ', '))
+            }
+            Check ($kinds -notcontains 'Сложение:field') 'замечание к полной шапке'
+            # Хеш: те же тексты с LF вместо CRLF и без BOM - тот же хеш; другой текст - другой.
+            $hash = Get-UtDirHash $root
+            $copy = Join-Path $dir 'копия'
+            Copy-Item -LiteralPath $root -Destination $copy -Recurse
+            $moduleCopy = Join-Path $copy 'CommonModules\ОМ_Пример\Ext\Module.bsl'
+            [System.IO.File]::WriteAllText($moduleCopy, ([System.IO.File]::ReadAllText($moduleCopy, $utf8).TrimStart([char]0xFEFF).Replace("`r`n", "`n")), $utf8)
+            Check ((Get-UtDirHash $copy) -eq $hash) 'хеш зависит от BOM и переводов строк'
+            [System.IO.File]::AppendAllText($moduleCopy, "`n// правка", $utf8)
+            Check ((Get-UtDirHash $copy) -ne $hash) 'хеш не заметил правку'
+            # Заготовки: новый модуль и новый тест - без замечаний; выключить и включить.
+            $null = New-UtModule -Dir $root -Name 'ОМ_Новый' -Subsystem 'Тесты_Общие' -Method 'Первый' -Presentation 'Первый тест' -Checks 'CommonModule.Новый.Метод' -How 'вызываем' -Why 'надо' -Author 'Тестов А.Б. 20261118'
+            $null = Add-UtTest -Dir $root -Module 'ОМ_Новый' -Method 'Второй' -Presentation 'Второй тест' -Checks 'CommonModule.Новый.Другой' -How 'так' -Why 'потому' -Author 'Тестов А.Б. 20261118' -Tags 'медленный'
+            $after = Get-UtCatalog -Dir $root
+            $newTests = @($after.Tests | Where-Object { $_.Module -eq 'ОМ_Новый' })
+            Check ($newTests.Count -eq 2) ("в новом модуле тестов {0}, ждали 2" -f $newTests.Count)
+            Check (@($after.Problems | Where-Object { $_.Module -eq 'ОМ_Новый' }).Count -eq 0) ("замечания к заготовкам: " + (@($after.Problems | Where-Object { $_.Module -eq 'ОМ_Новый' } | ForEach-Object { Format-UtProblem $_ }) -join ' | '))
+            Check (@($newTests | Where-Object { $_.Subsystem -eq 'Тесты_Общие' }).Count -eq 2) 'новый модуль не попал в подсистему'
+            $null = Set-UtDisabled -Dir $root -Module 'ОМ_Новый' -Method 'Первый' -Reason 'ломается на пустой базе'
+            $off = @((Get-UtCatalog -Dir $root).Tests | Where-Object { $_.Key -eq 'ОМ_Новый.Первый' })[0]
+            Check ($off.Disabled -eq 'ломается на пустой базе') ("выключение: «{0}»" -f $off.Disabled)
+            $null = Set-UtDisabled -Dir $root -Module 'ОМ_Новый' -Method 'Первый' -Reason ''
+            $on = @((Get-UtCatalog -Dir $root).Tests | Where-Object { $_.Key -eq 'ОМ_Новый.Первый' })[0]
+            Check (-not $on.Disabled -and @($on.Problems).Count -eq 0) ("включение: «{0}», замечания {1}" -f $on.Disabled, (@($on.Problems) -join ' | '))
+            # jUnit YAxUnit и сравнение с эталоном.
+            $junit = Join-Path $dir 'junit.xml'
+            [System.IO.File]::WriteAllText($junit, ('<?xml version="1.0" encoding="UTF-8"?><testsuites><testsuite classname="ОМ_Пример" context="Сервер" name="ОМ_Пример [Сервер]">' +
+                    '<testcase name="Сложение двух чисел" classname="ОМ_Пример.Сложение" context="Сервер" time="0.5"/>' +
+                    '<testcase name="Вычитание" classname="ОМ_Пример.Вычитание" context="Сервер" time="0.1"><failure message="ожидали 2, а было 3"/></testcase>' +
+                    '<testcase name="Вычитание" classname="ОМ_Пример.Вычитание" context="Сервер" time="0.1"/>' +
+                    '</testsuite><testsuite classname="ОМ_Сломан" context="Сервер" name="ОМ_Сломан [Сервер]"><error message="модуль не компилируется"/></testsuite></testsuites>'), $utf8)
+            $results = @(Read-UtJUnit $junit)
+            $keys = @($results | ForEach-Object { '{0}={1}' -f $_.Key, $_.Status })
+            foreach ($expected in @('ОМ_Пример.Сложение [Сервер]=OK', 'ОМ_Пример.Вычитание [Сервер]=FAIL', 'ОМ_Пример.Вычитание [Сервер] #2=OK', 'ОМ_Сломан [Сервер] набор=ERROR')) {
+                Check ($keys -contains $expected) ("в разборе jUnit нет {0}: {1}" -f $expected, ($keys -join ', '))
+            }
+            $baselineFile = Join-Path $dir 'baseline.txt'
+            [System.IO.File]::WriteAllLines($baselineFile, [string[]]@("OK`tОМ_Пример.Сложение [Сервер]`t", "FAIL`tОМ_Сломан [Сервер] набор`tстарое", "OK`tОМ_Пропал.Тест [Сервер]`t"), $utf8Bom)
+            $comparison = Compare-UtResults -Current $results -BaselineFile $baselineFile
+            $newKeys = (@($comparison.NewFailed | ForEach-Object { $_.Key }) -join ',')
+            Check ($newKeys -eq 'ОМ_Пример.Вычитание [Сервер]') ("новые падения: " + $newKeys)
+            Check (@($comparison.KnownFailed).Count -eq 1 -and @($comparison.Gone) -contains 'ОМ_Пропал.Тест [Сервер]') 'известное падение или пропавший тест не опознаны'
+        }
+    },
+    @{
+        Name = 'gate-unittests-first-load'
+        Text = 'модульные тесты: тестовое расширение из файлов грузится в temp (его там не было), YAxUnit прогоняет, эталон записан; второй прогон не грузит заново; замечания проверки конфигурации по модулям тестов не в счёт'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $unitConfig
+            $null = Add-UnitTestSource -Dir (Join-Path $sb 'tests')
+            $checkLog = '{ОбщийМодуль.ОМ_Пример.Модуль(5,2)}: Переменная не определена (ЮТТесты)'
+            $fake = @{ absent = @('Тесты'); unittests = @($unitAllOk); designer = @(@{ match = @('/CheckConfig'); exit = 101; log = $checkLog }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            Check-Step $r 'Тесты: загрузить Тесты' 'OK'
+            Check-Step $r 'Модульные тесты' 'OK'
+            Check-Step $r 'Проверка конфигурации' 'OK'
+            Check ((Get-Calls $r @('/LoadConfigFromFiles', '-Extension Тесты')).Count -eq 1) 'тесты не загружены из файлов'
+            Check ((Get-Calls $r @('/UpdateDBCfg', '-Extension Тесты')).Count -eq 1) 'конфигурация БД тестового расширения не обновлена'
+            Check ((Get-Calls $r @('RunUnitTests=')).Count -eq 1) 'YAxUnit не запускался'
+            Check (Test-Path -LiteralPath (Join-Path $sb 'baseline\erp_temp_test\unittests.txt')) 'эталон модульных тестов не записан'
+            Check (Test-Path -LiteralPath (Join-Path $sb 'state\unittests\Тесты.state.txt')) 'нет состояния тестового расширения'
+            if ($r.RunDir) {
+                Check (Test-Path -LiteralPath (Join-Path $r.RunDir 'unittests-Тесты.catalog.txt')) 'нет каталога тестов в папке прогона'
+                $json = [System.IO.File]::ReadAllText((Join-Path $r.RunDir 'unittests\yaxunit.json'), $utf8) | ConvertFrom-Json
+                Check (@($json.filter.extensions) -contains 'Тесты' -and $json.closeAfterTests -eq $true -and $json.reportFormat -eq 'jUnit') 'настройки YAxUnit не те'
+            }
+            $second = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
+            Check-Common $second; Check-Verdict $second 'GREEN' 0
+            Check ((Get-Calls $second @('/LoadConfigFromFiles', '-Extension Тесты')).Count -eq 1) 'файлы не менялись, а тесты загружены второй раз'
+            Check ($null -eq (Get-Step $second 'Тесты: загрузить')) 'шаг загрузки тестов во втором прогоне'
+        }
+    },
+    @{
+        Name = 'gate-unittests-new-failure-accept'
+        Text = 'модульные тесты: новое падение - красный, unittests.new.txt; принять в эталон - то же падение потом известное, зелёный'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $unitConfig
+            $null = Add-UnitTestSource -Dir (Join-Path $sb 'tests')
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ absent = @('Тесты'); unittests = @($unitAllOk) }
+            Check-Verdict $r 'GREEN' 0
+            $red = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ unittests = @($unitMinusFails) }
+            Check-Common $red; Check-Verdict $red 'RED' 1
+            Check-Step $red 'Модульные тесты' 'FAIL'
+            if ($red.RunDir) {
+                $new = Join-Path $red.RunDir 'unittests.new.txt'
+                Check ((Test-Path -LiteralPath $new) -and ([System.IO.File]::ReadAllText($new, $utf8) -match 'ОМ_Пример\.Вычитание \[Сервер\]')) 'новое падение не в unittests.new.txt'
+            }
+            $accept = Invoke-Script -Sandbox $sb -Answers @(
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Принять новое последнего прогона в эталон' },
+                @{ Kind = 'confirm'; Header = 'Принять новое прогона'; Yes = $true },
+                @{ Kind = 'one'; Header = 'Посмотрел'; Item = '^Вернуться в меню' },
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
+            Check-Common $accept
+            Check (@($accept.Output | Where-Object { $_ -match 'Принято как известное: результаты модульных тестов' }).Count -eq 1) 'результаты модульных тестов не приняты в эталон'
+            $known = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ unittests = @($unitMinusFails) }
+            Check-Common $known; Check-Verdict $known 'GREEN' 0
+            $step = Get-Step $known 'Модульные тесты'
+            Check ($null -ne $step -and [string]$step.detail -match 'известных 1') ("после принятия: {0}" -f $(if ($null -ne $step) { $step.detail } else { 'шага нет' }))
+        }
+    },
+    @{
+        Name = 'gate-unittests-edited-in-temp'
+        Text = 'модульные тесты: в temp правили в конфигураторе, а файлы новые - вопрос; «Забрать из temp» кладёт правку в файлы и архив, загрузки нет; дальше без вопросов'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $unitConfig
+            $source = Add-UnitTestSource -Dir (Join-Path $sb 'tests')
+            $fake = @{ absent = @('Тесты'); unittests = @($unitAllOk) }
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
+            Check-Verdict $r 'GREEN' 0
+            # Правка в «конфигураторе temp» - в базе подставной 1С; и новые файлы тестов (новый комплект).
+            $stored = Join-Path $sb 'fake\ext\Тесты\CommonModules\ОМ_Пример\Ext\Module.bsl'
+            [System.IO.File]::AppendAllText($stored, "`r`n// правка в конфигураторе", $utf8)
+            [System.IO.File]::AppendAllText((Join-Path $source 'CommonModules\ОМ_Пример\Ext\Module.bsl'), "`r`n// правка в файлах", $utf8)
+            $q = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake -Answers @(
+                @{ Kind = 'one'; Header = 'правили в конфигураторе'; Item = '^Забрать тесты' })
+            Check-Common $q; Check-Verdict $q 'GREEN' 0
+            Check ((Get-Calls $q @('/LoadConfigFromFiles', '-Extension Тесты')).Count -eq 1) 'после «Забрать» тесты всё равно загружены из файлов'
+            $text = [System.IO.File]::ReadAllText((Join-Path $source 'CommonModules\ОМ_Пример\Ext\Module.bsl'), $utf8)
+            Check ($text.Contains('правка в конфигураторе') -and -not $text.Contains('правка в файлах')) 'в файлах тестов не то, что в temp'
+            Check (@(Get-ChildItem -LiteralPath (Join-Path $sb 'out') -Filter 'Тесты_*.zip' -ErrorAction SilentlyContinue).Count -eq 1) 'нет архива для отправки в out'
+            Check (@(Get-ChildItem -LiteralPath (Join-Path $sb 'tests\.old') -Directory -ErrorAction SilentlyContinue).Count -eq 1) 'прежние файлы тестов не сохранены в tests\.old'
+            if ($q.RunDir) { Check (Test-Path -LiteralPath (Join-Path $q.RunDir 'unittests\Тесты-temp-before')) 'нет копии тестов temp в папке прогона' }
+            $third = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
+            Check-Common $third; Check-Verdict $third 'GREEN' 0
+            Check ($null -eq (Get-Step $third 'Тесты: загрузить')) 'после «Забрать» снова шаг загрузки тестов'
+        }
+    },
+    @{
+        Name = 'menu-unittests-new-take-run'
+        Text = 'меню «Тесты»: новый тест по шаблону в файлах, проверка описаний, прогон одного теста из карточки, забрать из temp'
+        Run = {
+            param($Name)
+            $config = @{ UnitTestExtensions = @('Тесты'); UnitTestAuthor = 'Тестов А.Б.' }
+            $sb = New-Sandbox $Name -Config $config
+            $source = Add-UnitTestSource -Dir (Join-Path $sb 'tests')
+            $fake = @{ absent = @('Тесты'); unittests = @($unitAllOk) }
+            $r = Invoke-Script -Sandbox $sb -Fake $fake -Answers @(
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Модульные тесты' },
+                @{ Kind = 'one'; Header = 'Модульные тесты \(YAxUnit\)'; Item = '^Новый тест' },
+                @{ Kind = 'one'; Header = 'в какой модуль'; Item = '^ОМ_Пример' },
+                @{ Kind = 'text'; Header = 'Имя процедуры теста'; Text = 'Умножение' },
+                @{ Kind = 'text'; Header = '^@Тест'; Text = 'Умножение двух чисел' },
+                @{ Kind = 'text'; Header = '^@Проверяет'; Text = 'CommonModule.Пример.Умножить' },
+                @{ Kind = 'text'; Header = '^@Как'; Text = 'умножаем 2 на 3' },
+                @{ Kind = 'text'; Header = '^@Зачем'; Text = 'проверка меню' },
+                @{ Kind = 'text'; Header = '^@Теги'; Text = '' },
+                @{ Kind = 'one'; Header = 'Посмотрел'; Item = '^Вернуться к тестам' },
+                @{ Kind = 'one'; Header = 'Модульные тесты \(YAxUnit\)'; Item = '^Проверить описания' },
+                @{ Kind = 'one'; Header = 'Модульные тесты \(YAxUnit\)'; Item = '^Список тестов' },
+                @{ Kind = 'one'; Header = '^Тесты \('; Item = 'ОМ_Пример\.Сложение' },
+                @{ Kind = 'one'; Header = 'Сложение двух чисел'; Item = '^Прогнать только этот' },
+                @{ Kind = 'one'; Header = 'Посмотрел'; Item = '^Вернуться к тестам' },
+                @{ Kind = 'one'; Header = '^Тесты \('; Cancel = $true },
+                @{ Kind = 'one'; Header = 'Модульные тесты \(YAxUnit\)'; Item = '^Забрать тесты' },
+                @{ Kind = 'one'; Header = 'Посмотрел'; Item = '^Вернуться к тестам' },
+                @{ Kind = 'one'; Header = 'Модульные тесты \(YAxUnit\)'; Item = '^Назад' },
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            Check ($r.UnusedAnswers -eq 0) ("тест ждал вопросов, а их не было: {0}" -f $r.UnusedAnswers)
+            $crash = @($r.Output | Where-Object { $_ -match '^Остановлено: |ParserError|Не получилось' })
+            Check ($crash.Count -eq 0) ("ошибка: " + (($crash | Select-Object -First 3) -join ' | '))
+            # Прогон одного теста: фильтр YAxUnit - только он; загрузились файлы с новым тестом (его в temp не было).
+            $runs = @(Get-ChildItem -LiteralPath (Join-Path $sb 'tests-runs') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*-run' })
+            Check ($runs.Count -eq 1) ("служебных прогонов тестов {0}, ждали 1" -f $runs.Count)
+            if ($runs.Count -eq 1) {
+                $json = [System.IO.File]::ReadAllText((Join-Path $runs[0].FullName 'unittests\yaxunit.json'), $utf8) | ConvertFrom-Json
+                Check ((@($json.filter.tests) -join ',') -eq 'ОМ_Пример.Сложение') ("фильтр одного теста: {0}" -f (@($json.filter.tests) -join ','))
+                Check ($json.filter.tests -is [array] -and $json.filter.extensions -is [array]) 'filter.tests и filter.extensions в настройках YAxUnit - не массивы JSON'
+            }
+            Check ((Get-Calls $r @('/LoadConfigFromFiles', '-Extension Тесты')).Count -eq 1) 'новые файлы тестов не загружены перед прогоном'
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'baseline\erp_temp_test\unittests.txt'))) 'прогон одного теста записал эталон'
+            # Забрали из temp: в файлах - то, что загружено (с новым тестом), в out - архив.
+            $text = [System.IO.File]::ReadAllText((Join-Path $source 'CommonModules\ОМ_Пример\Ext\Module.bsl'), $utf8)
+            Check ($text.Contains('// @Тест Умножение двух чисел') -and $text.Contains('.ДобавитьТест("Умножение", "Умножение двух чисел");')) 'новый тест не в файлах'
+            Check ($text -match '// @Автор Тестов А\.Б\. \d{8}') 'автор нового теста без даты'
+            Check (@(Get-ChildItem -LiteralPath (Join-Path $sb 'out') -Filter 'Тесты_*.zip' -ErrorAction SilentlyContinue).Count -eq 1) 'нет архива «Забрать тесты»'
+        }
+    },
+    @{
+        Name = 'deploy-unittest-extension-guard'
+        Text = 'deploy: тестовое расширение в DeployExtensions - отказ, в рабочую тесты не уходят'
+        Run = {
+            param($Name)
+            $config = @{}
+            foreach ($key in $deployConfig.Keys) { $config[$key] = $deployConfig[$key] }
+            $config['DeployExtensions'] = @('Адаптация', 'Тесты')
+            $sb = New-Sandbox $Name -Config $config
+            [System.IO.File]::WriteAllLines((Join-Path $sb 'config.site.psd1'), [string[]]@('@{', "    UnitTestExtensions = @('Тесты')", '}'), $utf8Bom)
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-StatusOnly' -Com (New-ComState)
+            Check ($r.ExitCode -ne 0) 'deploy с тестовым расширением в DeployExtensions не остановился'
+            Check (@($r.Output | Where-Object { $_ -match 'тестовое расширение' }).Count -gt 0) 'нет объяснения про тестовое расширение'
+            Check (@($r.Calls | Where-Object { $_.Line.Contains('/LoadCfg') }).Count -eq 0) 'deploy что-то загружал'
+        }
+    },
+    @{
+        Name = 'settings-site-not-shadowed'
+        Text = 'настройки: пустое значение в config.psd1 не закрывает config.site.psd1 (убирается), умолчание для ключа площадки не дописывается; гейт берёт значение площадки'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ ContractorExtensions = @() }
+            [System.IO.File]::WriteAllLines((Join-Path $sb 'config.site.psd1'), [string[]]@('@{', "    ContractorExtensions = @('Доработки')", "    UnitTestAuthor = 'Тестов А.Б.'", '}'), $utf8Bom)
+            $r = Invoke-Script -Sandbox $sb -Script 'settings.ps1' -Answers @(@{ Kind = 'one'; Header = '^Настройки: '; Item = '^Готово$' })
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            $config = Import-PowerShellDataFile -LiteralPath (Join-Path $sb 'config.psd1')
+            Check (-not $config.ContainsKey('ContractorExtensions')) 'пустой ContractorExtensions остался в config.psd1 и закрывает настройку площадки'
+            Check (-not $config.ContainsKey('UnitTestAuthor')) 'умолчание UnitTestAuthor дописано поверх настройки площадки'
+            Check ($config.ContainsKey('ReleaseJobsLock')) 'обычные умолчания не дописаны'
         }
     }
 )
