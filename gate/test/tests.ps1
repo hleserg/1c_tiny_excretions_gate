@@ -1254,6 +1254,31 @@ $tests = @(
         }
     },
     @{
+        Name = 'deploy-base-state'
+        Text = '«Показать состояние баз»: блокировка сеансов (код тот же), сообщение, регламентные, конфигуратор; в базе ничего не меняется'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-ComState -ProdJobsDenied $true -Sessions @(@{ id = 9; base = 'erp_base'; app = 'Designer'; user = 'Разработчик'; host = 'pc9' })
+            $com.bases.erp_base.sessionsDenied = $true
+            $com.bases.erp_base.permissionCode = '0'
+            $com.bases.erp_base.deniedMessage = 'Идёт обновление'
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-BaseState' -Com $com
+            Check-DeployCommon $r -LocksExpected $false
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            $text = $r.Output -join "`n"
+            Check ($text -match 'Блокировка начала сеансов: ВКЛЮЧЕНА') 'нет блокировки сеансов рабочей'
+            Check ($text -match 'код разрешения: тот же, что UnlockCode') 'нет строки о коде разрешения'
+            Check ($text -match 'сообщение: Идёт обновление') 'нет сообщения блокировки'
+            Check ($text -match 'Блокировка регламентных заданий: ВКЛЮЧЕНА') 'нет блокировки регламентных'
+            Check ($text -match 'из них конфигураторов: 1') 'нет конфигуратора в сеансах'
+            Check (@($r.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'состояние баз что-то поменяло'
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'deploy\state\deploy.json'))) 'появился deploy.json'
+            $runDirs = @(Get-ChildItem -LiteralPath (Join-Path $sb 'deploy') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8}-\d{6}$' })
+            Check ($runDirs.Count -eq 0) 'показ состояния создал папку запуска обновления'
+        }
+    },
+    @{
         Name = 'deploy-epf-only'
         Text = 'только внешние обработки: новая обработка записана, блокировок нет, чужая блокировка регламентных заданий не снята'
         Run = {

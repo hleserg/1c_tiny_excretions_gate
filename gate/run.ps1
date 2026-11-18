@@ -2311,6 +2311,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         $menu.Add([pscustomobject]@{ Key = 'settings'; Label = 'Настройки (config.psd1)' })
         if (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1')) {
             $menu.Add([pscustomobject]@{ Key = 'deploy'; Label = 'Обновить рабочую базу (deploy)' })
+            $menu.Add([pscustomobject]@{ Key = 'basestate'; Label = 'Показать состояние баз: блокировки и сеансы' })
             $menu.Add([pscustomobject]@{ Key = 'rollback'; Label = 'Откатить рабочую базу' })
             $menu.Add([pscustomobject]@{ Key = 'pullext'; Label = 'Подтянуть расширения из рабочей (в inbox)' })
             $menu.Add([pscustomobject]@{ Key = 'pullepf'; Label = 'Подтянуть обработки из рабочей (в inbox)' })
@@ -2345,6 +2346,14 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         if ($choice -eq 'rollback') {
             if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -Rollback -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') -Rollback }
             exit $LASTEXITCODE
+        }
+        if ($choice -eq 'basestate') {
+            # Только чтение: блокировки и сеансы temp и рабочей - и обратно в меню.
+            try {
+                if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -BaseState -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') -BaseState }
+            }
+            catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+            continue
         }
         if ($choice -eq 'pullext' -or $choice -eq 'pullepf') {
             # Взять из рабочей в inbox и вернуться в меню: новое уже в списке «Прогон с обновлением из inbox».

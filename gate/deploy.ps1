@@ -46,6 +46,8 @@ param(
     # Взять из рабочей в inbox расширения или внешние обработки, которые отличаются от temp.
     [switch]$PullExtensions,
     [switch]$PullProcessings,
+    # Показать состояние баз (блокировка начала сеансов, её даты и сообщение, блокировка регламентных, сеансы) и выйти.
+    [switch]$BaseState,
     # Папка канала интерфейса ci.exe: его задаёт сам ci.exe (или run.ps1 из ci.exe), руками не нужен.
     [string]$UiChannel = ''
 )
@@ -536,16 +538,28 @@ Initialize-Stats -Dir (Resolve-RootPath ([string](Get-Setting $cfg 'StatsDir' 's
 $deployRoot = Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))
 $mirrorRoot = Join-Path $deployRoot 'mirror'
 $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
-$script:RunDir = Join-Path $deployRoot $runId
-New-Item -ItemType Directory -Path $script:RunDir -Force | Out-Null
-$script:RunLogPath = Join-Path $script:RunDir 'run.log'
-Set-StatRun $runId
+if ($BaseState) {
+    # Показать состояние - не запуск обновления: своей папки запуска нет (в истории обновлений его не видно),
+    # журнал - в deploy\state\run.log, каждый раз заново.
+    $script:RunDir = Join-Path $deployRoot 'state'
+    New-Item -ItemType Directory -Path $script:RunDir -Force | Out-Null
+    $script:RunLogPath = Join-Path $script:RunDir 'run.log'
+    [System.IO.File]::WriteAllText($script:RunLogPath, '', $Utf8Bom)
+}
+else {
+    $script:RunDir = Join-Path $deployRoot $runId
+    New-Item -ItemType Directory -Path $script:RunDir -Force | Out-Null
+    $script:RunLogPath = Join-Path $script:RunDir 'run.log'
+    Set-StatRun $runId
+}
 $runsRoot = Resolve-RootPath ([string](Get-Setting $cfg 'RunsDir' 'runs'))
 
-Write-Host ''
-Write-Host ("Обновление рабочей базы {0} из {1}, запуск {2}" -f $script:ProdBase, $script:TempBase, $runId) -ForegroundColor Cyan
-Write-Host ("Папка запуска: {0}" -f $script:RunDir)
-Write-RunLog ("Запуск {0}: {1} -> {2}" -f $runId, $script:TempBase, $script:ProdBase)
+if (-not $BaseState) {
+    Write-Host ''
+    Write-Host ("Обновление рабочей базы {0} из {1}, запуск {2}" -f $script:ProdBase, $script:TempBase, $runId) -ForegroundColor Cyan
+    Write-Host ("Папка запуска: {0}" -f $script:RunDir)
+    Write-RunLog ("Запуск {0}: {1} -> {2}" -f $runId, $script:TempBase, $script:ProdBase)
+}
 
 #endregion
 
@@ -1206,6 +1220,67 @@ function Write-ProcessingBackup {
     catch { Write-RunLog ("Прежняя версия {0} не раскодировалась: {1}" -f $Proc.ObjName, $_.Exception.Message) }
     return $target
 }
+#endregion
+
+#region Состояние баз
+
+function Format-LockDate {
+    # Дата блокировки из кластера: пустая дата 1С (0001 или 0100 год) - «не задана».
+    param($Value)
+    if ($null -eq $Value) { return 'не задана' }
+    try { $date = [datetime]$Value } catch { return [string]$Value }
+    if ($date.Year -lt 1900) { return 'не задана' }
+    return $date.ToString('dd.MM.yyyy HH:mm')
+}
+
+function Show-BaseState {
+    # Блокировки базы и сеансы - только чтение, ничего не меняется.
+    param($Link, [string]$BaseName, [string]$User, [string]$Password)
+    Write-Host ''
+    Write-Line ("{0}" -f $BaseName) 'Cyan'
+    try { $info = (Get-BaseInfo -Link $Link -BaseName $BaseName -User $User -Password $Password).InfoBase }
+    catch { Write-Line ("  свойства базы в кластере не прочитал: {0}" -f $_.Exception.Message) 'Yellow'; $info = $null }
+    if ($null -ne $info) {
+        if ([bool]$info.SessionsDenied) {
+            $now = Get-Date
+            $fromText = Format-LockDate $info.DeniedFrom
+            $toText = Format-LockDate $info.DeniedTo
+            $active = $true
+            try { if ($fromText -ne 'не задана' -and $now -lt [datetime]$info.DeniedFrom) { $active = $false } } catch { }
+            try { if ($toText -ne 'не задана' -and $now -gt [datetime]$info.DeniedTo) { $active = $false } } catch { }
+            $activeText = 'действует сейчас'
+            if (-not $active) { $activeText = 'включена, но сейчас вне её срока' }
+            Write-Line ("  Блокировка начала сеансов: ВКЛЮЧЕНА, {0}" -f $activeText) 'Red'
+            Write-Line ("    с {0} по {1}" -f $fromText, $toText)
+            if ([string]$info.DeniedMessage) { Write-Line ("    сообщение: {0}" -f ([string]$info.DeniedMessage).Trim()) }
+            $code = [string]$info.PermissionCode
+            if (-not $code) { Write-Line '    код разрешения: не задан (войти нельзя никому)' 'Yellow' }
+            elseif ($code -eq $script:UnlockCode) { Write-Line '    код разрешения: тот же, что UnlockCode - гейт и deploy в неё войдут' 'Green' }
+            else { Write-Line '    код разрешения: другой, не UnlockCode - гейт и deploy в неё не войдут' 'Yellow' }
+        }
+        else { Write-Line '  Блокировка начала сеансов: нет' 'Green' }
+        if ([bool]$info.ScheduledJobsDenied) { Write-Line '  Блокировка регламентных заданий: ВКЛЮЧЕНА' 'Red' }
+        else { Write-Line '  Блокировка регламентных заданий: нет' 'Green' }
+    }
+    $sessions = @(Get-BaseSessions $Link $BaseName)
+    $errors = @($sessions | Where-Object { $_.IsError })
+    foreach ($entry in $errors) { Write-Line ("  сеансы не прочитал: {0}" -f $entry.Text) 'Yellow' }
+    $live = @($sessions | Where-Object { -not $_.IsError })
+    if ($errors.Count -eq 0) {
+        $designers = @($live | Where-Object { $_.IsDesigner })
+        Write-Line ("  Сеансов: {0}, из них конфигураторов: {1}" -f $live.Count, $designers.Count)
+        foreach ($entry in $designers) { Write-Line ('    ' + $entry.Text) 'Yellow' }
+    }
+}
+
+if ($BaseState) {
+    Write-Line ("СОСТОЯНИЕ БАЗ на {0}" -f (Get-Date -Format 'dd.MM.yyyy HH:mm:ss')) 'Cyan'
+    $stateLink = Connect-ClusterAgent
+    Show-BaseState -Link $stateLink -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
+    Show-BaseState -Link $stateLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+    exit 0
+}
+
 #endregion
 
 #region Подтянуть из рабочей
