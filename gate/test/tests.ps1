@@ -1216,6 +1216,44 @@ $tests = @(
         }
     },
     @{
+        Name = 'deploy-light-fail-keep-question'
+        Text = 'проверки после обновления нашли проблему: сводка, вопрос кнопками внизу (оставить или откатить); «оставить» - обновлено, блокировки сняты'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $fake = @{ canary = @(@{ status = 'error' }) }
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Fake $fake -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить все' },
+                $deployRiskAnswer, $deployNameAnswer,
+                @{ Kind = 'one'; Header = 'Оставить обновление в erp_base'; Item = '^Оставить$' })
+            Check-DeployCommon $r
+            Check (@($r.Output | Where-Object { $_ -match 'ИТОГ ПРОВЕРОК ПОСЛЕ ОБНОВЛЕНИЯ' }).Count -eq 1) 'нет сводки проверок перед вопросом'
+            $question = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Оставить обновление в erp_base') })
+            Check ($question.Count -eq 1 -and $question[0].Contains('"dock"') -and $question[0].Contains('DeployKeepTimeoutMin')) 'вопрос не внизу экрана или без срока ожидания'
+            $record = Get-DeployRecord $sb
+            if ($null -ne $record) { Check ($record.outcome -eq 'updated') ("итог {0}, ждали updated" -f $record.outcome) } else { Check $false 'нет deploy.json' }
+        }
+    },
+    @{
+        Name = 'deploy-light-fail-no-wait'
+        Text = 'DeployKeepTimeoutMin = 0: после проблемных проверок не спрашивает, обновление оставлено, блокировки сняты'
+        Run = {
+            param($Name)
+            $config = @{}
+            foreach ($key in $deployConfig.Keys) { $config[$key] = $deployConfig[$key] }
+            $config['DeployKeepTimeoutMin'] = 0
+            $sb = New-Sandbox $Name -Config $config
+            $fake = @{ canary = @(@{ status = 'error' }) }
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Fake $fake -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить все' },
+                $deployRiskAnswer, $deployNameAnswer)
+            Check-DeployCommon $r
+            Check (@($r.Output | Where-Object { $_ -match 'не спрашиваю, обновление оставлено' }).Count -eq 1) 'нет строки об оставленном обновлении'
+            $record = Get-DeployRecord $sb
+            if ($null -ne $record) { Check ($record.outcome -eq 'updated') ("итог {0}, ждали updated" -f $record.outcome) } else { Check $false 'нет deploy.json' }
+        }
+    },
+    @{
         Name = 'deploy-epf-only'
         Text = 'только внешние обработки: новая обработка записана, блокировок нет, чужая блокировка регламентных заданий не снята'
         Run = {

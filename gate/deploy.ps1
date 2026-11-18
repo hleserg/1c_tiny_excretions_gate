@@ -514,6 +514,10 @@ $sessionLockHours = [int](Get-Setting $cfg 'SessionLockHours' 2)
 if ($sessionLockHours -lt 1) { $sessionLockHours = 1 }
 $prodSelfCheckForms = [bool](Get-Setting $cfg 'ProdSelfCheckForms' $false)
 $prodSelfCheckTimeoutMin = [int](Get-Setting $cfg 'ProdSelfCheckTimeoutMin' 60)
+# Сколько ждать ответа на «оставить или откатить» после проверок на рабочей. Нет ответа - обновление
+# остаётся: блокировки рабочей (сеансы, регламентные) не должны висеть до утра из-за вопроса. 0 - не спрашивать.
+$deployKeepTimeoutMin = [int](Get-Setting $cfg 'DeployKeepTimeoutMin' 10)
+if ($deployKeepTimeoutMin -lt 0) { $deployKeepTimeoutMin = 0 }
 $timeoutLoadSec = 60 * [int](Get-Setting $cfg 'TimeoutLoadMin' 30)
 $timeoutUpdateSec = 60 * [int](Get-Setting $cfg 'TimeoutUpdateMin' 120)
 $canaryEpf = Resolve-RootPath ([string](Get-Setting $cfg 'CanaryEpf' 'tools\Канарейка.epf'))
@@ -2340,11 +2344,36 @@ if ($outcome -eq 'updated') {
     }
 
     if (@($light | Where-Object { $_.Status -eq 'FAIL' }).Count -gt 0) {
+        # Решение - после всех проверок, и итог их - перед глазами: сводка здесь, вопрос в ci.exe - кнопками
+        # внизу экрана (журнал над ним листается). Отчёт об изменениях и статья в базу знаний - после ответа:
+        # в них пишется, оставлено обновление или откачено.
         Write-Host ''
+        Write-Line 'ИТОГ ПРОВЕРОК ПОСЛЕ ОБНОВЛЕНИЯ' 'Cyan'
+        foreach ($item in $light) {
+            $itemColor = 'Green'
+            if ($item.Status -eq 'FAIL') { $itemColor = 'Red' } elseif ($item.Status -eq 'WARN') { $itemColor = 'Yellow' }
+            Write-Line ("  [{0}] {1}: {2}" -f $item.Status, $item.Name, $item.Text) $itemColor
+        }
         Write-Line 'Лёгкий прогон нашёл проблемы.' 'Red'
         $keepUpdate = $null
+        if ($deployKeepTimeoutMin -eq 0) {
+            $keepUpdate = $true
+            Write-Line '  DeployKeepTimeoutMin = 0: не спрашиваю, обновление оставлено' 'Yellow'
+        }
+        $keepDeadline = (Get-Date).AddMinutes($deployKeepTimeoutMin)
         while ($null -eq $keepUpdate) {
-            $keepUpdate = Confirm-Ui -Question 'Оставить обновление в рабочей базе?' -Yes 'Оставить' -No 'Откатить'
+            $leftMin = [Math]::Max(1, [int][Math]::Ceiling(($keepDeadline - (Get-Date)).TotalMinutes))
+            $picked = Read-UiChoice -Header ("Проверки нашли проблемы. Оставить обновление в {0}?" -f $script:ProdBase) -Keys @('1', '2') `
+                -Labels @('Оставить', 'Откатить к резервным копиям') -DefaultKey '1' -Dock `
+                -Notes @(("Итог проверок - над вопросом, журнал листается. Без ответа ещё ~{0} мин - обновление остаётся (DeployKeepTimeoutMin)." -f $leftMin)) `
+                -Poll { if ((Get-Date) -ge $keepDeadline) { return 'timeout' } return '' }
+            if ($picked -eq '1') { $keepUpdate = $true }
+            elseif ($picked -eq '2') { $keepUpdate = $false }
+            elseif ($picked -eq 'timeout' -or (Get-Date) -ge $keepDeadline) {
+                $keepUpdate = $true
+                Write-Line ("  ответа нет {0} мин: обновление оставлено" -f $deployKeepTimeoutMin) 'Yellow'
+                Write-RunLog ("Ответа на «оставить или откатить» нет {0} мин: обновление оставлено" -f $deployKeepTimeoutMin)
+            }
         }
         if (-not $keepUpdate) {
             if (Invoke-ProdRollback) { $outcome = 'rolledBack' } else { $outcome = 'rollbackFailed' }
