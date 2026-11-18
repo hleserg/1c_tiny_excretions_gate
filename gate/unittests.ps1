@@ -180,7 +180,7 @@ function Get-UtSubsystemMap {
     foreach ($file in @(Get-ChildItem -LiteralPath $root -Recurse -Filter '*.xml' -File)) {
         $relative = $file.FullName.Substring($root.Length + 1)
         # Subsystems\А.xml -> А; Subsystems\А\Subsystems\Б.xml -> А/Б. Ext\CommandInterface.xml - не подсистема.
-        $parts = @($relative.Split('\', '/') | Where-Object { $_ -and $_ -ne 'Subsystems' })
+        $parts = @($relative.Split([char[]]@('\', '/')) | Where-Object { $_ -and $_ -ne 'Subsystems' })
         if ($parts -contains 'Ext') { continue }
         $path = (@($parts | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_) }) -join '/')
         try { $xml = Get-UtXml $file.FullName } catch { continue }
@@ -737,7 +737,7 @@ function Get-UtSubsystemList {
     if (-not (Test-Path -LiteralPath $root)) { return , $result.ToArray() }
     foreach ($file in @(Get-ChildItem -LiteralPath $root -Recurse -Filter '*.xml' -File | Sort-Object FullName)) {
         $relative = $file.FullName.Substring($root.Length + 1)
-        $parts = @($relative.Split('\', '/') | Where-Object { $_ -and $_ -ne 'Subsystems' })
+        $parts = @($relative.Split([char[]]@('\', '/')) | Where-Object { $_ -and $_ -ne 'Subsystems' })
         if ($parts -contains 'Ext') { continue }
         $path = (@($parts | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_) }) -join '/')
         $synonym = ''
