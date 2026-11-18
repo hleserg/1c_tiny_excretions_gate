@@ -540,6 +540,39 @@ $tests = @(
         }
     },
     @{
+        Name = 'gate-designer-busy-retry'
+        Text = 'конфигуратор temp занят посреди прогона («Ошибка блокировки ... для конфигурирования»): вопрос, «закрыть отсюда» - команда повторяется, прогон идёт дальше'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $busy = 'Ошибка блокировки информационной базы для конфигурирования. Возможно, информационная база уже открыта Конфигуратором. С этой информационной базой уже работает конфигуратор: компьютер: pc1, сеанс: 5'
+            $fake = @{ designer = @(@{ match = @('/LoadCfg', 'Адаптация'); exit = 1; log = $busy; times = 1 }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake -Answers @(
+                @{ Kind = 'one'; Header = 'Открыт конфигуратор'; Item = '^Закрыть отсюда' })
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            Check ((Get-Calls $r @('/LoadCfg', 'Адаптация')).Count -eq 2) 'загрузка не повторилась после закрытия конфигуратора'
+        }
+    },
+    @{
+        Name = 'gate-designer-busy-cancel'
+        Text = 'конфигуратор temp занят, на вопрос - «Отмена»: прогон завершается, в run.log - «отменено пользователем»'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $busy = 'Ошибка блокировки информационной базы для конфигурирования. С этой информационной базой уже работает конфигуратор: компьютер: pc1, сеанс: 5'
+            $fake = @{ designer = @(@{ match = @('/LoadCfg', 'Адаптация'); exit = 1; log = $busy; times = 1 }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake -Answers @(
+                @{ Kind = 'one'; Header = 'Открыт конфигуратор'; Item = '^Отмена' })
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            Check ($r.ExitCode -ne 0) 'прогон не завершился после отмены'
+            Check (@($r.Output | Where-Object { $_ -match 'отменено пользователем' }).Count -gt 0) 'нет «отменено пользователем» в выводе'
+            if ($r.RunDir) { Check ([System.IO.File]::ReadAllText((Join-Path $r.RunDir 'run.log'), $utf8) -match 'Отменено пользователем: открыт конфигуратор') 'нет записи об отмене в run.log' }
+            Check ((Get-Calls $r @('/LoadCfg', 'Адаптация')).Count -eq 1) 'после отмены загрузка повторялась'
+        }
+    },
+    @{
         Name = 'gate-selfcheck-new-error-keep'
         Text = 'самопроверка после загрузки нашла новую ошибку: красный; на вопрос «оставить?» - оставить'
         Run = {
@@ -1334,6 +1367,24 @@ $tests = @(
             $stateLine = [array]::IndexOf(@($r.Output), @($r.Output | Where-Object { $_ -match 'СОСТОЯНИЕ БАЗ' } | Select-Object -First 1)[0])
             $waitLine = [array]::IndexOf(@($r.Output), @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Посмотрел') } | Select-Object -First 1)[0])
             Check ($stateLine -ge 0 -and $waitLine -gt $stateLine) 'кнопка «Вернуться в меню» не после вывода состояния'
+        }
+    },
+    @{
+        Name = 'deploy-designer-busy-retry'
+        Text = 'deploy: конфигуратор рабочей занят на выгрузке - вопрос, «закрыть отсюда» завершает только конфигуратор рабочей, выгрузка повторяется'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $busy = 'Ошибка блокировки информационной базы для конфигурирования. С этой информационной базой уже работает конфигуратор: компьютер: pc9, сеанс: 9'
+            $fake = @{ designer = @(@{ match = @('/DumpConfigToFiles', 'erp_base'); exit = 1; log = $busy; times = 1 }) }
+            $com = New-ComState -Sessions @(@{ id = 9; base = 'erp_base'; app = 'Designer'; user = 'Разработчик'; host = 'pc9' }, @{ id = 10; base = 'erp_temp_test'; app = 'Designer'; user = 'Тест'; host = 'pc2' })
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CompareExtensions' -Fake $fake -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Открыт конфигуратор erp_base'; Item = '^Закрыть отсюда' })
+            Check-DeployCommon $r -LocksExpected $false
+            Check (@($r.ComLog | Where-Object { $_ -match 'TerminateSession 9$' }).Count -eq 1) 'конфигуратор рабочей не закрыт'
+            Check (@($r.ComLog | Where-Object { $_ -match 'TerminateSession 10$' }).Count -eq 0) 'закрыт конфигуратор temp, хотя занята рабочая'
+            Check ((Get-Calls $r @('/DumpConfigToFiles', 'erp_base', '-Extension Адаптация')).Count -eq 2) 'выгрузка рабочей не повторилась'
+            Check (@($r.Output | Where-Object { $_ -match 'НЕ СРАВНИЛИСЬ' }).Count -eq 0) 'после закрытия конфигуратора сравнение всё равно не прошло'
         }
     },
     @{

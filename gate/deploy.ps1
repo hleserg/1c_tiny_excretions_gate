@@ -192,8 +192,51 @@ function Read-V8Log {
     return @($text -split "`r?`n")
 }
 
+function Test-DesignerBusy {
+    # Пакетный конфигуратор не подключился: конфигурация базы открыта в другом конфигураторе.
+    param([string[]]$Lines)
+    foreach ($line in $Lines) {
+        if ($null -eq $line) { continue }
+        if ($line.Contains('уже работает конфигуратор') -or $line.Contains('уже открыта Конфигуратором') -or $line.Contains('Ошибка блокировки информационной базы для конфигурирования')) { return $true }
+    }
+    return $false
+}
+
+function Resolve-DesignerBusy {
+    # Конфигуратор базы открыт в другом сеансе - дальше идти нельзя, пока он открыт. Спрашиваем: закрыть отсюда
+    # (только конфигураторы этой базы, имя - целиком) или ждать, пока закроют сами (опрос раз в 3 секунды).
+    # Отмена - прогон завершается с записью «отменено пользователем». Без человека - $false (как раньше: ошибка шага).
+    param([string]$BaseName, [string]$Title)
+    if (-not (Test-UiCanAsk)) { return $false }
+    $link = Connect-ClusterAgent
+    $designers = @(Get-BaseSessions $link $BaseName | Where-Object { -not $_.IsError -and $_.IsDesigner })
+    Write-Line ("  {0}: открыт конфигуратор {1} - дальше нельзя, пока он открыт" -f $Title, $BaseName) 'Yellow'
+    foreach ($entry in $designers) { Write-Line ('    ' + $entry.Text) 'Yellow' }
+    $answer = Read-UiChoice -Header ("Открыт конфигуратор {0}: «{1}» не может идти дальше. Закрой его сам - скрипт увидит и продолжит, или:" -f $BaseName, $Title) `
+        -Keys @('1', '2') -Labels @('Закрыть отсюда (сеанс прерывается, несохранённые правки в нём пропадут)', 'Отмена (прогон завершится)') -CancelKey '2' -Poll {
+        $now = @(Get-BaseSessions $link $BaseName)
+        if (@($now | Where-Object { $_.IsError }).Count -eq 0 -and @($now | Where-Object { $_.IsDesigner }).Count -eq 0) { return 'closed' }
+        return ''
+    }
+    if ($answer -eq '2') {
+        Write-RunLog ("Отменено пользователем: открыт конфигуратор {0} ({1})" -f $BaseName, $Title)
+        throw ("отменено пользователем: открыт конфигуратор {0}, «{1}» не выполнено" -f $BaseName, $Title)
+    }
+    if ($answer -eq '1') {
+        foreach ($line in @(Stop-BaseSessions -Link $link -BaseName $BaseName -Designers)) { Write-Line ('  ' + $line) }
+        for ($wait = 0; $wait -lt 10; $wait++) {
+            Start-Sleep -Seconds 3
+            if (@(Get-BaseSessions $link $BaseName | Where-Object { -not $_.IsError -and $_.IsDesigner }).Count -eq 0) { break }
+        }
+    }
+    Write-Line ("  конфигуратор {0} закрыт, повторяю: {1}" -f $BaseName, $Title) 'Green'
+    Write-RunLog ("Конфигуратор {0} закрыт ({1}), повтор: {2}" -f $BaseName, $answer, $Title)
+    return $true
+}
+
 function Invoke-Designer {
-    # Пакетный конфигуратор указанной базы. Лог - в папке запуска.
+    # Пакетный конфигуратор указанной базы. Лог - в папке запуска. База открыта в другом конфигураторе -
+    # вопрос (Resolve-DesignerBusy) и повтор той же команды.
     param([string]$BaseName, [string[]]$Command, [string]$LogName, [int]$TimeoutSec, [string]$Title = '')
     $user = $script:TempUser
     $password = $script:TempPassword
@@ -201,8 +244,12 @@ function Invoke-Designer {
     $logPath = Join-Path $script:RunDir $LogName
     $argList = @('DESIGNER') + @(Get-ConnectionArgs -BaseName $BaseName -User $user -Password $password) +
         @('/DisableStartupDialogs', '/DisableStartupMessages') + $Command + @('/Out', ('"{0}"' -f $logPath))
-    $result = Invoke-V8 -Exe $script:V8 -Arguments $argList -TimeoutSec $TimeoutSec -Title $Title
-    $lines = @(Read-V8Log $logPath)
+    while ($true) {
+        $result = Invoke-V8 -Exe $script:V8 -Arguments $argList -TimeoutSec $TimeoutSec -Title $Title
+        $lines = @(Read-V8Log $logPath)
+        if ($result.ExitCode -eq 0 -or $result.TimedOut -or -not (Test-DesignerBusy $lines)) { break }
+        if (-not (Resolve-DesignerBusy -BaseName $BaseName -Title (Get-NonEmptyTitle $Title $LogName))) { break }
+    }
     return [pscustomobject]@{
         ExitCode = $result.ExitCode
         TimedOut = $result.TimedOut
@@ -211,6 +258,12 @@ function Invoke-Designer {
         Lines    = $lines
         Text     = (($lines | Where-Object { $_ }) -join ' ')
     }
+}
+
+function Get-NonEmptyTitle {
+    param([string]$Title, [string]$Fallback)
+    if ($Title) { return $Title }
+    return $Fallback
 }
 
 function Read-KeyValueFile {
@@ -1488,6 +1541,7 @@ if ($CompareExtensions) {
     [void]$cmpHtml.Append('<html><head><meta charset="utf-8"></head><body>')
     [void]$cmpHtml.Append(('<h1>Расширения: {0} и {1}, {2}</h1><p>Было - рабочая, стало - temp: то, что принесёт обновление.</p>' -f (ConvertTo-Html $script:ProdBase), (ConvertTo-Html $script:TempBase), (Get-Date -Format 'dd.MM.yyyy HH:mm')))
     $cmpDiffer = 0
+    $cmpFailed = 0
     foreach ($name in $deployExtensions) {
         Write-Host ''
         $tempVersion = ''; $prodVersion = ''
@@ -1506,8 +1560,8 @@ if ($CompareExtensions) {
         Write-Line ("  {0}: {1} - выгружаю обе базы в файлы" -f $name, $versions) 'Cyan'
         $tempDump = Update-DumpDir -BaseName $script:TempBase -Extension $name -Dir (Join-Path (Join-Path $script:RunDir 'temp') $name)
         $prodDump = Update-DumpDir -BaseName $script:ProdBase -Extension $name -Dir (Join-Path (Join-Path $script:RunDir 'prod') $name)
-        if (-not $tempDump.Ok -and -not $tempDump.Absent) { Write-Line ("    из {0} не выгрузил: {1}" -f $script:TempBase, $tempDump.Detail) 'Red'; continue }
-        if (-not $prodDump.Ok -and -not $prodDump.Absent) { Write-Line ("    из {0} не выгрузил: {1}" -f $script:ProdBase, $prodDump.Detail) 'Red'; continue }
+        if (-not $tempDump.Ok -and -not $tempDump.Absent) { Write-Line ("    из {0} не выгрузил: {1}" -f $script:TempBase, $tempDump.Detail) 'Red'; $cmpFailed++; continue }
+        if (-not $prodDump.Ok -and -not $prodDump.Absent) { Write-Line ("    из {0} не выгрузил: {1}" -f $script:ProdBase, $prodDump.Detail) 'Red'; $cmpFailed++; continue }
         [void]$cmpHtml.Append(('<h2>{0}</h2><p>{1}</p>' -f (ConvertTo-Html $name), (ConvertTo-Html $versions)))
         if ($tempDump.Absent) { Write-Line '    в temp его нет: обновление его не принесёт' 'Yellow'; [void]$cmpHtml.Append('<p>В temp его нет.</p>'); continue }
         if ($prodDump.Absent) { Write-Line '    в рабочей его нет: обновление добавит целиком' 'Yellow'; [void]$cmpHtml.Append('<p>В рабочей его нет: обновление добавит целиком.</p>') }
@@ -1526,7 +1580,10 @@ if ($CompareExtensions) {
     $cmpFile = Join-Path $script:RunDir 'compare.html'
     [System.IO.File]::WriteAllText($cmpFile, $cmpHtml.ToString(), $Utf8Bom)
     Write-Host ''
-    Write-Line ("Отличаются расширений: {0}. Обозначения: + новая процедура, ~ изменена, - удалена. Отчёт: {1}" -f $cmpDiffer, $cmpFile) 'Cyan'
+    $cmpColor = 'Cyan'
+    $cmpFailText = ''
+    if ($cmpFailed -gt 0) { $cmpColor = 'Red'; $cmpFailText = (", НЕ СРАВНИЛИСЬ: {0} (см. выше)" -f $cmpFailed) }
+    Write-Line ("Отличаются расширений: {0}{1}. Обозначения: + новая процедура, ~ изменена, - удалена. Отчёт: {2}" -f $cmpDiffer, $cmpFailText, $cmpFile) $cmpColor
     exit 0
 }
 

@@ -353,7 +353,7 @@ function Test-DesignerBusy {
     param([string[]]$Lines)
     foreach ($line in $Lines) {
         if ($null -eq $line) { continue }
-        if ($line.Contains('уже работает конфигуратор') -or $line.Contains('уже открыта Конфигуратором')) { return $true }
+        if ($line.Contains('уже работает конфигуратор') -or $line.Contains('уже открыта Конфигуратором') -or $line.Contains('Ошибка блокировки информационной базы для конфигурирования')) { return $true }
     }
     return $false
 }
@@ -2527,17 +2527,65 @@ Write-Host ("Прогон {0}, база {1}" -f $runId, $baseKey) -ForegroundCol
 Write-Host ("Папка прогона: {0}" -f $RunDir)
 Write-RunLog ("Прогон {0}, база {1}, комплект: {2}" -f $runId, $baseKey, $Kit)
 
+function Resolve-TestDesignerBusy {
+    # Конфигуратор тестовой базы открыт в другом сеансе - дальше идти нельзя, пока он открыт. Сначала - не наша ли
+    # это параллельная проверка конфигурации: её дождаться. Потом вопрос: закрыть отсюда (только конфигураторы этой
+    # базы) или ждать, пока закроют сами. Отмена - прогон завершается с записью «отменено пользователем».
+    # Без человека (ночной запуск) - $false: шаг падает, как раньше.
+    param([string]$Title)
+    if ($null -ne $script:BackgroundCheck) {
+        Write-Host ("  {0}: конфигуратор занят - возможно, нашей же параллельной проверкой конфигурации; дождусь её" -f $Title) -ForegroundColor Yellow
+        Write-RunLog ("Конфигуратор занят ({0}): жду параллельную проверку конфигурации" -f $Title)
+        Complete-BackgroundCheck
+        return $true
+    }
+    if (-not (Test-UiCanAsk)) { return $false }
+    $link = Connect-TestBaseAgent
+    $designers = @(Get-TestBaseSessions $link | Where-Object { -not $_.IsError -and $_.IsDesigner })
+    Write-Host ("  {0}: открыт конфигуратор {1} - дальше нельзя, пока он открыт" -f $Title, $script:Base) -ForegroundColor Yellow
+    foreach ($entry in $designers) { Write-Host ('    ' + $entry.Text) -ForegroundColor Yellow }
+    $answer = Read-UiChoice -Header ("Открыт конфигуратор {0}: «{1}» не может идти дальше. Закрой его сам - гейт увидит и продолжит, или:" -f $script:Base, $Title) `
+        -Keys @('1', '2') -Labels @('Закрыть отсюда (сеанс прерывается, несохранённые правки в нём пропадут)', 'Отмена (прогон завершится)') -CancelKey '2' -Poll {
+        $nowSessions = @(Get-TestBaseSessions $link)
+        if (@($nowSessions | Where-Object { $_.IsError }).Count -eq 0 -and @($nowSessions | Where-Object { $_.IsDesigner }).Count -eq 0) { return 'closed' }
+        return ''
+    }
+    if ($answer -eq '2') {
+        Write-RunLog ("Отменено пользователем: открыт конфигуратор {0} ({1})" -f $script:Base, $Title)
+        throw ("отменено пользователем: открыт конфигуратор {0}, «{1}» не выполнено" -f $script:Base, $Title)
+    }
+    if ($answer -eq '1') {
+        foreach ($line in @(Stop-TestBaseSessions -Link $link -Designers)) { Write-Host ('  ' + $line) }
+        for ($wait = 0; $wait -lt 10; $wait++) {
+            Start-Sleep -Seconds 3
+            if (@(Get-TestBaseSessions $link | Where-Object { -not $_.IsError -and $_.IsDesigner }).Count -eq 0) { break }
+        }
+    }
+    Write-Host ("  конфигуратор {0} закрыт, повторяю: {1}" -f $script:Base, $Title) -ForegroundColor Green
+    Write-RunLog ("Конфигуратор {0} закрыт ({1}), повтор: {2}" -f $script:Base, $answer, $Title)
+    return $true
+}
+
 function Invoke-Designer {
+    # Пакетный конфигуратор тестовой базы. Она открыта в другом конфигураторе - вопрос (Resolve-TestDesignerBusy)
+    # и повтор той же команды.
     param([string[]]$Command, [string]$LogName, [int]$TimeoutSec, [string]$Title = '')
     $logPath = Join-Path $RunDir $LogName
     $argList = $designerBase + $Command + @('/Out', ('"{0}"' -f $logPath))
-    $result = Invoke-V8 -Exe $v8 -Arguments $argList -TimeoutSec $TimeoutSec -Title $Title
+    while ($true) {
+        $result = Invoke-V8 -Exe $v8 -Arguments $argList -TimeoutSec $TimeoutSec -Title $Title
+        $lines = @(Read-V8Log $logPath)
+        if ($result.ExitCode -eq 0 -or $result.TimedOut -or -not (Test-DesignerBusy $lines)) { break }
+        $busyTitle = $Title
+        if (-not $busyTitle) { $busyTitle = $LogName }
+        if (-not (Resolve-TestDesignerBusy -Title $busyTitle)) { break }
+    }
     return [pscustomobject]@{
         ExitCode = $result.ExitCode
         TimedOut = $result.TimedOut
         Seconds  = $result.Seconds
         Log      = $logPath
-        Lines    = @(Read-V8Log $logPath)
+        Lines    = $lines
     }
 }
 
