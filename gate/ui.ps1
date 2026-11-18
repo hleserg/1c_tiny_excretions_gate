@@ -310,9 +310,10 @@ function Confirm-Ui {
     # DangerYes - «да» опасно (откат): в ci.exe щелчок мышью по нему срабатывает только со второго раза.
     param([string]$Question, [string]$Yes = 'Да', [string]$No = 'Нет', [switch]$DangerYes)
     if ($script:UiChannelDir) {
-        $question = @{ kind = 'confirm'; header = $Question; yes = $Yes; no = $No }
-        if ($DangerYes) { $question['danger'] = @(0) }
-        $answer = Request-UiAnswer -Question $question
+        # Не $question: это тот же параметр $Question (имена переменных без учёта регистра).
+        $uiQuestion = @{ kind = 'confirm'; header = $Question; yes = $Yes; no = $No }
+        if ($DangerYes) { $uiQuestion['danger'] = @(0) }
+        $answer = Request-UiAnswer -Question $uiQuestion
         if ([bool](Get-UiField $answer 'cancel' $false)) { return $null }
         return [bool](Get-UiField $answer 'yes' $false)
     }
