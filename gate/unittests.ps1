@@ -45,6 +45,18 @@ function Get-UtXml {
     return $xml
 }
 
+function Get-UtFiles {
+    # Файлы папки с подпапками: Rel - путь от папки через «/», по именам (не вычитанием строк: Windows отдаёт
+    # FullName то в коротком виде 8.3 - RUNNER~1, то в длинном, и длины корня не совпадают), Full - полный путь.
+    param([string]$Dir, [string]$Prefix = '')
+    foreach ($item in @(Get-ChildItem -LiteralPath $Dir -Force)) {
+        $relative = $item.Name
+        if ($Prefix) { $relative = $Prefix + '/' + $item.Name }
+        if ($item.PSIsContainer) { Get-UtFiles -Dir $item.FullName -Prefix $relative }
+        else { [pscustomobject]@{ Rel = $relative; Full = $item.FullName } }
+    }
+}
+
 function Get-UtDirHash {
     # Хеш содержимого папки выгрузки: пути и тексты файлов, без ConfigDumpInfo.xml (служебный файл выгрузки,
     # в нём версии объектов). Тексты (.xml, .bsl, .txt, .html, .json) - без BOM, с переводами строк LF: выгрузка
@@ -52,11 +64,8 @@ function Get-UtDirHash {
     # Пустая строка - папки нет или в ней нет Configuration.xml.
     param([string]$Dir)
     if (-not $Dir -or -not (Test-Path -LiteralPath (Join-Path $Dir 'Configuration.xml'))) { return '' }
-    $root = (Resolve-Path -LiteralPath $Dir).ProviderPath.TrimEnd('\', '/')
     $byRelative = @{}
-    foreach ($file in @(Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object { $_.Name -ne 'ConfigDumpInfo.xml' })) {
-        $byRelative[$file.FullName.Substring($root.Length + 1).Replace('\', '/')] = $file.FullName
-    }
+    foreach ($file in @(Get-UtFiles $Dir | Where-Object { $_.Rel -ne 'ConfigDumpInfo.xml' })) { $byRelative[$file.Rel] = $file.Full }
     $names = [string[]]@($byRelative.Keys)
     [System.Array]::Sort($names, [System.StringComparer]::Ordinal)
     $textKinds = @('.xml', '.bsl', '.txt', '.html', '.htm', '.json', '.md')
@@ -177,13 +186,12 @@ function Get-UtSubsystemMap {
     $map = @{}
     $root = Join-Path $Dir 'Subsystems'
     if (-not (Test-Path -LiteralPath $root)) { return $map }
-    foreach ($file in @(Get-ChildItem -LiteralPath $root -Recurse -Filter '*.xml' -File)) {
-        $relative = $file.FullName.Substring($root.Length + 1)
+    foreach ($file in @(Get-UtFiles $root | Where-Object { $_.Rel -like '*.xml' })) {
         # Subsystems\А.xml -> А; Subsystems\А\Subsystems\Б.xml -> А/Б. Ext\CommandInterface.xml - не подсистема.
-        $parts = @($relative.Split([char[]]@('\', '/')) | Where-Object { $_ -and $_ -ne 'Subsystems' })
+        $parts = @($file.Rel.Split('/') | Where-Object { $_ -and $_ -ne 'Subsystems' })
         if ($parts -contains 'Ext') { continue }
         $path = (@($parts | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_) }) -join '/')
-        try { $xml = Get-UtXml $file.FullName } catch { continue }
+        try { $xml = Get-UtXml $file.Full } catch { continue }
         $synonym = ''
         $content = @()
         foreach ($node in @($xml.GetElementsByTagName('Content'))) {
@@ -735,14 +743,13 @@ function Get-UtSubsystemList {
     $result = New-Object System.Collections.Generic.List[object]
     $root = Join-Path $Dir 'Subsystems'
     if (-not (Test-Path -LiteralPath $root)) { return , $result.ToArray() }
-    foreach ($file in @(Get-ChildItem -LiteralPath $root -Recurse -Filter '*.xml' -File | Sort-Object FullName)) {
-        $relative = $file.FullName.Substring($root.Length + 1)
-        $parts = @($relative.Split([char[]]@('\', '/')) | Where-Object { $_ -and $_ -ne 'Subsystems' })
+    foreach ($file in @(Get-UtFiles $root | Where-Object { $_.Rel -like '*.xml' } | Sort-Object Rel)) {
+        $parts = @($file.Rel.Split('/') | Where-Object { $_ -and $_ -ne 'Subsystems' })
         if ($parts -contains 'Ext') { continue }
         $path = (@($parts | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_) }) -join '/')
         $synonym = ''
         try {
-            $xml = Get-UtXml $file.FullName
+            $xml = Get-UtXml $file.Full
             foreach ($node in @($xml.GetElementsByTagName('v8:content'))) { $synonym = ([string]$node.InnerText).Trim(); break }
         }
         catch { $synonym = '' }

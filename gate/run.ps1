@@ -2380,13 +2380,11 @@ function New-UtZip {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     New-Item -ItemType Directory -Path (Split-Path -Parent $ZipPath) -Force | Out-Null
     if (Test-Path -LiteralPath $ZipPath) { Remove-Item -LiteralPath $ZipPath -Force }
-    $rootFull = (Resolve-Path -LiteralPath $Dir).ProviderPath.TrimEnd('\')
-    $prefix = Split-Path -Leaf $rootFull
+    $prefix = Split-Path -Leaf $Dir
     $archive = [System.IO.Compression.ZipFile]::Open($ZipPath, [System.IO.Compression.ZipArchiveMode]::Create, [System.Text.Encoding]::UTF8)
     try {
-        foreach ($file in @(Get-ChildItem -LiteralPath $rootFull -Recurse -File)) {
-            $entryName = $prefix + '/' + $file.FullName.Substring($rootFull.Length + 1).Replace('\', '/')
-            $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, $entryName)
+        foreach ($file in @(Get-UtFiles $Dir)) {
+            $null = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.Full, ($prefix + '/' + $file.Rel))
         }
     }
     finally { $archive.Dispose() }
