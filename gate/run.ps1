@@ -4273,6 +4273,61 @@ function Invoke-Designer {
     }
 }
 
+function Get-ToolSourceHash {
+    # Отпечаток выгрузки обработки в файлы: <Имя>.xml и папка <Имя>, путь и хеш каждого файла.
+    param([string]$Xml)
+    $root = Split-Path -Parent $Xml
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $files = @(Get-Item -LiteralPath $Xml)
+    $dir = Join-Path $root ([System.IO.Path]::GetFileNameWithoutExtension($Xml))
+    if (Test-Path -LiteralPath $dir) { $files += @(Get-ChildItem -LiteralPath $dir -Recurse -File) }
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($file in @($files | Sort-Object FullName)) {
+        $relative = $file.FullName.Substring($root.Length + 1).Replace('\', '/')
+        $lines.Add(('{0}={1}' -f $relative, [System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($file.FullName))).Replace('-', '')))
+    }
+    return [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes(($lines -join "`n")))).Replace('-', '')
+}
+
+function Update-GateTools {
+    # Обработки гейта (самопроверка, канарейка) - из исходников поставки tools\src (их кладёт install.ps1): собраны
+    # не из них (отпечаток в <обработка>.source.txt другой или его нет) - сборка конфигуратором тестовой базы,
+    # прежняя - в <обработка>.old. Не собралась - прогон со старой и предупреждение.
+    $sourceDir = Resolve-RootPath 'tools\src'
+    if (-not (Test-Path -LiteralPath $sourceDir)) { return }
+    $tools = @(
+        @{ Xml = 'ВыполнитьПослеОбновления.xml'; Epf = $selfCheckEpf; Title = 'самопроверки' },
+        @{ Xml = 'Канарейка.xml'; Epf = (Resolve-RootPath ([string](Get-Setting $cfg 'CanaryEpf' 'tools\Канарейка.epf'))); Title = 'канарейки' })
+    foreach ($tool in $tools) {
+        $xml = Join-Path $sourceDir $tool.Xml
+        if (-not (Test-Path -LiteralPath $xml)) { continue }
+        $hash = Get-ToolSourceHash $xml
+        $marker = $tool.Epf + '.source.txt'
+        $built = ''
+        if (Test-Path -LiteralPath $marker) { $built = ([System.IO.File]::ReadAllText($marker)).Trim() }
+        if ((Test-Path -LiteralPath $tool.Epf) -and $built -eq $hash) { continue }
+        $newFile = [System.IO.Path]::ChangeExtension($tool.Epf, '.new.epf')
+        if (Test-Path -LiteralPath $newFile) { Remove-Item -LiteralPath $newFile -Force }
+        New-Item -ItemType Directory -Path (Split-Path -Parent $tool.Epf) -Force | Out-Null
+        $result = Invoke-Designer -Command @('/LoadExternalDataProcessorOrReportFromFiles', ('"{0}"' -f $xml), ('"{0}"' -f $newFile)) `
+            -LogName ('build_tool_{0}.log' -f [System.IO.Path]::GetFileNameWithoutExtension($tool.Xml)) -TimeoutSec $timeoutLoadSec -Title ("Собрать обработку {0} из поставки" -f $tool.Title)
+        if ($result.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $newFile)) {
+            $why = (@($result.Lines | Where-Object { $_ }) | Select-Object -First 2) -join ' | '
+            if ($why) { $why = ': ' + $why }
+            $detail = 'обработка {0} из поставки не собралась (код {1}{2}), прогон - с прежней {3}' -f $tool.Title, $result.ExitCode, $why, $tool.Epf
+            if (-not (Test-Path -LiteralPath $tool.Epf)) { $detail = 'обработка {0} из поставки не собралась (код {1}{2}), прежней нет' -f $tool.Title, $result.ExitCode, $why }
+            Write-Host ('  ' + $detail) -ForegroundColor Yellow
+            Add-StepResult -Name 'Сборка обработок гейта' -Status 'WARN' -Detail $detail
+            continue
+        }
+        if (Test-Path -LiteralPath $tool.Epf) { Copy-Item -LiteralPath $tool.Epf -Destination ($tool.Epf + '.old') -Force }
+        Move-Item -LiteralPath $newFile -Destination $tool.Epf -Force
+        [System.IO.File]::WriteAllText($marker, $hash, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host ("  обработка {0} собрана из поставки: {1} (прежняя - {1}.old)" -f $tool.Title, $tool.Epf) -ForegroundColor Green
+        Write-RunLog ("Обработка {0} собрана из {1}, отпечаток {2}" -f $tool.Title, $xml, $hash)
+    }
+}
+
 function Start-DesignerBackground {
     # Конфигуратор с командой - без ожидания: процесс идёт параллельно со следующими шагами.
     # Итог берёт Complete-BackgroundCheck. Тот же журнал вызова и маскировка паролей, что у Invoke-V8.
@@ -5659,6 +5714,14 @@ $processingOnlyText = 'комплект только из внешних обр�
 # шагами после загрузки: она самая долгая (около 27 минут на temp), а канарейка, самопроверка и выгрузка
 # расширений от неё не зависят. Итог берётся перед вердиктом. $false - как раньше, по очереди.
 $parallelCheckConfig = ([bool](Get-Setting $cfg 'ParallelCheckConfig' $true) -and $checkOnly.Count -le 1 -and [bool](Get-Setting $cfg 'RunCheckConfig' $true) -and -not [bool](Get-Setting $cfg 'RunCheckModules' $false))
+
+# Обработки гейта собраны не из этой поставки (обновление из GitHub их не собирает) - собрать сейчас, до первого
+# запуска самопроверки и канарейки.
+Update-GateTools
+if ($selfCheckOff -like 'нет обработки*' -and (Test-Path -LiteralPath $selfCheckEpf)) {
+    $selfCheckOff = ''
+    if (-not (Test-Path -LiteralPath $v8c)) { $selfCheckOff = "нет тонкого клиента $v8c" }
+}
 
 # План прогона для ci.exe: шаги, которые пойдут, если ничего не упадёт.
 $planSteps = New-Object System.Collections.Generic.List[string]

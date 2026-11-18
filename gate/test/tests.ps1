@@ -618,6 +618,39 @@ $tests = @(
         }
     },
     @{
+        Name = 'gate-tools-build'
+        Text = 'обработки гейта из поставки (tools\src): собраны не из неё - прогон сам собирает самопроверку и канарейку конфигуратором до первого шага, прежние - в .old, отпечаток - в .source.txt; второй прогон не собирает; поменялись исходники самопроверки - собирается только она'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $src = Join-Path $sb 'tools\src'
+            foreach ($toolName in @('ВыполнитьПослеОбновления', 'Канарейка')) {
+                New-Item -ItemType Directory -Path (Join-Path $src ($toolName + '\Ext')) -Force | Out-Null
+                [System.IO.File]::WriteAllText((Join-Path $src ($toolName + '.xml')), ('<MetaDataObject><ExternalDataProcessor><Properties><Name>' + $toolName + '</Name></Properties></ExternalDataProcessor></MetaDataObject>'), $utf8)
+                [System.IO.File]::WriteAllText((Join-Path $src ($toolName + '\Ext\ObjectModule.bsl')), 'Процедура А() КонецПроцедуры', $utf8)
+            }
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep'
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            Check ((Get-Calls $r @('/LoadExternalDataProcessorOrReportFromFiles')).Count -eq 2) ("сборок обработок гейта {0}, ждали 2" -f (Get-Calls $r @('/LoadExternalDataProcessorOrReportFromFiles')).Count)
+            foreach ($toolName in @('ВыполнитьПослеОбновления', 'Канарейка')) {
+                $epf = Join-Path $sb ('tools\' + $toolName + '.epf')
+                Check ((Test-Path -LiteralPath $epf) -and ([System.IO.File]::ReadAllText($epf) -match '^FAKEEPF')) ("{0}.epf не собрана из поставки" -f $toolName)
+                Check ((Test-Path -LiteralPath ($epf + '.old')) -and ([System.IO.File]::ReadAllText($epf + '.old', $utf8) -eq 'fake')) ("прежняя {0}.epf не сохранена в .old" -f $toolName)
+                Check (Test-Path -LiteralPath ($epf + '.source.txt')) ("нет отпечатка исходников {0}" -f $toolName)
+            }
+            Reset-FakeState $sb
+            $again = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep'
+            Check-Common $again; Check-Verdict $again 'GREEN' 0
+            Check ((Get-Calls $again @('/LoadExternalDataProcessorOrReportFromFiles')).Count -eq 0) 'второй прогон снова собирал обработки гейта'
+            [System.IO.File]::WriteAllText((Join-Path $src 'ВыполнитьПослеОбновления\Ext\ObjectModule.bsl'), 'Процедура Б() КонецПроцедуры', $utf8)
+            Reset-FakeState $sb
+            $changed = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep'
+            Check-Common $changed; Check-Verdict $changed 'GREEN' 0
+            $builds = @(Get-Calls $changed @('/LoadExternalDataProcessorOrReportFromFiles'))
+            Check ($builds.Count -eq 1 -and $builds[0].Line -match 'ВыполнитьПослеОбновления') ("после правки исходников самопроверки собиралось: " + (@($builds | ForEach-Object { $_.Line }) -join ' | '))
+        }
+    },
+    @{
         Name = 'gate-menu-kit-green'
         Text = 'меню: прогон с обновлением из inbox, отметить .cfe, зелёный; обновление уходит из inbox в папку прогона'
         Run = {

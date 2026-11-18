@@ -117,6 +117,16 @@ foreach ($item in @(Get-ChildItem -LiteralPath $source -Recurse -File)) {
 }
 foreach ($dir in @('tools', 'inbox', 'secrets')) { New-Item -ItemType Directory -Path (Join-Path $Target $dir) -Force | Out-Null }
 Write-Host ("Скопировано файлов: {0} -> {1}" -f $copied, $Target) -ForegroundColor Green
+# Исходники обработок гейта (выгрузка в файлы) - в tools\src: из них run.ps1 сам собирает tools\*.epf в начале
+# прогона, если обработки собраны не из этой поставки (обновление из GitHub ставит комплект без вопросов).
+$epfKit = Join-Path $PSScriptRoot 'epf'
+if (Test-Path -LiteralPath $epfKit) {
+    $toolsSrc = Join-Path (Join-Path $Target 'tools') 'src'
+    if (Test-Path -LiteralPath $toolsSrc) { Remove-Item -LiteralPath $toolsSrc -Recurse -Force }
+    New-Item -ItemType Directory -Path $toolsSrc -Force | Out-Null
+    Copy-Item -Path (Join-Path $epfKit '*') -Destination $toolsSrc -Recurse -Force
+    Write-Host ("Исходники обработок гейта - в {0}: tools\*.epf гейт пересоберёт сам в начале следующего прогона" -f $toolsSrc) -ForegroundColor Green
+}
 
 # Настройки площадки (config.site.psd1, есть в заводской сборке): гейт берёт из них ключи, которых нет в config.psd1.
 $sitePath = Join-Path $Target 'config.site.psd1'
