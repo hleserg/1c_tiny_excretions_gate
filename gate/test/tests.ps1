@@ -1279,6 +1279,44 @@ $tests = @(
         }
     },
     @{
+        Name = 'deploy-compare-extensions'
+        Text = '«Сравнить расширения»: одинаковые - по COM без выгрузки, отличающиеся - выгрузка обеих баз и разница по процедурам; в базах ничего не меняется'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $oldModule = "Процедура Старая() Экспорт`r`nКонецПроцедуры"
+            $newModule = $oldModule + "`r`n`r`nПроцедура НоваяПроцедура() Экспорт`r`nКонецПроцедуры"
+            $fake = @{ dumps = @{
+                    'Адаптация@erp_temp_test' = @{ 'CommonModules/Тест/Ext/Module.bsl' = $newModule }
+                    'Адаптация@erp_base' = @{ 'CommonModules/Тест/Ext/Module.bsl' = $oldModule } } }
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CompareExtensions' -Fake $fake -Com (New-ComState)
+            Check-DeployCommon $r -LocksExpected $false
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            $text = $r.Output -join "`n"
+            Check ($text -match 'Доработки: одинаковые') 'одинаковые Доработки не показаны одинаковыми'
+            Check ($text -match '\+ НоваяПроцедура') 'нет новой процедуры в разнице Адаптация'
+            Check ((Get-Calls $r @('/DumpConfigToFiles', '-Extension Доработки')).Count -eq 0) 'одинаковые Доработки выгружались'
+            Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0 -and (Get-Calls $r @('/UpdateDBCfg')).Count -eq 0) 'сравнение что-то загружало'
+            Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\compare-ext\compare.html')) 'нет compare.html'
+        }
+    },
+    @{
+        Name = 'deploy-compare-processings'
+        Text = '«Сравнить внешние обработки»: отличающаяся обработка - версии и разница по модулю; в базах ничего не меняется'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '2' $printNew)) -ProdProcessings @((New-PrintProcessing '1' $printOld))
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CompareProcessings' -Com $com
+            Check-DeployCommon $r -LocksExpected $false
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            $text = $r.Output -join "`n"
+            Check ($text -match 'Печать \(Печать актов\): отличается, temp 2, рабочая 1') 'нет строки об отличающейся обработке'
+            Check ($text -match '\+ НоваяПроцедура') 'нет новой процедуры в разнице обработки'
+            Check ((Get-Calls $r @('ENTERPRISE', 'regepf')).Count -eq 0) 'сравнение записывало обработку'
+        }
+    },
+    @{
         Name = 'deploy-epf-only'
         Text = 'только внешние обработки: новая обработка записана, блокировок нет, чужая блокировка регламентных заданий не снята'
         Run = {

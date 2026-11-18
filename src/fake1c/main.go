@@ -234,7 +234,12 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 		ext := valueAfter(args, "-Extension")
 		writeUTF8(filepath.Join(dir, "Configuration.xml"), "<MetaDataObject><Configuration><Properties><Name>"+ext+"</Name></Properties></Configuration></MetaDataObject>")
 		writeUTF8(filepath.Join(dir, "ConfigDumpInfo.xml"), "<ConfigDumpInfo/>")
-		for rel, text := range sc.Dumps[ext] {
+		files := sc.Dumps[ext]
+		// "<расширение>@<база>" - выгрузка именно этой базы (сравнение temp и рабочей); нет такой - общая.
+		if byBase, ok := sc.Dumps[ext+"@"+infobaseName(args)]; ok {
+			files = byBase
+		}
+		for rel, text := range files {
 			writeUTF8(filepath.Join(dir, filepath.FromSlash(rel)), text)
 		}
 	}
@@ -490,4 +495,22 @@ func processingRun(mode string, r processing, dir string, p map[string]string) {
 		}
 	}
 	writeUTF8(dir+"result.txt", strings.Join(lines, "\n"))
+}
+
+// infobaseName - имя базы из ключа /S"сервер\база" (кавычки уже сняты разбором командной строки) или
+// последней папки из /F.
+func infobaseName(args []string) string {
+	for _, a := range args {
+		if len(a) > 2 && (strings.HasPrefix(a, "/S") || strings.HasPrefix(a, "/s")) {
+			v := strings.Trim(a[2:], "\"")
+			if i := strings.LastIndexAny(v, "\\/"); i >= 0 {
+				return v[i+1:]
+			}
+			return v
+		}
+		if len(a) > 2 && (strings.HasPrefix(a, "/F") || strings.HasPrefix(a, "/f")) {
+			return filepath.Base(strings.Trim(a[2:], "\""))
+		}
+	}
+	return ""
 }

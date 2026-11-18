@@ -48,6 +48,9 @@ param(
     [switch]$PullProcessings,
     # Показать состояние баз (блокировка начала сеансов, её даты и сообщение, блокировка регламентных, сеансы) и выйти.
     [switch]$BaseState,
+    # Сравнить temp и рабочую и показать разницу: расширения (по выгрузкам в файлы) или внешние обработки. Только чтение.
+    [switch]$CompareExtensions,
+    [switch]$CompareProcessings,
     # Папка канала интерфейса ci.exe: его задаёт сам ci.exe (или run.ps1 из ci.exe), руками не нужен.
     [string]$UiChannel = ''
 )
@@ -538,10 +541,13 @@ Initialize-Stats -Dir (Resolve-RootPath ([string](Get-Setting $cfg 'StatsDir' 's
 $deployRoot = Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))
 $mirrorRoot = Join-Path $deployRoot 'mirror'
 $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
-if ($BaseState) {
-    # Показать состояние - не запуск обновления: своей папки запуска нет (в истории обновлений его не видно),
+$viewOnly = ($BaseState -or $CompareExtensions -or $CompareProcessings)
+if ($viewOnly) {
+    # Показать состояние или сравнить - не запуск обновления: своей папки запуска нет (в истории обновлений его не видно),
     # журнал - в deploy\state\run.log, каждый раз заново.
-    $script:RunDir = Join-Path $deployRoot 'state'
+    $viewName = 'state'
+    if ($CompareExtensions) { $viewName = 'compare-ext' } elseif ($CompareProcessings) { $viewName = 'compare-epf' }
+    $script:RunDir = Join-Path $deployRoot $viewName
     New-Item -ItemType Directory -Path $script:RunDir -Force | Out-Null
     $script:RunLogPath = Join-Path $script:RunDir 'run.log'
     [System.IO.File]::WriteAllText($script:RunLogPath, '', $Utf8Bom)
@@ -554,7 +560,7 @@ else {
 }
 $runsRoot = Resolve-RootPath ([string](Get-Setting $cfg 'RunsDir' 'runs'))
 
-if (-not $BaseState) {
+if (-not $viewOnly) {
     Write-Host ''
     Write-Host ("Обновление рабочей базы {0} из {1}, запуск {2}" -f $script:ProdBase, $script:TempBase, $runId) -ForegroundColor Cyan
     Write-Host ("Папка запуска: {0}" -f $script:RunDir)
@@ -577,7 +583,13 @@ function Update-Mirror {
     # Выгрузка расширения базы в файлы, в постоянную папку зеркала. Если выгрузка там уже есть - только
     # изменения (-update), не получилось - заново целиком.
     param([string]$BaseName, [string]$Extension)
-    $dir = Join-Path (Join-Path $mirrorRoot $BaseName) $Extension
+    return (Update-DumpDir -BaseName $BaseName -Extension $Extension -Dir (Join-Path (Join-Path $mirrorRoot $BaseName) $Extension))
+}
+
+function Update-DumpDir {
+    # Выгрузка расширения базы в файлы в папку Dir: есть прежняя - только изменения (-update), иначе целиком.
+    param([string]$BaseName, [string]$Extension, [string]$Dir)
+    $dir = $Dir
     $hasDump = Test-Path -LiteralPath (Join-Path $dir 'ConfigDumpInfo.xml')
     $logName = "dump_{0}_{1}.log" -f $BaseName, $Extension
     $command = @('/DumpConfigToFiles', ('"{0}"' -f $dir), '-Extension', $Extension)
@@ -1222,6 +1234,151 @@ function Write-ProcessingBackup {
 }
 #endregion
 
+#region Разница по выгрузкам в файлы (отчёт об изменениях, сравнение temp и рабочей)
+
+$objectTypeNames = @{
+    Catalogs = 'Справочник'; Documents = 'Документ'; CommonModules = 'Общий модуль'; DataProcessors = 'Обработка'
+    Reports = 'Отчёт'; InformationRegisters = 'Регистр сведений'; AccumulationRegisters = 'Регистр накопления'
+    AccountingRegisters = 'Регистр бухгалтерии'; CalculationRegisters = 'Регистр расчёта'; Enums = 'Перечисление'
+    Roles = 'Роль'; CommonForms = 'Общая форма'; Subsystems = 'Подсистема'; Constants = 'Константа'
+    ScheduledJobs = 'Регламентное задание'; EventSubscriptions = 'Подписка на событие'; CommonCommands = 'Общая команда'
+    CommonTemplates = 'Общий макет'; CommonPictures = 'Общая картинка'; HTTPServices = 'HTTP-сервис'; WebServices = 'Веб-сервис'
+    DocumentJournals = 'Журнал документов'; ChartsOfCharacteristicTypes = 'План видов характеристик'
+    ChartsOfAccounts = 'План счетов'; ChartsOfCalculationTypes = 'План видов расчёта'; BusinessProcesses = 'Бизнес-процесс'
+    Tasks = 'Задача'; ExchangePlans = 'План обмена'; FilterCriteria = 'Критерий отбора'; DefinedTypes = 'Определяемый тип'
+    FunctionalOptions = 'Функциональная опция'; FunctionalOptionsParameters = 'Параметр функциональных опций'
+    SessionParameters = 'Параметр сеанса'; CommonAttributes = 'Общий реквизит'; CommandGroups = 'Группа команд'
+    XDTOPackages = 'Пакет XDTO'; StyleItems = 'Элемент стиля'; Styles = 'Стиль'; Languages = 'Язык'
+    DocumentNumerators = 'Нумератор'; Sequences = 'Последовательность'; SettingsStorages = 'Хранилище настроек'
+}
+
+function Get-ObjectKey {
+    # Путь файла выгрузки -> объект метаданных и его часть.
+    param([string]$Relative)
+    $parts = $Relative.Split('/')
+    if ($parts.Count -lt 2 -or -not $objectTypeNames.ContainsKey($parts[0])) {
+        return [pscustomobject]@{ Object = 'Свойства расширения'; Part = $Relative }
+    }
+    $name = $parts[1]
+    if ($name.EndsWith('.xml')) { $name = $name.Substring(0, $name.Length - 4) }
+    $object = '{0}.{1}' -f $objectTypeNames[$parts[0]], $name
+    $rest = ''
+    if ($parts.Count -gt 2) { $rest = ($parts[2..($parts.Count - 1)] -join '/') }
+    $part = switch -Regex ($rest) {
+        '^$' { 'свойства объекта (реквизиты, состав)'; break }
+        '^Ext/ObjectModule\.bsl$' { 'модуль объекта'; break }
+        '^Ext/ManagerModule\.bsl$' { 'модуль менеджера'; break }
+        '^Ext/RecordSetModule\.bsl$' { 'модуль набора записей'; break }
+        '^Ext/Module\.bsl$' { 'модуль'; break }
+        '^Ext/ValueManagerModule\.bsl$' { 'модуль менеджера значения'; break }
+        '^Ext/CommandModule\.bsl$' { 'модуль команды'; break }
+        '^Ext/Rights\.xml$' { 'права'; break }
+        '^Ext/Predefined\.xml$' { 'предопределённые'; break }
+        '^Forms/([^/]+)\.xml$' { 'форма {0}: свойства' -f $Matches[1]; break }
+        '^Forms/([^/]+)/Ext/Form\.xml$' { 'форма {0}: элементы и реквизиты' -f $Matches[1]; break }
+        '^Forms/([^/]+)/Ext/Form/Module\.bsl$' { 'форма {0}: модуль' -f $Matches[1]; break }
+        '^Commands/([^/]+)/Ext/CommandModule\.bsl$' { 'команда {0}: модуль' -f $Matches[1]; break }
+        '^Templates/([^/]+?)(\.xml|/.*)$' { 'макет {0}' -f $Matches[1]; break }
+        default { $rest }
+    }
+    return [pscustomobject]@{ Object = $object; Part = [string]$part }
+}
+
+function Get-BslMethods {
+    # Процедуры и функции модуля: имя -> текст и перехват (&Перед, &После, &Вместо, &ИзменениеИКонтроль).
+    param([string]$Path)
+    $methods = @{}
+    if ([string]::IsNullOrEmpty($Path) -or -not (Test-Path -LiteralPath $Path)) { return $methods }
+    $current = $null
+    $intercept = ''
+    $buffer = $null
+    foreach ($line in [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)) {
+        $trim = $line.Trim()
+        if ($null -eq $current) {
+            $found = [regex]::Match($trim, '^&(Перед|После|Вместо|ИзменениеИКонтроль)\s*\(\s*"([^"]+)"')
+            if ($found.Success) { $intercept = '&{0}("{1}")' -f $found.Groups[1].Value, $found.Groups[2].Value; continue }
+            $found = [regex]::Match($trim, '^(?:Асинх\s+)?(Процедура|Функция)\s+([\w]+)\s*\(', 'IgnoreCase')
+            if ($found.Success) {
+                $current = $found.Groups[2].Value
+                $buffer = New-Object System.Collections.Generic.List[string]
+                $buffer.Add($trim)
+            }
+            continue
+        }
+        $buffer.Add($trim)
+        if ($trim -match '^Конец(Процедуры|Функции)') {
+            $methods[$current] = [pscustomobject]@{ Text = ($buffer -join "`n"); Intercept = $intercept }
+            $current = $null
+            $intercept = ''
+        }
+    }
+    return $methods
+}
+
+function Get-AuthorMarks {
+    # Новые пометки авторов (// ** ...): строки, которых не было в старом модуле.
+    param([string]$OldPath, [string]$NewPath)
+    $old = @{}
+    if ($OldPath -and (Test-Path -LiteralPath $OldPath)) { foreach ($line in [System.IO.File]::ReadAllLines($OldPath, [System.Text.Encoding]::UTF8)) { $old[$line.Trim()] = $true } }
+    $marks = New-Object System.Collections.Generic.List[string]
+    if (-not $NewPath -or -not (Test-Path -LiteralPath $NewPath)) { return $marks.ToArray() }
+    foreach ($line in [System.IO.File]::ReadAllLines($NewPath, [System.Text.Encoding]::UTF8)) {
+        $trim = $line.Trim()
+        if ($trim -match '^//\s*\*\*' -and -not $old.ContainsKey($trim) -and -not $marks.Contains($trim)) { $marks.Add($trim) }
+    }
+    return $marks.ToArray()
+}
+
+function Get-ExtensionChanges {
+    # Что изменилось в расширении: объекты новые, удалённые, изменённые (по частям), процедуры модулей, пометки авторов.
+    # KeyPrefix - для выгрузки внешней обработки: её файлы лежат без папки вида объекта, с ним они
+    # читаются как объект «Обработка.<имя>» (модуль объекта, формы, макеты).
+    param([string]$OldDir, [string]$NewDir, [string]$KeyPrefix = '')
+    $oldHashes = Get-TreeHashes $OldDir
+    $newHashes = Get-TreeHashes $NewDir
+    $objects = @{}
+    $marks = New-Object System.Collections.Generic.List[string]
+    $allKeys = @(@($oldHashes.Keys) + @($newHashes.Keys) | Sort-Object -Unique)
+    foreach ($relative in $allKeys) {
+        $inOld = $oldHashes.ContainsKey($relative)
+        $inNew = $newHashes.ContainsKey($relative)
+        if ($inOld -and $inNew -and $oldHashes[$relative] -eq $newHashes[$relative]) { continue }
+        $key = Get-ObjectKey ($KeyPrefix + $relative)
+        if (-not $objects.ContainsKey($key.Object)) {
+            $objects[$key.Object] = [pscustomobject]@{ Name = $key.Object; Added = $false; Removed = $false; Parts = (New-Object System.Collections.Generic.List[string]) }
+        }
+        $object = $objects[$key.Object]
+        $isObjectFile = (($KeyPrefix + $relative) -match '^[^/]+/[^/]+\.xml$')
+        if ($isObjectFile -and -not $inOld) { $object.Added = $true }
+        if ($isObjectFile -and -not $inNew) { $object.Removed = $true }
+        $partText = $key.Part
+        if (-not $inOld) { $partText = $partText + ' - новое' }
+        elseif (-not $inNew) { $partText = $partText + ' - удалено' }
+        if ($relative.EndsWith('.bsl')) {
+            $oldPath = ''
+            if ($OldDir) { $oldPath = Join-Path $OldDir $relative.Replace('/', '\') }
+            $newPath = Join-Path $NewDir $relative.Replace('/', '\')
+            $oldMethods = Get-BslMethods $oldPath
+            $newMethods = Get-BslMethods $newPath
+            $methodNotes = New-Object System.Collections.Generic.List[string]
+            foreach ($name in @($newMethods.Keys | Sort-Object)) {
+                $label = $name
+                if ($newMethods[$name].Intercept) { $label = '{0} ({1})' -f $name, $newMethods[$name].Intercept }
+                if (-not $oldMethods.ContainsKey($name)) { $methodNotes.Add('+ ' + $label) }
+                elseif ($oldMethods[$name].Text -ne $newMethods[$name].Text) { $methodNotes.Add('~ ' + $label) }
+            }
+            foreach ($name in @($oldMethods.Keys | Sort-Object)) { if (-not $newMethods.ContainsKey($name)) { $methodNotes.Add('- ' + $name) } }
+            if ($methodNotes.Count -gt 0) { $partText = $partText + ': ' + ($methodNotes -join '; ') }
+            elseif ($inOld -and $inNew) { $partText = $partText + ': изменения вне процедур (переменные, комментарии, области)' }
+            foreach ($mark in @(Get-AuthorMarks $oldPath $newPath)) { if (-not $marks.Contains($mark)) { $marks.Add($mark) } }
+        }
+        $object.Parts.Add($partText)
+    }
+    return [pscustomobject]@{ Objects = @($objects.Values | Sort-Object Name); Marks = $marks.ToArray() }
+}
+
+#endregion
+
 #region Состояние баз
 
 function Format-LockDate {
@@ -1278,6 +1435,149 @@ if ($BaseState) {
     $stateLink = Connect-ClusterAgent
     Show-BaseState -Link $stateLink -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
     Show-BaseState -Link $stateLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+    exit 0
+}
+
+function Get-NonEmpty {
+    param([string]$Value, [string]$Default)
+    if ([string]::IsNullOrEmpty($Value)) { return $Default }
+    return $Value
+}
+
+function Write-ChangeGroups {
+    # Разница одного расширения или обработки: в консоль и в html. Было - рабочая, стало - temp.
+    param($Changes, [System.Text.StringBuilder]$Html)
+    $groups = @(
+        @{ Title = 'Есть только в temp (новые)'; Items = @($Changes.Objects | Where-Object { $_.Added }) },
+        @{ Title = 'Есть только в рабочей (в temp удалены)'; Items = @($Changes.Objects | Where-Object { $_.Removed }) },
+        @{ Title = 'Отличаются'; Items = @($Changes.Objects | Where-Object { -not $_.Added -and -not $_.Removed }) }
+    )
+    foreach ($group in $groups) {
+        if ($group.Items.Count -eq 0) { continue }
+        Write-Line ("    {0}:" -f $group.Title) 'Yellow'
+        [void]$Html.Append(('<h3>{0}</h3><ul>' -f (ConvertTo-Html $group.Title)))
+        foreach ($object in $group.Items) {
+            Write-Line ("      {0}" -f $object.Name)
+            [void]$Html.Append(('<li><b>{0}</b><ul>' -f (ConvertTo-Html $object.Name)))
+            foreach ($part in $object.Parts) {
+                Write-Line ("        {0}" -f $part) 'DarkGray'
+                [void]$Html.Append(('<li>{0}</li>' -f (ConvertTo-Html $part)))
+            }
+            [void]$Html.Append('</ul></li>')
+        }
+        [void]$Html.Append('</ul>')
+    }
+    if (@($Changes.Marks).Count -gt 0) {
+        Write-Line '    Пометки авторов, которых нет в рабочей:' 'Yellow'
+        [void]$Html.Append('<h3>Пометки авторов, которых нет в рабочей</h3><ul>')
+        foreach ($mark in $Changes.Marks) { Write-Line ("      {0}" -f $mark) 'DarkGray'; [void]$Html.Append(('<li>{0}</li>' -f (ConvertTo-Html $mark))) }
+        [void]$Html.Append('</ul>')
+    }
+}
+
+if ($CompareExtensions) {
+    # Расширения temp и рабочей: версии и хеши через COM (быстро), где отличаются или не прочитались -
+    # выгрузка обеих баз в файлы (конфигуратор, только чтение; повторно - только изменения) и разница по
+    # объектам и процедурам. Было - рабочая, стало - temp: то, что принесёт обновление.
+    Write-Line ("СРАВНЕНИЕ РАСШИРЕНИЙ: {0} (было) и {1} (стало), {2}" -f $script:ProdBase, $script:TempBase, (Get-Date -Format 'dd.MM.yyyy HH:mm')) 'Cyan'
+    $cmpTemp = Get-ExtensionStates -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
+    $cmpProd = Get-ExtensionStates -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+    if (-not $cmpTemp.Ok) { Write-Line ("  {0}: через COM не прочитал - {1}; сравню по выгрузкам" -f $script:TempBase, $cmpTemp.Error) 'Yellow' }
+    if (-not $cmpProd.Ok) { Write-Line ("  {0}: через COM не прочитал - {1}; сравню по выгрузкам" -f $script:ProdBase, $cmpProd.Error) 'Yellow' }
+    $cmpHtml = New-Object System.Text.StringBuilder
+    [void]$cmpHtml.Append('<html><head><meta charset="utf-8"></head><body>')
+    [void]$cmpHtml.Append(('<h1>Расширения: {0} и {1}, {2}</h1><p>Было - рабочая, стало - temp: то, что принесёт обновление.</p>' -f (ConvertTo-Html $script:ProdBase), (ConvertTo-Html $script:TempBase), (Get-Date -Format 'dd.MM.yyyy HH:mm')))
+    $cmpDiffer = 0
+    foreach ($name in $deployExtensions) {
+        Write-Host ''
+        $tempVersion = ''; $prodVersion = ''
+        if ($cmpTemp.Ok -and $cmpTemp.Items.ContainsKey($name)) { $tempVersion = [string]$cmpTemp.Items[$name].Version }
+        if ($cmpProd.Ok -and $cmpProd.Items.ContainsKey($name)) { $prodVersion = [string]$cmpProd.Items[$name].Version }
+        $versions = "temp {0}, рабочая {1}" -f (Get-NonEmpty $tempVersion '?'), (Get-NonEmpty $prodVersion '?')
+        if ($cmpTemp.Ok -and $cmpProd.Ok) {
+            $inTemp = $cmpTemp.Items.ContainsKey($name); $inProd = $cmpProd.Items.ContainsKey($name)
+            if (-not $inTemp -and -not $inProd) { Write-Line ("  {0}: нет ни в temp, ни в рабочей" -f $name) 'DarkGray'; continue }
+            if ($inTemp -and $inProd -and $cmpTemp.Items[$name].Hash -and $cmpTemp.Items[$name].Hash -eq $cmpProd.Items[$name].Hash) {
+                Write-Line ("  {0}: одинаковые ({1})" -f $name, $versions) 'Green'
+                [void]$cmpHtml.Append(('<h2>{0}: одинаковые</h2><p>{1}</p>' -f (ConvertTo-Html $name), (ConvertTo-Html $versions)))
+                continue
+            }
+        }
+        Write-Line ("  {0}: {1} - выгружаю обе базы в файлы" -f $name, $versions) 'Cyan'
+        $tempDump = Update-DumpDir -BaseName $script:TempBase -Extension $name -Dir (Join-Path (Join-Path $script:RunDir 'temp') $name)
+        $prodDump = Update-DumpDir -BaseName $script:ProdBase -Extension $name -Dir (Join-Path (Join-Path $script:RunDir 'prod') $name)
+        if (-not $tempDump.Ok -and -not $tempDump.Absent) { Write-Line ("    из {0} не выгрузил: {1}" -f $script:TempBase, $tempDump.Detail) 'Red'; continue }
+        if (-not $prodDump.Ok -and -not $prodDump.Absent) { Write-Line ("    из {0} не выгрузил: {1}" -f $script:ProdBase, $prodDump.Detail) 'Red'; continue }
+        [void]$cmpHtml.Append(('<h2>{0}</h2><p>{1}</p>' -f (ConvertTo-Html $name), (ConvertTo-Html $versions)))
+        if ($tempDump.Absent) { Write-Line '    в temp его нет: обновление его не принесёт' 'Yellow'; [void]$cmpHtml.Append('<p>В temp его нет.</p>'); continue }
+        if ($prodDump.Absent) { Write-Line '    в рабочей его нет: обновление добавит целиком' 'Yellow'; [void]$cmpHtml.Append('<p>В рабочей его нет: обновление добавит целиком.</p>') }
+        $prodDir = ''
+        if ($prodDump.Ok) { $prodDir = $prodDump.Dir }
+        $changes = Get-ExtensionChanges -OldDir $prodDir -NewDir $tempDump.Dir
+        if (@($changes.Objects).Count -eq 0) {
+            Write-Line '    по выгрузкам отличий нет (разница только в служебных данных)' 'Green'
+            [void]$cmpHtml.Append('<p>По выгрузкам отличий нет.</p>')
+            continue
+        }
+        $cmpDiffer++
+        Write-ChangeGroups -Changes $changes -Html $cmpHtml
+    }
+    [void]$cmpHtml.Append('<p>Обозначения: + новая процедура, ~ изменена, - удалена.</p></body></html>')
+    $cmpFile = Join-Path $script:RunDir 'compare.html'
+    [System.IO.File]::WriteAllText($cmpFile, $cmpHtml.ToString(), $Utf8Bom)
+    Write-Host ''
+    Write-Line ("Отличаются расширений: {0}. Обозначения: + новая процедура, ~ изменена, - удалена. Отчёт: {1}" -f $cmpDiffer, $cmpFile) 'Cyan'
+    exit 0
+}
+
+if ($CompareProcessings) {
+    # Внешние обработки справочника «Дополнительные отчёты и обработки» temp и рабочей: через COM (только
+    # чтение), по имени объекта. Отличаются - выгрузка обоих файлов в файлы конфигуратором temp и разница
+    # по модулям и формам. Было - рабочая, стало - temp.
+    Write-Line ("СРАВНЕНИЕ ВНЕШНИХ ОБРАБОТОК: {0} (было) и {1} (стало), {2}" -f $script:ProdBase, $script:TempBase, (Get-Date -Format 'dd.MM.yyyy HH:mm')) 'Cyan'
+    foreach ($side in @('temp', 'prod', 'dump')) { $sideDir = Join-Path $script:RunDir $side; if (Test-Path -LiteralPath $sideDir) { Remove-Item -LiteralPath $sideDir -Recurse -Force } }
+    $tempList = Export-Processings -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword -Dir (Join-Path $script:RunDir 'temp')
+    $prodList = Export-Processings -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword -Dir (Join-Path $script:RunDir 'prod')
+    if (-not $tempList.Ok) { Write-Line ("  {0}: не выгрузил - {1}" -f $script:TempBase, $tempList.Error) 'Red' }
+    if (-not $prodList.Ok) { Write-Line ("  {0}: не выгрузил - {1}" -f $script:ProdBase, $prodList.Error) 'Red' }
+    if (-not $tempList.Ok -or -not $prodList.Ok) { exit 1 }
+    $tempByName = @{}; foreach ($item in @($tempList.Items)) { $tempByName[[string]$item.ObjName] = $item }
+    $prodByName = @{}; foreach ($item in @($prodList.Items)) { $prodByName[[string]$item.ObjName] = $item }
+    $cmpHtml = New-Object System.Text.StringBuilder
+    [void]$cmpHtml.Append('<html><head><meta charset="utf-8"></head><body>')
+    [void]$cmpHtml.Append(('<h1>Внешние обработки: {0} и {1}, {2}</h1><p>Было - рабочая, стало - temp.</p>' -f (ConvertTo-Html $script:ProdBase), (ConvertTo-Html $script:TempBase), (Get-Date -Format 'dd.MM.yyyy HH:mm')))
+    $same = 0; $differ = 0
+    foreach ($name in @(@($tempByName.Keys) + @($prodByName.Keys) | Sort-Object -Unique)) {
+        $inTemp = $tempByName.ContainsKey($name); $inProd = $prodByName.ContainsKey($name)
+        if ($inTemp -and $inProd -and $tempByName[$name].Hash -eq $prodByName[$name].Hash) { $same++; continue }
+        $differ++
+        Write-Host ''
+        if (-not $inProd) {
+            Write-Line ("  {0} ({1}, версия {2}): есть только в temp" -f $name, $tempByName[$name].Title, (Get-NonEmpty $tempByName[$name].Version '-')) 'Yellow'
+            [void]$cmpHtml.Append(('<h2>{0}: есть только в temp</h2><p>{1}, версия {2}</p>' -f (ConvertTo-Html $name), (ConvertTo-Html $tempByName[$name].Title), (ConvertTo-Html $tempByName[$name].Version)))
+            continue
+        }
+        if (-not $inTemp) {
+            Write-Line ("  {0} ({1}, версия {2}): есть только в рабочей" -f $name, $prodByName[$name].Title, (Get-NonEmpty $prodByName[$name].Version '-')) 'Yellow'
+            [void]$cmpHtml.Append(('<h2>{0}: есть только в рабочей</h2><p>{1}, версия {2}</p>' -f (ConvertTo-Html $name), (ConvertTo-Html $prodByName[$name].Title), (ConvertTo-Html $prodByName[$name].Version)))
+            continue
+        }
+        $versions = "temp {0}, рабочая {1}" -f (Get-NonEmpty $tempByName[$name].Version '-'), (Get-NonEmpty $prodByName[$name].Version '-')
+        Write-Line ("  {0} ({1}): отличается, {2}" -f $name, $tempByName[$name].Title, $versions) 'Yellow'
+        [void]$cmpHtml.Append(('<h2>{0}: отличается</h2><p>{1}, {2}</p>' -f (ConvertTo-Html $name), (ConvertTo-Html $tempByName[$name].Title), (ConvertTo-Html $versions)))
+        $dumpRoot = Join-Path $script:RunDir 'dump'
+        $newDump = Get-ProcessingDump -File $tempByName[$name].File -Dir (Join-Path $dumpRoot ($name + '-temp')) -Title ("Выгрузить в файлы {0} из temp" -f $name)
+        $oldDump = Get-ProcessingDump -File $prodByName[$name].File -Dir (Join-Path $dumpRoot ($name + '-prod')) -Title ("Выгрузить в файлы {0} из рабочей" -f $name)
+        if (-not $newDump -or -not $oldDump) { Write-Line '    в файлы не выгрузилась: разницы по модулям нет, см. run.log' 'Red'; continue }
+        $changes = Get-ExtensionChanges -OldDir $oldDump -NewDir $newDump -KeyPrefix 'DataProcessors/'
+        if (@($changes.Objects).Count -eq 0) { Write-Line '    по выгрузке отличий нет: разница в самом файле (служебные данные)' 'DarkGray'; continue }
+        Write-ChangeGroups -Changes $changes -Html $cmpHtml
+    }
+    [void]$cmpHtml.Append('<p>Обозначения: + новая процедура, ~ изменена, - удалена.</p></body></html>')
+    $cmpFile = Join-Path $script:RunDir 'compare.html'
+    [System.IO.File]::WriteAllText($cmpFile, $cmpHtml.ToString(), $Utf8Bom)
+    Write-Host ''
+    Write-Line ("Обработок: одинаковых {0}, отличаются {1}. Отчёт: {2}" -f $same, $differ, $cmpFile) 'Cyan'
     exit 0
 }
 
@@ -2459,147 +2759,6 @@ if ($outcome -eq 'updated') {
 #endregion
 
 #region Отчёт об изменениях
-
-$objectTypeNames = @{
-    Catalogs = 'Справочник'; Documents = 'Документ'; CommonModules = 'Общий модуль'; DataProcessors = 'Обработка'
-    Reports = 'Отчёт'; InformationRegisters = 'Регистр сведений'; AccumulationRegisters = 'Регистр накопления'
-    AccountingRegisters = 'Регистр бухгалтерии'; CalculationRegisters = 'Регистр расчёта'; Enums = 'Перечисление'
-    Roles = 'Роль'; CommonForms = 'Общая форма'; Subsystems = 'Подсистема'; Constants = 'Константа'
-    ScheduledJobs = 'Регламентное задание'; EventSubscriptions = 'Подписка на событие'; CommonCommands = 'Общая команда'
-    CommonTemplates = 'Общий макет'; CommonPictures = 'Общая картинка'; HTTPServices = 'HTTP-сервис'; WebServices = 'Веб-сервис'
-    DocumentJournals = 'Журнал документов'; ChartsOfCharacteristicTypes = 'План видов характеристик'
-    ChartsOfAccounts = 'План счетов'; ChartsOfCalculationTypes = 'План видов расчёта'; BusinessProcesses = 'Бизнес-процесс'
-    Tasks = 'Задача'; ExchangePlans = 'План обмена'; FilterCriteria = 'Критерий отбора'; DefinedTypes = 'Определяемый тип'
-    FunctionalOptions = 'Функциональная опция'; FunctionalOptionsParameters = 'Параметр функциональных опций'
-    SessionParameters = 'Параметр сеанса'; CommonAttributes = 'Общий реквизит'; CommandGroups = 'Группа команд'
-    XDTOPackages = 'Пакет XDTO'; StyleItems = 'Элемент стиля'; Styles = 'Стиль'; Languages = 'Язык'
-    DocumentNumerators = 'Нумератор'; Sequences = 'Последовательность'; SettingsStorages = 'Хранилище настроек'
-}
-
-function Get-ObjectKey {
-    # Путь файла выгрузки -> объект метаданных и его часть.
-    param([string]$Relative)
-    $parts = $Relative.Split('/')
-    if ($parts.Count -lt 2 -or -not $objectTypeNames.ContainsKey($parts[0])) {
-        return [pscustomobject]@{ Object = 'Свойства расширения'; Part = $Relative }
-    }
-    $name = $parts[1]
-    if ($name.EndsWith('.xml')) { $name = $name.Substring(0, $name.Length - 4) }
-    $object = '{0}.{1}' -f $objectTypeNames[$parts[0]], $name
-    $rest = ''
-    if ($parts.Count -gt 2) { $rest = ($parts[2..($parts.Count - 1)] -join '/') }
-    $part = switch -Regex ($rest) {
-        '^$' { 'свойства объекта (реквизиты, состав)'; break }
-        '^Ext/ObjectModule\.bsl$' { 'модуль объекта'; break }
-        '^Ext/ManagerModule\.bsl$' { 'модуль менеджера'; break }
-        '^Ext/RecordSetModule\.bsl$' { 'модуль набора записей'; break }
-        '^Ext/Module\.bsl$' { 'модуль'; break }
-        '^Ext/ValueManagerModule\.bsl$' { 'модуль менеджера значения'; break }
-        '^Ext/CommandModule\.bsl$' { 'модуль команды'; break }
-        '^Ext/Rights\.xml$' { 'права'; break }
-        '^Ext/Predefined\.xml$' { 'предопределённые'; break }
-        '^Forms/([^/]+)\.xml$' { 'форма {0}: свойства' -f $Matches[1]; break }
-        '^Forms/([^/]+)/Ext/Form\.xml$' { 'форма {0}: элементы и реквизиты' -f $Matches[1]; break }
-        '^Forms/([^/]+)/Ext/Form/Module\.bsl$' { 'форма {0}: модуль' -f $Matches[1]; break }
-        '^Commands/([^/]+)/Ext/CommandModule\.bsl$' { 'команда {0}: модуль' -f $Matches[1]; break }
-        '^Templates/([^/]+?)(\.xml|/.*)$' { 'макет {0}' -f $Matches[1]; break }
-        default { $rest }
-    }
-    return [pscustomobject]@{ Object = $object; Part = [string]$part }
-}
-
-function Get-BslMethods {
-    # Процедуры и функции модуля: имя -> текст и перехват (&Перед, &После, &Вместо, &ИзменениеИКонтроль).
-    param([string]$Path)
-    $methods = @{}
-    if ([string]::IsNullOrEmpty($Path) -or -not (Test-Path -LiteralPath $Path)) { return $methods }
-    $current = $null
-    $intercept = ''
-    $buffer = $null
-    foreach ($line in [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)) {
-        $trim = $line.Trim()
-        if ($null -eq $current) {
-            $found = [regex]::Match($trim, '^&(Перед|После|Вместо|ИзменениеИКонтроль)\s*\(\s*"([^"]+)"')
-            if ($found.Success) { $intercept = '&{0}("{1}")' -f $found.Groups[1].Value, $found.Groups[2].Value; continue }
-            $found = [regex]::Match($trim, '^(?:Асинх\s+)?(Процедура|Функция)\s+([\w]+)\s*\(', 'IgnoreCase')
-            if ($found.Success) {
-                $current = $found.Groups[2].Value
-                $buffer = New-Object System.Collections.Generic.List[string]
-                $buffer.Add($trim)
-            }
-            continue
-        }
-        $buffer.Add($trim)
-        if ($trim -match '^Конец(Процедуры|Функции)') {
-            $methods[$current] = [pscustomobject]@{ Text = ($buffer -join "`n"); Intercept = $intercept }
-            $current = $null
-            $intercept = ''
-        }
-    }
-    return $methods
-}
-
-function Get-AuthorMarks {
-    # Новые пометки авторов (// ** ...): строки, которых не было в старом модуле.
-    param([string]$OldPath, [string]$NewPath)
-    $old = @{}
-    if ($OldPath -and (Test-Path -LiteralPath $OldPath)) { foreach ($line in [System.IO.File]::ReadAllLines($OldPath, [System.Text.Encoding]::UTF8)) { $old[$line.Trim()] = $true } }
-    $marks = New-Object System.Collections.Generic.List[string]
-    if (-not $NewPath -or -not (Test-Path -LiteralPath $NewPath)) { return $marks.ToArray() }
-    foreach ($line in [System.IO.File]::ReadAllLines($NewPath, [System.Text.Encoding]::UTF8)) {
-        $trim = $line.Trim()
-        if ($trim -match '^//\s*\*\*' -and -not $old.ContainsKey($trim) -and -not $marks.Contains($trim)) { $marks.Add($trim) }
-    }
-    return $marks.ToArray()
-}
-
-function Get-ExtensionChanges {
-    # Что изменилось в расширении: объекты новые, удалённые, изменённые (по частям), процедуры модулей, пометки авторов.
-    # KeyPrefix - для выгрузки внешней обработки: её файлы лежат без папки вида объекта, с ним они
-    # читаются как объект «Обработка.<имя>» (модуль объекта, формы, макеты).
-    param([string]$OldDir, [string]$NewDir, [string]$KeyPrefix = '')
-    $oldHashes = Get-TreeHashes $OldDir
-    $newHashes = Get-TreeHashes $NewDir
-    $objects = @{}
-    $marks = New-Object System.Collections.Generic.List[string]
-    $allKeys = @(@($oldHashes.Keys) + @($newHashes.Keys) | Sort-Object -Unique)
-    foreach ($relative in $allKeys) {
-        $inOld = $oldHashes.ContainsKey($relative)
-        $inNew = $newHashes.ContainsKey($relative)
-        if ($inOld -and $inNew -and $oldHashes[$relative] -eq $newHashes[$relative]) { continue }
-        $key = Get-ObjectKey ($KeyPrefix + $relative)
-        if (-not $objects.ContainsKey($key.Object)) {
-            $objects[$key.Object] = [pscustomobject]@{ Name = $key.Object; Added = $false; Removed = $false; Parts = (New-Object System.Collections.Generic.List[string]) }
-        }
-        $object = $objects[$key.Object]
-        $isObjectFile = (($KeyPrefix + $relative) -match '^[^/]+/[^/]+\.xml$')
-        if ($isObjectFile -and -not $inOld) { $object.Added = $true }
-        if ($isObjectFile -and -not $inNew) { $object.Removed = $true }
-        $partText = $key.Part
-        if (-not $inOld) { $partText = $partText + ' - новое' }
-        elseif (-not $inNew) { $partText = $partText + ' - удалено' }
-        if ($relative.EndsWith('.bsl')) {
-            $oldPath = ''
-            if ($OldDir) { $oldPath = Join-Path $OldDir $relative.Replace('/', '\') }
-            $newPath = Join-Path $NewDir $relative.Replace('/', '\')
-            $oldMethods = Get-BslMethods $oldPath
-            $newMethods = Get-BslMethods $newPath
-            $methodNotes = New-Object System.Collections.Generic.List[string]
-            foreach ($name in @($newMethods.Keys | Sort-Object)) {
-                $label = $name
-                if ($newMethods[$name].Intercept) { $label = '{0} ({1})' -f $name, $newMethods[$name].Intercept }
-                if (-not $oldMethods.ContainsKey($name)) { $methodNotes.Add('+ ' + $label) }
-                elseif ($oldMethods[$name].Text -ne $newMethods[$name].Text) { $methodNotes.Add('~ ' + $label) }
-            }
-            foreach ($name in @($oldMethods.Keys | Sort-Object)) { if (-not $newMethods.ContainsKey($name)) { $methodNotes.Add('- ' + $name) } }
-            if ($methodNotes.Count -gt 0) { $partText = $partText + ': ' + ($methodNotes -join '; ') }
-            elseif ($inOld -and $inNew) { $partText = $partText + ': изменения вне процедур (переменные, комментарии, области)' }
-            foreach ($mark in @(Get-AuthorMarks $oldPath $newPath)) { if (-not $marks.Contains($mark)) { $marks.Add($mark) } }
-        }
-        $object.Parts.Add($partText)
-    }
-    return [pscustomobject]@{ Objects = @($objects.Values | Sort-Object Name); Marks = $marks.ToArray() }
-}
 
 $reportTitle = "Обновление расширений {0} от {1}" -f $script:ProdBase, (Get-Date -Format 'dd.MM.yyyy HH:mm')
 if ($mode -eq 'asis') { $reportTitle = "Обновление конфигурации БД {0} как есть от {1}" -f $script:ProdBase, (Get-Date -Format 'dd.MM.yyyy HH:mm') }
