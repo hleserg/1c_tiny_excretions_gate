@@ -1933,7 +1933,8 @@ $tests = @(
             Check ((Get-Calls $r @('selfcheck;', 'start=999999')).Count -eq 1) 'нет сеанса проверки базы (самопроверка без заданий)'
             if ($r.RunDir) {
                 Check (Test-Path -LiteralPath (Join-Path $r.RunDir 'checkconfig_all.norm.txt')) 'файлы проверки конфигурации не скопированы в папку продолжения'
-                Check ([System.IO.File]::ReadAllText((Join-Path $r.RunDir 'summary.txt'), $utf8) -match ('Загрузить Адаптация \(из прогона {0}\)' -f $firstName)) 'в summary.txt нет пометки «из прогона»'
+                $summaryFile = Join-Path $r.RunDir 'summary.txt'
+                Check ((Test-Path -LiteralPath $summaryFile) -and ([System.IO.File]::ReadAllText($summaryFile, $utf8) -match ('Загрузить Адаптация \(из прогона {0}\)' -f $firstName))) 'в summary.txt нет пометки «из прогона»'
             }
         }
     },
@@ -1992,8 +1993,12 @@ $tests = @(
             Check (-not (Test-Path -LiteralPath $fixed)) 'исправленный файл остался в inbox'
             if ($r.RunDir) {
                 Check (Test-Path -LiteralPath (Join-Path $r.RunDir ('inbox\' + $fixedName))) 'исправленного файла нет в папке продолжения'
-                $state = [System.IO.File]::ReadAllText((Join-Path $r.RunDir 'resume.json'), $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
-                $backup = [string]@($state.kit.items)[0].backup
+                $stateFile = Join-Path $r.RunDir 'resume.json'
+                $backup = 'нет resume.json'
+                if (Test-Path -LiteralPath $stateFile) {
+                    $state = [System.IO.File]::ReadAllText($stateFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                    $backup = [string]@($state.kit.items)[0].backup
+                }
                 Check ($backup -like ('*\' + $firstName + '\before\*')) ('прежняя версия - не из первого прогона: ' + $backup)
             }
         }

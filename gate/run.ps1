@@ -2415,7 +2415,7 @@ $script:StepsLogPath = ''
 # Сведения этого прогона для продолжения (resume.json): этапы, комплект, «до» цепочки.
 $script:RunState = $null
 # Этот прогон - продолжение: прежний прогон, с какого этапа, что берётся готовым.
-$script:Resume = $null
+$script:ResumeRun = $null
 # Что выбрали в меню или ключом -Resume: план и этап.
 $script:ResumeRequest = $null
 # Комплект продолжения: обновления прежнего прогона (или новые из inbox для тех же имён).
@@ -2934,7 +2934,7 @@ function Initialize-Resume {
     $state = $plan.Record.State
     $reused = @{}
     for ($i = 0; $i -lt $Request.Row.Index; $i++) { $reused[$script:ResumePhases[$i]] = $true }
-    $script:Resume = [pscustomobject]@{
+    $script:ResumeRun = [pscustomobject]@{
         Plan = $plan; PrevDir = $plan.Dir; PrevName = $plan.Name; Start = $Request.Phase; StartRow = $Request.Row
         Reused = $reused; Unverified = [bool]$Request.Unverified; State = $state; Steps = @($plan.Record.Steps)
         Strict = [bool]$Request.Row.Strict; Info = [bool]$Request.Row.Info
@@ -2966,14 +2966,14 @@ function Initialize-Resume {
 function Set-ResumeStart {
     # Начало продолжения перенесено (база изменилась после прежнего прогона): этапы с этого - заново.
     param([string]$Phase)
-    $row = @($script:Resume.Plan.Rows | Where-Object { $_.Phase -eq $Phase })[0]
+    $row = @($script:ResumeRun.Plan.Rows | Where-Object { $_.Phase -eq $Phase })[0]
     $reused = @{}
     for ($i = 0; $i -lt $row.Index; $i++) { $reused[$script:ResumePhases[$i]] = $true }
-    $script:Resume.Start = $Phase
-    $script:Resume.StartRow = $row
-    $script:Resume.Reused = $reused
-    $script:Resume.Strict = $false
-    $script:Resume.Info = [bool]$row.Info
+    $script:ResumeRun.Start = $Phase
+    $script:ResumeRun.StartRow = $row
+    $script:ResumeRun.Reused = $reused
+    $script:ResumeRun.Strict = $false
+    $script:ResumeRun.Info = [bool]$row.Info
     $script:RunState.start = $Phase
     Write-RunLog ('Продолжение: начало перенесено на этап ' + $Phase)
 }
@@ -2982,12 +2982,12 @@ function Set-ResumeKitFields {
     # Комплект продолжения. Прежние версии и «было ли в базе» - из первого прогона цепочки (этап сохранения взят
     # готовым). «Загружено» - из прежнего прогона, если комплект не откатывали: откат продолжения должен вернуть и то,
     # что загрузил прежний прогон. У обработки, которую прежний прогон уже записал, прежней остаётся версия до цепочки.
-    $prevKit = Get-UiField $script:Resume.State 'kit' $null
-    $kept = ($script:Resume.Plan.Decision -ne 'rolledBack')
+    $prevKit = Get-UiField $script:ResumeRun.State 'kit' $null
+    $kept = ($script:ResumeRun.Plan.Decision -ne 'rolledBack')
     foreach ($item in $kitItems) {
         $prev = @(@(Get-UiField $prevKit 'items' @()) | Where-Object { [string](Get-UiField $_ 'name' '') -eq $item.Name } | Select-Object -First 1)
         if ($prev.Count -eq 0) { continue }
-        if ($script:Resume.Reused.ContainsKey('backup')) {
+        if ($script:ResumeRun.Reused.ContainsKey('backup')) {
             $item.Backup = [string](Get-UiField $prev[0] 'backup' '')
             $item.WasInBase = [string](Get-UiField $prev[0] 'wasInBase' 'unknown')
         }
@@ -3011,7 +3011,7 @@ function Set-ResumeKitFields {
             $proc.ObjectName = [string](Get-UiField $old 'objectName' '')
             $proc | Add-Member -NotePropertyName KeepRoot -NotePropertyValue $true -Force
         }
-        if ($script:Resume.Reused.ContainsKey('load')) {
+        if ($script:ResumeRun.Reused.ContainsKey('load')) {
             $proc.NewVersion = [string](Get-UiField $old 'newVersion' '')
             $builtFile = [string](Get-UiField $old 'file' '')
             if ($builtFile -and (Test-Path -LiteralPath $builtFile)) { $proc.File = $builtFile }
@@ -3053,7 +3053,7 @@ function Copy-PhaseFiles {
     # Файлы этапа - из прежнего прогона в папку этого (что уже есть, не трогается).
     param([string]$Phase)
     foreach ($pattern in @($script:ResumePhaseFiles[$Phase])) {
-        foreach ($item in @(Get-ChildItem -LiteralPath $script:Resume.PrevDir -Filter $pattern -ErrorAction SilentlyContinue)) {
+        foreach ($item in @(Get-ChildItem -LiteralPath $script:ResumeRun.PrevDir -Filter $pattern -ErrorAction SilentlyContinue)) {
             $target = Join-Path $RunDir $item.Name
             if (Test-Path -LiteralPath $target) { continue }
             try { Copy-Item -LiteralPath $item.FullName -Destination $target -Recurse -Force }
@@ -3065,13 +3065,13 @@ function Copy-PhaseFiles {
 function Restore-Phase {
     # Этап берётся готовым из прежнего прогона: его шаги - с пометкой «из прогона», файлы - копией. $true - взят.
     param([string]$Phase)
-    if ($null -eq $script:Resume -or -not $script:Resume.Reused.ContainsKey($Phase)) { return $false }
+    if ($null -eq $script:ResumeRun -or -not $script:ResumeRun.Reused.ContainsKey($Phase)) { return $false }
     $script:StepPhase = $Phase
     Copy-PhaseFiles -Phase $Phase
-    $prevDir = [System.IO.Path]::GetFullPath($script:Resume.PrevDir).TrimEnd('\')
-    foreach ($step in @($script:Resume.Steps | Where-Object { [string](Get-UiField $_ 'phase' '') -eq $Phase })) {
+    $prevDir = [System.IO.Path]::GetFullPath($script:ResumeRun.PrevDir).TrimEnd('\')
+    foreach ($step in @($script:ResumeRun.Steps | Where-Object { [string](Get-UiField $_ 'phase' '') -eq $Phase })) {
         $origin = [string](Get-UiField $step 'from' '')
-        if (-not $origin) { $origin = $script:Resume.PrevName }
+        if (-not $origin) { $origin = $script:ResumeRun.PrevName }
         $log = [string](Get-UiField $step 'log' '')
         if ($log -and $log.StartsWith($prevDir + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
             $copied = Join-Path $RunDir $log.Substring($prevDir.Length + 1)
@@ -3080,8 +3080,8 @@ function Restore-Phase {
         Add-StepResult -Name ([string](Get-UiField $step 'name' '')) -Status ([string](Get-UiField $step 'status' 'SKIP')) -Detail ([string](Get-UiField $step 'detail' '')) `
             -Log $log -Seconds ([int](Get-UiField $step 'seconds' 0)) -From $origin
     }
-    $prevPhase = Get-UiField (Get-UiField $script:Resume.State 'phases' $null) $Phase $null
-    Set-PhaseState -Phase $Phase -State ([string](Get-UiField $prevPhase 'state' 'done')) -From ([string](Get-UiField $prevPhase 'from' $script:Resume.PrevName))
+    $prevPhase = Get-UiField (Get-UiField $script:ResumeRun.State 'phases' $null) $Phase $null
+    Set-PhaseState -Phase $Phase -State ([string](Get-UiField $prevPhase 'state' 'done')) -From ([string](Get-UiField $prevPhase 'from' $script:ResumeRun.PrevName))
     return $true
 }
 
@@ -3089,12 +3089,12 @@ function Restore-ChainReferences {
     # Этапы, которые продолжение выполняет заново, сравниваются с тем же эталоном, что в первом прогоне цепочки: с его
     # копией перед загрузкой (before-selfcheck первого прогона). Прогон цепочки принимали в эталон - эталон не
     # трогается: принятое важнее.
-    if ($null -eq $script:Resume -or [bool]$script:RunState.accepted) { return }
+    if ($null -eq $script:ResumeRun -or [bool]$script:RunState.accepted) { return }
     $snapshot = [string]$script:RunState.referenceSnapshotDir
     if (-not $snapshot -or -not (Test-Path -LiteralPath $snapshot)) { return }
     $names = @()
-    if (-not $script:Resume.Reused.ContainsKey('dumps')) { $names += @('exchange-rules.state.txt', 'exchange-rules.findings.txt') }
-    if (-not $script:Resume.Reused.ContainsKey('selfcheck')) { $names += @('selfcheck.norm.txt', 'selfcheck.info.txt', 'selfcheck.snapshots.txt', 'selfcheck.exchange.txt', 'coverage.txt') }
+    if (-not $script:ResumeRun.Reused.ContainsKey('dumps')) { $names += @('exchange-rules.state.txt', 'exchange-rules.findings.txt') }
+    if (-not $script:ResumeRun.Reused.ContainsKey('selfcheck')) { $names += @('selfcheck.norm.txt', 'selfcheck.info.txt', 'selfcheck.snapshots.txt', 'selfcheck.exchange.txt', 'coverage.txt') }
     foreach ($name in $names) {
         $saved = Join-Path $snapshot $name
         $current = Join-Path $baselineDir $name
@@ -3139,7 +3139,7 @@ function Invoke-ResumeBaseCheck {
     # концом очереди): обработка записывает сведения о базе - расширения и их хеш-суммы - и закрывается.
     # Строго (готовыми берутся шаги после загрузки): база другая - эти шаги готовыми брать нельзя, вопрос.
     # Не строго (готовой берётся только загрузка) - для отчёта: что в базе изменилось после прогона.
-    $r = $script:Resume
+    $r = $script:ResumeRun
     if (-not $r.Strict -and -not $r.Info) { return }
     $stepName = 'Проверка базы перед продолжением'
     $script:StepPhase = 'resume'
@@ -4018,14 +4018,14 @@ if ($Resume) {
     if (-not $resumePlan.Ok) { throw ("Продолжить прогон {0} нельзя: {1}" -f (Split-Path -Leaf $resumeDir), $resumePlan.Reason) }
     $resumePhase = $resumePlan.Default
     if ($FromStep) { $resumePhase = Resolve-ResumeFromStep -Plan $resumePlan -Text $FromStep }
-    $resumeRequest = New-ResumeRequest -Plan $resumePlan -Phase $resumePhase
-    foreach ($line in (Get-ResumeRequestLines $resumeRequest)) { Write-Host ('  ' + $line) }
-    if ($resumeRequest.Unverified) {
+    $cliRequest = New-ResumeRequest -Plan $resumePlan -Phase $resumePhase
+    foreach ($line in (Get-ResumeRequestLines $cliRequest)) { Write-Host ('  ' + $line) }
+    if ($cliRequest.Unverified) {
         $sure = $null
         if (Test-UiCanAsk) { $sure = Confirm-Ui -Question ('Проверить базу не с чем. В {0} после прогона {1} ничего не загружали и не правили?' -f $baseKey, $resumePlan.Name) -Yes 'Не меняли, продолжить' -No 'Выйти' }
         if ($sure -ne $true) { throw 'Продолжение отменено: базу проверить не с чем, а подтверждения, что её не меняли, нет.' }
     }
-    $script:ResumeRequest = $resumeRequest
+    $script:ResumeRequest = $cliRequest
 }
 elseif ($FromStep) { throw '-FromStep - только вместе с -Resume.' }
 $checkOnly = @(Get-Setting $cfg 'CheckOnly' @() | Where-Object { $_ })
@@ -5393,7 +5393,7 @@ $kitProcessings = @()
 if ($script:ResumeKitFound.Count -gt 0) {
     # Продолжение: комплект прежнего прогона (новое из inbox для тех же имён - вместо прежнего).
     $kitFound = @($script:ResumeKitFound)
-    $Kit = 'продолжение {0}: {1}' -f $script:Resume.PrevName, (@($script:Resume.Plan.Sources | ForEach-Object { $_.Name }) -join ', ')
+    $Kit = 'продолжение {0}: {1}' -f $script:ResumeRun.PrevName, (@($script:ResumeRun.Plan.Sources | ForEach-Object { $_.Name }) -join ', ')
     Write-RunLog ("Комплект продолжения: {0}" -f $Kit)
 }
 elseif ($script:MenuItems.Count -gt 0) {
@@ -5540,7 +5540,7 @@ else {
 # Отпечатки обновлений комплекта: по ним продолжение видит, что в inbox новое и загрузку надо повторить.
 foreach ($item in $kitItems) { $item | Add-Member -NotePropertyName Hash -NotePropertyValue (Get-KitSourceHash $item.Path) -Force }
 foreach ($proc in $kitProcessings) { $proc | Add-Member -NotePropertyName Hash -NotePropertyValue (Get-KitSourceHash $proc.Path) -Force }
-if ($null -ne $script:Resume) { Set-ResumeKitFields }
+if ($null -ne $script:ResumeRun) { Set-ResumeKitFields }
 Save-RunState
 
 #endregion
@@ -5607,7 +5607,7 @@ $parallelCheckConfig = ([bool](Get-Setting $cfg 'ParallelCheckConfig' $true) -an
 # План прогона для ci.exe: шаги, которые пойдут, если ничего не упадёт.
 $planSteps = New-Object System.Collections.Generic.List[string]
 $planSteps.Add('Подготовка базы')
-if ($null -ne $script:Resume -and ($script:Resume.Strict -or ($script:Resume.Info -and $null -ne $script:Resume.Plan.Target))) { $planSteps.Add('Проверка базы перед продолжением') }
+if ($null -ne $script:ResumeRun -and ($script:ResumeRun.Strict -or ($script:ResumeRun.Info -and $null -ne $script:ResumeRun.Plan.Target))) { $planSteps.Add('Проверка базы перед продолжением') }
 if ($kitItems.Count -gt 0 -and -not $selfCheckOff) { $planSteps.Add('Самопроверка до загрузки') }
 foreach ($item in $kitItems) { $planSteps.Add(("Сохранить текущее {0}" -f $item.Name)) }
 foreach ($item in $kitItems) {
@@ -5848,7 +5848,7 @@ $exchangeBeforeFile = ''
 $exchangeSetFile = ''
 
 # Продолжение: та ли база, что после загрузки в прежнем прогоне (когда шаги после загрузки берутся готовыми).
-if ($null -ne $script:Resume) { Invoke-ResumeBaseCheck }
+if ($null -ne $script:ResumeRun) { Invoke-ResumeBaseCheck }
 
 # 1. Самопроверка до загрузки: состояние, с которым будет сравниваться состояние после.
 # Заодно из её сведений известно, какие расширения стояли в базе до загрузки.
@@ -6522,8 +6522,8 @@ function Write-RunSummary {
     param([string]$KitDecision, [string[]]$Aftermath)
     # Продолжение: откуда и с какого этапа (в списке прогонов - «↻ продолжение»).
     $resumeInfo = $null
-    if ($null -ne $script:Resume) {
-        $resumeInfo = [pscustomobject]@{ from = $script:Resume.PrevName; root = [string]$script:RunState.root; start = $script:Resume.Start; startTitle = [string]$script:Resume.StartRow.Title }
+    if ($null -ne $script:ResumeRun) {
+        $resumeInfo = [pscustomobject]@{ from = $script:ResumeRun.PrevName; root = [string]$script:RunState.root; start = $script:ResumeRun.Start; startTitle = [string]$script:ResumeRun.StartRow.Title }
     }
     $summary = [pscustomobject]@{
         runId       = $runId
