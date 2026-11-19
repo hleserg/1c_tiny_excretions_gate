@@ -18,6 +18,9 @@ import (
 // readClipboard - текст из буфера обмена Windows (в тестах подменяется).
 var readClipboard = clipboard.ReadAll
 
+// writeClipboard - текст в буфер обмена Windows (в тестах подменяется).
+var writeClipboard = clipboard.WriteAll
+
 type dialog struct {
 	ev       uiEvent
 	local    string // не пусто - вопрос самого ci.exe (остановка), не движка
@@ -787,7 +790,7 @@ func (d *dialog) ViewDocked(width int) string {
 				buttons = append(buttons, styleButton.Render(label))
 			}
 		}
-		help = "←→ выбор · enter ок · цифра, щелчок мышью - сразу · ↑↓ PgUp PgDn журнал · esc отмена"
+		help = "←→ выбор · enter ок · цифра, щелчок мышью - сразу · ↑↓ PgUp PgDn журнал · F2 журнал в буфер обмена · esc отмена"
 	} else {
 		yes := nonEmpty(d.ev.Yes, "Да")
 		no := nonEmpty(d.ev.No, "Нет")
@@ -796,7 +799,7 @@ func (d *dialog) ViewDocked(width int) string {
 			yb, nb = styleButtonActive.Render(yes), styleButton.Render(no)
 		}
 		buttons = []string{yb, nb}
-		help = "←→ выбор · enter ок · y/n, щелчок мышью · ↑↓ PgUp PgDn журнал · esc отмена"
+		help = "←→ выбор · enter ок · y/n, щелчок мышью · ↑↓ PgUp PgDn журнал · F2 журнал в буфер обмена · esc отмена"
 	}
 	// Кнопки в ряд; не влезают в ширину - столбиком. Места кнопок - для щелчка мышью.
 	top := strings.Count(b.String(), "\n")
