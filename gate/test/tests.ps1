@@ -2778,6 +2778,50 @@ $tests = @(
         }
     },
     @{
+        Name = 'git-typical-resume'
+        Text = 'типовая в git: отправка не прошла уже после коммита - повтор не коммитит заново (было бы «nothing to commit»), а отправляет готовый коммит'
+        Run = {
+            param($Name)
+            $gitCommand = Get-Command git -ErrorAction SilentlyContinue
+            if ($null -eq $gitCommand) { Write-Host '       пропущен: нет git в PATH'; return }
+            $gitExe = $gitCommand.Source
+            $sb = New-GitSandbox $Name -Extra @{ TypicalRepo = 'owner/typical'; TypicalKeepDump = $true; TypicalMinFreeGB = 1 }
+            $bare = Join-Path $sb 'typical-remote.git'
+            $null = & $gitExe init --bare --quiet $bare 2>&1
+            # Ветку в хранилище не записать (чужой файл блокировки ссылки): отправка отклоняется - как обрыв после коммита.
+            $refLock = Join-Path $bare 'refs\heads\main.lock'
+            New-Item -ItemType Directory -Path (Split-Path -Parent $refLock) -Force | Out-Null
+            [System.IO.File]::WriteAllText($refLock, '')
+            $env:CI_FAKE_GIT_EXE = $gitExe
+            $env:CI_FAKE_GIT_REMOTE = $bare
+            try {
+                $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
+                $com.bases.erp_temp_test['config'] = @{ name = 'ERP'; synonym = 'ERP завода'; version = '2.5.22.149' }
+                $dumps = New-GitDumps
+                $dumps['@config'] = @{ 'Catalogs/Items.xml' = '<Items/>' }
+                $typicalAnswer = @{ Kind = 'confirm'; Header = 'Выгрузить и типовую'; Yes = $true }
+                $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = $dumps } -Com $com -Answers ($gitBootstrapAnswers + @($typicalAnswer))
+                Check (@($first.Output | Where-Object { $_ -match '^Остановлено: git push' }).Count -eq 1) ("первая отправка должна была не пройти: " + (@($first.Output | Select-Object -Last 3) -join ' | '))
+                Check ($first.ExitCode -eq 1) ("первый запуск: код возврата {0}, ждали 1" -f $first.ExitCode)
+                Remove-Item -LiteralPath $refLock -Force
+                Reset-FakeState $sb
+                $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = $dumps } -Com $com -Answers @($typicalAnswer)
+                Check-DeployCommon $r -LocksExpected $false
+                Check (@($r.Output | Where-Object { $_ -match 'коммит уже сделан прошлым запуском' }).Count -eq 1) 'повтор не сказал, что коммит уже есть'
+                $tree = @(& $gitExe --git-dir=$bare ls-tree -r --name-only main 2>&1 | ForEach-Object { [string]$_ })
+                Check ($tree -contains 'Catalogs/Items.xml') ("после повтора типовой в хранилище нет: {0}" -f ($tree -join ', '))
+                $commits = ([string](& $gitExe --git-dir=$bare rev-list --count main 2>&1)).Trim()
+                Check ($commits -eq '1') ("коммитов в хранилище {0}, ждали 1" -f $commits)
+                $stateFile = Join-Path $sb 'git\typical\typical.json'
+                Check (Test-Path -LiteralPath $stateFile) 'после повтора нет typical.json'
+            }
+            finally {
+                Remove-Item -Path 'env:CI_FAKE_GIT_EXE' -ErrorAction SilentlyContinue
+                Remove-Item -Path 'env:CI_FAKE_GIT_REMOTE' -ErrorAction SilentlyContinue
+            }
+        }
+    },
+    @{
         Name = 'git-portable-download'
         Text = 'портативный git: нет tools\git - последний MinGit 64 бита (не busybox) из релизов git-for-windows, сверка sha256 с digest релиза, распаковка в tools\git; второй раз не скачивает; не та сумма - отказ, tools\git не появляется'
         Run = {

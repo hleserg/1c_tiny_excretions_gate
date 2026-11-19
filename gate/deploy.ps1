@@ -3033,22 +3033,32 @@ function Invoke-GitTypical {
     Write-Line '  складываю в git: сотня тысяч файлов, в первый раз - до часа и дольше (каждый файл сжимается и пишется объектом)'
     $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('add', '-A') -TimeoutSec 14400 -Title 'Типовая: git add (файлы - в объекты git)'
     $staged = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('diff', '--cached', '--quiet') -AllowFail
+    $hasHead = ((Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('rev-parse', '--verify', '--quiet', 'HEAD') -AllowFail).ExitCode -eq 0)
     if ($staged.ExitCode -eq 0 -and $fetch.ExitCode -eq 0) {
         $state['commit'] = (Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('rev-parse', 'HEAD')).Output.Trim()
         Write-Line ("  в {0} уже ровно это: коммит {1}" -f $repo, (Get-GitShort $state['commit'])) 'Green'
     }
     else {
-        $messageFile = Join-Path $typicalRoot 'commit-message.txt'
-        [System.IO.File]::WriteAllText($messageFile, ("Типовая {0} из {1}`n`nВыгрузка в файлы конфигуратором, {2}. Файлов больше 50 МБ мимо git: {3}.`n" -f $title, $script:TempBase, (Get-Date).ToString('dd.MM.yyyy HH:mm'), @($big).Count), (New-Object System.Text.UTF8Encoding($false)))
-        $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('commit', '--quiet', '--no-verify', '-F', $messageFile) -TimeoutSec 7200 -Title 'Типовая: git commit'
+        if ($staged.ExitCode -eq 0 -and $hasHead) {
+            # Коммит сделан прошлым запуском, который оборвался до отправки (таймаут, остановка): второй раз
+            # коммитить нечего («nothing to commit»), остаётся отправить.
+            Write-Line '  коммит уже сделан прошлым запуском: остаётся отправить'
+        }
+        else {
+            $messageFile = Join-Path $typicalRoot 'commit-message.txt'
+            [System.IO.File]::WriteAllText($messageFile, ("Типовая {0} из {1}`n`nВыгрузка в файлы конфигуратором, {2}. Файлов больше 50 МБ мимо git: {3}.`n" -f $title, $script:TempBase, (Get-Date).ToString('dd.MM.yyyy HH:mm'), @($big).Count), (New-Object System.Text.UTF8Encoding($false)))
+            $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('commit', '--quiet', '--no-verify', '-F', $messageFile) -TimeoutSec 7200 -Title 'Типовая: git commit'
+        }
+        # Упаковка - до отправки: объекты (после add их сотни тысяч мелких) - в один сжатый файл, отправка берёт его
+        # готовым. Не вышло - отправка упакует сама.
+        $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('gc', '--prune=now', '--quiet') -TimeoutSec 14400 -AllowFail -Title 'Типовая: git gc (сжать объекты перед отправкой)'
         Write-Line ("  отправляю в {0} (ветка {1}; первый раз - надолго)" -f $repo, $branch)
         $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('push', '--no-verify', $url, ('HEAD:refs/heads/' + $branch)) -Token $token -TimeoutSec 14400 -Title 'Типовая: git push (отправка в GitHub)'
         $state['commit'] = (Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('rev-parse', 'HEAD')).Output.Trim()
         Write-Line ("Типовая {0} - в {1}: коммит {2}, https://github.com/{1}" -f $title, $repo, (Get-GitShort $state['commit'])) 'Green'
     }
     if (@($big).Count -gt 0) { Write-Line ("  мимо git (больше 50 МБ): {0}" -f (@($big) -join ', ')) 'Yellow' }
-    # Место после: объекты git - в один сжатый файл (после add их сотня тысяч мелких), выгрузку - долой, если не держим.
-    $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('gc', '--prune=now', '--quiet') -TimeoutSec 7200 -AllowFail -Title 'Типовая: git gc (сжать объекты)'
+    # Место после: выгрузку - долой, если не держим (объекты git уже сжаты перед отправкой).
     if (-not [bool](Get-Setting $cfg 'TypicalKeepDump' $false)) {
         Remove-Item -LiteralPath $dump -Recurse -Force -ErrorAction SilentlyContinue
         Write-Line '  выгрузку в файлы удалил (TypicalKeepDump выключен): следующая версия выгрузится целиком'

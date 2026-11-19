@@ -680,6 +680,10 @@ function Invoke-GitCli {
     $settings.Add(@('core.safecrlf', 'false'))
     $settings.Add(@('http.postBuffer', '524288000'))
     $settings.Add(@('credential.helper', ''))
+    # Автоматическую упаковку после команд (gc --auto, maintenance) git не запускает: после первого коммита типовой
+    # она сжимала двести тысяч объектов, commit её ждал и упирался в таймаут. Упаковка - отдельным шагом (gc).
+    $settings.Add(@('gc.auto', '0'))
+    $settings.Add(@('maintenance.auto', 'false'))
     $settings.Add(@('user.name', 'ci-gate'))
     $settings.Add(@('user.email', 'ci-gate@users.noreply.github.com'))
     if ($Token) {
@@ -703,6 +707,12 @@ function Invoke-GitCli {
     $info.EnvironmentVariables['LANGUAGE'] = 'C'
     $info.EnvironmentVariables['GCM_INTERACTIVE'] = 'never'
     $process = [System.Diagnostics.Process]::Start($info)
+    # Снять git целиком: cmd\git.exe портативного git - обёртка, настоящий git.exe и его помощники - дочерние
+    # процессы; Kill() снял бы одну обёртку, а остальные работали бы дальше и держали репозиторий.
+    $stopGit = {
+        try { $null = & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $process.Id /T /F 2>&1 } catch { }
+        try { if (-not $process.HasExited) { $process.Kill() } } catch { }
+    }
     $outTask = $process.StandardOutput.ReadToEndAsync()
     $errTask = $process.StandardError.ReadToEndAsync()
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -710,7 +720,7 @@ function Invoke-GitCli {
     if ($Title) { Write-Host ("  ...  {0}: начато в {1}, жду не дольше {2} мин" -f $Title, (Get-Date -Format 'HH:mm:ss'), [int]($TimeoutSec / 60)) -ForegroundColor DarkGray }
     while (-not $process.WaitForExit(250)) {
         if ($watch.Elapsed.TotalSeconds -ge $TimeoutSec) {
-            try { $process.Kill() } catch { }
+            & $stopGit
             if ($showProgress) { Complete-UiProgress }
             throw ('git {0}: не закончил за {1} мин' -f $Arguments[0], [int]($TimeoutSec / 60))
         }
@@ -718,7 +728,7 @@ function Invoke-GitCli {
             # Строка хода проверяет и просьбу остановиться (файл stop канала ci.exe): тогда git снимается.
             try { Write-UiProgress -Title $Title -Elapsed $watch.Elapsed.TotalSeconds }
             catch {
-                try { $process.Kill() } catch { }
+                & $stopGit
                 Complete-UiProgress
                 throw
             }
