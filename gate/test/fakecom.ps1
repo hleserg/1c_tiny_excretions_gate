@@ -25,7 +25,7 @@ deploy.ps1 берёт его вместо настоящего, когда за�
   }
 
 Что умеет - то, чем пользуется deploy.ps1:
-  агент: ConnectAgent, GetClusters, Authenticate, GetSessions, TerminateSession, GetWorkingProcesses;
+  агент: ConnectAgent, GetClusters, Authenticate, GetInfoBases, GetInfoBaseSessions, TerminateSession, GetWorkingProcesses;
   рабочий процесс: ConnectWorkingProcess, AuthenticateAdmin, AddAuthentication, GetInfoBases, UpdateInfoBase;
   внешнее соединение: Connect, ConfigurationExtensions.Get, ConfigurationExtensionsSource, Base64String,
   расширение.GetData().Write, Metadata (Name, Synonym, Version - из «config» базы), NewObject('Query') - запрос к справочнику обработок (Execute, Select, Next,
@@ -107,14 +107,25 @@ function New-FakeComConnector {
 function New-FakeComAgent {
     param([string]$File)
     $agent = [pscustomobject]@{ StateFile = $File }
-    $agent | Add-Member -MemberType ScriptMethod -Name GetClusters -Value { return , @([pscustomobject]@{ HostName = 'fake'; MainPort = 1541 }) }
+    $agent | Add-Member -MemberType ScriptMethod -Name GetClusters -Value {
+        $state = Read-FakeComState $this.StateFile
+        $clusterHost = 'fake'
+        if ($state.PSObject.Properties['clusterHost']) { $clusterHost = $state.clusterHost }
+        return , @([pscustomobject]@{ HostName = $clusterHost; MainPort = 1541 })
+    }
+    $agent | Add-Member -MemberType ScriptMethod -Name GetInfoBases -Value {
+        param($Cluster)
+        $state = Read-FakeComState $this.StateFile
+        foreach ($base in $state.bases.PSObject.Properties) { [pscustomobject]@{ Name = $base.Name } }
+    }
     $agent | Add-Member -MemberType ScriptMethod -Name Authenticate -Value { param($Cluster, $User, $Password) }
     $agent | Add-Member -MemberType ScriptMethod -Name GetWorkingProcesses -Value { param($Cluster) return , @([pscustomobject]@{ Running = 1; HostName = 'fake'; MainPort = 1560 }) }
-    $agent | Add-Member -MemberType ScriptMethod -Name GetSessions -Value {
-        param($Cluster)
+    $agent | Add-Member -MemberType ScriptMethod -Name GetInfoBaseSessions -Value {
+        param($Cluster, $ShortBase)
         $state = Read-FakeComState $this.StateFile
         $list = New-Object System.Collections.Generic.List[object]
         foreach ($session in (Get-FakeComList $state 'sessions')) {
+            if ($session.base -ine $ShortBase.Name) { continue }
             $list.Add([pscustomobject]@{
                     SessionID = [int]$session.id; AppID = [string]$session.app; StartedAt = '17.11.2026 10:00:00'
                     userName = [string]$session.user; Host = [string]$session.host; infoBase = [pscustomobject]@{ Name = [string]$session.base }
@@ -148,6 +159,7 @@ function New-FakeComProcess {
             if ($base.PSObject.Properties['deniedFrom'] -and [string]$base.deniedFrom) { $from = [datetime]$base.deniedFrom }
             if ($base.PSObject.Properties['deniedTo'] -and [string]$base.deniedTo) { $to = [datetime]$base.deniedTo }
             $list.Add([pscustomobject]@{
+                    DBMS = 'MSSQLServer'; dbServerName = 'fixture-db'; dbName = $property.Name
                     Name = $property.Name; ScheduledJobsDenied = [bool]$base.scheduledJobsDenied; SessionsDenied = [bool]$base.sessionsDenied
                     PermissionCode = [string]$base.permissionCode; DeniedMessage = [string]$base.deniedMessage; DeniedFrom = $from; DeniedTo = $to
                 })

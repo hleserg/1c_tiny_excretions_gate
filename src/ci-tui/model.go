@@ -239,6 +239,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "plan":
 			m.setPlan(ev.Steps, ev.Parallel)
 			return m, m.syncOverall()
+		case "reset":
+			m.resetRun()
+			m.layout()
 		case "subplan":
 			m.setSubPlan(ev)
 			m.layout()
@@ -489,12 +492,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// Прогон кончился: снова главное меню гейта. Esc - так же, как Enter: привычнее.
 		if !m.running {
 			m.lines = nil
-			m.steps = nil
-			m.pipe = nil
-			m.sub = nil
-			m.planned = false
-			m.overall = newOverallBar()
-			m.verdict = ""
+			m.resetRun()
 			m.notice = ""
 			m.refreshLog()
 			return m, m.startCmd()

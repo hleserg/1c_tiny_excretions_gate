@@ -141,11 +141,9 @@ if ($UiChannel) {
 
 # Блокировку начала сеансов на время прогона ставит гейт (ответ «завершить и продолжить» перед началом).
 # Снимает её в конце прогона и при остановке; если скрипт оборвали, она кончится сама через SessionLockHours.
-$script:SessionLockSet = $false
-$script:SessionLockCode = ''
+$script:TestLockState = $null
 # Блокировку регламентных заданий гейт ставит в начале и обычно оставляет. С ключом -ReleaseJobsLock
 # (или настройкой ReleaseJobsLock) снимает в конце, но только если поставил её сам.
-$script:JobsLockSet = $false
 $script:JobsLockRelease = $false
 # Проверка конфигурации, которая идёт параллельно с остальными шагами, и ожидаемые длительности шагов плана
 # (для оценки, сколько осталось всего прогона).
@@ -169,15 +167,13 @@ trap {
     if ([string]$_.FullyQualifiedErrorId -ne [string]$_.Exception.Message -and $null -ne $_.InvocationInfo) {
         Write-Host ("  {0}" -f ($_.InvocationInfo.PositionMessage -split "`r?`n")[0]) -ForegroundColor DarkGray
     }
-    if ($script:SessionLockSet -or ($script:JobsLockSet -and $script:JobsLockRelease)) {
-        try { Clear-TestBaseLocks } catch { Write-Host ("Блокировки снять не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Yellow }
-    }
     # Итог остановленного прогона - в GitHub: причина, шаги, что успели, конец run.log.
     if ($script:PublishRunDir) { Invoke-RunPublish -Stage 'crash' -Message $_.Exception.Message }
     exit 1
 }
 
 $Root = $PSScriptRoot
+. (Join-Path $Root 'cluster-target.ps1')
 # Версия гейта - из заголовка этого файла (её ставит сборщик); показывается в меню у «Обновить гейт».
 $script:GateVersion = 'неизвестна'
 $gateVersionFound = [regex]::Match((@(Get-Content -LiteralPath $PSCommandPath -Encoding UTF8 -TotalCount 80) -join "`n"), 'Версия (\d{8}\.\d{6})\.')
@@ -2277,6 +2273,7 @@ foreach ($unitName in $unitTestExtensions) {
 # (файл .epf или .erf, каталог выгрузки обработки). Обработки гейт пока только показывает.
 $inboxDir = Resolve-RootPath ([string](Get-Setting $cfg 'InboxDir' 'inbox'))
 # Меню и вопросы (ui.ps1): из ci.exe их рисует ci.exe, без него - консоль.
+. (Join-Path $Root 'locks.ps1')
 . (Join-Path $Root 'ui.ps1')
 Initialize-Ui -Channel $UiChannel
 
@@ -4204,6 +4201,8 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         $picked = Select-UiOne -Header ("Гейт расширений: {0} на {1}" -f $script:Base, $script:Server) -Items @($menu | ForEach-Object { $_.Label }) -Notes $notes
         if ($picked -lt 0) { $choice = 'exit' } else { $choice = $menu[$picked].Key }
         if ($choice -eq 'exit') { Write-Host 'Выход.'; exit 0 }
+        # Экран ci.exe - с чистого листа: шаги и вердикт прошлого действия не должны висеть над следующим.
+        Send-UiReset
         if ($choice -eq 'deploy') {
             if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') }
             exit $LASTEXITCODE
@@ -5386,6 +5385,7 @@ function Connect-TestBaseAgent {
     $link = [pscustomobject]@{
         Connector       = $null
         Agent           = $null
+        Server          = $script:Server
         Clusters        = @()
         Errors          = @()
         ClusterUser     = [string](Get-Setting $cfg 'ClusterAdmin' '')
@@ -5434,46 +5434,24 @@ function Get-TestBaseSessions {
     # Возвращает объекты: Text - для человека, IsDesigner - конфигуратор, IsError - не получилось прочитать.
     param($Link)
     $list = New-Object System.Collections.Generic.List[object]
-    foreach ($message in @($Link.Errors)) { $list.Add([pscustomobject]@{ Text = $message; IsDesigner = $false; IsError = $true }) }
-    foreach ($cluster in @($Link.Clusters)) {
-        foreach ($session in @($Link.Agent.GetSessions($cluster))) {
-            $sessionBase = ''
-            try { $sessionBase = [string]$session.infoBase.Name } catch { continue }
-            if ($sessionBase -ine $script:Base) { continue }
+    try {
+        $target = Resolve-ClusterBase $Link $script:Base $adminUser $adminPassword
+        foreach ($session in @($Link.Agent.GetInfoBaseSessions($target.Cluster, $target.ShortBase))) {
             $list.Add([pscustomobject]@{ Text = (Format-ClusterSession $session); IsDesigner = ([string]$session.AppID -eq 'Designer'); IsError = $false })
         }
     }
+    catch { $list.Add([pscustomobject]@{ Text = $_.Exception.Message; IsDesigner = $false; IsError = $true }) }
     return $list.ToArray()
 }
 
 function Get-TestBaseInfoBase {
-    # Свойства тестовой базы в кластере через рабочий процесс. Менять их платформа даёт только со входом в саму
-    # базу: пользователь и пароль - как у конфигуратора (AdminUser), пустое имя - вход текущим пользователем Windows.
-    # Возвращает соединение с рабочим процессом (Process) и описание базы (InfoBase).
     param($Link)
-    if ($null -eq $Link.Agent) { throw (@($Link.Errors) -join '; ') }
-    foreach ($cluster in @($Link.Clusters)) {
-        $processes = @($Link.Agent.GetWorkingProcesses($cluster) | Where-Object { [int]$_.Running -eq 1 })
-        if ($processes.Count -eq 0) { continue }
-        $process = $Link.Connector.ConnectWorkingProcess(("tcp://{0}:{1}" -f $processes[0].HostName, $processes[0].MainPort))
-        $process.AuthenticateAdmin($Link.ClusterUser, $Link.ClusterPassword)
-        $process.AddAuthentication($adminUser, $adminPassword)
-        foreach ($infoBase in @($process.GetInfoBases())) {
-            if ([string]$infoBase.Name -ieq $script:Base) {
-                return [pscustomobject]@{ Process = $process; InfoBase = $infoBase }
-            }
-        }
-    }
-    throw ("в кластере не нашёл базу {0} или нет рабочего процесса" -f $script:Base)
+    return (Get-CurrentClusterBase $Link $script:Base $adminUser $adminPassword)
 }
 
 function Read-TestBaseInfoBase {
-    # Описание базы, прочитанное заново: после UpdateInfoBase проверяем, что изменение записалось.
     param($Target)
-    foreach ($infoBase in @($Target.Process.GetInfoBases())) {
-        if ([string]$infoBase.Name -ieq $script:Base) { return $infoBase }
-    }
-    throw ("база {0} пропала из списка баз кластера" -f $script:Base)
+    return (Read-ClusterBaseAgain $Target $script:Base)
 }
 
 function Set-TestBaseSessionLock {
@@ -5481,69 +5459,36 @@ function Set-TestBaseSessionLock {
     # Срок - SessionLockHours: если скрипт оборвут, блокировка кончится сама.
     # Чужую блокировку (стояла до гейта) не трогаем.
     param($Target, [string]$Code, [int]$Hours)
-    $infoBase = $Target.InfoBase
+    $infoBase = Read-TestBaseInfoBase $Target
     if ([bool]$infoBase.SessionsDenied) {
         $existing = [string]$infoBase.PermissionCode
-        if ($existing -and $existing -ne $Code) {
+        if ($existing -cne $Code) {
             return ("блокировка сеансов уже стоит, не моя, код разрешения у неё другой: впиши его в UnlockCode, иначе гейт в базу не войдёт")
         }
         return 'блокировка сеансов уже стоит, не моя: не трогаю и в конце не снимаю'
     }
     $until = (Get-Date).AddHours($Hours)
     # С запасом назад: часы сервера 1С и этой машины могут расходиться на минуты.
-    $infoBase.DeniedFrom = (Get-Date).AddMinutes(-30)
-    $infoBase.DeniedTo = $until
-    $infoBase.DeniedMessage = ("Идёт проверка расширений, база заблокирована до {0}" -f $until.ToString('HH:mm'))
-    $infoBase.PermissionCode = $Code
-    $infoBase.SessionsDenied = $true
-    $Target.Process.UpdateInfoBase($infoBase)
-    $check = Read-TestBaseInfoBase $Target
-    if (-not [bool]$check.SessionsDenied) { throw 'блокировка сеансов не записалась' }
-    $script:SessionLockSet = $true
-    $script:SessionLockCode = $Code
+    $message = "Идёт проверка расширений, база заблокирована до {0}" -f $until.ToString('HH:mm')
+    Set-GateSessionLock $script:TestLockState $Target ((Get-Date).AddMinutes(-30)) $until $Code $message { param($t) Read-TestBaseInfoBase $t }
     Write-RunLog ("Блокировка начала сеансов {0} поставлена до {1}" -f $script:Base, $until.ToString('yyyy-MM-dd HH:mm'))
     return ("поставил блокировку начала сеансов до {0} (код разрешения из UnlockCode); сниму в конце прогона" -f $until.ToString('HH:mm'))
 }
 
 function Clear-TestBaseLocks {
-    # В конце прогона и при остановке. Снимает блокировку начала сеансов, которую поставил гейт: только если она
-    # всё ещё наша (стоит, и код разрешения тот же). Блокировку регламентных заданий снимает, только если её
-    # поставил гейт и задан ключ -ReleaseJobsLock или настройка ReleaseJobsLock.
-    # Подключение новое: за время прогона старое могло отвалиться.
-    $releaseSessions = $script:SessionLockSet
-    $releaseJobs = ($script:JobsLockSet -and $script:JobsLockRelease)
-    if (-not $releaseSessions -and -not $releaseJobs) { return }
-    $script:SessionLockSet = $false
-    $script:JobsLockSet = $false
+    $state = $script:TestLockState
+    if ($null -eq $state -or (-not $state.Expected.Count -and -not ($state.JobsSet -and $script:JobsLockRelease))) { return }
     try {
         $target = Get-TestBaseInfoBase (Connect-TestBaseAgent)
-        $infoBase = $target.InfoBase
-        $changes = New-Object System.Collections.Generic.List[string]
-        if ($releaseSessions) {
-            if ([bool]$infoBase.SessionsDenied -and [string]$infoBase.PermissionCode -eq $script:SessionLockCode) {
-                $infoBase.SessionsDenied = $false
-                $infoBase.DeniedMessage = ''
-                $infoBase.PermissionCode = ''
-                $changes.Add('блокировку начала сеансов')
-            }
-            else {
-                Write-Host ("Блокировка начала сеансов {0} уже снята или заменена чужой: не трогаю." -f $script:Base) -ForegroundColor DarkGray
-                Write-RunLog 'Блокировка начала сеансов к концу прогона уже не наша, не трогаю'
-            }
-        }
-        if ($releaseJobs -and [bool]$infoBase.ScheduledJobsDenied) {
-            $infoBase.ScheduledJobsDenied = $false
-            $changes.Add('блокировку регламентных заданий')
-        }
-        if ($changes.Count -gt 0) {
-            $target.Process.UpdateInfoBase($infoBase)
-            $text = "Снял у {0}: {1}." -f $script:Base, ($changes -join ' и ')
+        $released = Restore-GateLocks $state $target $script:JobsLockRelease { param($t) Read-TestBaseInfoBase $t }
+        if ($released) {
+            $text = "Снял у {0}: {1}." -f $script:Base, $released
             Write-Host $text
             Write-RunLog $text
         }
     }
     catch {
-        $text = "Блокировки {0} снять не получилось: {1}. Блокировка сеансов кончится сама в срок; снять руками - в консоли кластера, erp_temp - Свойства." -f $script:Base, $_.Exception.Message
+        $text = "Снятие блокировок {0} не подтверждено: {1}. Проверь свойства базы в консоли кластера." -f $script:Base, $_.Exception.Message
         Write-Host $text -ForegroundColor Yellow
         Write-RunLog $text
     }
@@ -5562,30 +5507,23 @@ function Stop-TestBaseSessions {
         return $lines.ToArray()
     }
     if ($null -eq $Link) { $Link = Connect-TestBaseAgent }
-    foreach ($message in @($Link.Errors)) { $lines.Add($message) }
-    if ($null -eq $Link.Agent) { return $lines.ToArray() }
-
+    $target = Resolve-ClusterBase $Link $script:Base $adminUser $adminPassword
     $killed = 0
-    foreach ($cluster in @($Link.Clusters)) {
-        foreach ($session in @($Link.Agent.GetSessions($cluster))) {
-            $sessionBase = ''
-            try { $sessionBase = [string]$session.infoBase.Name } catch { continue }
-            if ($sessionBase -ine $script:Base) { continue }
-            $description = Format-ClusterSession $session
-            $isDesigner = ([string]$session.AppID -eq 'Designer')
-            if ($Designers -and -not $isDesigner) { continue }
-            if ($isDesigner -and -not $Designers) {
-                $lines.Add(("{0} - конфигуратор, не трогаю: закрой его сам" -f $description))
-                continue
-            }
-            try {
-                $Link.Agent.TerminateSession($cluster, $session)
-                $killed++
-                $lines.Add(("{0} - завершён" -f $description))
-            }
-            catch {
-                $lines.Add(("{0} - не завершился: {1}" -f $description, $_.Exception.Message))
-            }
+    foreach ($session in @($Link.Agent.GetInfoBaseSessions($target.Cluster, $target.ShortBase))) {
+        $description = Format-ClusterSession $session
+        $isDesigner = ([string]$session.AppID -eq 'Designer')
+        if ($Designers -and -not $isDesigner) { continue }
+        if ($isDesigner -and -not $Designers) {
+            $lines.Add(("{0} - конфигуратор, не трогаю: закрой его сам" -f $description))
+            continue
+        }
+        try {
+            $Link.Agent.TerminateSession($target.Cluster, $session)
+            $killed++
+            $lines.Add(("{0} - завершён" -f $description))
+        }
+        catch {
+            $lines.Add(("{0} - не завершился: {1}" -f $description, $_.Exception.Message))
         }
     }
     if ($killed -eq 0 -and $lines.Count -eq 0) {
@@ -6049,6 +5987,7 @@ Save-RunState
 
 # Меню «Тесты» (ключ -Tests): только тестовые расширения, без комплекта, подготовки базы, проверок и вердикта гейта.
 if ($Tests) {
+    if (-not $script:FileBase -and $Tests -ne 'Take') { $null = Get-TestBaseInfoBase (Connect-TestBaseAgent) }
     if ($unitTestExtensions.Count -eq 0) { throw 'модульных тестов нет: в config.psd1 пустой UnitTestExtensions' }
     $serviceFailed = 0
     if ($Tests -eq 'Take') {
@@ -6181,26 +6120,21 @@ function Add-PrepLine {
     Write-RunLog ('Подготовка базы: ' + $Text)
 }
 
+$script:TestLockState = New-GateLockState
+try {
 Write-Host 'Подготовка базы:'
 if (-not [string]::IsNullOrEmpty($script:FileBase)) {
     Add-PrepLine 'база файловая: блокировки ставятся через кластер, здесь их нет; сеансы не проверяю'
 }
 else {
     $prepLink = Connect-TestBaseAgent
-    $prepTarget = $null
+    $prepTarget = Get-TestBaseInfoBase $prepLink
     try {
-        $prepTarget = Get-TestBaseInfoBase $prepLink
-        if ([bool]$prepTarget.InfoBase.ScheduledJobsDenied) {
-            Add-PrepLine 'блокировка регламентных заданий уже стоит'
-        }
-        else {
-            $prepTarget.InfoBase.ScheduledJobsDenied = $true
-            $prepTarget.Process.UpdateInfoBase($prepTarget.InfoBase)
-            if (-not [bool](Read-TestBaseInfoBase $prepTarget).ScheduledJobsDenied) { throw 'флажок не записался' }
-            $script:JobsLockSet = $true
+        if (Set-GateJobsLock $script:TestLockState $prepTarget { param($t) Read-TestBaseInfoBase $t }) {
             if ($script:JobsLockRelease) { Add-PrepLine 'поставил блокировку регламентных заданий; в конце прогона сниму (-ReleaseJobsLock)' 'Green' }
             else { Add-PrepLine 'поставил блокировку регламентных заданий; она остаётся и после прогона' 'Green' }
         }
+        else { Add-PrepLine 'блокировка регламентных заданий уже стоит' }
     }
     catch {
         $prepTarget = $null
@@ -7349,7 +7283,8 @@ if ($decision -ne 'rolledBack' -and $decision -ne 'rollbackFailed') {
     }
 }
 
-Clear-TestBaseLocks
+}
+finally { Clear-TestBaseLocks }
 Invoke-RunPublish -Stage 'final'
 
 exit $exitCode

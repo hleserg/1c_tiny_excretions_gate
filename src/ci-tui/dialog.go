@@ -240,7 +240,10 @@ func (d *dialog) Update(msg tea.Msg) tea.Cmd {
 				d.finish(answer{Index: d.cursor})
 			} else {
 				sel := d.selected()
-				if len(sel) == 0 {
+				if len(sel) == 0 && d.ev.AllowEmpty {
+					// Скрипт разрешил пустой выбор (например, «какие обработки записать» - ни одной).
+					d.finish(answer{Indexes: []int{}, Index: -1})
+				} else if len(sel) == 0 {
 					d.warning = "ничего не отмечено: пробел ставит отметку"
 				} else {
 					d.finish(answer{Indexes: sel, Index: -1})
@@ -541,7 +544,11 @@ func (d *dialog) View() string {
 		if d.ev.Kind == "one" {
 			b.WriteString(wrapBlock("↑↓ выбор · enter ок · цифра или буква, щелчок мышью - сразу · esc отмена", inner, styleHelp))
 		} else {
-			b.WriteString(wrapBlock("↑↓ выбор · пробел или щелчок - отметить · a все · enter дальше · esc отмена", inner, styleHelp))
+			help := "↑↓ выбор · пробел или щелчок - отметить · a все · enter дальше · esc отмена"
+			if d.ev.AllowEmpty {
+				help = "↑↓ выбор · пробел или щелчок - отметить · a все · enter дальше (можно без отметок) · esc отмена"
+			}
+			b.WriteString(wrapBlock(help, inner, styleHelp))
 		}
 	case "confirm":
 		yes := nonEmpty(d.ev.Yes, "Да")
