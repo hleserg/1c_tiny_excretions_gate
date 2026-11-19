@@ -50,6 +50,7 @@ type model struct {
 	script    string
 	extra     []string
 	eng       *engine
+	starting  bool
 	running   bool
 	exitCode  int
 	exitErr   error
@@ -85,14 +86,15 @@ func newModel(baseDir, script string, extra []string) model {
 	sp.Style = styleAccent
 	bar := progress.New(progress.WithGradient("#5A56E0", "#3EC7A0"), progress.WithoutPercentage())
 	return model{
-		baseDir: baseDir,
-		script:  script,
-		extra:   extra,
-		follow:  true,
-		logView: viewport.New(80, 20),
-		bar:     bar,
-		overall: newOverallBar(),
-		spin:    sp,
+		baseDir:  baseDir,
+		script:   script,
+		extra:    extra,
+		starting: true,
+		follow:   true,
+		logView:  viewport.New(80, 20),
+		bar:      bar,
+		overall:  newOverallBar(),
+		spin:     sp,
 	}
 }
 
@@ -107,7 +109,7 @@ func tick() tea.Cmd {
 func (m model) startCmd() tea.Cmd {
 	base, script, extra := m.baseDir, m.script, m.extra
 	return func() tea.Msg {
-		eng, err := startEngine(program, base, script, extra)
+		eng, err := startEngine(base, script, extra)
 		return engineStartedMsg{eng: eng, err: err}
 	}
 }
@@ -212,6 +214,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case engineStartedMsg:
+		m.starting = false
 		if msg.err != nil {
 			m.appendLine("Остановлено: " + msg.err.Error())
 			m.running = false
@@ -221,12 +224,12 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.eng = msg.eng
 		m.running = true
-		m.started = time.Now()
+		m.started = msg.eng.started
 		m.exitCode = 0
 		m.exitErr = nil
 		m.stopAsked = time.Time{}
 		m.touchActive()
-		return m, nil
+		return m, func() tea.Msg { return msg.eng.wait(program) }
 
 	case lineMsg:
 		m.appendLine(msg.text)
@@ -293,6 +296,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.queue = nil
 		if m.eng != nil {
 			m.eng.cleanup()
+			m.eng = nil
 		}
 		m.closeAll()
 		m.layout()
@@ -467,6 +471,9 @@ func describeAnswer(d *dialog) string {
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c", "q":
+		if m.starting {
+			return m, nil
+		}
 		if !m.running {
 			return m, tea.Quit
 		}
@@ -487,7 +494,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "enter", "r", "esc":
 		// Прогон кончился: снова главное меню гейта. Esc - так же, как Enter: привычнее.
-		if !m.running {
+		if !m.starting && !m.running {
+			m.starting = true
 			m.lines = nil
 			m.steps = nil
 			m.pipe = nil
@@ -548,6 +556,8 @@ func (m model) viewHeader() string {
 		state = styleWarn.Render(" останавливается ")
 	case m.running:
 		state = styleOk.Render(" " + m.spin.View() + " работает ")
+	case m.starting:
+		state = styleAccent.Render(" запускается ")
 	case m.exitCode == 0:
 		state = styleOk.Render(" готово ")
 	default:
@@ -638,7 +648,7 @@ func (m model) viewProgress() string {
 func (m model) viewFooter() string {
 	var help string
 	switch {
-	case m.dialog != nil:
+	case m.dialog != nil || m.starting:
 		help = ""
 	case m.running:
 		help = "↑↓ PgUp PgDn журнал · f к концу · q остановить скрипт"
