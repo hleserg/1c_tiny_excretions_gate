@@ -2610,7 +2610,18 @@ function Invoke-GitTypical {
     $git = Get-PortableGit -ToolsDir (Resolve-RootPath 'tools') -Exe ([string](Get-Setting $cfg 'GitExe' ''))
     Write-Line ("  git: {0}" -f $git)
     $dump = Join-Path $root 'dump'
-    Write-Line ("  выгружаю типовую {0} в файлы: {1} (первый раз - надолго)" -f $script:TempBase, $dump)
+    # Место: выгрузка ERP в файлы - гигабайты и сотня тысяч файлов, плюс объекты git. Не хватит - не начинаю, иначе
+    # кончится место на диске машины гейта (было: выгрузка вручную съела диск целиком).
+    $hasDump = Test-Path -LiteralPath (Join-Path $dump 'ConfigDumpInfo.xml')
+    $needGb = [double](Get-Setting $cfg 'TypicalMinFreeGB' 12)
+    if ($hasDump) { $needGb = [Math]::Max(2, $needGb / 4) }
+    $drive = New-Object System.IO.DriveInfo ([System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($root)))
+    $freeGb = [Math]::Round($drive.AvailableFreeSpace / 1GB, 1)
+    if ($freeGb -lt $needGb) {
+        Write-Line ("  на диске {0} свободно {1} ГБ, а выгрузке типовой нужно не меньше {2} ГБ (настройка TypicalMinFreeGB): не выгружаю. Освободи место или перенеси GitDir на другой диск." -f $drive.Name, $freeGb, $needGb) 'Yellow'
+        return
+    }
+    Write-Line ("  выгружаю типовую {0} в файлы: {1} (первый раз - надолго; на диске {2} свободно {3} ГБ)" -f $script:TempBase, $dump, $drive.Name, $freeGb)
     Update-TypicalDump -Dir $dump
     # Больше 50 МБ GitHub не любит (больше 100 МБ - не примет): такие файлы - мимо git, их список - в README.
     $dumpFull = [System.IO.Path]::GetFullPath($dump).TrimEnd('\', '/')
@@ -2653,6 +2664,12 @@ function Invoke-GitTypical {
         Write-Line ("Типовая {0} - в {1}: коммит {2}, https://github.com/{1}" -f $title, $repo, (Get-GitShort $state['commit'])) 'Green'
     }
     if (@($big).Count -gt 0) { Write-Line ("  мимо git (больше 50 МБ): {0}" -f (@($big) -join ', ')) 'Yellow' }
+    # Место после: объекты git - в один сжатый файл (после add их сотня тысяч мелких), выгрузку - долой, если не держим.
+    $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('gc', '--prune=now', '--quiet') -TimeoutSec 7200 -AllowFail
+    if (-not [bool](Get-Setting $cfg 'TypicalKeepDump' $false)) {
+        Remove-Item -LiteralPath $dump -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Line '  выгрузку в файлы удалил (TypicalKeepDump выключен): следующая версия выгрузится целиком'
+    }
     $state['name'] = $info.Name
     $state['version'] = $info.Version
     $state['time'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')

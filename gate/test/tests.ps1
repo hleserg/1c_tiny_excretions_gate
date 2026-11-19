@@ -2343,7 +2343,7 @@ $tests = @(
             $gitCommand = Get-Command git -ErrorAction SilentlyContinue
             if ($null -eq $gitCommand) { Write-Host '       пропущен: нет git в PATH'; return }
             $gitExe = $gitCommand.Source
-            $sb = New-GitSandbox $Name -Extra @{ TypicalRepo = 'owner/typical' }
+            $sb = New-GitSandbox $Name -Extra @{ TypicalRepo = 'owner/typical'; TypicalKeepDump = $true; TypicalMinFreeGB = 1 }
             $bare = Join-Path $sb 'typical-remote.git'
             $null = & $gitExe init --bare --quiet $bare 2>&1
             $env:CI_FAKE_GIT_EXE = $gitExe

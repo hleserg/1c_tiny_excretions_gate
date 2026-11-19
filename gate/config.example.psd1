@@ -160,6 +160,9 @@
     # TypicalRepo = 'владелец/репозиторий'
     TypicalBranch = 'main'
     TypicalDumpTimeoutMin = 180
+    # Свободного места меньше - типовую не выгружать (ГБ); держать ли выгрузку между версиями (гигабайты на диске).
+    TypicalMinFreeGB = 12
+    TypicalKeepDump = $false
     GitDir = 'git'
     UpdateTagPrefix = 'gate-'
 
