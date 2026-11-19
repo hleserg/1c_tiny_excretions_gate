@@ -803,6 +803,39 @@ $tests = @(
         }
     },
     @{
+        Name = 'gate-exchange-snapshot-lastupdate'
+        Text = 'обмены: в сообщениях сдвинулись только даты LastUpdate (в разобранном XML и в обрезанном) - зелёный, разницы снимков нет'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $tasks = {
+                param([string]$Date)
+                $whole = '<Message xmlns:msg="http://www.1c.ru/SSL/Exchange/Message"><msg:Header><msg:Format>EnterpriseData/1.8</msg:Format>' +
+                    '<msg:Info><msg:Item><msg:Name>А</msg:Name><msg:LastUpdate>' + $Date + ':41</msg:LastUpdate></msg:Item>' +
+                    '<msg:Item><msg:Name>Б</msg:Name><msg:LastUpdate>' + $Date + ':43</msg:LastUpdate></msg:Item></msg:Info></msg:Header>' +
+                    '<Body xmlns="EnterpriseData/1.8"><Сумма>100</Сумма></Body></Message>'
+                # Обрезанное сообщение как XML не разбирается: сравнивается строками, дату закрывает маска по умолчанию.
+                $cut = '<Message xmlns:msg="http://www.1c.ru/SSL/Exchange/Message"><msg:Header>' + "`n`t`t<msg:LastUpdate>" + $Date + ":41</msg:LastUpdate>`n`t`t<msg:LastUpdate>" + $Date + ":43</msg:LastUpdate>`n<Body><Сумма>100"
+                return @(
+                    @{ key = 'Окружение'; title = 'Окружение и расширения'; step = 'Окружение'; lines = @('[ОК] Обработка запущена под полными правами') },
+                    @{ key = 'Обмены'; title = 'Обмены'; step = 'Обмены'; lines = @('[ОК] Бухгалтерия: Документ.РеализацияТоваровУслуг выгружается')
+                        snapshots = @{ 'обмен|Бухгалтерия|Документ.РеализацияТоваровУслуг|11111111-2222-3333-4444-555555555555' = $whole
+                            'обмен|ЗУП|Справочник.Организации|22222222-3333-4444-5555-666666666666' = $cut } }
+                )
+            }
+            $fake = @{ selfcheck = @(
+                    @{ tasks = (& $tasks '2026-11-18T17:42') },
+                    @{ tasks = (& $tasks '2026-11-19T09:05'); fingerprint = 'после' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            Check-Step $r 'Самопроверка после загрузки' 'OK'
+            $step = Get-Step $r 'Самопроверка после загрузки'
+            if ($null -ne $step) { Check ([string]$step.detail -match 'снимков 2, изменились 0') ("в итоге шага нет сведений о снимках: {0}" -f $step.detail) }
+            if ($r.RunDir) { Check (-not (Test-Path -LiteralPath (Join-Path $r.RunDir 'selfcheck-after.snapshots.diff.txt'))) 'файл разницы есть, хотя сдвинулись только даты LastUpdate' }
+        }
+    },
+    @{
         Name = 'gate-snapshot-masks'
         Text = 'снимки отличаются только тем, что закрыто SnapshotMasks (идентификатор, дата в обрезанном XML): зелёный'
         Run = {
@@ -1677,6 +1710,25 @@ $tests = @(
             Check (-not (Test-Path -LiteralPath (Join-Path $sb 'deploy\state\deploy.json'))) 'появился deploy.json'
             $runDirs = @(Get-ChildItem -LiteralPath (Join-Path $sb 'deploy') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8}-\d{6}$' })
             Check ($runDirs.Count -eq 0) 'показ состояния создал папку запуска обновления'
+        }
+    },
+    @{
+        Name = 'deploy-com-check'
+        Text = '«Проверка внешнего соединения»: по шагам, чем читаются расширения temp, и итог обычного чтения; только temp, конфигуратор не запускается, блокировки не трогаются'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ComCheck' -Com (New-ComState)
+            Check-DeployCommon $r -LocksExpected $false
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check (@($r.Output | Where-Object { $_ -cmatch 'ПРОВЕРКА ВНЕШНЕГО СОЕДИНЕНИЯ С erp_temp_test' }).Count -eq 1) 'нет заголовка проверки'
+            Check (@($r.Output | Where-Object { $_ -match '\[есть\] менеджер, PowerShell: соединение\.ConfigurationExtensions' }).Count -eq 1) 'нет строки о менеджере расширений'
+            Check (@($r.Output | Where-Object { $_ -match '\[есть\] хеш-сумма, PowerShell' }).Count -eq 1) 'нет строки о хеш-сумме'
+            Check (@($r.Output | Where-Object { $_ -match 'Адаптация: версия 1\.0\.0\.h2, хеш-сумма есть' }).Count -eq 1) 'обычное чтение не показало расширение с версией'
+            Check (@($r.Output | Where-Object { $_ -match 'ИТОГ: расширения erp_temp_test через внешнее соединение читаются: 2' }).Count -eq 1) 'нет итога проверки'
+            Check (@($r.Calls).Count -eq 0) ("проверка запускала 1С: {0}" -f (@($r.Calls | ForEach-Object { $_.Line } | Select-Object -First 2) -join ' | '))
+            Check (@($r.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'проверка меняла блокировки или сеансы'
+            Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\comcheck\run.log')) 'нет журнала deploy\comcheck\run.log'
         }
     },
     @{

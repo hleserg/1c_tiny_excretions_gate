@@ -23,6 +23,10 @@
         «Проверка перед обновлением (только чтение)» в её форме. Что изменит загрузка комплекта и каких настроек
         не хватает. Рабочую только читает: ни блокировок, ни записи.
 
+    .\deploy.ps1 -ComCheck
+        Диагностика внешнего соединения (COM) с temp: что PowerShell видит у объектов 1С и каким способом читаются
+        расширения конфигурации (версии, хеш-суммы). Только чтение, рабочую не трогает. Журнал - deploy\comcheck.
+
     .\deploy.ps1 -Prepare / -ApplyPrepared / -CancelPrepared
         Обновление в два приёма. -Prepare: резервные копии, взять из temp и загрузить новые версии расширений
         в конфигурацию рабочей базы - без обновления конфигурации БД, без блокировок и без завершения сеансов
@@ -74,6 +78,8 @@ param(
     [switch]$CompareProcessings,
     # Проверка рабочей перед обновлением («Выполнить после обновления», режим precheck). Рабочую только читает.
     [switch]$ProdPreCheck,
+    # Диагностика внешнего соединения (COM) с temp: каким способом читаются расширения. Только чтение, только temp.
+    [switch]$ComCheck,
     # Репозиторий расширений (ExtensionsRepo): выгрузить temp в git или загрузить из git в temp. Рабочую не трогает.
     [switch]$GitExport,
     [switch]$GitImport,
@@ -720,12 +726,12 @@ Initialize-Stats -Dir (Resolve-RootPath ([string](Get-Setting $cfg 'StatsDir' 's
 $deployRoot = Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))
 $mirrorRoot = Join-Path $deployRoot 'mirror'
 $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
-$viewOnly = ($BaseState -or $CompareExtensions -or $CompareProcessings -or $ProdPreCheck -or $GitExport -or $GitImport -or $GitProd -or $GitTypical)
+$viewOnly = ($BaseState -or $CompareExtensions -or $CompareProcessings -or $ProdPreCheck -or $ComCheck -or $GitExport -or $GitImport -or $GitProd -or $GitTypical)
 if ($viewOnly) {
     # Показать состояние или сравнить - не запуск обновления: своей папки запуска нет (в истории обновлений его не видно),
     # журнал - в deploy\state\run.log, каждый раз заново.
     $viewName = 'state'
-    if ($CompareExtensions) { $viewName = 'compare-ext' } elseif ($CompareProcessings) { $viewName = 'compare-epf' } elseif ($ProdPreCheck) { $viewName = 'precheck' } elseif ($GitExport -or $GitImport -or $GitProd -or $GitTypical) { $viewName = 'git' }
+    if ($CompareExtensions) { $viewName = 'compare-ext' } elseif ($CompareProcessings) { $viewName = 'compare-epf' } elseif ($ProdPreCheck) { $viewName = 'precheck' } elseif ($ComCheck) { $viewName = 'comcheck' } elseif ($GitExport -or $GitImport -or $GitProd -or $GitTypical) { $viewName = 'git' }
     $script:RunDir = Join-Path $deployRoot $viewName
     New-Item -ItemType Directory -Path $script:RunDir -Force | Out-Null
     $script:RunLogPath = Join-Path $script:RunDir 'run.log'
@@ -899,6 +905,35 @@ function Get-ExtensionStates {
         $items = @{}
         if ($FakeScript) { . $FakeScript; $connector = New-FakeComConnector $FakeFile }
         else { $connector = New-Object -ComObject V83.COMConnector }
+        # Член объекта 1С. Настоящий COM - поздним связыванием (IDispatch) напрямую: PowerShell видит у объектов 1С
+        # не всё - РасширенияКонфигурации у соединения приходило пустым, хотя Метаданные и запросы работали.
+        # Arguments не $null - вызов метода (без параметров - @()). Параметры - без обёрток PowerShell: в массиве
+        # они сами не снимаются, и 1С получила бы не свой объект. Запятая - чтобы коллекция 1С не развернулась
+        # в элементы по дороге. Подставной COM тестов - обычные объекты PowerShell.
+        $member = {
+            param($Object, [string]$Name, [object[]]$Arguments = $null)
+            if ($null -eq $Object) { throw ("нет объекта, у которого брать «{0}»" -f $Name) }
+            if ([Runtime.InteropServices.Marshal]::IsComObject($Object)) {
+                $flags = [System.Reflection.BindingFlags]::GetProperty
+                $raw = $null
+                if ($null -ne $Arguments) {
+                    $flags = [System.Reflection.BindingFlags]::InvokeMethod
+                    $raw = New-Object 'object[]' $Arguments.Count
+                    for ($k = 0; $k -lt $Arguments.Count; $k++) { if ($null -ne $Arguments[$k]) { $raw[$k] = $Arguments[$k].PSObject.BaseObject } }
+                }
+                # Тип System.__ComObject - по имени: он внутренний, а позднее связывание идёт через него.
+                $comType = [type]::GetType('System.__ComObject')
+                if ($null -eq $comType) { $comType = $Object.GetType() }
+                try { return , ($comType.InvokeMember($Name, $flags, $null, $Object, $raw)) }
+                catch {
+                    $memberError = $_.Exception
+                    while ($null -ne $memberError.InnerException) { $memberError = $memberError.InnerException }
+                    throw ("{0}: {1}" -f $Name, [string]$memberError.Message)
+                }
+            }
+            if ($null -ne $Arguments) { return , ($Object.$Name.Invoke($Arguments)) }
+            return , ($Object.$Name)
+        }
         # Ошибка соединения - её текстом (блокировка сеансов, пароль), а не «null-valued expression» дальше.
         try { $connection = $connector.Connect($Line) }
         catch {
@@ -910,19 +945,29 @@ function Get-ExtensionStates {
             # Расширения из базы данных; не вышло (источник не виден через COM) - Получить() без параметров.
             # Каждый шаг проверяется: «пусто» говорит, на каком вызове, а не «null-valued expression».
             if ($null -eq $connection) { throw 'внешнее соединение не вернуло объект соединения' }
-            $manager = $connection.ConfigurationExtensions
-            if ($null -eq $manager) { throw 'РасширенияКонфигурации недоступны через внешнее соединение (права пользователя на администрирование расширений?)' }
+            $manager = $null
+            $managerError = ''
+            foreach ($managerName in @('ConfigurationExtensions', 'РасширенияКонфигурации')) {
+                try { $manager = & $member $connection $managerName }
+                catch { $manager = $null; $managerError = [string]$_.Exception.Message }
+                if ($null -ne $manager) { break }
+            }
+            if ($null -eq $manager) {
+                if (-not $managerError) { $managerError = 'свойство пустое' }
+                throw ('РасширенияКонфигурации недоступны через внешнее соединение: {0} (диагностика - .\deploy.ps1 -ComCheck)' -f $managerError)
+            }
             $list = $null
             $source = $null
-            try { $source = $connection.ConfigurationExtensionsSource.Database } catch { $source = $null }
-            if ($null -ne $source) { try { $list = $manager.Get($connection.NewObject('Structure'), $source) } catch { $list = $null } }
-            if ($null -eq $list) { $list = $manager.Get() }
+            try { $source = & $member (& $member $connection 'ConfigurationExtensionsSource') 'Database' } catch { $source = $null }
+            if ($null -ne $source) { try { $list = & $member $manager 'Get' @((& $member $connection 'NewObject' @('Structure')), $source) } catch { $list = $null } }
+            if ($null -eq $list) { $list = & $member $manager 'Get' @() }
             if ($null -eq $list) { throw 'РасширенияКонфигурации.Получить() вернул пусто' }
-            for ($i = 0; $i -lt [int]$list.Count(); $i++) {
-                $extension = $list.Get($i)
+            $count = [int](& $member $list 'Count' @())
+            for ($i = 0; $i -lt $count; $i++) {
+                $extension = & $member $list 'Get' @($i)
                 $hash = ''
-                try { $hash = [string]$connection.Base64String($extension.HashSum) } catch { $hash = '' }
-                $items[[string]$extension.Name] = [pscustomobject]@{ Version = [string]$extension.Version; Hash = $hash }
+                try { $hash = [string](& $member $connection 'Base64String' @((& $member $extension 'HashSum'))) } catch { $hash = '' }
+                $items[[string](& $member $extension 'Name')] = [pscustomobject]@{ Version = [string](& $member $extension 'Version'); Hash = $hash }
             }
         }
         finally {
@@ -1711,6 +1756,151 @@ function Update-SelfCheckEpf {
     Move-Item -LiteralPath $newFile -Destination $selfCheckEpf -Force
     [System.IO.File]::WriteAllText($marker, $hash, (New-Object System.Text.UTF8Encoding($false)))
     Write-Line ("  обработка самопроверки собрана из поставки: {0} (прежняя - {0}.old)" -f $selfCheckEpf) 'Green'
+}
+
+if ($ComCheck) {
+    # Диагностика внешнего соединения с temp. Чтение расширений через COM на машине гейта не работало: соединение
+    # есть, а РасширенияКонфигурации у него в PowerShell пусто (тесты этого не видят: в них COM подставной).
+    # Здесь - каждая попытка добраться до расширений и что она вернула, потом - итог обычного чтения
+    # (Get-ExtensionStates). Только чтение, только temp: рабочая не трогается.
+    Write-Host ''
+    Write-Line ("ПРОВЕРКА ВНЕШНЕГО СОЕДИНЕНИЯ С {0}, {1}" -f $script:TempBase, (Get-Date -Format 'dd.MM.yyyy HH:mm:ss')) 'Cyan'
+    Write-Line ("  PowerShell {0}, процесс {1}-битный; только чтение, {2} не трогаю" -f $PSVersionTable.PSVersion, ([IntPtr]::Size * 8), $script:ProdBase)
+    $probe = {
+        param([string]$Line, [string]$FakeScript, [string]$FakeFile)
+        $report = New-Object System.Collections.Generic.List[string]
+        function Add-Probe {
+            # Одна попытка: что вернула или чем упала. Действие отдаёт значение через запятую (коллекция 1С цела).
+            param([string]$Label, [scriptblock]$Action)
+            $value = $null
+            try {
+                $value = & $Action
+                $text = 'пусто'
+                if ($null -ne $value) {
+                    if ([Runtime.InteropServices.Marshal]::IsComObject($value)) { $text = 'объект COM' }
+                    else {
+                        $text = [string]$value
+                        if ($text.Length -gt 90) { $text = $text.Substring(0, 90) + '...' }
+                        $text = '{0} «{1}»' -f $value.GetType().Name, $text
+                    }
+                }
+                $report.Add(('[{0}] {1}: {2}' -f $(if ($null -ne $value) { 'есть' } else { 'пусто' }), $Label, $text))
+            }
+            catch {
+                $failure = $_.Exception
+                while ($null -ne $failure.InnerException) { $failure = $failure.InnerException }
+                $report.Add(('[ошибка] {0}: {1}' -f $Label, (([string]$failure.Message) -replace '\s+', ' ')))
+                $value = $null
+            }
+            return , $value
+        }
+        $late = {
+            # Позднее связывание (IDispatch) напрямую, мимо PowerShell.
+            param($Object, [string]$Name, [object[]]$Arguments = $null)
+            $flags = [System.Reflection.BindingFlags]::GetProperty
+            $raw = $null
+            if ($null -ne $Arguments) {
+                $flags = [System.Reflection.BindingFlags]::InvokeMethod
+                $raw = New-Object 'object[]' $Arguments.Count
+                for ($k = 0; $k -lt $Arguments.Count; $k++) { if ($null -ne $Arguments[$k]) { $raw[$k] = $Arguments[$k].PSObject.BaseObject } }
+            }
+            $comType = [type]::GetType('System.__ComObject')
+            if ($null -eq $comType) { $comType = $Object.GetType() }
+            return , ($comType.InvokeMember($Name, $flags, $null, $Object, $raw))
+        }
+        if ($FakeScript) { . $FakeScript; $connector = New-FakeComConnector $FakeFile }
+        else { $connector = New-Object -ComObject V83.COMConnector }
+        $connection = $null
+        try {
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            try { $connection = $connector.Connect($Line) }
+            catch {
+                $connectError = $_.Exception
+                while ($null -ne $connectError.InnerException) { $connectError = $connectError.InnerException }
+                $report.Add(('[ошибка] соединение: {0}' -f [string]$connectError.Message))
+                return , $report.ToArray()
+            }
+            $report.Add(('[есть] соединение: за {0} с; объект COM: {1}' -f [int]$watch.Elapsed.TotalSeconds, [Runtime.InteropServices.Marshal]::IsComObject($connection)))
+            try {
+                $names = @($connection | Get-Member -ErrorAction Stop | ForEach-Object { [string]$_.Name })
+                $about = @($names | Where-Object { $_ -match 'xtension|асширени|etadata|етаданн|NewObject' })
+                $report.Add(('[есть] PowerShell видит у соединения членов: {0}; из нужных: {1}' -f $names.Count, $(if ($about.Count -gt 0) { $about -join ', ' } else { 'ни одного' })))
+            }
+            catch { $report.Add(('[ошибка] список членов соединения (Get-Member): {0}' -f [string]$_.Exception.Message)) }
+            $conCom = [Runtime.InteropServices.Marshal]::IsComObject($connection)
+            if (-not $conCom) { $report.Add('[есть] соединение - не объект COM (подставное): позднее связывание не проверяю') }
+            $null = Add-Probe 'Метаданные.Версия, как видит PowerShell' { , $connection.Metadata.Version }
+            if ($conCom) { $null = Add-Probe 'Метаданные.Версия, позднее связывание' { , (& $late (& $late $connection 'Metadata') 'Version') } }
+            $managers = @(
+                (Add-Probe 'менеджер, PowerShell: соединение.ConfigurationExtensions' { , $connection.ConfigurationExtensions }),
+                (Add-Probe 'менеджер, PowerShell: соединение.РасширенияКонфигурации' { , $connection.'РасширенияКонфигурации' }),
+                $(if ($conCom) { (Add-Probe 'менеджер, позднее связывание: ConfigurationExtensions' { , (& $late $connection 'ConfigurationExtensions') }) } else { $null }),
+                $(if ($conCom) { (Add-Probe 'менеджер, позднее связывание: РасширенияКонфигурации' { , (& $late $connection 'РасширенияКонфигурации') }) } else { $null })
+            )
+            $manager = $null
+            foreach ($candidate in $managers) { if ($null -ne $candidate) { $manager = $candidate; break } }
+            if ($null -eq $manager) { $report.Add('[пусто] менеджер расширений не получен ни одним способом: дальше проверять нечем') }
+            else {
+                $isCom = [Runtime.InteropServices.Marshal]::IsComObject($manager)
+                $lists = @(
+                    (Add-Probe 'список, PowerShell: менеджер.Get()' { , $manager.Get() }),
+                    $(if ($isCom) { (Add-Probe 'список, позднее связывание: Get()' { , (& $late $manager 'Get' @()) }) } else { $null }),
+                    $(if ($isCom) { (Add-Probe 'список, позднее связывание: Получить()' { , (& $late $manager 'Получить' @()) }) } else { $null })
+                )
+                $list = $null
+                foreach ($candidate in $lists) { if ($null -ne $candidate) { $list = $candidate; break } }
+                if ($null -eq $list) { $report.Add('[пусто] список расширений не получен ни одним способом') }
+                else {
+                    $listCom = [Runtime.InteropServices.Marshal]::IsComObject($list)
+                    $null = Add-Probe 'количество, PowerShell: список.Count()' { , $list.Count() }
+                    if ($listCom) { $null = Add-Probe 'количество, позднее связывание: Count()' { , (& $late $list 'Count' @()) } }
+                    $first = Add-Probe 'первое расширение, PowerShell: список.Get(0)' { , $list.Get(0) }
+                    if ($null -eq $first -and $listCom) { $first = Add-Probe 'первое расширение, позднее связывание: Get(0)' { , (& $late $list 'Get' @(0)) } }
+                    if ($null -ne $first) {
+                        $firstCom = [Runtime.InteropServices.Marshal]::IsComObject($first)
+                        $null = Add-Probe 'имя и версия, PowerShell' { , ('{0} {1}' -f $first.Name, $first.Version) }
+                        if ($firstCom) { $null = Add-Probe 'имя и версия, позднее связывание' { , ('{0} {1}' -f (& $late $first 'Name'), (& $late $first 'Version')) } }
+                        $null = Add-Probe 'хеш-сумма, PowerShell: соединение.Base64String(расширение.HashSum)' { , $connection.Base64String($first.HashSum) }
+                        if ($firstCom) { $null = Add-Probe 'хеш-сумма, позднее связывание' { , (& $late $connection 'Base64String' @((& $late $first 'HashSum'))) } }
+                    }
+                }
+                $null = Add-Probe 'источник «база данных», PowerShell: соединение.ConfigurationExtensionsSource.Database' { , $connection.ConfigurationExtensionsSource.Database }
+                if ($isCom) { $null = Add-Probe 'источник «база данных», позднее связывание' { , (& $late (& $late $connection 'ConfigurationExtensionsSource') 'Database') } }
+            }
+        }
+        finally {
+            foreach ($comObject in @($connection, $connector)) {
+                if ($null -ne $comObject -and [Runtime.InteropServices.Marshal]::IsComObject($comObject)) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($comObject) }
+            }
+        }
+        return , $report.ToArray()
+    }
+    $call = Invoke-UiBackground -Script $probe -Arguments @((Get-ComConnectionLine $script:TempBase $script:TempUser $script:TempPassword), $script:FakeComScript, [string]$env:CI_FAKE_COM) `
+        -Title ("Проверить внешнее соединение с {0}" -f $script:TempBase) -TimeoutSec ($comTimeoutSec * 2)
+    $probeLines = @()
+    if ($call.Ok -and $null -ne $call.Result) { $probeLines = @($call.Result | ForEach-Object { [string]$_ }) }
+    foreach ($line in $probeLines) {
+        $color = 'Gray'
+        if ($line.StartsWith('[ошибка]')) { $color = 'Red' } elseif ($line.StartsWith('[пусто]')) { $color = 'Yellow' } elseif ($line.StartsWith('[есть]')) { $color = 'Green' }
+        if ($script:TempPassword) { $line = $line.Replace($script:TempPassword, '***') }
+        Write-Line ('  ' + $line) $color
+    }
+    if (-not $call.Ok) {
+        $probeError = [string]$call.Error
+        if ($script:TempPassword -and $probeError) { $probeError = $probeError.Replace($script:TempPassword, '***') }
+        Write-Line ("  проверка оборвалась: {0}" -f $probeError) 'Red'
+    }
+    Write-Host ''
+    Write-Line 'Обычное чтение расширений (им пользуются сравнение и обновление):'
+    $comStates = Get-ExtensionStates -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
+    if ($comStates.Ok) {
+        foreach ($name in @($comStates.Items.Keys | Sort-Object)) { Write-Line ("  {0}: версия {1}, хеш-сумма {2}" -f $name, $(if ($comStates.Items[$name].Version) { [string]$comStates.Items[$name].Version } else { '?' }), $(if ($comStates.Items[$name].Hash) { 'есть' } else { 'нет' })) }
+        Write-Line ("ИТОГ: расширения {0} через внешнее соединение читаются: {1}. В базе ничего не изменено. Журнал: {2}" -f $script:TempBase, $comStates.Items.Count, $script:RunLogPath) 'Green'
+        exit 0
+    }
+    Write-Line ("  не прочитал: {0}" -f $comStates.Error) 'Red'
+    Write-Line ("ИТОГ: расширения {0} через внешнее соединение не читаются - сравнение идёт по выгрузкам. В базе ничего не изменено. Журнал: {1}" -f $script:TempBase, $script:RunLogPath) 'Yellow'
+    exit 1
 }
 
 if ($ProdPreCheck) {
@@ -2824,14 +3014,24 @@ function Invoke-GitTypical {
     New-Item -ItemType Directory -Path (Split-Path -Parent $exclude) -Force | Out-Null
     [System.IO.File]::WriteAllText($exclude, ((@('# Пишет гейт: служебный файл конфигуратора и файлы больше 50 МБ.', '/ConfigDumpInfo.xml') + @($big | ForEach-Object { '/' + $_ })) -join "`n") + "`n", (New-Object System.Text.UTF8Encoding($false)))
     # Коммит - поверх того, что сейчас в ветке на GitHub (её могли двигать не отсюда); пустой репозиторий - первый коммит.
-    $fetch = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('fetch', '--depth', '1', '--no-tags', $url, $branch) -Token $token -TimeoutSec 3600 -AllowFail
+    $fetch = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('fetch', '--depth', '1', '--no-tags', $url, $branch) -Token $token -TimeoutSec 3600 -AllowFail -Title 'Типовая: git fetch (что сейчас в GitHub)'
     if ($fetch.ExitCode -eq 0) {
         $remoteSha = (Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('rev-parse', 'FETCH_HEAD')).Output.Trim()
         $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('update-ref', 'HEAD', $remoteSha)
     }
     elseif ($fetch.Output -notmatch "couldn't find remote ref") { throw ("git fetch из {0}: {1}" -f $repo, (@($fetch.Output -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 2) -join ' | ')) }
-    Write-Line '  складываю в git (сотня тысяч файлов - пара минут)'
-    $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('add', '-A') -TimeoutSec 3600
+    # index.lock от оборванного git (таймаут, остановка, снятый процесс): с ним «git add» не начинается. Убирается,
+    # только если с этим репозиторием сейчас не работает другой git.
+    $indexLock = Join-Path $gitDir 'index.lock'
+    if (Test-Path -LiteralPath $indexLock) {
+        $busy = @()
+        try { $busy = @(Get-CimInstance Win32_Process -Filter "name='git.exe'" -ErrorAction Stop | Where-Object { ([string]$_.CommandLine).Contains($gitDir) }) } catch { $busy = @() }
+        if ($busy.Count -gt 0) { throw ("с репозиторием типовой уже работает другой git (процесс {0}): дождись его или сними" -f $busy[0].ProcessId) }
+        Remove-Item -LiteralPath $indexLock -Force
+        Write-Line '  убрал index.lock от прошлого оборванного запуска'
+    }
+    Write-Line '  складываю в git: сотня тысяч файлов, в первый раз - до часа и дольше (каждый файл сжимается и пишется объектом)'
+    $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('add', '-A') -TimeoutSec 14400 -Title 'Типовая: git add (файлы - в объекты git)'
     $staged = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('diff', '--cached', '--quiet') -AllowFail
     if ($staged.ExitCode -eq 0 -and $fetch.ExitCode -eq 0) {
         $state['commit'] = (Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('rev-parse', 'HEAD')).Output.Trim()
@@ -2840,15 +3040,15 @@ function Invoke-GitTypical {
     else {
         $messageFile = Join-Path $typicalRoot 'commit-message.txt'
         [System.IO.File]::WriteAllText($messageFile, ("Типовая {0} из {1}`n`nВыгрузка в файлы конфигуратором, {2}. Файлов больше 50 МБ мимо git: {3}.`n" -f $title, $script:TempBase, (Get-Date).ToString('dd.MM.yyyy HH:mm'), @($big).Count), (New-Object System.Text.UTF8Encoding($false)))
-        $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('commit', '--quiet', '--no-verify', '-F', $messageFile) -TimeoutSec 3600
+        $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('commit', '--quiet', '--no-verify', '-F', $messageFile) -TimeoutSec 7200 -Title 'Типовая: git commit'
         Write-Line ("  отправляю в {0} (ветка {1}; первый раз - надолго)" -f $repo, $branch)
-        $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('push', '--no-verify', $url, ('HEAD:refs/heads/' + $branch)) -Token $token -TimeoutSec 14400
+        $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('push', '--no-verify', $url, ('HEAD:refs/heads/' + $branch)) -Token $token -TimeoutSec 14400 -Title 'Типовая: git push (отправка в GitHub)'
         $state['commit'] = (Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('rev-parse', 'HEAD')).Output.Trim()
         Write-Line ("Типовая {0} - в {1}: коммит {2}, https://github.com/{1}" -f $title, $repo, (Get-GitShort $state['commit'])) 'Green'
     }
     if (@($big).Count -gt 0) { Write-Line ("  мимо git (больше 50 МБ): {0}" -f (@($big) -join ', ')) 'Yellow' }
     # Место после: объекты git - в один сжатый файл (после add их сотня тысяч мелких), выгрузку - долой, если не держим.
-    $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('gc', '--prune=now', '--quiet') -TimeoutSec 7200 -AllowFail
+    $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('gc', '--prune=now', '--quiet') -TimeoutSec 7200 -AllowFail -Title 'Типовая: git gc (сжать объекты)'
     if (-not [bool](Get-Setting $cfg 'TypicalKeepDump' $false)) {
         Remove-Item -LiteralPath $dump -Recurse -Force -ErrorAction SilentlyContinue
         Write-Line '  выгрузку в файлы удалил (TypicalKeepDump выключен): следующая версия выгрузится целиком'

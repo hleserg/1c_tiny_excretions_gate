@@ -809,7 +809,8 @@ function Compare-SelfCheck {
 function Format-SelfCheckSnapshot {
     # Текст снимка -> строки для сравнения. XML (сообщение обмена) разбирается и раскладывается по строкам
     # с отступами, из него убираются поля заголовка, которые меняются при каждой выгрузке сами по себе:
-    # дата создания и номера сообщений. Не XML - строки как есть, без хвостовых пробелов.
+    # дата создания и номера сообщений; у дат последнего обновления (LastUpdate) значение заменяется на «*» -
+    # сами поля остаются, чтобы было видно, если их стало больше или меньше. Не XML - строки как есть, без хвостовых пробелов.
     param([string[]]$Lines)
     $text = ($Lines -join "`n").Trim()
     if ($text.StartsWith('<')) {
@@ -821,6 +822,9 @@ function Format-SelfCheckSnapshot {
             foreach ($child in @($document.ChildNodes)) { if ($child -is [System.Xml.XmlDeclaration]) { [void]$document.RemoveChild($child) } }
             $volatile = @($document.SelectNodes("//*[local-name()='CreationDate' or local-name()='MessageNo' or local-name()='ReceivedNo']"))
             foreach ($node in $volatile) { [void]$node.ParentNode.RemoveChild($node) }
+            # LastUpdate в заголовке сообщения - даты, которые сдвигаются сами между прогонами (прогоны 18 и 19.11.2026:
+            # «снимки изменились», а разница - только в них).
+            foreach ($node in @($document.SelectNodes("//*[local-name()='LastUpdate']"))) { $node.InnerText = '*' }
             $settings = New-Object System.Xml.XmlWriterSettings
             $settings.Indent = $true
             $settings.IndentChars = '  '
@@ -1988,7 +1992,7 @@ function Compare-SelfCheckSnapshots {
     param($Current, [string]$ReferenceFile, [string]$DiffPath)
     $reference = Read-SelfCheckSnapshots $ReferenceFile
     # По умолчанию - поля заголовка сообщения обмена: XML-снимок, который не разобрался (обрезан), ими не отличается.
-    $masks = @(Get-Setting $cfg 'SnapshotMasks' @('(?<=<(?:\w+:)?(?:CreationDate|MessageNo|ReceivedNo)>)[^<]*') | Where-Object { $_ })
+    $masks = @(Get-Setting $cfg 'SnapshotMasks' @('(?<=<(?:\w+:)?(?:CreationDate|MessageNo|ReceivedNo|LastUpdate)>)[^<]*') | Where-Object { $_ })
     $changed = New-Object System.Collections.Generic.List[string]
     $added = New-Object System.Collections.Generic.List[string]
     $diff = New-Object System.Collections.Generic.List[string]
@@ -4102,6 +4106,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
                 $menu.Add([pscustomobject]@{ Key = 'cancelprep'; Label = 'Отменить подготовку рабочей: вернуть расширения к применённым версиям' })
             }
             $menu.Add([pscustomobject]@{ Key = 'basestate'; Label = 'Показать состояние баз: блокировки и сеансы' })
+            $menu.Add([pscustomobject]@{ Key = 'comcheck'; Label = ('Проверка внешнего соединения (COM) с {0}: как читаются расширения, только читает' -f $script:Base) })
             $menu.Add([pscustomobject]@{ Key = 'cmpext'; Label = 'Сравнить расширения: рабочая и temp' })
             $menu.Add([pscustomobject]@{ Key = 'cmpepf'; Label = 'Сравнить внешние обработки: рабочая и temp' })
             $menu.Add([pscustomobject]@{ Key = 'precheck'; Label = 'Проверка рабочей перед обновлением (только читает): что изменит загрузка, каких настроек нет' })
@@ -4167,6 +4172,15 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             # Только чтение: «Выполнить после обновления» в рабочей в режиме precheck - и обратно в меню.
             try {
                 if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -ProdPreCheck -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') -ProdPreCheck }
+            }
+            catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+            Wait-UiAcknowledge
+            continue
+        }
+        if ($choice -eq 'comcheck') {
+            # Только чтение, только temp: каким способом через внешнее соединение читаются расширения - и обратно в меню.
+            try {
+                if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -ComCheck -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') -ComCheck }
             }
             catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
             Wait-UiAcknowledge

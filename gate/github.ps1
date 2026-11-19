@@ -659,7 +659,9 @@ function Invoke-GitCli {
     # git с отдельной папкой репозитория (GitDir) и рабочей папкой (WorkTree): выгрузку конфигуратор может стереть
     # и выгрузить заново целиком, репозиторий при этом цел. Token - заголовком для github.com через GIT_CONFIG_*
     # (в командной строке и журнале его нет). Возвращает ExitCode и Output (stdout и stderr). AllowFail - не бросать.
-    param([string]$Git, [string]$GitDir, [string]$WorkTree, [string[]]$Arguments, [string]$Token = '', [int]$TimeoutSec = 3600, [switch]$AllowFail)
+    # Title - долгая команда: строка «начато в ..., жду не дольше ...» и строка хода со временем, как у вызовов 1С;
+    # просьба остановиться из ci.exe снимает git. Без Title - тихо (короткие команды).
+    param([string]$Git, [string]$GitDir, [string]$WorkTree, [string[]]$Arguments, [string]$Token = '', [int]$TimeoutSec = 3600, [switch]$AllowFail, [string]$Title = '')
     $all = @(('--git-dir=' + $GitDir), ('--work-tree=' + $WorkTree)) + @($Arguments)
     $quoted = @($all | ForEach-Object { if ([string]$_ -match '[\s"]') { '"' + ([string]$_).Replace('"', '\"') + '"' } else { [string]$_ } }) -join ' '
     $info = New-Object System.Diagnostics.ProcessStartInfo
@@ -703,10 +705,26 @@ function Invoke-GitCli {
     $process = [System.Diagnostics.Process]::Start($info)
     $outTask = $process.StandardOutput.ReadToEndAsync()
     $errTask = $process.StandardError.ReadToEndAsync()
-    if (-not $process.WaitForExit($TimeoutSec * 1000)) {
-        try { $process.Kill() } catch { }
-        throw ('git {0}: не закончил за {1} мин' -f $Arguments[0], [int]($TimeoutSec / 60))
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $showProgress = ($Title -and $null -ne (Get-Command Write-UiProgress -ErrorAction SilentlyContinue))
+    if ($Title) { Write-Host ("  ...  {0}: начато в {1}, жду не дольше {2} мин" -f $Title, (Get-Date -Format 'HH:mm:ss'), [int]($TimeoutSec / 60)) -ForegroundColor DarkGray }
+    while (-not $process.WaitForExit(250)) {
+        if ($watch.Elapsed.TotalSeconds -ge $TimeoutSec) {
+            try { $process.Kill() } catch { }
+            if ($showProgress) { Complete-UiProgress }
+            throw ('git {0}: не закончил за {1} мин' -f $Arguments[0], [int]($TimeoutSec / 60))
+        }
+        if ($showProgress) {
+            # Строка хода проверяет и просьбу остановиться (файл stop канала ci.exe): тогда git снимается.
+            try { Write-UiProgress -Title $Title -Elapsed $watch.Elapsed.TotalSeconds }
+            catch {
+                try { $process.Kill() } catch { }
+                Complete-UiProgress
+                throw
+            }
+        }
     }
+    if ($showProgress) { Complete-UiProgress }
     $process.WaitForExit()
     $output = ($outTask.Result + $errTask.Result).Trim()
     if ($Token) { $output = $output.Replace($Token, '***') }
