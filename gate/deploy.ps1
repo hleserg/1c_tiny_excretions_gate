@@ -3016,7 +3016,8 @@ function Undo-PreparedExtensions {
             $ok = $false
             continue
         }
-        if ($result.ExitCode -eq 0) { Write-Line ("  {0}: возвращено к применённой версии" -f $name) 'Green' }
+        if ($result.ExitCode -eq 0 -and -not $backup) { Write-Line ("  {0}: удалено - до подготовки его в рабочей не было" -f $name) 'Green' }
+        elseif ($result.ExitCode -eq 0) { Write-Line ("  {0}: возвращено к применённой версии" -f $name) 'Green' }
         else { Write-Line ("  {0}: вернуть не получилось - {1}" -f $name, $result.Text) 'Red'; $ok = $false }
     }
     return $ok
