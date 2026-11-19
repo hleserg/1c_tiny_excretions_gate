@@ -3134,7 +3134,11 @@ $tests = @(
             Check ($state.pendingNumber -eq 2 -and $state.pendingCommit -eq $state.commit) 'нет ожидающего проверки PR'
             Check ((Get-GhHead -Gh $gh -Branch $state.pendingBranch).Sha -eq $state.commit) 'ветка снимка указывает на другой коммит'
             $files = Get-GhFiles -Gh $gh -Commit $state.commit
-            Check ($files[$adaptPath] -eq (Get-GitBlobSha ($utf8.GetBytes($dumps['Адаптация']['CommonModules/АГБ_Общий/Ext/Module.bsl'])))) 'в PR нет правки temp'
+            $dumpPath = Join-Path (Join-Path $sb 'git\ext\work') $adaptPath
+            $dumpBytes = [System.IO.File]::ReadAllBytes($dumpPath)
+            $expectedText = $dumps['Адаптация']['CommonModules/АГБ_Общий/Ext/Module.bsl']
+            Check ([System.IO.File]::ReadAllText($dumpPath, $utf8) -ceq $expectedText) 'выгружен другой текст модуля temp'
+            Check ($files[$adaptPath] -eq (Get-GitBlobSha $dumpBytes)) 'байты модуля в PR отличаются от выгрузки temp'
             Check (-not (Test-Path -LiteralPath (Join-Path $sb 'runs'))) 'гейт начал загрузку до слияния'
             Reset-FakeState $sb
             $wait = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport -GitUnattended' -Fake @{ dumps = $dumps } -Com $com
