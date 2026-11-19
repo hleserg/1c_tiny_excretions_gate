@@ -22,6 +22,30 @@ func newTextDialog(value string, secret bool) *dialog {
 	return newDialog(uiEvent{Kind: "text", Header: "Пароль", Value: value, Secret: secret}, 100, 40)
 }
 
+// Вопрос с несколькими отметками: Enter без отметок - отказ с подсказкой; если скрипт разрешил пустой выбор
+// (allowEmpty) - ответ «ни одного», не отмена.
+func TestManyEmptySelection(t *testing.T) {
+	strict := newDialog(uiEvent{Kind: "many", Header: "Что обновить", Items: []string{"А", "Б"}}, 100, 40)
+	strict.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if strict.finished || strict.warning == "" {
+		t.Fatalf("пустой выбор принят без разрешения: finished=%v warning=%q", strict.finished, strict.warning)
+	}
+	loose := newDialog(uiEvent{Kind: "many", Header: "Какие обработки записать", Items: []string{"А", "Б"}, AllowEmpty: true}, 100, 40)
+	loose.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if !loose.finished || loose.result.Cancel || len(loose.result.Indexes) != 0 {
+		t.Fatalf("разрешённый пустой выбор: finished=%v cancel=%v indexes=%v", loose.finished, loose.result.Cancel, loose.result.Indexes)
+	}
+	if !strings.Contains(loose.View(), "можно без отметок") {
+		t.Fatalf("в подсказке нет слов «можно без отметок»")
+	}
+	// С отметкой - как обычно.
+	marked := newDialog(uiEvent{Kind: "many", Header: "Какие обработки записать", Items: []string{"А", "Б"}, AllowEmpty: true, Preselected: []int{1}}, 100, 40)
+	marked.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if !marked.finished || len(marked.result.Indexes) != 1 || marked.result.Indexes[0] != 1 {
+		t.Fatalf("выбор с отметкой: %v", marked.result.Indexes)
+	}
+}
+
 func TestPasteCtrlVTrimsNewline(t *testing.T) {
 	withClipboard(t, "  github_pat_11ABC\r\n", nil)
 	d := newTextDialog("", true)

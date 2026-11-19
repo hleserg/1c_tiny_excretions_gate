@@ -3767,13 +3767,19 @@ else {
     }
 
     # Внешние обработки - отдельным списком после расширений. «Все» и «Только обработки» - отмечены все,
-    # «Выбранные» - ни одной. В «как есть» обработки не трогаются.
+    # «Выбранные» и «подготовленным» - ни одной (подготовка касалась только расширений). В «как есть» обработки
+    # не трогаются. Enter без отметок - не записывать ни одной и идти дальше с расширениями: раньше пустой выбор
+    # не принимался, а Esc выходил из обновления - обновить расширения, не трогая обработки, было нельзя
+    # (рабочая 19.11: в списке были обработки, которые в рабочей новее, чем в temp).
     if ($mode -ne 'asis' -and -not $Prepare -and $processingsPending.Count -gt 0) {
         $procLabels = @($processingsPending | ForEach-Object { '{0} ({1})  {2}' -f $_.ObjName, $_.Title, $_.Text })
         $procPreselected = @()
-        if ($mode -eq '1' -or $mode -eq 'epf' -or $mode -eq 'prepared') { $procPreselected = @(0..($processingsPending.Count - 1)) }
-        $procPicked = Select-UiMany -Header ("Какие внешние обработки записать в {0}" -f $script:ProdBase) -Items $procLabels -Preselected $procPreselected
+        if ($mode -eq '1' -or $mode -eq 'epf') { $procPreselected = @(0..($processingsPending.Count - 1)) }
+        $procNotes = @(('Отмеченное запишется в {0} поверх того, что там есть: «изменена» значит «отличается», в рабочей версия может быть новее - сверь версии.' -f $script:ProdBase),
+            'Enter без отметок - обработки не трогать.')
+        $procPicked = Select-UiMany -Header ("Какие внешние обработки записать в {0}" -f $script:ProdBase) -Items $procLabels -Preselected $procPreselected -Notes $procNotes -AllowEmpty
         if ($null -eq $procPicked) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
+        if (@($procPicked).Count -eq 0) { Write-Line '  внешние обработки: не отмечено ни одной - не трогаю' }
         $selectedProcessings = @($procPicked | Sort-Object | ForEach-Object { $processingsPending[$_] })
     }
     if ($selected.Count -eq 0 -and $selectedProcessings.Count -eq 0) { Write-Host 'Ничего не выбрано: выход, ничего не обновлял.'; exit 0 }

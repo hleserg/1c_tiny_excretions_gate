@@ -35,6 +35,7 @@ type uiEvent struct {
 	Current     string     `json:"current"`
 	Blocks      []subBlock `json:"blocks"`
 	Preselected []int      `json:"preselected"`
+	AllowEmpty  bool       `json:"allowEmpty"` // вопрос many: Enter без отметок - ответ «ни одного», а не отказ
 	Yes         string     `json:"yes"`
 	No          string     `json:"no"`
 	Lines       []string   `json:"lines"`
