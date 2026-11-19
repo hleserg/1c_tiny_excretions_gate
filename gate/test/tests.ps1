@@ -613,6 +613,47 @@ $rulesAfterLines = @(
 $rulesModuleControlOnly = $rulesControlLines -join "`n"
 $rulesModule = (@($rulesControlLines) + @($rulesAfterLines)) -join "`n"
 
+function New-FakeGateRelease {
+    # Подставной GitHub с релизами гейта для update.ps1 в песочнице: токен файлом DPAPI, прежний ci.exe, комплект-заглушка
+    # (install.ps1 пишет, куда и как её позвали, и ci\run.ps1), ответы на адреса - в fake-http: релиз 20991231.000000 с
+    # верной суммой, 20000101.000000 - с неверной, чужой тег. Возвращает токен и папку ответов.
+    param([string]$Sandbox, [string]$Name)
+    New-Item -ItemType Directory -Path (Join-Path $Sandbox 'secrets') -Force | Out-Null
+    $secret = 'tok-секрет-123'
+    [System.IO.File]::WriteAllText((Join-Path $Sandbox 'secrets\github.txt'), (ConvertFrom-SecureString -SecureString (ConvertTo-SecureString $secret -AsPlainText -Force)))
+    [System.IO.File]::WriteAllText((Join-Path $Sandbox 'ci.exe'), 'старый ci.exe')
+    # Комплект: install.ps1-заглушка (пишет, куда и как её позвали) и ci\run.ps1.
+    $kit = Join-Path $workRoot ($Name + '-kit')
+    New-Item -ItemType Directory -Path (Join-Path $kit 'ci') -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $kit 'install.ps1'), ('param([string]$Target, [switch]$Unattended)' + "`r`n" + '[System.IO.File]::WriteAllText((Join-Path $Target "installed-marker.txt"), ("target=" + $Target + " unattended=" + [bool]$Unattended))'), $utf8Bom)
+    [System.IO.File]::WriteAllText((Join-Path $kit 'ci\run.ps1'), '# Версия 20991231.000000.', $utf8Bom)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = Join-Path $workRoot ($Name + '.zip')
+    if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+    [System.IO.Compression.ZipFile]::CreateFromDirectory($kit, $zip)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $digest = -join @($sha.ComputeHash([System.IO.File]::ReadAllBytes($zip)) | ForEach-Object { $_.ToString('x2') })
+    $http = Join-Path $Sandbox 'fake-http'
+    New-Item -ItemType Directory -Path $http -Force | Out-Null
+    $put = {
+        param([string]$Url, $Content)
+        $file = Join-Path $http ([regex]::Replace($Url, '[^A-Za-z0-9.\-]', '_'))
+        if ($Content -is [byte[]]) { [System.IO.File]::WriteAllBytes($file, $Content) } else { [System.IO.File]::WriteAllText($file, [string]$Content, $utf8) }
+    }
+    $releases = @(
+        @{ tag_name = 'gate-20991231.000000'; draft = $false; published_at = '2099-12-31T10:00:00Z'; body = "- модульные тесты`n- обновление из GitHub"
+            assets = @(@{ name = 'ci-gate_20991231.000000.zip'; url = 'https://api.github.com/repos/owner/repo/releases/assets/1'; size = 1000; digest = ('sha256:' + $digest) }) },
+        @{ tag_name = 'gate-20000101.000000'; draft = $false; published_at = '2000-01-01T10:00:00Z'; body = 'старый'
+            assets = @(@{ name = 'ci-gate_20000101.000000.zip'; url = 'https://api.github.com/repos/owner/repo/releases/assets/2'; size = 1000; digest = ('sha256:' + ('0' * 64)) }) },
+        @{ tag_name = 'other-1'; draft = $false; published_at = '2099-01-01T10:00:00Z'; body = ''; assets = @() })
+    & $put 'https://api.github.com/repos/owner/repo/releases?per_page=30' (ConvertTo-Json -InputObject $releases -Depth 6)
+    & $put 'https://api.github.com/repos/owner/repo/releases/assets/1' 'REDIRECT https://objects.example.com/new.zip'
+    & $put 'https://api.github.com/repos/owner/repo/releases/assets/2' 'REDIRECT https://objects.example.com/old.zip'
+    & $put 'https://objects.example.com/new.zip' ([System.IO.File]::ReadAllBytes($zip))
+    & $put 'https://objects.example.com/old.zip' ([System.IO.File]::ReadAllBytes($zip))
+    return [pscustomobject]@{ Secret = $secret; Http = $http }
+}
+
 $tests = @(
     @{
         Name = 'gate-asis-green'
@@ -3276,39 +3317,9 @@ $tests = @(
         Run = {
             param($Name)
             $sb = New-Sandbox $Name -Config @{ UpdateRepo = 'owner/repo'; GitHubTokenPassFile = 'secrets\github.txt' }
-            New-Item -ItemType Directory -Path (Join-Path $sb 'secrets') -Force | Out-Null
-            $secret = 'tok-секрет-123'
-            [System.IO.File]::WriteAllText((Join-Path $sb 'secrets\github.txt'), (ConvertFrom-SecureString -SecureString (ConvertTo-SecureString $secret -AsPlainText -Force)))
-            [System.IO.File]::WriteAllText((Join-Path $sb 'ci.exe'), 'старый ci.exe')
-            # Комплект: install.ps1-заглушка (пишет, куда и как её позвали) и ci\run.ps1.
-            $kit = Join-Path $workRoot ($Name + '-kit')
-            New-Item -ItemType Directory -Path (Join-Path $kit 'ci') -Force | Out-Null
-            [System.IO.File]::WriteAllText((Join-Path $kit 'install.ps1'), ('param([string]$Target, [switch]$Unattended)' + "`r`n" + '[System.IO.File]::WriteAllText((Join-Path $Target "installed-marker.txt"), ("target=" + $Target + " unattended=" + [bool]$Unattended))'), $utf8Bom)
-            [System.IO.File]::WriteAllText((Join-Path $kit 'ci\run.ps1'), '# Версия 20991231.000000.', $utf8Bom)
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            $zip = Join-Path $workRoot ($Name + '.zip')
-            if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-            [System.IO.Compression.ZipFile]::CreateFromDirectory($kit, $zip)
-            $sha = [System.Security.Cryptography.SHA256]::Create()
-            $digest = -join @($sha.ComputeHash([System.IO.File]::ReadAllBytes($zip)) | ForEach-Object { $_.ToString('x2') })
-            $http = Join-Path $sb 'fake-http'
-            New-Item -ItemType Directory -Path $http -Force | Out-Null
-            $put = {
-                param([string]$Url, $Content)
-                $file = Join-Path $http ([regex]::Replace($Url, '[^A-Za-z0-9.\-]', '_'))
-                if ($Content -is [byte[]]) { [System.IO.File]::WriteAllBytes($file, $Content) } else { [System.IO.File]::WriteAllText($file, [string]$Content, $utf8) }
-            }
-            $releases = @(
-                @{ tag_name = 'gate-20991231.000000'; draft = $false; published_at = '2099-12-31T10:00:00Z'; body = "- модульные тесты`n- обновление из GitHub"
-                    assets = @(@{ name = 'ci-gate_20991231.000000.zip'; url = 'https://api.github.com/repos/owner/repo/releases/assets/1'; size = 1000; digest = ('sha256:' + $digest) }) },
-                @{ tag_name = 'gate-20000101.000000'; draft = $false; published_at = '2000-01-01T10:00:00Z'; body = 'старый'
-                    assets = @(@{ name = 'ci-gate_20000101.000000.zip'; url = 'https://api.github.com/repos/owner/repo/releases/assets/2'; size = 1000; digest = ('sha256:' + ('0' * 64)) }) },
-                @{ tag_name = 'other-1'; draft = $false; published_at = '2099-01-01T10:00:00Z'; body = ''; assets = @() })
-            & $put 'https://api.github.com/repos/owner/repo/releases?per_page=30' (ConvertTo-Json -InputObject $releases -Depth 6)
-            & $put 'https://api.github.com/repos/owner/repo/releases/assets/1' 'REDIRECT https://objects.example.com/new.zip'
-            & $put 'https://api.github.com/repos/owner/repo/releases/assets/2' 'REDIRECT https://objects.example.com/old.zip'
-            & $put 'https://objects.example.com/new.zip' ([System.IO.File]::ReadAllBytes($zip))
-            & $put 'https://objects.example.com/old.zip' ([System.IO.File]::ReadAllBytes($zip))
+            $release = New-FakeGateRelease -Sandbox $sb -Name $Name
+            $secret = $release.Secret
+            $http = $release.Http
             $r = Invoke-Script -Sandbox $sb -Script 'update.ps1' -Answers @(
                 @{ Kind = 'one'; Header = 'Обновление гейта из owner/repo'; Item = '^20991231\.000000 .*новее' },
                 @{ Kind = 'confirm'; Header = 'Поставить 20991231\.000000\?'; Yes = $true })
@@ -3330,6 +3341,53 @@ $tests = @(
             Check ($bad.ExitCode -eq 1) ("не та сумма: код {0}, ждали 1" -f $bad.ExitCode)
             Check (@($bad.Output | Where-Object { $_ -match 'контрольная сумма' }).Count -gt 0) 'нет объяснения про контрольную сумму'
             Check (-not (Test-Path -LiteralPath $marker)) 'установщик запущен при неверной сумме'
+        }
+    },
+    @{
+        Name = 'menu-update-restart'
+        Text = 'меню гейта: после «Обновить гейт из GitHub» - не «Вернуться в меню», а «Перезапустить ci» или «Закрыть ci»; ci.exe получает событие close (restart - по выбору), меню второй раз не открывается'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ UpdateRepo = 'owner/repo'; GitHubTokenPassFile = 'secrets\github.txt' }
+            $null = New-FakeGateRelease -Sandbox $sb -Name $Name
+            # События close для ci.exe из вывода скрипта.
+            $getCloses = {
+                param($Result)
+                $found = @(foreach ($line in @($Result.Output | Where-Object { $_.StartsWith('@@ui:') })) {
+                        $uiEvent = $null
+                        try { $uiEvent = $line.Substring(5) | ConvertFrom-Json } catch { $uiEvent = $null }
+                        if ($null -ne $uiEvent -and [string]$uiEvent.kind -eq 'close') { $uiEvent }
+                    })
+                return , $found
+            }
+            $r = Invoke-Script -Sandbox $sb -Answers @(
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Обновить гейт из GitHub' },
+                @{ Kind = 'one'; Header = 'Обновление гейта из owner/repo'; Item = '^20991231\.000000 ' },
+                @{ Kind = 'confirm'; Header = 'Поставить 20991231\.000000\?'; Yes = $true },
+                @{ Kind = 'one'; Header = 'Гейт обновлён'; Item = '^Перезапустить ci' })
+            Check ($r.ExitCode -eq 0) ("код {0}, ждали 0: {1}" -f $r.ExitCode, (($r.Output | Select-Object -Last 5) -join ' | '))
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            Check ($r.UnusedAnswers -eq 0) ("тест ждал вопросов, а их не было: {0}" -f $r.UnusedAnswers)
+            Check (@($r.Output | Where-Object { $_ -match '^Остановлено: |ParserError' }).Count -eq 0) 'скрипт упал'
+            Check (Test-Path -LiteralPath (Join-Path $sb 'installed-marker.txt')) 'установщик комплекта не запускался'
+            $closes = & $getCloses $r
+            Check ($closes.Count -eq 1) ("событий close для ci.exe {0}, ждали 1" -f $closes.Count)
+            if ($closes.Count -eq 1) { Check ([bool]$closes[0].restart) '«Перезапустить ci»: событие close без restart' }
+            $menus = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Гейт расширений') })
+            Check ($menus.Count -eq 1) ("меню гейта показано {0} раз, ждали 1: после обновления оно не открывается" -f $menus.Count)
+            Check (@($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Вернуться в меню') }).Count -eq 0) 'после обновления предложено «Вернуться в меню»'
+            # Ещё раз тот же релиз, ответ «Закрыть ci»: событие close без restart.
+            $c = Invoke-Script -Sandbox $sb -Answers @(
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Обновить гейт из GitHub' },
+                @{ Kind = 'one'; Header = 'Обновление гейта из owner/repo'; Item = '^20991231\.000000 ' },
+                @{ Kind = 'confirm'; Header = 'Поставить 20991231\.000000\?'; Yes = $true },
+                @{ Kind = 'one'; Header = 'Гейт обновлён'; Item = '^Закрыть ci' })
+            Check ($c.ExitCode -eq 0) ("«Закрыть ci»: код {0}, ждали 0: {1}" -f $c.ExitCode, (($c.Output | Select-Object -Last 5) -join ' | '))
+            Check ($c.Unexpected.Count -eq 0) ("«Закрыть ci»: неожиданные вопросы: " + ($c.Unexpected -join ' | '))
+            Check ($c.UnusedAnswers -eq 0) ("«Закрыть ci»: тест ждал вопросов, а их не было: {0}" -f $c.UnusedAnswers)
+            $closes = & $getCloses $c
+            Check ($closes.Count -eq 1) ("«Закрыть ci»: событий close {0}, ждали 1" -f $closes.Count)
+            if ($closes.Count -eq 1) { Check (-not [bool]$closes[0].restart) '«Закрыть ci»: событие close с restart' }
         }
     },
     @{
