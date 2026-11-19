@@ -106,7 +106,8 @@ type scenario struct {
 	Regepf    []processing   `json:"regepf"`
 	Unregepf  []processing   `json:"unregepf"`
 	Kbarticle []processing   `json:"kbarticle"`
-	// Выгрузка расширения в файлы (/DumpConfigToFiles): расширение -> путь файла от корня выгрузки -> текст.
+	// Выгрузка расширения в файлы (/DumpConfigToFiles): расширение -> путь файла от корня выгрузки -> текст;
+	// основная конфигурация (без -Extension) - ключ "@config"
 	Dumps      map[string]map[string]string `json:"dumps"`
 	ClientExit int                          `json:"clientExit"`
 	Unittests  []unitRun                    `json:"unittests"`
@@ -286,9 +287,14 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 			copyTree(store, dir)
 		}
 		writeUTF8(filepath.Join(dir, "ConfigDumpInfo.xml"), "<ConfigDumpInfo/>")
-		files := sc.Dumps[ext]
+		// Без -Extension - основная конфигурация: ключ "@config".
+		key := ext
+		if key == "" {
+			key = "@config"
+		}
+		files := sc.Dumps[key]
 		// "<расширение>@<база>" - выгрузка именно этой базы (сравнение temp и рабочей); нет такой - общая.
-		if byBase, ok := sc.Dumps[ext+"@"+infobaseName(args)]; ok {
+		if byBase, ok := sc.Dumps[key+"@"+infobaseName(args)]; ok {
 			files = byBase
 		}
 		for rel, text := range files {

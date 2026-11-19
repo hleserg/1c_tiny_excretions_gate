@@ -486,9 +486,10 @@ function New-PrintProcessing {
 . (Join-Path $ciRoot 'github.ps1')
 
 function New-GitSandbox {
-    param([string]$Name)
+    param([string]$Name, [hashtable]$Extra = @{})
     $config = $deployConfig.Clone()
     $config['ExtensionsRepo'] = 'owner/ext'
+    foreach ($key in @($Extra.Keys)) { $config[$key] = $Extra[$key] }
     $config['GitHubTokenPassFile'] = 'secrets\github.txt'
     $sb = New-Sandbox $Name -Config $config
     New-Item -ItemType Directory -Path (Join-Path $sb 'secrets') -Force | Out-Null
@@ -2261,6 +2262,105 @@ $tests = @(
             $prod2 = (Get-GhHead -Gh $gh -Branch 'prod').Sha
             Check ($prod2 -and $prod2 -ne $prod -and (Read-GhFakeCommit -Gh $gh -Sha $prod2).Parents -contains $prod) 'второй снимок не лёг коммитом поверх прежнего prod'
             Check ((Get-GhHead -Gh $gh -Branch 'main').Sha -eq $main) 'второй снимок рабочей тронул main'
+        }
+    },
+    @{
+        Name = 'git-typical'
+        Text = 'типовая в git (TypicalRepo, портативный git; в тесте - git из PATH и bare-репозиторий вместо GitHub): в конце «Выгрузить temp в git» - вопрос, выгрузка основной конфигурации без -Extension, коммит с README.md без ConfigDumpInfo.xml, push; та же версия - «уже в», без вопросов; новая версия - вопрос «обновилась», выгрузка с -update, коммит поверх прежнего'
+        Run = {
+            param($Name)
+            $gitCommand = Get-Command git -ErrorAction SilentlyContinue
+            if ($null -eq $gitCommand) { Write-Host '       пропущен: нет git в PATH'; return }
+            $gitExe = $gitCommand.Source
+            $sb = New-GitSandbox $Name -Extra @{ TypicalRepo = 'owner/typical' }
+            $bare = Join-Path $sb 'typical-remote.git'
+            $null = & $gitExe init --bare --quiet $bare 2>&1
+            $env:CI_FAKE_GIT_EXE = $gitExe
+            $env:CI_FAKE_GIT_REMOTE = $bare
+            try {
+                $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
+                $com.bases.erp_temp_test['config'] = @{ name = 'ERP'; synonym = 'ERP завода'; version = '2.5.22.149' }
+                $dumps = New-GitDumps
+                $dumps['@config'] = @{ 'Catalogs/Items.xml' = '<Items/>'; 'CommonModules/Common/Ext/Module.bsl' = 'Процедура А() КонецПроцедуры' }
+                $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = $dumps } -Com $com -Answers ($gitBootstrapAnswers + @(@{ Kind = 'confirm'; Header = 'Выгрузить и типовую'; Yes = $true }))
+                Check-DeployCommon $first -LocksExpected $false
+                Check ($first.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($first.Unexpected -join ' | '))
+                $tree = @(& $gitExe --git-dir=$bare ls-tree -r --name-only main 2>&1 | ForEach-Object { [string]$_ })
+                foreach ($path in @('README.md', 'Configuration.xml', 'Catalogs/Items.xml', 'CommonModules/Common/Ext/Module.bsl')) { Check ($tree -contains $path) ("в репозитории типовой нет {0}: {1}" -f $path, ($tree -join ' ')) }
+                Check ($tree -notcontains 'ConfigDumpInfo.xml') 'ConfigDumpInfo.xml попал в репозиторий типовой'
+                $firstSha = [string](& $gitExe --git-dir=$bare rev-parse main 2>&1)
+                $dumpCalls = @(Get-Calls $first @('/DumpConfigToFiles') | Where-Object { -not $_.Line.Contains('-Extension') })
+                Check ($dumpCalls.Count -eq 1 -and -not $dumpCalls[0].Line.Contains('-update')) ("выгрузка типовой: " + (@($dumpCalls | ForEach-Object { $_.Line }) -join ' | '))
+                $stateFile = Join-Path $sb 'git\typical\typical.json'
+                Check ((Test-Path -LiteralPath $stateFile) -and (([System.IO.File]::ReadAllText($stateFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json).version -eq '2.5.22.149')) 'typical.json без версии типовой'
+                Reset-FakeState $sb
+                $same = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = $dumps } -Com $com
+                Check-DeployCommon $same -LocksExpected $false
+                Check ($same.Unexpected.Count -eq 0) ("та же версия типовой - а вопросы: " + ($same.Unexpected -join ' | '))
+                Check (@($same.Output | Where-Object { $_ -match 'типовая .*уже в owner/typical' }).Count -eq 1) 'та же версия типовой: не сказано «уже в»'
+                Check (@(Get-Calls $same @('/DumpConfigToFiles') | Where-Object { -not $_.Line.Contains('-Extension') }).Count -eq 0) 'та же версия типовой: выгружалась заново'
+                $com.bases.erp_temp_test['config']['version'] = '2.5.23.10'
+                $dumps['@config']['CommonModules/Common/Ext/Module.bsl'] = 'Процедура Б() КонецПроцедуры'
+                Reset-FakeState $sb
+                $next = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = $dumps } -Com $com -Answers @(@{ Kind = 'confirm'; Header = 'обновилась: 2\.5\.22\.149 -> 2\.5\.23\.10'; Yes = $true })
+                Check-DeployCommon $next -LocksExpected $false
+                Check ($next.Unexpected.Count -eq 0) ("новая версия типовой - неожиданные вопросы: " + ($next.Unexpected -join ' | '))
+                $nextSha = [string](& $gitExe --git-dir=$bare rev-parse main 2>&1)
+                $parent = [string](& $gitExe --git-dir=$bare rev-parse 'main~1' 2>&1)
+                Check ($nextSha -ne $firstSha -and $parent -eq $firstSha) ("новая версия типовой не легла коммитом поверх прежнего: {0} -> {1}, родитель {2}" -f $firstSha, $nextSha, $parent)
+                $updateCalls = @(Get-Calls $next @('/DumpConfigToFiles', '-update') | Where-Object { -not $_.Line.Contains('-Extension') })
+                Check ($updateCalls.Count -eq 1) 'новая версия типовой выгружалась не с -update'
+            }
+            finally {
+                Remove-Item -Path 'env:CI_FAKE_GIT_EXE' -ErrorAction SilentlyContinue
+                Remove-Item -Path 'env:CI_FAKE_GIT_REMOTE' -ErrorAction SilentlyContinue
+            }
+        }
+    },
+    @{
+        Name = 'git-portable-download'
+        Text = 'портативный git: нет tools\git - последний MinGit 64 бита (не busybox) из релизов git-for-windows, сверка sha256 с digest релиза, распаковка в tools\git; второй раз не скачивает; не та сумма - отказ, tools\git не появляется'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $http = Join-Path $sb 'http'
+            New-Item -ItemType Directory -Path $http -Force | Out-Null
+            $put = { param([string]$Url, $Content) $file = Join-Path $http ([regex]::Replace($Url, '[^A-Za-z0-9.\-]', '_')); if ($Content -is [byte[]]) { [System.IO.File]::WriteAllBytes($file, $Content) } else { [System.IO.File]::WriteAllText($file, [string]$Content, $utf8) } }
+            $source = Join-Path $sb 'mingit-src'
+            New-Item -ItemType Directory -Path (Join-Path $source 'cmd') -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $source 'cmd\git.exe'), 'MZ fake git', $utf8)
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = Join-Path $sb 'mingit.zip'
+            [System.IO.Compression.ZipFile]::CreateFromDirectory($source, $zip)
+            $zipBytes = [System.IO.File]::ReadAllBytes($zip)
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            $digest = -join @($sha.ComputeHash($zipBytes) | ForEach-Object { $_.ToString('x2') })
+            $release = @{ tag_name = 'v2.47.1.windows.1'; assets = @(
+                    @{ name = 'MinGit-2.47.1-busybox-64-bit.zip'; url = 'https://api.github.com/repos/git-for-windows/git/releases/assets/9'; digest = ('sha256:' + ('0' * 64)) },
+                    @{ name = 'MinGit-2.47.1-64-bit.zip'; url = 'https://api.github.com/repos/git-for-windows/git/releases/assets/10'; digest = ('sha256:' + $digest) }) }
+            & $put 'https://api.github.com/repos/git-for-windows/git/releases/latest' (ConvertTo-Json -InputObject $release -Depth 5)
+            & $put 'https://api.github.com/repos/git-for-windows/git/releases/assets/10' 'REDIRECT https://objects.example.com/mingit.zip'
+            & $put 'https://objects.example.com/mingit.zip' $zipBytes
+            $env:CI_FAKE_HTTP = $http
+            Remove-Item -Path 'env:CI_FAKE_GIT_EXE' -ErrorAction SilentlyContinue
+            try {
+                $tools = Join-Path $sb 'tools-git'
+                $exe = Get-PortableGit -ToolsDir $tools
+                Check ($exe -eq (Join-Path $tools 'git\cmd\git.exe') -and (Test-Path -LiteralPath $exe)) ("git не распакован в tools\git: {0}" -f $exe)
+                $log = [System.IO.File]::ReadAllText((Join-Path $http 'requests.log'), $utf8)
+                Check ($log -match 'assets/10' -and $log -notmatch 'assets/9') 'скачан не тот файл релиза (нужен MinGit 64 бита, не busybox)'
+                $before = @([System.IO.File]::ReadAllLines((Join-Path $http 'requests.log'))).Count
+                $again = Get-PortableGit -ToolsDir $tools
+                Check ($again -eq $exe -and @([System.IO.File]::ReadAllLines((Join-Path $http 'requests.log'))).Count -eq $before) 'второй раз git скачивался снова'
+                $release.assets[1].digest = 'sha256:' + ('1' * 64)
+                & $put 'https://api.github.com/repos/git-for-windows/git/releases/latest' (ConvertTo-Json -InputObject $release -Depth 5)
+                $badTools = Join-Path $sb 'tools-bad'
+                $failed = $false
+                try { $null = Get-PortableGit -ToolsDir $badTools } catch { $failed = $_.Exception.Message -match 'контрольная сумма' }
+                Check $failed 'не та контрольная сумма - а git поставлен'
+                Check (-not (Test-Path -LiteralPath (Join-Path $badTools 'git'))) 'не та контрольная сумма - а tools\git появился'
+            }
+            finally { Remove-Item -Path 'env:CI_FAKE_HTTP' -ErrorAction SilentlyContinue }
         }
     },
     @{

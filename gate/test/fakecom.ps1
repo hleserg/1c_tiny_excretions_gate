@@ -28,7 +28,7 @@ deploy.ps1 берёт его вместо настоящего, когда за�
   агент: ConnectAgent, GetClusters, Authenticate, GetSessions, TerminateSession, GetWorkingProcesses;
   рабочий процесс: ConnectWorkingProcess, AuthenticateAdmin, AddAuthentication, GetInfoBases, UpdateInfoBase;
   внешнее соединение: Connect, ConfigurationExtensions.Get, ConfigurationExtensionsSource, Base64String,
-  расширение.GetData().Write, NewObject('Query') - запрос к справочнику обработок (Execute, Select, Next,
+  расширение.GetData().Write, Metadata (Name, Synonym, Version - из «config» базы), NewObject('Query') - запрос к справочнику обработок (Execute, Select, Next,
   Storage.Get().Write; с «НЕ Спр.ПометкаУдаления» в тексте - без помеченных; ссылка.UUID(), String) и к его табличной
   части Назначение (в тексте «.Назначение»). Нет ref у обработки - УИД из её номера; нет content - файла нет.
 #>
@@ -186,6 +186,16 @@ function New-FakeComConnection {
         return (New-Object FakeComList -ArgumentList (, [object[]]$items.ToArray()))
     }
     $connection.ConfigurationExtensions = $extensions
+    # Метаданные основной конфигурации: из «config» базы (name, synonym, version), нет - условные.
+    $metadata = [pscustomobject]@{ Name = 'Конфигурация'; Synonym = 'Конфигурация'; Version = '1.0.0.1' }
+    $baseState = Get-FakeComBase (Read-FakeComState $File) $Base
+    if ($null -ne $baseState -and $null -ne $baseState.PSObject.Properties['config'] -and $null -ne $baseState.config) {
+        foreach ($field in @('Name', 'Synonym', 'Version')) {
+            $property = $baseState.config.PSObject.Properties[$field.ToLowerInvariant()]
+            if ($null -ne $property -and $property.Value) { $metadata.$field = [string]$property.Value }
+        }
+    }
+    $connection | Add-Member -NotePropertyName Metadata -NotePropertyValue $metadata
     $connection | Add-Member -MemberType ScriptMethod -Name Base64String -Value { param($Value) return [string]$Value }
     $connection | Add-Member -MemberType ScriptMethod -Name String -Value { param($Value) return [string]$Value }
     $connection | Add-Member -MemberType ScriptMethod -Name NewObject -Value {

@@ -155,6 +155,11 @@
     ExtensionsBranch = 'main'
     # Снимок внешних обработок рабочей (deploy.ps1 -GitProd) - в эту ветку; пишет её только гейт.
     ExtensionsProdBranch = 'prod'
+    # Типовая конфигурация temp - в свой репозиторий (только для чтения агентами), портативным git (MinGit в
+    # tools\git, скачивается сам; или GitExe). Выгружается в конце «Выгрузить temp в git», если версия изменилась.
+    # TypicalRepo = 'владелец/репозиторий'
+    TypicalBranch = 'main'
+    TypicalDumpTimeoutMin = 180
     GitDir = 'git'
     UpdateTagPrefix = 'gate-'
 

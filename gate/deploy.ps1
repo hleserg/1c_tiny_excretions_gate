@@ -61,6 +61,9 @@ param(
     [switch]$GitImport,
     # Снимок внешних обработок рабочей в ветку prod репозитория расширений (ExtensionsProdBranch). Рабочую только читает.
     [switch]$GitProd,
+    # Типовая конфигурация temp - в репозиторий TypicalRepo (только для чтения агентами), если её версия изменилась.
+    # Делается и в конце -GitExport.
+    [switch]$GitTypical,
     # С -GitImport: без человека (ночной прогон): правки temp - веткой и pull request, temp не трогается;
     # правок нет и main ушёл вперёд - прогон гейта с ним без вопросов (-OnNotGreen Keep).
     [switch]$GitUnattended,
@@ -634,12 +637,12 @@ Initialize-Stats -Dir (Resolve-RootPath ([string](Get-Setting $cfg 'StatsDir' 's
 $deployRoot = Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))
 $mirrorRoot = Join-Path $deployRoot 'mirror'
 $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
-$viewOnly = ($BaseState -or $CompareExtensions -or $CompareProcessings -or $GitExport -or $GitImport -or $GitProd)
+$viewOnly = ($BaseState -or $CompareExtensions -or $CompareProcessings -or $GitExport -or $GitImport -or $GitProd -or $GitTypical)
 if ($viewOnly) {
     # Показать состояние или сравнить - не запуск обновления: своей папки запуска нет (в истории обновлений его не видно),
     # журнал - в deploy\state\run.log, каждый раз заново.
     $viewName = 'state'
-    if ($CompareExtensions) { $viewName = 'compare-ext' } elseif ($CompareProcessings) { $viewName = 'compare-epf' } elseif ($GitExport -or $GitImport -or $GitProd) { $viewName = 'git' }
+    if ($CompareExtensions) { $viewName = 'compare-ext' } elseif ($CompareProcessings) { $viewName = 'compare-epf' } elseif ($GitExport -or $GitImport -or $GitProd -or $GitTypical) { $viewName = 'git' }
     $script:RunDir = Join-Path $deployRoot $viewName
     New-Item -ItemType Directory -Path $script:RunDir -Force | Out-Null
     $script:RunLogPath = Join-Path $script:RunDir 'run.log'
@@ -2479,6 +2482,176 @@ function Invoke-GitProdSnapshot {
     Write-Line ("Записал в {0} ({1}): коммит {2}. Разница с temp: https://github.com/{0}/compare/{3}...{1}" -f $Setup.Repo, $prodBranch, (Get-GitShort $sha), $Setup.Branch) 'Green'
 }
 
+function Get-ComConfigInfo {
+    # Имя, синоним и версия основной конфигурации базы - внешним соединением (только чтение). Не вышло - Ok = $false.
+    param([string]$BaseName, [string]$User, [string]$Password)
+    $reader = {
+        param([string]$Line, [string]$FakeScript, [string]$FakeFile)
+        if ($FakeScript) { . $FakeScript; $connector = New-FakeComConnector $FakeFile }
+        else { $connector = New-Object -ComObject V83.COMConnector }
+        $connection = $null
+        try {
+            try { $connection = $connector.Connect($Line) }
+            catch {
+                $connectError = $_.Exception
+                while ($null -ne $connectError.InnerException) { $connectError = $connectError.InnerException }
+                throw ([string]$connectError.Message)
+            }
+            $metadata = $connection.Metadata
+            return [pscustomobject]@{ Name = [string]$metadata.Name; Synonym = [string]$metadata.Synonym; Version = [string]$metadata.Version }
+        }
+        finally {
+            foreach ($comObject in @($connection, $connector)) {
+                if ($null -ne $comObject -and [Runtime.InteropServices.Marshal]::IsComObject($comObject)) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($comObject) }
+            }
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
+        }
+    }
+    $call = Invoke-UiBackground -Script $reader -Arguments @((Get-ComConnectionLine $BaseName $User $Password), $script:FakeComScript, [string]$env:CI_FAKE_COM) `
+        -Title ("Версия конфигурации {0}" -f $BaseName) -TimeoutSec $comTimeoutSec
+    $message = $call.Error
+    if ($Password -and $message) { $message = $message.Replace($Password, '***') }
+    if (-not $call.Ok -or $null -eq $call.Result) {
+        if (-not $message) { $message = 'внешнее соединение ничего не вернуло' }
+        return [pscustomobject]@{ Ok = $false; Error = $message; Name = ''; Synonym = ''; Version = '' }
+    }
+    $info = @($call.Result)[0]
+    return [pscustomobject]@{ Ok = $true; Error = ''; Name = [string]$info.Name; Synonym = [string]$info.Synonym; Version = [string]$info.Version }
+}
+
+function Update-TypicalDump {
+    # Основная конфигурация temp в файлы (без -Extension): есть прежняя выгрузка - только изменения (-update),
+    # не вышло или нет её - целиком.
+    param([string]$Dir)
+    $timeout = 60 * [int](Get-Setting $cfg 'TypicalDumpTimeoutMin' 180)
+    $hasDump = Test-Path -LiteralPath (Join-Path $Dir 'ConfigDumpInfo.xml')
+    $command = @('/DumpConfigToFiles', ('"{0}"' -f $Dir))
+    if ($hasDump) { $command += '-update' }
+    else {
+        if (Test-Path -LiteralPath $Dir) { Remove-Item -LiteralPath $Dir -Recurse -Force }
+        New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+    }
+    $result = Invoke-Designer -BaseName $script:TempBase -Command $command -LogName 'dump_typical.log' -TimeoutSec $timeout -Title ("Выгрузить типовую {0} в файлы" -f $script:TempBase)
+    if ($result.ExitCode -ne 0 -and $hasDump -and -not $result.TimedOut) {
+        Remove-Item -LiteralPath $Dir -Recurse -Force
+        New-Item -ItemType Directory -Path $Dir -Force | Out-Null
+        $result = Invoke-Designer -BaseName $script:TempBase -Command @('/DumpConfigToFiles', ('"{0}"' -f $Dir)) -LogName 'dump_typical.log' -TimeoutSec $timeout -Title ("Выгрузить типовую {0} в файлы целиком" -f $script:TempBase)
+    }
+    if ($result.ExitCode -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $Dir 'Configuration.xml'))) {
+        throw ("типовая {0} в файлы не выгрузилась (код {1}): {2}" -f $script:TempBase, $result.ExitCode, $result.Text)
+    }
+}
+
+function Get-TypicalReadme {
+    param($Info, [string[]]$Big, [string]$ExtensionsRepo)
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add(('# Типовая конфигурация {0} ({1}), версия {2}' -f $Info.Synonym, $Info.Name, $Info.Version))
+    $lines.Add('')
+    $lines.Add(('Выгрузка основной конфигурации тестовой базы {0} в файлы (конфигуратор, «Выгрузить конфигурацию в файлы»). Пишет только гейт:' -f $script:TempBase))
+    $lines.Add('при «Выгрузить temp в git», когда версия конфигурации в тестовой базе изменилась (после обновления типовой).')
+    $lines.Add('')
+    $where = 'в расширениях'
+    if ($ExtensionsRepo) { $where = 'в расширениях (репозиторий `{0}`)' -f $ExtensionsRepo }
+    $lines.Add(('**Только для чтения.** Типовую не меняем: правки - {0}. Отсюда в базу ничего не загружается: типовая обновляется' -f $where))
+    $lines.Add('файлом обновления от 1С (.cfu). Pull request сюда не принимаются.')
+    $lines.Add('')
+    $lines.Add('- `ConfigDumpInfo.xml` не хранится.')
+    if (@($Big).Count -gt 0) {
+        $lines.Add('- Файлы больше 50 МБ не хранятся (ограничение GitHub):')
+        foreach ($path in @($Big)) { $lines.Add(('  - `{0}`' -f $path)) }
+    }
+    else { $lines.Add('- Файлов больше 50 МБ нет: выгрузка целиком.') }
+    $lines.Add('')
+    $lines.Add('История версий - история коммитов: разница двух коммитов - что поменялось в типовой при обновлении.')
+    return ($lines -join "`n") + "`n"
+}
+
+function Invoke-GitTypical {
+    # Типовая temp - в репозиторий TypicalRepo портативным git (через REST сотня тысяч файлов не пролезает). Версия
+    # та же, что в прошлый раз, - ничего не делает; иначе вопрос, выгрузка в файлы, коммит поверх ветки, push.
+    # Репозиторий git - отдельно от выгрузки (repo.git): конфигуратор может стереть выгрузку и выгрузить заново.
+    $repo = [string](Get-Setting $cfg 'TypicalRepo' '')
+    if (-not $repo) { return }
+    $branch = [string](Get-Setting $cfg 'TypicalBranch' 'main')
+    if ($repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw ("TypicalRepo «{0}» - не в виде владелец/имя" -f $repo) }
+    $root = Join-Path (Resolve-RootPath ([string](Get-Setting $cfg 'GitDir' 'git'))) ($repo.Split('/')[1])
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    $statePath = Join-Path $root 'typical.json'
+    $state = [ordered]@{ repo = $repo; name = ''; version = ''; commit = ''; time = '' }
+    if (Test-Path -LiteralPath $statePath) {
+        try {
+            $read = [System.IO.File]::ReadAllText($statePath, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+            foreach ($name in @($state.Keys)) { if ($null -ne $read.PSObject.Properties[$name]) { $state[$name] = [string]$read.$name } }
+        }
+        catch { Write-RunLog ("git: {0} не прочитан: {1}" -f $statePath, $_.Exception.Message) }
+    }
+    if ($state['repo'] -ne $repo) { $state['version'] = ''; $state['commit'] = ''; $state['repo'] = $repo }
+    Write-Host ''
+    Write-Line ("Типовая {0} - в {1}: смотрю версию" -f $script:TempBase, $repo) 'Cyan'
+    $info = Get-ComConfigInfo -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
+    if (-not $info.Ok) { Write-Line ("  версию конфигурации {0} не прочитал: {1}. Типовую не выгружаю." -f $script:TempBase, $info.Error) 'Yellow'; return }
+    $title = '{0} ({1}) {2}' -f $info.Synonym, $info.Name, $info.Version
+    if ($state['version'] -eq $info.Version -and $state['commit']) {
+        Write-Line ("  типовая {0} уже в {1} (коммит {2}): выгружать нечего." -f $title, $repo, (Get-GitShort $state['commit'])) 'Green'
+        return
+    }
+    $question = "Выгрузить и типовую {0} в {1} (только для чтения агентами)? Первый раз долго: выгрузка в файлы и отправка около гигабайта, порядка часа." -f $title, $repo
+    if ($state['version']) { $question = "Типовая в {0} обновилась: {1} -> {2}. Выгрузить новую версию в {3}?" -f $script:TempBase, $state['version'], $info.Version, $repo }
+    $answer = Confirm-Ui -Question $question -Yes 'Выгрузить' -No 'Не сейчас'
+    if (-not $answer) { Write-Line '  типовую не выгружаю: спрошу в следующий раз.'; return }
+    $git = Get-PortableGit -ToolsDir (Resolve-RootPath 'tools') -Exe ([string](Get-Setting $cfg 'GitExe' ''))
+    Write-Line ("  git: {0}" -f $git)
+    $dump = Join-Path $root 'dump'
+    Write-Line ("  выгружаю типовую {0} в файлы: {1} (первый раз - надолго)" -f $script:TempBase, $dump)
+    Update-TypicalDump -Dir $dump
+    # Больше 50 МБ GitHub не любит (больше 100 МБ - не примет): такие файлы - мимо git, их список - в README.
+    $dumpFull = [System.IO.Path]::GetFullPath($dump).TrimEnd('\', '/')
+    $big = @(Get-ChildItem -LiteralPath $dump -Recurse -File | Where-Object { $_.Length -gt 50MB } | ForEach-Object { $_.FullName.Substring($dumpFull.Length + 1).Replace('\', '/') } | Sort-Object)
+    [System.IO.File]::WriteAllText((Join-Path $dump 'README.md'), (Get-TypicalReadme -Info $info -Big $big -ExtensionsRepo ([string](Get-Setting $cfg 'ExtensionsRepo' ''))), (New-Object System.Text.UTF8Encoding($false)))
+    $gitDir = Join-Path $root 'repo.git'
+    $token = ''
+    $url = 'https://github.com/{0}.git' -f $repo
+    if ($env:CI_FAKE_GIT_REMOTE) { $url = [string]$env:CI_FAKE_GIT_REMOTE }
+    else {
+        $tokenFile = [string](Get-Setting $cfg 'GitHubTokenPassFile' '')
+        if (-not $tokenFile) { throw 'нет токена GitHub: «Настройки - Обновление гейта и git», GitHubTokenPassFile' }
+        $token = ([string](Get-PlainPassword $tokenFile)).Trim()
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $gitDir 'HEAD'))) { $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('init', '--quiet') }
+    $exclude = Join-Path (Join-Path $gitDir 'info') 'exclude'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $exclude) -Force | Out-Null
+    [System.IO.File]::WriteAllText($exclude, ((@('# Пишет гейт: служебный файл конфигуратора и файлы больше 50 МБ.', '/ConfigDumpInfo.xml') + @($big | ForEach-Object { '/' + $_ })) -join "`n") + "`n", (New-Object System.Text.UTF8Encoding($false)))
+    # Коммит - поверх того, что сейчас в ветке на GitHub (её могли двигать не отсюда); пустой репозиторий - первый коммит.
+    $fetch = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('fetch', '--depth', '1', '--no-tags', $url, $branch) -Token $token -TimeoutSec 3600 -AllowFail
+    if ($fetch.ExitCode -eq 0) {
+        $remoteSha = (Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('rev-parse', 'FETCH_HEAD')).Output.Trim()
+        $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('update-ref', 'HEAD', $remoteSha)
+    }
+    elseif ($fetch.Output -notmatch "couldn't find remote ref") { throw ("git fetch из {0}: {1}" -f $repo, (@($fetch.Output -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 2) -join ' | ')) }
+    Write-Line '  складываю в git (сотня тысяч файлов - пара минут)'
+    $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('add', '-A') -TimeoutSec 3600
+    $staged = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('diff', '--cached', '--quiet') -AllowFail
+    if ($staged.ExitCode -eq 0 -and $fetch.ExitCode -eq 0) {
+        $state['commit'] = (Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('rev-parse', 'HEAD')).Output.Trim()
+        Write-Line ("  в {0} уже ровно это: коммит {1}" -f $repo, (Get-GitShort $state['commit'])) 'Green'
+    }
+    else {
+        $messageFile = Join-Path $root 'commit-message.txt'
+        [System.IO.File]::WriteAllText($messageFile, ("Типовая {0} из {1}`n`nВыгрузка в файлы конфигуратором, {2}. Файлов больше 50 МБ мимо git: {3}.`n" -f $title, $script:TempBase, (Get-Date).ToString('dd.MM.yyyy HH:mm'), @($big).Count), (New-Object System.Text.UTF8Encoding($false)))
+        $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('commit', '--quiet', '--no-verify', '-F', $messageFile) -TimeoutSec 3600
+        Write-Line ("  отправляю в {0} (ветка {1}; первый раз - надолго)" -f $repo, $branch)
+        $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('push', '--no-verify', $url, ('HEAD:refs/heads/' + $branch)) -Token $token -TimeoutSec 14400
+        $state['commit'] = (Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('rev-parse', 'HEAD')).Output.Trim()
+        Write-Line ("Типовая {0} - в {1}: коммит {2}, https://github.com/{1}" -f $title, $repo, (Get-GitShort $state['commit'])) 'Green'
+    }
+    if (@($big).Count -gt 0) { Write-Line ("  мимо git (больше 50 МБ): {0}" -f (@($big) -join ', ')) 'Yellow' }
+    $state['name'] = $info.Name
+    $state['version'] = $info.Version
+    $state['time'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    [System.IO.File]::WriteAllText($statePath, (ConvertTo-Json -InputObject $state), $Utf8Bom)
+}
+
 function Set-GitLoaded {
     # Temp соответствует коммиту Commit; pull request с правками temp, если он уже в main, больше не ждём.
     param($Setup, $State, [string]$Commit, [string]$Run)
@@ -2492,11 +2665,15 @@ function Set-GitLoaded {
     Save-GitState $Setup $State
 }
 
-if ($GitExport -or $GitImport -or $GitProd) {
+if ($GitExport -or $GitImport -or $GitProd -or $GitTypical) {
     if (-not $GitUnattended -and -not (Test-UiCanAsk)) { throw 'выгрузить в git и загрузить из git можно только из консоли или ci.exe (без человека - deploy.ps1 -GitImport -GitUnattended)' }
-    if ($GitUnattended -and $GitProd) { throw 'снимок рабочей в git без человека пока не делается: запусти из меню' }
+    if ($GitUnattended -and ($GitProd -or $GitTypical)) { throw 'снимок рабочей и типовую в git без человека пока не выгружаю: запусти из меню' }
     if ($GitUnattended -and $GitExport) { throw 'выгрузка в git без человека не бывает: первую выгрузку и выбор делает человек' }
     . (Join-Path $Root 'github.ps1')
+    if ($GitTypical) {
+        Invoke-GitTypical
+        exit 0
+    }
     $gitSetup = Get-GitSetup
     $gitState = Read-GitState $gitSetup
     Write-Host ''
@@ -2508,6 +2685,8 @@ if ($GitExport -or $GitImport -or $GitProd) {
     if ($GitExport) {
         Write-Host ("ВЫГРУЗИТЬ {0} В GIT ({1}, {2})" -f $script:TempBase, $gitSetup.Repo, $gitSetup.Branch) -ForegroundColor Cyan
         Invoke-GitExport -Setup $gitSetup -State $gitState
+        # Типовая - туда же, если задан TypicalRepo и её версия изменилась (после обновления типовой).
+        Invoke-GitTypical
         exit 0
     }
     Write-Host ("ЗАГРУЗИТЬ ИЗ GIT В {0} ({1}, {2})" -f $script:TempBase, $gitSetup.Repo, $gitSetup.Branch) -ForegroundColor Cyan

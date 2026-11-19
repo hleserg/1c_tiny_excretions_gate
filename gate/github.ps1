@@ -12,6 +12,12 @@
 коммит), commits\<хеш>.txt (родитель, сообщение, строки «путь<TAB>хеш блоба»), blobs\<хеш>, pulls.txt
 (номер, ветка, куда, заголовок), pulls\<номер>.md; каждое действие - строкой в requests.log. Слияние
 (Merge-GhBranch) - трёхстороннее по файлам от общего предка, как у git.
+
+Большие репозитории (выгрузка типовой конфигурации, десятки тысяч файлов) через REST не пролезают: для них -
+портативный git (MinGit из релизов git-for-windows, скачивается в tools\git без установки и прав администратора)
+и Invoke-GitCli. Токен - заголовком через переменные окружения GIT_CONFIG_*, не в командной строке.
+Подставные: CI_FAKE_GIT_EXE - готовый git.exe (без скачивания), CI_FAKE_HTTP - ответы на адреса файлами (как у
+update.ps1), CI_FAKE_GIT_REMOTE - адрес удалённого репозитория вместо github.com (папка bare-репозитория).
 Версия 00000000.000000.
 #>
 
@@ -548,6 +554,168 @@ function Save-GhFiles {
     finally { $archive.Dispose() }
     Remove-Item -LiteralPath $zip -Force
     return $saved
+}
+
+#endregion
+
+#region Портативный git
+
+function Invoke-GhDownload {
+    # GET без токена (публичные релизы): строка ответа или файл (OutFile). Переадресации - вручную. Подставной:
+    # CI_FAKE_HTTP - папка, ответ на адрес - файл с именем адреса (не буквы и цифры - «_»), «REDIRECT <адрес>» -
+    # переадресация, запросы - в requests.log.
+    param([string]$Url, [string]$Accept = 'application/vnd.github+json', [string]$OutFile = '')
+    $current = $Url
+    for ($hop = 0; $hop -lt 6; $hop++) {
+        if ($env:CI_FAKE_HTTP) {
+            $file = Join-Path $env:CI_FAKE_HTTP ([regex]::Replace($current, '[^A-Za-z0-9.\-]', '_'))
+            [System.IO.File]::AppendAllText((Join-Path $env:CI_FAKE_HTTP 'requests.log'), ("GET {0} accept={1}`r`n" -f $current, $Accept), (New-Object System.Text.UTF8Encoding($false)))
+            if (-not (Test-Path -LiteralPath $file)) { throw ("GitHub ответил 404 на {0}" -f $current) }
+            $bytes = [System.IO.File]::ReadAllBytes($file)
+            if ([System.Text.Encoding]::UTF8.GetString($bytes, 0, [Math]::Min(9, $bytes.Length)) -eq 'REDIRECT ') {
+                $current = ([System.Text.Encoding]::UTF8.GetString($bytes)).Substring(9).Trim()
+                continue
+            }
+            if ($OutFile) { [System.IO.File]::WriteAllBytes($OutFile, $bytes); return $OutFile }
+            return [System.Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xFEFF)
+        }
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+        $request = [System.Net.HttpWebRequest]::Create($current)
+        $request.AllowAutoRedirect = $false
+        $request.UserAgent = 'ci-gate'
+        $request.Accept = $Accept
+        $request.Timeout = 60000
+        $request.ReadWriteTimeout = 300000
+        if ($null -ne $request.Proxy) { $request.Proxy.Credentials = [System.Net.CredentialCache]::DefaultCredentials }
+        $response = $null
+        try { $response = $request.GetResponse() }
+        catch {
+            $exception = $_.Exception
+            while ($null -ne $exception -and -not ($exception -is [System.Net.WebException])) { $exception = $exception.InnerException }
+            if ($null -eq $exception -or $null -eq $exception.Response) { throw ("нет связи с {0}: {1}" -f ([uri]$current).Host, $_.Exception.Message) }
+            $response = $exception.Response
+        }
+        try {
+            $code = [int]$response.StatusCode
+            if ($code -ge 300 -and $code -lt 400) {
+                $next = $response.Headers['Location']
+                if (-not $next) { throw ("GitHub ответил {0} без адреса переадресации" -f $code) }
+                $current = $next
+                continue
+            }
+            if ($code -ge 400) { throw ("GitHub ответил {0} на {1}" -f $code, $current) }
+            $stream = $response.GetResponseStream()
+            if ($OutFile) {
+                $target = [System.IO.File]::Create($OutFile)
+                try { $stream.CopyTo($target) } finally { $target.Dispose() }
+                return $OutFile
+            }
+            $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
+            return $reader.ReadToEnd()
+        }
+        finally { $response.Close() }
+    }
+    throw ("слишком много переадресаций: {0}" -f $Url)
+}
+
+function Get-PortableGit {
+    # git.exe для больших репозиториев: CI_FAKE_GIT_EXE (тесты); Exe (настройка GitExe) - если есть; tools\git\cmd\git.exe;
+    # иначе - последний MinGit (64 бита, не busybox) из релизов git-for-windows: скачать, сверить sha256 (digest
+    # файла релиза; нет его - отказ), распаковать в tools\git. Ни установки, ни прав администратора.
+    param([string]$ToolsDir, [string]$Exe = '')
+    if ($env:CI_FAKE_GIT_EXE) { return [string]$env:CI_FAKE_GIT_EXE }
+    if ($Exe -and (Test-Path -LiteralPath $Exe)) { return $Exe }
+    $gitRoot = Join-Path $ToolsDir 'git'
+    $gitExe = Join-Path (Join-Path $gitRoot 'cmd') 'git.exe'
+    if (Test-Path -LiteralPath $gitExe) { return $gitExe }
+    $text = Invoke-GhDownload -Url 'https://api.github.com/repos/git-for-windows/git/releases/latest'
+    $release = $text | ConvertFrom-Json
+    $asset = @($release.assets | Where-Object { [string]$_.name -match '^MinGit-[0-9.]+(\.windows\.\d+)?-64-bit\.zip$' }) | Select-Object -First 1
+    if ($null -eq $asset) { throw ('в последнем релизе git-for-windows ({0}) нет MinGit 64 бита: положи распакованный MinGit в {1} руками' -f $release.tag_name, $gitRoot) }
+    $digest = ''
+    if ($null -ne $asset.PSObject.Properties['digest']) { $digest = [string]$asset.digest }
+    $digestFound = [regex]::Match($digest, '^sha256:([0-9a-fA-F]{64})$')
+    if (-not $digestFound.Success) { throw ('у {0} в релизе нет контрольной суммы: не ставлю непроверенное. Положи распакованный MinGit в {1} руками' -f $asset.name, $gitRoot) }
+    $expected = $digestFound.Groups[1].Value.ToLowerInvariant()
+    New-Item -ItemType Directory -Path $ToolsDir -Force | Out-Null
+    $zip = Join-Path $ToolsDir ([string]$asset.name)
+    $null = Invoke-GhDownload -Url ([string]$asset.url) -Accept 'application/octet-stream' -OutFile $zip
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead($zip)
+    try { $actual = -join @($sha.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) } finally { $stream.Dispose(); $sha.Dispose() }
+    if ($actual -ne $expected) { Remove-Item -LiteralPath $zip -Force; throw ('контрольная сумма {0} не та: {1}, в релизе {2}' -f $asset.name, $actual, $expected) }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $unpacked = $gitRoot + '.new'
+    if (Test-Path -LiteralPath $unpacked) { Remove-Item -LiteralPath $unpacked -Recurse -Force }
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $unpacked)
+    Remove-Item -LiteralPath $zip -Force
+    if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $unpacked 'cmd') 'git.exe'))) { Remove-Item -LiteralPath $unpacked -Recurse -Force; throw ('в {0} нет cmd\git.exe - это не MinGit' -f $asset.name) }
+    if (Test-Path -LiteralPath $gitRoot) { Remove-Item -LiteralPath $gitRoot -Recurse -Force }
+    Move-Item -LiteralPath $unpacked -Destination $gitRoot
+    return $gitExe
+}
+
+function Invoke-GitCli {
+    # git с отдельной папкой репозитория (GitDir) и рабочей папкой (WorkTree): выгрузку конфигуратор может стереть
+    # и выгрузить заново целиком, репозиторий при этом цел. Token - заголовком для github.com через GIT_CONFIG_*
+    # (в командной строке и журнале его нет). Возвращает ExitCode и Output (stdout и stderr). AllowFail - не бросать.
+    param([string]$Git, [string]$GitDir, [string]$WorkTree, [string[]]$Arguments, [string]$Token = '', [int]$TimeoutSec = 3600, [switch]$AllowFail)
+    $all = @(('--git-dir=' + $GitDir), ('--work-tree=' + $WorkTree)) + @($Arguments)
+    $quoted = @($all | ForEach-Object { if ([string]$_ -match '[\s"]') { '"' + ([string]$_).Replace('"', '\"') + '"' } else { [string]$_ } }) -join ' '
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $Git
+    $info.Arguments = $quoted
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $info.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    $settings = New-Object System.Collections.Generic.List[string[]]
+    $settings.Add(@('core.quotepath', 'false'))
+    $settings.Add(@('core.autocrlf', 'false'))
+    $settings.Add(@('core.longpaths', 'true'))
+    $settings.Add(@('core.safecrlf', 'false'))
+    $settings.Add(@('http.postBuffer', '524288000'))
+    $settings.Add(@('credential.helper', ''))
+    $settings.Add(@('user.name', 'ci-gate'))
+    $settings.Add(@('user.email', 'ci-gate@users.noreply.github.com'))
+    if ($Token) {
+        $basic = [System.Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes('x-access-token:' + $Token))
+        $settings.Add(@('http.https://github.com/.extraheader', ('AUTHORIZATION: basic ' + $basic)))
+        # Прокси - системный, как у браузера (git сам его не видит).
+        try {
+            $proxy = [System.Net.WebRequest]::GetSystemWebProxy().GetProxy([uri]'https://github.com')
+            if ($proxy.Host -ne 'github.com') { $settings.Add(@('http.proxy', $proxy.AbsoluteUri)) }
+        }
+        catch { }
+    }
+    $info.EnvironmentVariables['GIT_CONFIG_COUNT'] = [string]$settings.Count
+    for ($index = 0; $index -lt $settings.Count; $index++) {
+        $info.EnvironmentVariables[('GIT_CONFIG_KEY_{0}' -f $index)] = $settings[$index][0]
+        $info.EnvironmentVariables[('GIT_CONFIG_VALUE_{0}' -f $index)] = $settings[$index][1]
+    }
+    $info.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
+    # Сообщения git - по-английски: по ним гейт узнаёт пустой репозиторий («couldn't find remote ref»).
+    $info.EnvironmentVariables['LC_ALL'] = 'C'
+    $info.EnvironmentVariables['LANGUAGE'] = 'C'
+    $info.EnvironmentVariables['GCM_INTERACTIVE'] = 'never'
+    $process = [System.Diagnostics.Process]::Start($info)
+    $outTask = $process.StandardOutput.ReadToEndAsync()
+    $errTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($TimeoutSec * 1000)) {
+        try { $process.Kill() } catch { }
+        throw ('git {0}: не закончил за {1} мин' -f $Arguments[0], [int]($TimeoutSec / 60))
+    }
+    $process.WaitForExit()
+    $output = ($outTask.Result + $errTask.Result).Trim()
+    if ($Token) { $output = $output.Replace($Token, '***') }
+    $code = $process.ExitCode
+    if ($code -ne 0 -and -not $AllowFail) {
+        $tail = @($output -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 3) -join ' | '
+        throw ('git {0} - код {1}: {2}' -f $Arguments[0], $code, $tail)
+    }
+    return [pscustomobject]@{ ExitCode = $code; Output = $output }
 }
 
 #endregion
