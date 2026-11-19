@@ -150,6 +150,8 @@ $script:JobsLockRelease = $false
 # Проверка конфигурации, которая идёт параллельно с остальными шагами, и ожидаемые длительности шагов плана
 # (для оценки, сколько осталось всего прогона).
 $script:BackgroundCheck = $null
+# Что запустить параллельной проверкой, когда основному ходу конфигуратор больше не нужен (Start-PendingBackgroundCheck).
+$script:BackgroundCheckPending = $null
 $script:RunPlanExpected = [ordered]@{}
 # Регулярное выражение замечаний проверки конфигурации по модулям тестовых расширений (Get-UtCheckIgnorePattern).
 $script:UtCheckIgnore = ''
@@ -4514,7 +4516,15 @@ function Resolve-TestDesignerBusy {
     # Без человека (ночной запуск) - $false: шаг падает, как раньше.
     param([string]$Title)
     if ($null -ne $script:BackgroundCheck) {
-        Write-Host ("  {0}: конфигуратор занят - возможно, нашей же параллельной проверкой конфигурации; дождусь её" -f $Title) -ForegroundColor Yellow
+        # Идёт ли она ещё, гейт знает точно: процесс его. Так бывает редко - проверка стартует, когда основному ходу
+        # конфигуратор уже не нужен (Start-PendingBackgroundCheck); сюда попадает, например, откат комплекта.
+        $ours = $script:BackgroundCheck
+        if (-not $ours.Process.HasExited) {
+            Write-Host ("  {0}: конфигуратор занят нашей параллельной проверкой конфигурации (идёт с {1}) - жду её, потом повторю шаг" -f $Title, (Get-Date).AddSeconds(-$ours.Watch.Elapsed.TotalSeconds).ToString('HH:mm:ss')) -ForegroundColor Yellow
+        }
+        else {
+            Write-Host ("  {0}: конфигуратор занят; наша параллельная проверка конфигурации уже закончилась - забираю её итог и повторяю шаг" -f $Title) -ForegroundColor Yellow
+        }
         Write-RunLog ("Конфигуратор занят ({0}): жду параллельную проверку конфигурации" -f $Title)
         Complete-BackgroundCheck
         return $true
@@ -4649,6 +4659,25 @@ function Start-DesignerBackground {
     }
 }
 
+function Start-PendingBackgroundCheck {
+    # Запускает отложенную параллельную проверку конфигурации - когда основному ходу конфигуратор больше не нужен:
+    # после выгрузки расширений в файлы, перед самопроверкой и тестами (они идут тонким клиентом). К базе
+    # подключается один конфигуратор: проверка, запущенная раньше, занимала его, выгрузка упиралась в «конфигуратор
+    # занят» и ждала всю проверку - параллельно с ней успевала пройти только канарейка.
+    if ($null -eq $script:BackgroundCheckPending -or $null -ne $script:BackgroundCheck) { return }
+    $pending = $script:BackgroundCheckPending
+    $script:BackgroundCheckPending = $null
+    if ($script:StopRun) {
+        $phaseBefore = $script:StepPhase
+        $script:StepPhase = 'checks'
+        Add-StepResult -Name $pending.Title -Status 'SKIP' -Detail 'пропущено: прогон остановлен'
+        Set-PhaseState 'checks' 'skipped'
+        $script:StepPhase = $phaseBefore
+        return
+    }
+    $script:BackgroundCheck = Start-DesignerBackground -Command $pending.Command -LogName $pending.LogName -TimeoutSec $pending.TimeoutSec -Title $pending.Title -FileKey $pending.FileKey
+}
+
 function Complete-BackgroundCheck {
     # Ждёт параллельную проверку конфигурации (в пределах её таймаута от начала) и оценивает её, как Add-CheckStep.
     # Шаг - этапа «Проверки конфигуратором»: этап кончается здесь.
@@ -4692,6 +4721,7 @@ function Get-RunRemainingSeconds {
     $currentSeen = $false
     $backgroundTitle = ''
     if ($null -ne $script:BackgroundCheck) { $backgroundTitle = [string]$script:BackgroundCheck.Title }
+    elseif ($null -ne $script:BackgroundCheckPending) { $backgroundTitle = [string]$script:BackgroundCheckPending.Title }
     foreach ($name in @($script:RunPlanExpected.Keys)) {
         if ($name -eq $backgroundTitle -or $name.StartsWith('Подготовка')) { continue }
         $isDone = $false
@@ -4713,6 +4743,10 @@ function Get-RunRemainingSeconds {
         $backgroundLeft = [Math]::Max(0, $script:BackgroundCheck.Expected - $script:BackgroundCheck.Watch.Elapsed.TotalSeconds)
         if ($Title -eq $backgroundTitle) { $backgroundLeft = [Math]::Max(0, [Math]::Max($script:BackgroundCheck.Expected, $Expected) - $Elapsed) }
         $total = [Math]::Max($sequential, $backgroundLeft)
+    }
+    elseif ($null -ne $script:BackgroundCheckPending -and $script:RunPlanExpected.Contains($backgroundTitle)) {
+        # Ещё не стартовала (ждёт, пока основному ходу нужен конфигуратор): пойдёт параллельно с остальным - целиком.
+        $total = [Math]::Max($sequential, [double]$script:RunPlanExpected[$backgroundTitle])
     }
     return [pscustomobject]@{ Seconds = [int]$total; Unknown = $unknown }
 }
@@ -6672,14 +6706,17 @@ else {
         Add-CheckStep -Name 'Проверка применимости' -Result $result -FileKey 'checkcanapply' -Blocking $true
     }
 
-    # Параллельная проверка конфигурации - после проверки применимости, а не вместе с ней: обе - конфигуратор,
-    # и вторая падала на блокировке базы (прогон 19.11: применимость захватила базу первой). Идёт параллельно
-    # с канарейкой и самопроверкой; итог - в Complete-BackgroundCheck перед вердиктом.
+    # Параллельная проверка конфигурации здесь только назначается: стартует она перед самопроверкой
+    # (Start-PendingBackgroundCheck), когда основному ходу конфигуратор больше не нужен. К базе подключается один
+    # конфигуратор: проверка, запущенная здесь, занимала его, и выгрузка расширений в файлы (шаг 5а) ждала её всю -
+    # параллельно успевала пройти только канарейка. И не вместе с проверкой применимости: та тоже конфигуратор
+    # (прогон 19.11: применимость захватила базу первой). Итог - в Complete-BackgroundCheck перед вердиктом.
     if ($runCheckConfig -and -not $script:StopRun -and $parallelCheckConfig) {
         foreach ($target in $targets) {
-            $script:BackgroundCheck = Start-DesignerBackground -Command (@('/CheckConfig', $checkConfigFlags) + $target.Selector) `
-                -LogName ("checkconfig_{0}.log" -f $target.Key) -TimeoutSec $timeoutCheckSec -Title ("Проверка конфигурации ({0})" -f $target.Key) `
-                -FileKey ("checkconfig_{0}" -f $target.Key)
+            $script:BackgroundCheckPending = @{
+                Command = (@('/CheckConfig', $checkConfigFlags) + $target.Selector); LogName = ("checkconfig_{0}.log" -f $target.Key)
+                TimeoutSec = $timeoutCheckSec; Title = ("Проверка конфигурации ({0})" -f $target.Key); FileKey = ("checkconfig_{0}" -f $target.Key)
+            }
         }
     }
 
@@ -6688,7 +6725,7 @@ else {
         $checksState = 'skipped'
     }
 }
-if ($checksState -and $null -ne $script:BackgroundCheck) { $checksState = '' }
+if ($checksState -and ($null -ne $script:BackgroundCheck -or $null -ne $script:BackgroundCheckPending)) { $checksState = '' }
 if ($checksState) { Set-PhaseState 'checks' $checksState }
 
 # 5. Канареечный вход: сеанс стартует, сервер отвечает, расширения применились.
@@ -6845,6 +6882,10 @@ if ($kitItems.Count -eq 0 -and (Test-Path -LiteralPath $selfCheckExchangeFile)) 
     $exchangeBeforeFile = $referenceExchangeCopy
 }
 
+# Конфигуратор основному ходу больше не нужен (самопроверка и тесты - тонкий клиент): параллельная проверка
+# конфигурации стартует здесь и идёт вместе с ними.
+Start-PendingBackgroundCheck
+
 # 6. Самопроверка: автозапуск обработки «Выполнить после обновления». Красное - только то, чего нет в эталоне
 # самопроверки: новые ошибки. Новые предупреждения и пропуски - жёлтое.
 $afterName = 'Самопроверка'
@@ -6989,6 +7030,7 @@ elseif ($runUnitTests -and -not $processingOnly) {
 else { Set-PhaseState 'unittests' 'na' }
 
 # Проверка конфигурации, которая шла параллельно: дождаться и оценить, как обычно.
+Start-PendingBackgroundCheck
 if ($null -ne $script:BackgroundCheck) { Complete-BackgroundCheck }
 
 #region Вердикт
