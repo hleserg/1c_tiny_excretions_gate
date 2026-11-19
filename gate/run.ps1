@@ -191,7 +191,9 @@ function Resolve-RootPath {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
     if ([System.IO.Path]::IsPathRooted($Path)) { return $Path }
-    return (Join-Path $Root $Path)
+    # Явно корень скрипта: имена переменных PowerShell без учёта регистра, и локальная $root вызывающей функции
+    # подменяла бы корень (было: токен для типовой искался в git\<репозиторий>\secrets).
+    return (Join-Path $script:Root $Path)
 }
 
 function Get-Setting {

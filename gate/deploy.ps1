@@ -111,7 +111,9 @@ function Resolve-RootPath {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
     if ([System.IO.Path]::IsPathRooted($Path)) { return $Path }
-    return (Join-Path $Root $Path)
+    # Явно корень скрипта: имена переменных PowerShell без учёта регистра, и локальная $root вызывающей функции
+    # подменяла бы корень (было: токен для типовой искался в git\<репозиторий>\secrets).
+    return (Join-Path $script:Root $Path)
 }
 
 function Get-Setting {
@@ -2645,9 +2647,9 @@ function Invoke-GitTypical {
     if (-not $repo) { return }
     $branch = [string](Get-Setting $cfg 'TypicalBranch' 'main')
     if ($repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw ("TypicalRepo «{0}» - не в виде владелец/имя" -f $repo) }
-    $root = Join-Path (Resolve-RootPath ([string](Get-Setting $cfg 'GitDir' 'git'))) ($repo.Split('/')[1])
-    New-Item -ItemType Directory -Path $root -Force | Out-Null
-    $statePath = Join-Path $root 'typical.json'
+    $typicalRoot = Join-Path (Resolve-RootPath ([string](Get-Setting $cfg 'GitDir' 'git'))) ($repo.Split('/')[1])
+    New-Item -ItemType Directory -Path $typicalRoot -Force | Out-Null
+    $statePath = Join-Path $typicalRoot 'typical.json'
     $state = [ordered]@{ repo = $repo; name = ''; version = ''; commit = ''; time = '' }
     if (Test-Path -LiteralPath $statePath) {
         try {
@@ -2670,15 +2672,21 @@ function Invoke-GitTypical {
     if ($state['version']) { $question = "Типовая в {0} обновилась: {1} -> {2}. Выгрузить новую версию в {3}?" -f $script:TempBase, $state['version'], $info.Version, $repo }
     $answer = Confirm-Ui -Question $question -Yes 'Выгрузить' -No 'Не сейчас'
     if (-not $answer) { Write-Line '  типовую не выгружаю: спрошу в следующий раз.'; return }
+    # Токен - до выгрузки: выгрузка в файлы идёт долго, и без токена она пропала бы зря.
+    $tokenFile = [string](Get-Setting $cfg 'GitHubTokenPassFile' '')
+    if (-not $tokenFile) { throw 'нет токена GitHub: «Настройки - Обновление гейта и git», GitHubTokenPassFile' }
+    $token = ([string](Get-PlainPassword $tokenFile)).Trim()
+    $url = 'https://github.com/{0}.git' -f $repo
+    if ($env:CI_FAKE_GIT_REMOTE) { $url = [string]$env:CI_FAKE_GIT_REMOTE; $token = '' }
     $git = Get-PortableGit -ToolsDir (Resolve-RootPath 'tools') -Exe ([string](Get-Setting $cfg 'GitExe' ''))
     Write-Line ("  git: {0}" -f $git)
-    $dump = Join-Path $root 'dump'
+    $dump = Join-Path $typicalRoot 'dump'
     # Место: выгрузка ERP в файлы - гигабайты и сотня тысяч файлов, плюс объекты git. Не хватит - не начинаю, иначе
     # кончится место на диске машины гейта (было: выгрузка вручную съела диск целиком).
     $hasDump = Test-Path -LiteralPath (Join-Path $dump 'ConfigDumpInfo.xml')
     $needGb = [double](Get-Setting $cfg 'TypicalMinFreeGB' 12)
     if ($hasDump) { $needGb = [Math]::Max(2, $needGb / 4) }
-    $drive = New-Object System.IO.DriveInfo ([System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($root)))
+    $drive = New-Object System.IO.DriveInfo ([System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($typicalRoot)))
     $freeGb = [Math]::Round($drive.AvailableFreeSpace / 1GB, 1)
     if ($freeGb -lt $needGb) {
         Write-Line ("  на диске {0} свободно {1} ГБ, а выгрузке типовой нужно не меньше {2} ГБ (настройка TypicalMinFreeGB): не выгружаю. Освободи место или перенеси GitDir на другой диск." -f $drive.Name, $freeGb, $needGb) 'Yellow'
@@ -2690,15 +2698,7 @@ function Invoke-GitTypical {
     $dumpFull = [System.IO.Path]::GetFullPath($dump).TrimEnd('\', '/')
     $big = @(Get-ChildItem -LiteralPath $dump -Recurse -File | Where-Object { $_.Length -gt 50MB } | ForEach-Object { $_.FullName.Substring($dumpFull.Length + 1).Replace('\', '/') } | Sort-Object)
     [System.IO.File]::WriteAllText((Join-Path $dump 'README.md'), (Get-TypicalReadme -Info $info -Big $big -ExtensionsRepo ([string](Get-Setting $cfg 'ExtensionsRepo' ''))), (New-Object System.Text.UTF8Encoding($false)))
-    $gitDir = Join-Path $root 'repo.git'
-    $token = ''
-    $url = 'https://github.com/{0}.git' -f $repo
-    if ($env:CI_FAKE_GIT_REMOTE) { $url = [string]$env:CI_FAKE_GIT_REMOTE }
-    else {
-        $tokenFile = [string](Get-Setting $cfg 'GitHubTokenPassFile' '')
-        if (-not $tokenFile) { throw 'нет токена GitHub: «Настройки - Обновление гейта и git», GitHubTokenPassFile' }
-        $token = ([string](Get-PlainPassword $tokenFile)).Trim()
-    }
+    $gitDir = Join-Path $typicalRoot 'repo.git'
     if (-not (Test-Path -LiteralPath (Join-Path $gitDir 'HEAD'))) { $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('init', '--quiet') }
     $exclude = Join-Path (Join-Path $gitDir 'info') 'exclude'
     New-Item -ItemType Directory -Path (Split-Path -Parent $exclude) -Force | Out-Null
@@ -2718,7 +2718,7 @@ function Invoke-GitTypical {
         Write-Line ("  в {0} уже ровно это: коммит {1}" -f $repo, (Get-GitShort $state['commit'])) 'Green'
     }
     else {
-        $messageFile = Join-Path $root 'commit-message.txt'
+        $messageFile = Join-Path $typicalRoot 'commit-message.txt'
         [System.IO.File]::WriteAllText($messageFile, ("Типовая {0} из {1}`n`nВыгрузка в файлы конфигуратором, {2}. Файлов больше 50 МБ мимо git: {3}.`n" -f $title, $script:TempBase, (Get-Date).ToString('dd.MM.yyyy HH:mm'), @($big).Count), (New-Object System.Text.UTF8Encoding($false)))
         $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('commit', '--quiet', '--no-verify', '-F', $messageFile) -TimeoutSec 3600
         Write-Line ("  отправляю в {0} (ветка {1}; первый раз - надолго)" -f $repo, $branch)
