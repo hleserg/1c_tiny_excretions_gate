@@ -2607,7 +2607,7 @@ $tests = @(
     },
     @{
         Name = 'git-import'
-        Text = '«Загрузить из git»: temp правили после загрузки - вопрос, «Отмена» ничего не трогает; правок нет - прогон гейта только с тем, что изменилось в main (-KitSource с коммитом), после прогона state.json - на main'
+        Text = '«Загрузить из git»: temp правили после загрузки - вопрос и файлы правок на экране, «Отмена» ничего не трогает; правок нет - так и сказано, названо, что изменит загрузка, прогон гейта только с тем, что изменилось в main (-KitSource с коммитом), после прогона state.json - на main'
         Run = {
             param($Name)
             $sb = New-GitSandbox $Name
@@ -2628,6 +2628,8 @@ $tests = @(
                 @{ Kind = 'one'; Header = 'правки после прошлой загрузки'; Item = '^Отмена' })
             Check-DeployCommon $drift -LocksExpected $false
             Check (@($drift.Output | Where-Object { $_ -match 'есть правки, которых нет в git' }).Count -eq 1) 'правки temp не замечены'
+            Check (@($drift.Output | Where-Object { $_.Contains('~ extensions/Адаптация/CommonModules/АГБ_Общий/Ext/Module.bsl') }).Count -eq 1) 'не назван файл, который правили в temp'
+            Check (@($drift.Output | Where-Object { $_ -match 'правок нет' }).Count -eq 0) 'при правках в temp сказано «правок нет»'
             Check (-not (Test-Path -LiteralPath (Join-Path $sb 'runs'))) 'после «Отмена» гейт запускался'
             Check ((Read-GitStateFile $sb).commit -eq $head) 'после «Отмена» state.json поменялся'
             Reset-FakeState $sb
@@ -2635,6 +2637,11 @@ $tests = @(
                 @{ Kind = 'confirm'; Header = 'Загрузить в erp_temp_test из main'; Yes = $true })
             Check-DeployCommon $load -LocksExpected $false
             Check ($load.ExitCode -eq 0) ("код {0}, ждали 0: {1}" -f $load.ExitCode, (($load.Output | Select-Object -Last 3) -join ' | '))
+            # Итог сверки и то, что изменит загрузка, - на экране: вопрос после ответа с экрана уходит.
+            Check (@($load.Output | Where-Object { $_ -match 'правок нет: erp_temp_test совпадает с коммитом' }).Count -eq 1) 'не сказано, что правок в temp нет'
+            Check (@($load.Output | Where-Object { $_ -match 'Загрузка изменит в erp_temp_test' }).Count -eq 1) 'не сказано, что изменит загрузка'
+            Check (@($load.Output | Where-Object { $_.Contains('~ extensions/Доработки/CommonModules/Д/Ext/Module.bsl') }).Count -eq 1) 'не назван файл, который изменит загрузка'
+            Check (@($load.Output | Where-Object { $_ -match '^\s*[~+-] extensions/Адаптация' }).Count -eq 0) 'в том, что изменит загрузка, названо расширение, которое не менялось'
             $stubFile = @(Get-ChildItem -LiteralPath (Join-Path $sb 'runs') -Recurse -Filter 'stub.txt' -ErrorAction SilentlyContinue)
             Check ($stubFile.Count -eq 1) 'гейт не запускался'
             if ($stubFile.Count -eq 1) {
