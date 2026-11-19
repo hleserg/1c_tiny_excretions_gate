@@ -204,10 +204,26 @@ function Get-Setting {
     return $Default
 }
 
+# Значения, которые в выводе и журнале заменяются звёздочками целиком (Get-MaskedLine): код разрешения входа.
+$script:MaskValues = @()
+
+function Get-MaskedLine {
+    # Чувствительное - звёздочками, одной обработкой на консоль, run.log и всё, что из них собирается (отчёты, итог
+    # в GitHub): пароль и код разрешения входа в ключах запуска 1С (/P, /UC) и в строке соединения (Pwd=, UC=) и
+    # само значение UnlockCode, где бы оно ни встретилось, - если в нём шесть знаков и больше (короткий код вроде
+    # «0» совпал бы с обычными цифрами текста; он закрыт в ключах и строке соединения).
+    param([string]$Line)
+    if (-not $Line) { return $Line }
+    $masked = [regex]::Replace([regex]::Replace($Line, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"')
+    $masked = [regex]::Replace($masked, '(?i)\b(Pwd|UC)="(?:[^"]|"")*"', '$1="***"')
+    foreach ($secret in @($script:MaskValues)) { if ($secret) { $masked = $masked.Replace([string]$secret, '***') } }
+    return $masked
+}
+
 function Write-RunLog {
     param([string]$Text)
     $stamp = Get-Date -Format 'HH:mm:ss'
-    [System.IO.File]::AppendAllText($script:RunLogPath, ("{0} {1}`r`n" -f $stamp, $Text), $Utf8Bom)
+    [System.IO.File]::AppendAllText($script:RunLogPath, ("{0} {1}`r`n" -f $stamp, (Get-MaskedLine $Text)), $Utf8Bom)
 }
 
 function Invoke-RunPublish {
@@ -2227,6 +2243,7 @@ $script:FileBase = [string](Get-Setting $cfg 'File' '')
 # Код разрешения входа: один и тот же для блокировки, которую ставит гейт, и для всех входов в базу. Пусто - 0.
 $script:UnlockCode = [string](Get-Setting $cfg 'UnlockCode' '0')
 if ([string]::IsNullOrWhiteSpace($script:UnlockCode)) { $script:UnlockCode = '0' }
+if ($script:UnlockCode.Length -ge 6) { $script:MaskValues = @($script:MaskValues) + @($script:UnlockCode) }
 
 if ([string]::IsNullOrEmpty($script:FileBase)) {
     if ([string]::IsNullOrEmpty($script:Server) -or [string]::IsNullOrEmpty($script:Base)) {
@@ -6231,6 +6248,8 @@ Send-UiPlan -StepNames $planSteps.ToArray() -Parallel $planParallel
 $script:PrepLines = New-Object System.Collections.Generic.List[string]
 function Add-PrepLine {
     param([string]$Text, [string]$Color = 'Gray')
+    # Строки подготовки уходят в итог прогона и в GitHub: чувствительное закрывается здесь же.
+    $Text = Get-MaskedLine $Text
     $script:PrepLines.Add($Text)
     Write-Host ('  ' + $Text) -ForegroundColor $Color
     Write-RunLog ('Подготовка базы: ' + $Text)
@@ -6374,7 +6393,7 @@ else {
                 $script:UnlockCode = $lockCode
                 $designerBase = @('DESIGNER') + @(Get-ConnectionArgs -User $adminUser -Password $adminPassword) +
                     @('/DisableStartupDialogs', '/DisableStartupMessages')
-                Add-PrepLine 'UnlockCode пустой: код разрешения входа на этот прогон - 123'
+                Add-PrepLine 'UnlockCode пустой: на этот прогон взят код разрешения входа по умолчанию; задай свой в Настройки, Базы, UnlockCode'
             }
             if ($null -eq $prepTarget) {
                 Add-PrepLine 'блокировку начала сеансов поставить не смог (нет входа в свойства базы, см. выше): сеансы могут вернуться' 'Yellow'

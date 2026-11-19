@@ -2389,6 +2389,39 @@ $tests = @(
         }
     },
     @{
+        Name = 'deploy-unlockcode-hidden'
+        Text = 'значение UnlockCode не попадает ни в вывод, ни в журналы: рабочая закрыта чужой блокировкой - сообщение называет настройку, а не её значение; обычный просмотр состояния - код в ключе /UC закрыт звёздочками'
+        Run = {
+            param($Name)
+            $secretCode = 'Kod-Razblokirovki-9731'
+            $config = @{} + $deployConfig
+            $config['UnlockCode'] = $secretCode
+            $sb = New-Sandbox $Name -Config $config
+            # Всё, что скрипт записал в свою папку: настройки и файлы подставных 1С и COM - не в счёт.
+            $findLeaks = {
+                param([string]$Dir)
+                $found = @(Get-ChildItem -LiteralPath $Dir -Recurse -File | Where-Object { $_.Name -ne 'config.psd1' -and $_.FullName -notmatch '\\(fake|chan|bin|test)\\' -and $_.Length -lt 5MB } | Where-Object { [System.IO.File]::ReadAllText($_.FullName, $utf8).Contains($secretCode) } | ForEach-Object { $_.FullName.Substring($Dir.Length) })
+                return , $found
+            }
+            $com = New-ComState
+            $com['lockedConnect'] = @('erp_base')
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-StatusOnly' -Com $com
+            Check-DeployCommon $r -LocksExpected $false
+            Check (@($r.Output | Where-Object { $_ -match 'код разрешения у неё не тот, что в UnlockCode' }).Count -gt 0) 'нет сообщения о чужой блокировке с именем настройки'
+            $shown = @($r.Output | Where-Object { $_.Contains($secretCode) })
+            Check ($shown.Count -eq 0) ('значение UnlockCode в выводе: ' + (($shown | Select-Object -First 2) -join ' | ').Replace($secretCode, '<код>'))
+            $leaks = & $findLeaks $sb
+            Check ($leaks.Count -eq 0) ('значение UnlockCode в файлах: ' + ($leaks -join ', '))
+            # Рабочая открыта: «Показать состояние баз» идёт до конца, кода по-прежнему нигде нет.
+            $s = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-BaseState' -Com (New-ComState)
+            Check-DeployCommon $s -LocksExpected $false
+            $shown = @($s.Output | Where-Object { $_.Contains($secretCode) })
+            Check ($shown.Count -eq 0) ('состояние баз: значение UnlockCode в выводе: ' + (($shown | Select-Object -First 2) -join ' | ').Replace($secretCode, '<код>'))
+            $leaks = & $findLeaks $sb
+            Check ($leaks.Count -eq 0) ('состояние баз: значение UnlockCode в файлах: ' + ($leaks -join ', '))
+        }
+    },
+    @{
         Name = 'settings-value-password'
         Text = 'настройки: значение сохраняется, пароль - файлом DPAPI, не целое число не сохраняется, умолчания дописаны'
         Run = {

@@ -146,15 +146,19 @@ function Get-Setting {
     return $Default
 }
 
+# Значения, которые в выводе и журнале заменяются звёздочками целиком (Get-MaskedLine): код разрешения входа.
+$script:MaskValues = @()
+
 function Write-RunLog {
     param([string]$Text)
     $stamp = Get-Date -Format 'HH:mm:ss'
-    [System.IO.File]::AppendAllText($script:RunLogPath, ("{0} {1}`r`n" -f $stamp, $Text), $Utf8Bom)
+    [System.IO.File]::AppendAllText($script:RunLogPath, ("{0} {1}`r`n" -f $stamp, (Get-MaskedLine $Text)), $Utf8Bom)
 }
 
 function Write-Line {
     # Строка в консоль и в run.log.
     param([string]$Text, [string]$Color = 'Gray')
+    $Text = Get-MaskedLine $Text
     Write-Host $Text -ForegroundColor $Color
     Write-RunLog $Text
 }
@@ -186,8 +190,16 @@ function Get-ConnectionArgs {
 }
 
 function Get-MaskedLine {
+    # Чувствительное - звёздочками, одной обработкой на консоль, run.log и всё, что из них собирается (отчёты, итог
+    # в GitHub): пароль и код разрешения входа в ключах запуска 1С (/P, /UC) и в строке соединения (Pwd=, UC=) и
+    # само значение UnlockCode, где бы оно ни встретилось, - если в нём шесть знаков и больше (короткий код вроде
+    # «0» совпал бы с обычными цифрами текста; он закрыт в ключах и строке соединения).
     param([string]$Line)
-    return [regex]::Replace([regex]::Replace($Line, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"')
+    if (-not $Line) { return $Line }
+    $masked = [regex]::Replace([regex]::Replace($Line, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"')
+    $masked = [regex]::Replace($masked, '(?i)\b(Pwd|UC)="(?:[^"]|"")*"', '$1="***"')
+    foreach ($secret in @($script:MaskValues)) { if ($secret) { $masked = $masked.Replace([string]$secret, '***') } }
+    return $masked
 }
 
 function Invoke-V8 {
@@ -618,6 +630,7 @@ $script:ProdBase = [string](Get-Setting $cfg 'ProdBase' '')
 # Код разрешения входа: один и тот же для блокировки рабочей и для всех входов (конфигуратор, внешнее соединение). Пусто - 0.
 $script:UnlockCode = [string](Get-Setting $cfg 'UnlockCode' '0')
 if ([string]::IsNullOrWhiteSpace($script:UnlockCode)) { $script:UnlockCode = '0' }
+if ($script:UnlockCode.Length -ge 6) { $script:MaskValues = @($script:MaskValues) + @($script:UnlockCode) }
 if (-not [string]::IsNullOrEmpty([string](Get-Setting $cfg 'File' ''))) { throw 'Скрипт обновления работает только с базами кластера: в config.psd1 заполнено File.' }
 if (-not $script:Server -or -not $script:TempBase) { throw 'В config.psd1 не заполнены Server и Base.' }
 if (-not $script:ProdBase) {
@@ -1011,7 +1024,7 @@ function Assert-ProdOpen {
     if ($States.Ok) { return }
     $text = ([string]$States.Error -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 2) -join ' '
     if (Test-SessionLockError $States.Error) {
-        Write-Line ("  {0}: стоит блокировка начала сеансов, и код разрешения у неё не тот, что в UnlockCode ({1}): {2}" -f $script:ProdBase, $script:UnlockCode, $text) 'Red'
+        Write-Line ("  {0}: стоит блокировка начала сеансов, и код разрешения у неё не тот, что в UnlockCode: {1}" -f $script:ProdBase, $text) 'Red'
         Write-Line '  Если блокировку ставил ты - впиши её код в Настройки, Базы, UnlockCode и запусти снова. Или сними её в консоли кластера.' 'Red'
     }
     elseif (Test-AuthError $States.Error) {
@@ -3997,7 +4010,7 @@ if ($needExclusive) {
             }
             return
         }
-        if ([string]::IsNullOrEmpty($script:UnlockCode)) { $script:UnlockCode = '123'; Write-Line '  UnlockCode пустой: код разрешения входа на этот запуск - 123' }
+        if ([string]::IsNullOrEmpty($script:UnlockCode)) { $script:UnlockCode = '123'; Write-Line '  UnlockCode пустой: на этот запуск взят код разрешения входа по умолчанию. Задай свой: Настройки, Базы, UnlockCode.' }
         $start = Get-Date
         if ($null -ne $StartAt) { $start = [datetime]$StartAt }
         $until = $start.AddHours($sessionLockHours)
