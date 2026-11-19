@@ -724,6 +724,33 @@ $tests = @(
         }
     },
     @{
+        Name = 'gate-checkconfig-busy-retry'
+        Text = 'параллельная проверка конфигурации стартует после проверки применимости; упала на «конфигуратор занят» - повторяется перед вердиктом, без «исправлено» в разборе'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $busy = 'Ошибка блокировки информационной базы для конфигурирования. Возможно, информационная база уже открыта Конфигуратором. С этой информационной базой уже работает конфигуратор: компьютер: pc1, сеанс: 1'
+            $fake = @{ designer = @(@{ match = @('/CheckConfig'); exit = 1; log = $busy; times = 1 }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            Check-Step $r 'Проверка конфигурации' 'OK'
+            Check ((Get-Calls $r @('/CheckConfig')).Count -eq 2) 'проверка конфигурации не повторилась после «конфигуратор занят»'
+            $lines = @($r.Calls | ForEach-Object { $_.Line })
+            $canApplyAt = -1
+            $checkAt = -1
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+                if ($canApplyAt -lt 0 -and $lines[$i].Contains('/CheckCanApplyConfigurationExtensions')) { $canApplyAt = $i }
+                if ($checkAt -lt 0 -and $lines[$i].Contains('/CheckConfig ')) { $checkAt = $i }
+            }
+            Check ($canApplyAt -ge 0 -and $checkAt -gt $canApplyAt) ("проверка конфигурации запущена не после проверки применимости ({0}, {1})" -f $canApplyAt, $checkAt)
+            if ($r.RunDir) {
+                $report = Join-Path $r.RunDir 'report.txt'
+                if (Test-Path -LiteralPath $report) { Check (-not ([System.IO.File]::ReadAllText($report, $utf8) -match 'Проверка конфигурации \(all\): новых \d+ \(блокирующих \d+\), исправлено')) 'в разборе «исправлено» по проверке конфигурации' }
+            }
+        }
+    },
+    @{
         Name = 'gate-designer-busy-cancel'
         Text = 'конфигуратор temp занят, на вопрос - «Отмена»: прогон завершается, в run.log - «отменено пользователем»'
         Run = {
@@ -1969,6 +1996,25 @@ $tests = @(
             Check-Common $second; Check-Verdict $second 'GREEN' 0
             Check ((Get-Calls $second @('/LoadConfigFromFiles', '-Extension Тесты')).Count -eq 1) 'файлы не менялись, а тесты загружены второй раз'
             Check ($null -eq (Get-Step $second 'Тесты: загрузить')) 'шаг загрузки тестов во втором прогоне'
+        }
+    },
+    @{
+        Name = 'gate-unittests-no-exitcode'
+        Text = 'модульные тесты: YAxUnit записал отчёт jUnit, но не код возврата и висит - итог по отчёту, клиент снят, шаг не красный'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $unitConfig
+            $null = Add-UnitTestSource -Dir (Join-Path $sb 'tests')
+            $hung = $unitAllOk.Clone()
+            $hung['noexitcode'] = $true
+            $hung['hang'] = 300
+            $fake = @{ absent = @('Тесты'); unittests = @($hung) }
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            Check-Step $r 'Модульные тесты' 'OK'
+            $step = Get-Step $r 'Модульные тесты'
+            if ($null -ne $step) { Check ([string]$step.detail -match 'кода возврата YAxUnit нет') ("в шаге нет пометки об итоге по отчёту: {0}" -f $step.detail) }
+            Check ($r.Seconds -lt 250) ("гейт ждал зависший клиент: {0} с" -f $r.Seconds)
         }
     },
     @{

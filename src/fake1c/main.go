@@ -97,6 +97,10 @@ type unitRun struct {
 	NoStart     bool              `json:"nostart"`
 	Exited      bool              `json:"exited"`
 	Code        string            `json:"code"`
+	// NoExitCode - отчёт пишется, кода возврата нет (движок упал после отчёта); Hang - сколько секунд клиент
+	// после этого ещё висит.
+	NoExitCode bool    `json:"noexitcode"`
+	Hang       float64 `json:"hang"`
 }
 
 type scenario struct {
@@ -700,6 +704,12 @@ func unitRun1(u unitRun, configPath string) {
 	if cfg.ReportPath != "" {
 		_ = os.MkdirAll(filepath.Dir(cfg.ReportPath), 0o755)
 		_ = os.WriteFile(cfg.ReportPath, []byte(b.String()), 0o644)
+	}
+	if u.NoExitCode {
+		if u.Hang > 0 {
+			time.Sleep(time.Duration(u.Hang * float64(time.Second)))
+		}
+		return
 	}
 	code := u.Code
 	if code == "" {

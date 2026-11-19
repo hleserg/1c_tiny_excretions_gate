@@ -3594,14 +3594,29 @@ function Test-UtEngineMissing {
     return $false
 }
 
+function Test-UtJunitSettled {
+    # Отчёт jUnit целый (кончается </testsuites>) и не менялся SettleSec секунд. Раньше файл не открывается: движок
+    # мог ещё писать, а чтение в этот момент мешает записи.
+    param([string]$Path, [int]$SettleSec)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+    if ($null -eq $item -or ((Get-Date) - $item.LastWriteTime).TotalSeconds -lt $SettleSec) { return $false }
+    $text = ''
+    try { $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8) } catch { return $false }
+    return $text.TrimEnd().EndsWith('</testsuites>')
+}
+
 function Invoke-UtSession {
     # Сеанс YAxUnit: тонкий клиент с /C"RunUnitTests=<файл настроек>". Итог - файл кода возврата (exitcode.txt)
-    # и отчёт jUnit. Начало работы движка - появился его лог. State: done, exited, nostart, timeout.
+    # и отчёт jUnit. Начало работы движка - появился его лог. State: done, exited, nostart, timeout; junit - кода
+    # возврата нет, а отчёт целый (движок упал после него): итог берётся по отчёту.
     param([string]$OutDir, [string[]]$Tests = @(), [string]$Title)
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
     $junit = Join-Path $OutDir 'junit.xml'
     $exitFile = Join-Path $OutDir 'exitcode.txt'
     $logFile = Join-Path $OutDir 'yaxunit.log'
+    # Итоги прошлого сеанса в той же папке (продолжение прогона) приняли бы за итог этого.
+    foreach ($stale in @($junit, $exitFile)) { if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force } }
     $filter = [ordered]@{ extensions = @($unitTestExtensions) }
     if (@($Tests).Count -gt 0) { $filter['tests'] = @($Tests) }
     $settings = [ordered]@{
@@ -3631,22 +3646,29 @@ function Invoke-UtSession {
         $started = Test-Path -LiteralPath $logFile
         if (-not $started -and $watch.Elapsed.TotalSeconds -ge $selfCheckStartTimeoutSec) { $state = 'nostart'; break }
         if ($watch.Elapsed.TotalSeconds -ge $unitTestTimeoutSec) { $state = 'timeout'; break }
+        # Отчёт jUnit дописан, а кода возврата нет и через 15 с: движок упал после отчёта (прогон 19.11 - не смог
+        # дописать свой лог). Итог - по отчёту.
+        if (Test-UtJunitSettled -Path $junit -SettleSec 15) { $state = 'junit'; break }
         if ($started) {
+            # Лог движка на ходу не читается: YAxUnit открывает его на запись монопольно, и чтение гейта в этот момент
+            # роняет движок («Ошибка совместного доступа к файлу»). Размер файла берётся без открытия.
             $detail = 'тесты идут'
-            try {
-                $last = @(Get-Content -LiteralPath $logFile -Encoding UTF8 -Tail 1 -ErrorAction Stop)
-                if ($last.Count -gt 0 -and $last[0]) { $detail = ($last[0] -replace '^\S+\s+\S+\s+', '').Trim() }
-            }
-            catch { }
+            try { $detail = 'тесты идут, лог движка {0} КБ' -f [int]((Get-Item -LiteralPath $logFile -ErrorAction Stop).Length / 1024) } catch { }
         }
         Write-UiProgress -Title $Title -Elapsed $watch.Elapsed.TotalSeconds -Expected $expected -Detail $detail
         Start-Sleep -Milliseconds 500
     }
     Complete-UiProgress
+    # Клиент закрылся без кода возврата, но отчёт целый - итог по отчёту.
+    if ($state -eq 'exited' -and (Test-UtJunitSettled -Path $junit -SettleSec 0)) { $state = 'junit' }
     $windows = @()
     if ($state -eq 'done') {
         # Код возврата записан, отчёт - перед ним; клиент закрывается сам.
         if (-not $process.WaitForExit(60000)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
+    }
+    elseif ($state -eq 'junit') {
+        Write-RunLog '  YAxUnit: отчёт jUnit есть, кода возврата нет - итог по отчёту'
+        if (-not $process.HasExited) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
     }
     elseif (-not $process.HasExited) {
         $windows = @(Save-ProcessWindows -ProcessId $process.Id -FilePrefix (Join-Path $OutDir 'client'))
@@ -3655,7 +3677,7 @@ function Invoke-UtSession {
     $code = ''
     if (Test-Path -LiteralPath $exitFile) { $code = ([System.IO.File]::ReadAllText($exitFile, [System.Text.Encoding]::UTF8)).Trim().TrimStart([char]0xFEFF) }
     $statStatus = 'FAIL'
-    if ($state -eq 'done') { $statStatus = 'OK' }
+    if ($state -eq 'done' -or $state -eq 'junit') { $statStatus = 'OK' }
     Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status $statStatus
     $exitCode = ''
     if ($process.HasExited) { $exitCode = $process.ExitCode }
@@ -3691,7 +3713,7 @@ function Invoke-UtStep {
         return
     }
     $session = Invoke-UtSession -OutDir $outDir -Tests $whitelist -Title $StepName
-    if ($session.State -ne 'done') {
+    if ($session.State -ne 'done' -and $session.State -ne 'junit') {
         $windowsText = ''
         if (@($session.Windows).Count -gt 0) { $windowsText = '. Окна клиента: ' + (@($session.Windows) -join '; ') }
         switch ($session.State) {
@@ -3732,6 +3754,7 @@ function Invoke-UtStep {
     if (@($comparison.Gone).Count -gt 0 -and -not $Filter) { $detail += (', пропало из эталона {0}' -f @($comparison.Gone).Count) }
     if (-not $comparison.HasBaseline) { $detail += '; эталона тестов не было' }
     if ($problems -gt 0) { $detail += ('; замечаний к описаниям тестов {0} (unittests-*.catalog.txt)' -f $problems) }
+    if ($session.State -eq 'junit') { $detail += '; кода возврата YAxUnit нет (движок упал после отчёта, см. unittests\yaxunit.log) - итог по junit.xml' }
     $detail += ('; {0} с' -f $session.Seconds)
     $status = 'OK'
     if (@($comparison.NewFailed).Count -gt 0) {
@@ -4495,7 +4518,7 @@ function Start-DesignerBackground {
     $null = $process.Handle
     return [pscustomobject]@{
         Process = $process; Watch = $watch; Log = $logPath; TimeoutSec = $TimeoutSec; Title = $Title; FileKey = $FileKey
-        Expected = [double](Get-ExpectedStepSeconds $Title)
+        Expected = [double](Get-ExpectedStepSeconds $Title); Command = $Command; LogName = $LogName
     }
 }
 
@@ -4512,11 +4535,20 @@ function Complete-BackgroundCheck {
     $background.Watch.Stop()
     $seconds = [int]$background.Watch.Elapsed.TotalSeconds
     Write-RunLog ("  {0}: код={1} таймаут={2} секунд={3}" -f $background.Title, $exitCode, (-not $finished), $seconds)
-    $statStatus = 'FAIL'
-    if (-not $finished) { $statStatus = 'TIMEOUT' } elseif ($exitCode -eq 0 -or $exitCode -eq 101) { $statStatus = 'OK' }
-    Add-StatFact -Title $background.Title -Seconds $background.Watch.Elapsed.TotalSeconds -Status $statStatus
     $script:BackgroundCheck = $null
     $result = [pscustomobject]@{ ExitCode = $exitCode; TimedOut = (-not $finished); Seconds = $seconds; Log = $background.Log; Lines = @(Read-V8Log $background.Log) }
+    if ($finished -and $exitCode -ne 0 -and $exitCode -ne 101 -and (Test-DesignerBusy $result.Lines)) {
+        # Конфигуратор базы был занят (другой шаг гейта или чужой сеанс) - проверка не выполнялась. Повтор сейчас,
+        # уже не параллельно; занят и теперь - вопрос, как у остальных шагов (Invoke-Designer).
+        Write-Host ("  {0}: конфигуратор был занят, проверка не выполнялась - повторяю сейчас" -f $background.Title) -ForegroundColor Yellow
+        Write-RunLog ("{0}: конфигуратор был занят ({1}) - повтор без параллели" -f $background.Title, (Get-LogTail $result.Lines 2))
+        $result = Invoke-Designer -Command $background.Command -LogName $background.LogName -TimeoutSec $background.TimeoutSec -Title $background.Title
+    }
+    else {
+        $statStatus = 'FAIL'
+        if (-not $finished) { $statStatus = 'TIMEOUT' } elseif ($exitCode -eq 0 -or $exitCode -eq 101) { $statStatus = 'OK' }
+        Add-StatFact -Title $background.Title -Seconds $background.Watch.Elapsed.TotalSeconds -Status $statStatus
+    }
     Add-CheckStep -Name $background.Title -Result $result -FileKey $background.FileKey -Blocking $true
     Set-PhaseState 'checks' 'done'
     $script:StepPhase = $phaseBefore
@@ -4611,7 +4643,6 @@ function Add-CheckStep {
         $records = $kept
         if ($utIgnored -gt 0) { Write-RunLog ("{0}: замечаний по модулям тестовых расширений не в счёт: {1}" -f $Name, $utIgnored) }
     }
-    [System.IO.File]::WriteAllLines((Join-Path $RunDir ($FileKey + '.norm.txt')), [string[]]$records, $Utf8Bom)
 
     if ($Result.TimedOut) {
         Add-StepResult -Name $Name -Status $badStatus -Detail 'таймаут, процесс снят' -Log $Result.Log -Seconds $Result.Seconds
@@ -4629,6 +4660,9 @@ function Add-CheckStep {
         Add-StepResult -Name $Name -Status $badStatus -Detail $detail -Log $Result.Log -Seconds $Result.Seconds
         return
     }
+    # Записи - только у проверки, которая выполнилась: иначе разбор (report.ps1) сравнивал бы с эталоном текст
+    # ошибки запуска и писал «исправлено» всё, что в эталоне (прогон 19.11: «исправлено 1399»).
+    [System.IO.File]::WriteAllLines((Join-Path $RunDir ($FileKey + '.norm.txt')), [string[]]$records, $Utf8Bom)
 
     $comparison = Compare-WithBaseline -Current $records -BaselineFile (Join-Path $baselineDir ($FileKey + '.norm.txt'))
 
@@ -6450,13 +6484,7 @@ else {
                 -FileKey ("checkmodules_{0}" -f $target.Key) -Blocking $true
         }
 
-        if ($runCheckConfig -and -not $script:StopRun -and $parallelCheckConfig) {
-            # Идёт параллельно: итог - в Complete-BackgroundCheck перед вердиктом.
-            $script:BackgroundCheck = Start-DesignerBackground -Command (@('/CheckConfig', $checkConfigFlags) + $target.Selector) `
-                -LogName ("checkconfig_{0}.log" -f $target.Key) -TimeoutSec $timeoutCheckSec -Title ("Проверка конфигурации ({0})" -f $target.Key) `
-                -FileKey ("checkconfig_{0}" -f $target.Key)
-        }
-        elseif ($runCheckConfig -and -not $script:StopRun) {
+        if ($runCheckConfig -and -not $script:StopRun -and -not $parallelCheckConfig) {
             $result = Invoke-Designer -Command (@('/CheckConfig', $checkConfigFlags) + $target.Selector) `
                 -LogName ("checkconfig_{0}.log" -f $target.Key) -TimeoutSec $timeoutCheckSec -Title ("Проверка конфигурации ({0})" -f $target.Key)
             Add-CheckStep -Name ("Проверка конфигурации ({0})" -f $target.Key) -Result $result `
@@ -6469,6 +6497,17 @@ else {
         $result = Invoke-Designer -Command @('/CheckCanApplyConfigurationExtensions') `
             -LogName 'checkcanapply.log' -TimeoutSec $timeoutCheckSec -Title 'Проверка применимости'
         Add-CheckStep -Name 'Проверка применимости' -Result $result -FileKey 'checkcanapply' -Blocking $true
+    }
+
+    # Параллельная проверка конфигурации - после проверки применимости, а не вместе с ней: обе - конфигуратор,
+    # и вторая падала на блокировке базы (прогон 19.11: применимость захватила базу первой). Идёт параллельно
+    # с канарейкой и самопроверкой; итог - в Complete-BackgroundCheck перед вердиктом.
+    if ($runCheckConfig -and -not $script:StopRun -and $parallelCheckConfig) {
+        foreach ($target in $targets) {
+            $script:BackgroundCheck = Start-DesignerBackground -Command (@('/CheckConfig', $checkConfigFlags) + $target.Selector) `
+                -LogName ("checkconfig_{0}.log" -f $target.Key) -TimeoutSec $timeoutCheckSec -Title ("Проверка конфигурации ({0})" -f $target.Key) `
+                -FileKey ("checkconfig_{0}" -f $target.Key)
+        }
     }
 
     if ($script:StopRun) {
