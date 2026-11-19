@@ -2745,6 +2745,9 @@ $tests = @(
                 foreach ($path in @('README.md', 'Configuration.xml', 'Catalogs/Items.xml', 'CommonModules/Common/Ext/Module.bsl')) { Check ($tree -contains $path) ("в репозитории типовой нет {0}: {1}" -f $path, ($tree -join ' ')) }
                 Check ($tree -notcontains 'ConfigDumpInfo.xml') 'ConfigDumpInfo.xml попал в репозиторий типовой'
                 $firstSha = [string](& $gitExe --git-dir=$bare rev-parse main 2>&1)
+                # Объекты - в одном pack: отдельных объектов (файл на объект) после выгрузки не остаётся.
+                $objectStats = @(& $gitExe ("--git-dir=" + (Join-Path $sb 'git\typical\repo.git')) count-objects -v 2>&1 | ForEach-Object { [string]$_ })
+                Check (($objectStats -contains 'count: 0') -and ($objectStats -contains 'packs: 1')) ("объекты типовой не в одном pack: " + ($objectStats -join '; '))
                 # Get-Calls отдаёт массив запятой: сначала в переменную, потом в конвейер (иначе в Where-Object придёт весь массив разом).
                 $firstDumps = Get-Calls $first @('/DumpConfigToFiles')
                 $dumpCalls = @($firstDumps | Where-Object { -not $_.Line.Contains('-Extension') })

@@ -3030,8 +3030,12 @@ function Invoke-GitTypical {
         Remove-Item -LiteralPath $indexLock -Force
         Write-Line '  убрал index.lock от прошлого оборванного запуска'
     }
-    Write-Line '  складываю в git: сотня тысяч файлов, в первый раз - до часа и дольше (каждый файл сжимается и пишется объектом)'
-    $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('add', '-A') -TimeoutSec 14400 -Title 'Типовая: git add (файлы - в объекты git)'
+    # Файлы - сразу в один pack, а не объект на файл (core.bigFileThreshold=1: «большим» считается любой файл, такие
+    # git пишет в pack потоком). Объект на файл - это двести тысяч мелких файлов в repo.git, и каждый проверяет
+    # антивирус при записи и при чтении: первая выгрузка 19.11.2026 упаковывала их часами. В таком pack нет
+    # дельта-сжатия - его делает пережатие перед первой отправкой (ниже), уже из одного файла.
+    Write-Line '  складываю в git: сотня тысяч файлов - в первый раз десятки минут'
+    $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('add', '-A') -TimeoutSec 14400 -Title 'Типовая: git add (файлы - в pack)' -Config @('core.bigFileThreshold=1')
     $staged = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('diff', '--cached', '--quiet') -AllowFail
     $hasHead = ((Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('rev-parse', '--verify', '--quiet', 'HEAD') -AllowFail).ExitCode -eq 0)
     if ($staged.ExitCode -eq 0 -and $fetch.ExitCode -eq 0) {
@@ -3049,9 +3053,12 @@ function Invoke-GitTypical {
             [System.IO.File]::WriteAllText($messageFile, ("Типовая {0} из {1}`n`nВыгрузка в файлы конфигуратором, {2}. Файлов больше 50 МБ мимо git: {3}.`n" -f $title, $script:TempBase, (Get-Date).ToString('dd.MM.yyyy HH:mm'), @($big).Count), (New-Object System.Text.UTF8Encoding($false)))
             $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('commit', '--quiet', '--no-verify', '-F', $messageFile) -TimeoutSec 7200 -Title 'Типовая: git commit'
         }
-        # Упаковка - до отправки: объекты (после add их сотни тысяч мелких) - в один сжатый файл, отправка берёт его
-        # готовым. Не вышло - отправка упакует сама.
-        $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('gc', '--prune=now', '--quiet') -TimeoutSec 14400 -AllowFail -Title 'Типовая: git gc (сжать объекты перед отправкой)'
+        # Упаковка - до отправки: всё в один pack, отправка берёт его готовым. Первая отправка (в хранилище ещё пусто) -
+        # с пересчётом дельта-сжатия (-f): после add оно не делалось, без него pack втрое больше. Дальше - без -f:
+        # пересчитывать всю типовую ради нескольких тысяч изменённых файлов незачем. Не вышло - отправка упакует сама.
+        $repackArgs = @('repack', '-a', '-d', '-q')
+        if ($fetch.ExitCode -ne 0) { $repackArgs = @('repack', '-a', '-d', '-f', '-q') }
+        $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments $repackArgs -TimeoutSec 14400 -AllowFail -Title 'Типовая: git repack (сжать объекты перед отправкой)'
         Write-Line ("  отправляю в {0} (ветка {1}; первый раз - надолго)" -f $repo, $branch)
         $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('push', '--no-verify', $url, ('HEAD:refs/heads/' + $branch)) -Token $token -TimeoutSec 14400 -Title 'Типовая: git push (отправка в GitHub)'
         $state['commit'] = (Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('rev-parse', 'HEAD')).Output.Trim()

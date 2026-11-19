@@ -661,7 +661,8 @@ function Invoke-GitCli {
     # (в командной строке и журнале его нет). Возвращает ExitCode и Output (stdout и stderr). AllowFail - не бросать.
     # Title - долгая команда: строка «начато в ..., жду не дольше ...» и строка хода со временем, как у вызовов 1С;
     # просьба остановиться из ci.exe снимает git. Без Title - тихо (короткие команды).
-    param([string]$Git, [string]$GitDir, [string]$WorkTree, [string[]]$Arguments, [string]$Token = '', [int]$TimeoutSec = 3600, [switch]$AllowFail, [string]$Title = '')
+    # Config - настройки git только для этого вызова («ключ=значение»).
+    param([string]$Git, [string]$GitDir, [string]$WorkTree, [string[]]$Arguments, [string]$Token = '', [int]$TimeoutSec = 3600, [switch]$AllowFail, [string]$Title = '', [string[]]$Config = @())
     $all = @(('--git-dir=' + $GitDir), ('--work-tree=' + $WorkTree)) + @($Arguments)
     $quoted = @($all | ForEach-Object { if ([string]$_ -match '[\s"]') { '"' + ([string]$_).Replace('"', '\"') + '"' } else { [string]$_ } }) -join ' '
     $info = New-Object System.Diagnostics.ProcessStartInfo
@@ -684,6 +685,10 @@ function Invoke-GitCli {
     # она сжимала двести тысяч объектов, commit её ждал и упирался в таймаут. Упаковка - отдельным шагом (gc).
     $settings.Add(@('gc.auto', '0'))
     $settings.Add(@('maintenance.auto', 'false'))
+    foreach ($pair in @($Config | Where-Object { $_ })) {
+        $cut = ([string]$pair).IndexOf('=')
+        if ($cut -gt 0) { $settings.Add(@(([string]$pair).Substring(0, $cut), ([string]$pair).Substring($cut + 1))) }
+    }
     $settings.Add(@('user.name', 'ci-gate'))
     $settings.Add(@('user.email', 'ci-gate@users.noreply.github.com'))
     if ($Token) {
