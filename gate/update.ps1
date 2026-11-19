@@ -9,7 +9,8 @@
   .\update.ps1 -Tag <тег>   поставить этот релиз
   .\update.ps1 -List        только показать релизы
 Ставит install.ps1 из скачанного комплекта (без вопросов): свои данные (config.psd1, runs, baseline, secrets ...)
-не трогаются. Работающий ci.exe переименовывается в ci.exe.old - после обновления ci нужно перезапустить.
+не трогаются. Работающий ci.exe переименовывается в ci.exe.old - после обновления ci нужно перезапустить (из меню
+гейта - кнопкой «Перезапустить ci»).
 #>
 [CmdletBinding()]
 param(
@@ -304,7 +305,7 @@ try {
     if ($null -ne $chosen) {
         Install-GateRelease -Release $chosen -Token $token
         Write-Host ''
-        Write-Host ("Гейт обновлён до {0}. Перезапусти ci (закрой окно и открой снова): работает ещё прежний." -f $chosen.Version) -ForegroundColor Green
+        Write-Host ("Гейт обновлён до {0}. Работает ещё прежний: новый - после перезапуска ci." -f $chosen.Version) -ForegroundColor Green
         $exitCode = 10
     }
 }

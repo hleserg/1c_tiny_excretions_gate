@@ -76,6 +76,11 @@ type model struct {
 	height    int
 	stopAsked time.Time
 	notice    string
+
+	// Скрипт попросил закрыть ci, когда кончится (событие close: гейт обновлён, а работает ещё прежний);
+	// restartAfter - и сразу открыть ci заново: в папке гейта уже новый ci.exe.
+	closeAfter   bool
+	restartAfter bool
 }
 
 func newModel(baseDir, script string, extra []string) model {
@@ -225,6 +230,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.exitCode = 0
 		m.exitErr = nil
 		m.stopAsked = time.Time{}
+		m.closeAfter = false
+		m.restartAfter = false
 		m.touchActive()
 		return m, nil
 
@@ -242,6 +249,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "reset":
 			m.resetRun()
 			m.layout()
+		case "close":
+			m.closeAfter = true
+			m.restartAfter = ev.Restart
 		case "subplan":
 			m.setSubPlan(ev)
 			m.layout()
@@ -298,6 +308,11 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.eng.cleanup()
 		}
 		m.closeAll()
+		if m.closeAfter && msg.code == 0 {
+			// Скрипт просил закрыть ci (после обновления гейта) и кончился без ошибки. С ошибкой экран остаётся:
+			// её нужно прочитать.
+			return m, tea.Quit
+		}
 		m.layout()
 		m.refreshLog()
 		return m, m.syncOverall()

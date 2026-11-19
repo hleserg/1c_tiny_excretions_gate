@@ -9,6 +9,8 @@
 # Если вопрос ждёт события (закроют конфигуратор, уйдут сеансы) и оно случилось, скрипт пишет
 # {"kind":"cancel","id":..} и идёт дальше. Файл stop в папке канала - просьба остановиться: скрипт
 # останавливается через свою обычную обработку ошибки (trap, finally), со снятием блокировок.
+# {"kind":"close","restart":..} - просьба к ci.exe закрыться, когда скрипт кончится без ошибки, а с restart - и
+# сразу открыться заново (после обновления гейта: в папке уже новый ci.exe).
 
 $script:UiChannelDir = ''
 $script:UiQuestionId = 0
@@ -49,6 +51,16 @@ function Send-UiReset {
     if (-not $script:UiChannelDir) { return }
     $script:UiSubPlanSent = ''
     Send-UiEvent @{ kind = 'reset' }
+}
+
+function Send-UiClose {
+    # Просьба к ci.exe закрыться, когда этот скрипт кончится без ошибки; Restart - и сразу открыть ci заново: ci.exe
+    # запускает тот ci.exe, что лежит в папке гейта, в этом же окне. Шлёт меню после обновления гейта: скрипты и
+    # ci.exe на диске уже новые, а работают прежние. ci.exe старше этой правки (20.11.2026) события не знает и остаётся на
+    # экране «готово». Без ci.exe ничего не делает.
+    param([switch]$Restart)
+    if (-not $script:UiChannelDir) { return }
+    Send-UiEvent @{ kind = 'close'; restart = [bool]$Restart }
 }
 
 function Send-UiSubPlan {
