@@ -23,6 +23,12 @@
         «Проверка перед обновлением (только чтение)» в её форме. Что изменит загрузка комплекта и каких настроек
         не хватает. Рабочую только читает: ни блокировок, ни записи.
 
+    .\deploy.ps1 -Prepare / -ApplyPrepared / -CancelPrepared
+        Обновление в два приёма. -Prepare: резервные копии, взять из temp и загрузить новые версии расширений
+        в конфигурацию рабочей базы - без обновления конфигурации БД, без блокировок и без завершения сеансов
+        (пользователи работают на прежних версиях). -ApplyPrepared: сеансы, блокировки, обновление конфигурации
+        БД, внешние обработки, проверки, отчёт. -CancelPrepared: вернуть расширения рабочей к применённым версиям.
+
     .\deploy.ps1 -GitExport / -GitImport
         Репозиторий расширений (ExtensionsRepo, раздел 5.23): выгрузить temp в git - первый раз коммитом в main,
         потом правки temp веткой temp/<время> и pull request; загрузить из git - проверка правок temp и обычный
@@ -53,6 +59,11 @@ param(
     [switch]$NoDump,
     # Откат рабочей базы к состоянию до одного из прошлых обновлений.
     [switch]$Rollback,
+    # Обновление в два приёма: подготовить (резервные копии и загрузка новых версий в конфигурацию рабочей без
+    # обновления конфигурации БД - пользователи работают), обновить подготовленным, отменить подготовку.
+    [switch]$Prepare,
+    [switch]$ApplyPrepared,
+    [switch]$CancelPrepared,
     # Взять из рабочей в inbox расширения или внешние обработки, которые отличаются от temp.
     [switch]$PullExtensions,
     [switch]$PullProcessings,
@@ -1030,7 +1041,7 @@ function Get-DeployHistory {
 function Get-DeployModeText {
     param($Record)
     $mode = [string](Get-JsonValue $Record 'mode' '')
-    $names = @{ '1' = 'все из temp'; '2' = 'выбранные из temp'; 'epf' = 'только внешние обработки'; 'asis' = 'как есть'; 'rollback' = 'откат' }
+    $names = @{ '1' = 'все из temp'; '2' = 'выбранные из temp'; 'epf' = 'только внешние обработки'; 'asis' = 'как есть'; 'rollback' = 'откат'; 'prepared' = 'подготовленным' }
     if ($names.ContainsKey($mode)) { return $names[$mode] }
     return 'обновление'
 }
@@ -2892,6 +2903,145 @@ if ($GitExport -or $GitImport -or $GitProd -or $GitTypical) {
 
 #endregion
 
+#region Подготовленное обновление рабочей
+
+# Обновление в два приёма. «Подготовить» (-Prepare): резервные копии, взять из temp и загрузить новые версии
+# расширений в конфигурацию рабочей базы - без обновления конфигурации БД, без блокировок и без завершения сеансов:
+# пользователи работают на прежних, применённых версиях. «Обновить подготовленным» (-ApplyPrepared): сеансы,
+# блокировки, обновление конфигурации БД, внешние обработки, проверки, отчёт. «Отменить подготовку»
+# (-CancelPrepared): конфигурации расширений рабочей возвращаются к применённым. Что подготовлено - в
+# deploy\prepared.json (пути полные); файлы - в папке запуска подготовки. Пока подготовка есть, одним проходом
+# и откатом рабочую не трогаем: резервная копия сняла бы загруженную, а не применённую версию.
+if (@(@($Prepare, $ApplyPrepared, $CancelPrepared, $Rollback) | Where-Object { $_ }).Count -gt 1) { throw 'ключи -Prepare, -ApplyPrepared, -CancelPrepared и -Rollback - по одному за запуск' }
+$preparedPath = Join-Path $deployRoot 'prepared.json'
+$preparedRunId = ''
+$preparedWhen = ''
+
+function Read-PreparedState {
+    # Подготовленное обновление рабочей или $null, если его нет.
+    if (-not (Test-Path -LiteralPath $preparedPath)) { return $null }
+    try { return ([System.IO.File]::ReadAllText($preparedPath, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json) }
+    catch { throw ("подготовленное обновление не читается ({0}): {1}" -f $preparedPath, $_.Exception.Message) }
+}
+
+function Get-PreparedItems {
+    # Расширения подготовки для отмены: Name, Status, Backup (полный путь или пусто).
+    param($State)
+    foreach ($item in @(Get-JsonValue $State 'extensions' @())) {
+        [pscustomobject]@{ Name = [string](Get-JsonValue $item 'name' ''); Status = [string](Get-JsonValue $item 'status' ''); Backup = [string](Get-JsonValue $item 'backup' '') }
+    }
+}
+
+function Get-PreparedText {
+    # «Адаптация (1.0 -> 2.0), Доработки (3 -> 4)»
+    param($State)
+    $parts = @(foreach ($item in @(Get-JsonValue $State 'extensions' @())) {
+            '{0} ({1} -> {2})' -f (Get-JsonValue $item 'name' ''), (Get-NonEmpty ([string](Get-JsonValue $item 'oldVersion' '')) 'нет'), (Get-NonEmpty ([string](Get-JsonValue $item 'newVersion' '')) '?')
+        })
+    return ($parts -join ', ')
+}
+
+function Get-PreparedBusyText {
+    param([string]$What, $State)
+    return ("{0} сейчас нельзя: есть подготовленное обновление от {1} ({2}) - в конфигурацию {3} загружены новые версии, не применённые. Сначала «Обновить рабочую подготовленным» или «Отменить подготовку»." -f $What, (Get-JsonValue $State 'timeText' '?'), (Get-PreparedText $State), $script:ProdBase)
+}
+
+function Save-PreparedState {
+    # deploy\prepared.json: что загружено в конфигурацию рабочей и не применено. Хеш рабочей читается после
+    # загрузки: по нему «Обновить подготовленным» увидит, что рабочую с тех пор меняли.
+    param([object[]]$Entries, [bool]$Partial, $TempStates, [string]$GateRun, [bool]$ReadProd = $true)
+    # ReadProd = $false - не читать: до загрузки хеш ещё не тот, а когда внешнее соединение не отвечает,
+    # каждая попытка - минута ожидания впустую.
+    $prodNow = $null
+    if ($ReadProd) { $prodNow = Get-ExtensionStates -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword }
+    $items = @(foreach ($entry in $Entries) {
+            $oldVersion = [string]$entry.ProdVersion
+            if (-not $oldVersion -and $entry.OldDir -and (Test-Path -LiteralPath $entry.OldDir)) { $oldVersion = [string](Get-ExtensionVersion $entry.OldDir) }
+            $newVersion = [string]$entry.TempVersion
+            if (-not $newVersion -and $entry.NewDir -and (Test-Path -LiteralPath $entry.NewDir)) { $newVersion = [string](Get-ExtensionVersion $entry.NewDir) }
+            $tempHash = ''
+            if ($null -ne $TempStates -and $TempStates.Ok -and $TempStates.Items.ContainsKey($entry.Name)) { $tempHash = [string]$TempStates.Items[$entry.Name].Hash }
+            $prodHash = ''
+            if ($null -ne $prodNow -and $prodNow.Ok -and $prodNow.Items.ContainsKey($entry.Name)) { $prodHash = [string]$prodNow.Items[$entry.Name].Hash }
+            [ordered]@{ name = [string]$entry.Name; status = [string]$entry.Status; oldVersion = $oldVersion; newVersion = $newVersion
+                backup = [string]$entry.Backup; newFile = [string]$entry.NewFile; oldDir = [string]$entry.OldDir; newDir = [string]$entry.NewDir
+                tempHash = $tempHash; prodHash = $prodHash }
+        })
+    $state = [ordered]@{
+        runId      = $runId
+        timeText   = (Get-Date).ToString('dd.MM.yyyy HH:mm')
+        base       = $script:ProdBase
+        tempBase   = $script:TempBase
+        user       = $env:USERNAME
+        partial    = $Partial
+        gate       = $GateRun
+        extensions = $items
+    }
+    [System.IO.File]::WriteAllText($preparedPath, (ConvertTo-Json -InputObject $state -Depth 5), $Utf8Bom)
+    Write-RunLog ("Подготовка записана: {0}" -f $preparedPath)
+}
+
+function Undo-PreparedExtensions {
+    # Возвращает конфигурации расширений рабочей к применённым версиям, в обратном порядке: загружается резервная
+    # копия, снятая до загрузки (она и есть применённая версия). Новое расширение (в рабочей его не было)
+    # удаляется по имени. Конфигурация БД не обновляется, блокировки и сеансы не трогаются. Items - записи
+    # с Name, Status, Backup. Команды - только те, что и при обновлении: «возврат к конфигурации БД»
+    # (/RollbackCfg) для расширения на рабочей не проверен и здесь не используется.
+    param([object[]]$Items)
+    $ok = $true
+    $list = @($Items)
+    [array]::Reverse($list)
+    foreach ($item in $list) {
+        $name = [string]$item.Name
+        $backup = [string]$item.Backup
+        if ($backup -and (Test-Path -LiteralPath $backup)) {
+            $result = Invoke-Designer -BaseName $script:ProdBase -Command @('/LoadCfg', ('"{0}"' -f $backup), '-Extension', $name) `
+                -LogName ("unprepare_load_{0}.log" -f $name) -TimeoutSec $timeoutLoadSec -Title ("Отмена подготовки: вернуть {0} из резервной копии" -f $name)
+        }
+        elseif ([string]$item.Status -eq 'new' -and -not $backup) {
+            # Удаляется одно расширение по имени. Ключа -AllExtensions здесь нет.
+            $result = Invoke-Designer -BaseName $script:ProdBase -Command @('/DeleteCfg', '-Extension', $name) `
+                -LogName ("unprepare_delete_{0}.log" -f $name) -TimeoutSec $timeoutLoadSec -Title ("Отмена подготовки: удалить новое {0}" -f $name)
+            if ($result.ExitCode -ne 0) {
+                # Загрузка могла не успеть: расширения в рабочей нет - удалять нечего.
+                $existing = Get-ExtensionStates -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+                if ($existing.Ok -and -not $existing.Items.ContainsKey($name)) {
+                    Write-Line ("  {0}: в {1} его нет - удалять нечего" -f $name, $script:ProdBase) 'Green'
+                    continue
+                }
+            }
+        }
+        else {
+            Write-Line ("  {0}: резервной копии нет ({1}) - вернуть нечем" -f $name, $backup) 'Red'
+            $ok = $false
+            continue
+        }
+        if ($result.ExitCode -eq 0) { Write-Line ("  {0}: возвращено к применённой версии" -f $name) 'Green' }
+        else { Write-Line ("  {0}: вернуть не получилось - {1}" -f $name, $result.Text) 'Red'; $ok = $false }
+    }
+    return $ok
+}
+
+$prepared = Read-PreparedState
+
+if ($CancelPrepared) {
+    if (-not (Test-UiCanAsk)) { throw 'отмена подготовки только из консоли или ci.exe' }
+    if ($null -eq $prepared) { Write-Line ("Подготовленного обновления {0} нет: отменять нечего." -f $script:ProdBase); exit 0 }
+    Write-Host ''
+    Write-Line ("ОТМЕНА ПОДГОТОВКИ {0}" -f $script:ProdBase) 'Cyan'
+    Write-Line ("  подготовлено {0}: {1}" -f (Get-JsonValue $prepared 'timeText' '?'), (Get-PreparedText $prepared))
+    $sure = Confirm-Ui -Question ("Вернуть расширения {0} к применённым версиям? В конфигурацию рабочей загрузятся резервные копии, снятые до подготовки; база данных, блокировки и сеансы не затрагиваются." -f $script:ProdBase) -Yes 'Да, отменить подготовку' -No 'Нет, выйти'
+    if ($sure -ne $true) { Write-Host 'Выход, ничего не менял.'; exit 0 }
+    if (Undo-PreparedExtensions -Items @(Get-PreparedItems $prepared)) {
+        Remove-Item -LiteralPath $preparedPath -Force
+        Write-Line ("ИТОГ: подготовка отменена, расширения {0} - как применены." -f $script:ProdBase) 'Green'
+        exit 0
+    }
+    Write-Line ("ИТОГ: подготовка отменена не полностью (см. выше). {0} оставлен: повтори отмену." -f $preparedPath) 'Red'
+    exit 1
+}
+
+#endregion
 #region Итог последнего прогона гейта
 
 $rollbackOf = ''
@@ -2902,6 +3052,7 @@ if ($Rollback) {
     # Откат рабочей базы: к состоянию до выбранного обновления, из его резервных копий. Дальше - обычный путь
     # обновления (блокировки, резервные копии текущего состояния, загрузка, обновление БД, лёгкий прогон, отчёт).
     if (-not (Test-UiCanAsk)) { throw 'откат рабочей базы только из консоли или ci.exe: без человека скрипт ничего не откатывает' }
+    if ($null -ne $prepared) { throw (Get-PreparedBusyText 'Откат' $prepared) }
     $ciLines = New-Object System.Collections.Generic.List[string]
     $advice = New-Object System.Collections.Generic.List[object]
     $gateRisks = New-Object System.Collections.Generic.List[string]
@@ -3250,6 +3401,7 @@ else {
     #region Что обновлять
 
     if (-not (Test-UiCanAsk)) { throw 'обновление рабочей базы только из консоли: без человека скрипт ничего не обновляет' }
+    if ($null -ne $prepared -and -not $Prepare -and -not $ApplyPrepared) { throw (Get-PreparedBusyText 'Обновление одним проходом' $prepared) }
 
     # Кнопки - всегда, что бы ни показал гейт и сравнение: решает человек.
     # «Все» - все необновлённые (изменённые в temp, новые, несравнённые); если таких нет - все из temp заново.
@@ -3257,6 +3409,52 @@ else {
     # сбрасываются (принимаются в эталон): они либо исправлены, либо неважны.
     $allTargets = @($pending)
     if ($allTargets.Count -eq 0) { $allTargets = @($fromTemp) }
+    $mode = ''
+    if ($ApplyPrepared) {
+        # Обновить подготовленным: что загружено при подготовке, то и применяется. Сверка: temp и рабочая с тех пор
+        # не менялись (по хеш-суммам через внешнее соединение, если они читаются).
+        if ($null -eq $prepared) { throw 'подготовленного обновления нет: сначала «Подготовить обновление рабочей»' }
+        if ([bool](Get-JsonValue $prepared 'partial' $false)) { throw 'подготовка не закончена (часть расширений не загрузилась): «Отменить подготовку» или «Подготовить заново»' }
+        if ([string](Get-JsonValue $prepared 'base' '') -ne $script:ProdBase) { throw ("подготовлено для базы {0}, а рабочая сейчас {1}" -f (Get-JsonValue $prepared 'base' '?'), $script:ProdBase) }
+        $preparedRunId = [string](Get-JsonValue $prepared 'runId' '')
+        $preparedWhen = [string](Get-JsonValue $prepared 'timeText' '')
+        Write-Host ''
+        Write-Host 'ПОДГОТОВЛЕННОЕ ОБНОВЛЕНИЕ' -ForegroundColor Cyan
+        Write-Line ("  подготовлено {0}: {1}" -f $preparedWhen, (Get-PreparedText $prepared))
+        $preparedByName = @{}
+        $preparedSelected = @()
+        $preparedChanged = New-Object System.Collections.Generic.List[string]
+        $preparedCompared = 0
+        foreach ($item in @(Get-JsonValue $prepared 'extensions' @())) {
+            $name = [string](Get-JsonValue $item 'name' '')
+            $match = @($extensions | Where-Object { $_.Name -eq $name })
+            if ($match.Count -eq 0) { throw ("в подготовленном обновлении есть {0}, а в DeployExtensions его нет" -f $name) }
+            $backupPath = [string](Get-JsonValue $item 'backup' '')
+            if ($backupPath -and -not (Test-Path -LiteralPath $backupPath)) { throw ("нет резервной копии подготовки {0}: «Отменить подготовку» и подготовить заново" -f $backupPath) }
+            $preparedByName[$name] = $item
+            $preparedSelected += $match[0]
+            $tempThen = [string](Get-JsonValue $item 'tempHash' '')
+            if ($tempThen -and $tempStates.Ok -and $tempStates.Items.ContainsKey($name) -and $tempStates.Items[$name].Hash) {
+                $preparedCompared++
+                if ($tempStates.Items[$name].Hash -ne $tempThen) { $preparedChanged.Add(("{0}: в {1} после подготовки изменено - в рабочую загружена версия на момент подготовки, не нынешняя" -f $name, $script:TempBase)) }
+            }
+            $prodThen = [string](Get-JsonValue $item 'prodHash' '')
+            if ($prodThen -and $prodStates.Ok -and $prodStates.Items.ContainsKey($name) -and $prodStates.Items[$name].Hash) {
+                $preparedCompared++
+                if ($prodStates.Items[$name].Hash -ne $prodThen) { $preparedChanged.Add(("{0}: в {1} после подготовки что-то меняли (хеш расширения другой)" -f $name, $script:ProdBase)) }
+            }
+        }
+        if ($preparedChanged.Count -gt 0) {
+            foreach ($line in $preparedChanged) { Write-Line ('  ' + $line) 'Yellow' }
+            $go = Confirm-Ui -Question ("После подготовки было изменено: {0}. Обновить {1} подготовленным всё равно? Надёжнее - «Подготовить заново»." -f ($preparedChanged -join '; '), $script:ProdBase) -Yes 'Да, обновлять подготовленным' -No 'Нет, выйти'
+            if ($go -ne $true) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
+            Write-RunLog ('Обновление подготовленным несмотря на: ' + ($preparedChanged -join '; '))
+        }
+        elseif ($preparedCompared -gt 0) { Write-Line ("  с подготовки {0} и {1} не менялись" -f $script:TempBase, $script:ProdBase) 'Green' }
+        else { Write-Line '  сверить с подготовкой не удалось: хеш-суммы расширений через внешнее соединение не прочитаны' 'Yellow' }
+        $mode = 'prepared'
+    }
+    if (-not $ApplyPrepared) {
     $modeMenu = New-Object System.Collections.Generic.List[object]
     $modeMenu.Add([pscustomobject]@{ Key = '1'; Label = ("Обновить все расширения из {0} в {1} ({2}); ошибки гейта сбросятся" -f $script:TempBase, $script:ProdBase, (@($allTargets | ForEach-Object { $_.Name }) -join ', ')) })
     $modeMenu.Add([pscustomobject]@{ Key = '2'; Label = 'Обновить выбранные расширения' })
@@ -3268,14 +3466,28 @@ else {
     $modeNotes = @()
     if ($pending.Count -eq 0 -and $fromTemp.Count -gt 0) { $modeNotes += 'необновлённых нет: в рабочей всё как в temp. «Обновить все» загрузит их заново' }
     if ($fromTemp.Count -eq 0) { $modeNotes += 'в temp нет ни одного расширения из DeployExtensions: загружать из temp неоткуда' }
-    $modeIndex = Select-UiOne -Header ("Обновление {0}" -f $script:ProdBase) -Items @($modeMenu | ForEach-Object { $_.Label }) -Notes $modeNotes
+    $modeHeader = ("Обновление {0}" -f $script:ProdBase)
+    if ($Prepare) {
+        # Подготовка: только расширения из temp. Внешние обработки записываются при обновлении; «как есть» здесь не нужно.
+        $modeMenu = New-Object System.Collections.Generic.List[object]
+        $modeMenu.Add([pscustomobject]@{ Key = '1'; Label = ("Подготовить все расширения из {0} в {1} ({2})" -f $script:TempBase, $script:ProdBase, (@($allTargets | ForEach-Object { $_.Name }) -join ', ')) })
+        $modeMenu.Add([pscustomobject]@{ Key = '2'; Label = 'Подготовить выбранные расширения' })
+        $modeMenu.Add([pscustomobject]@{ Key = 'exit'; Label = 'Выход' })
+        $modeHeader = ("Подготовка обновления {0}" -f $script:ProdBase)
+    }
+    $modeIndex = Select-UiOne -Header $modeHeader -Items @($modeMenu | ForEach-Object { $_.Label }) -Notes $modeNotes
     if ($modeIndex -lt 0 -or $modeMenu[$modeIndex].Key -eq 'exit') { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
     $mode = $modeMenu[$modeIndex].Key
     if (($mode -eq '1' -or $mode -eq '2') -and $fromTemp.Count -eq 0 -and $processingsPending.Count -eq 0) { Write-Host 'В temp нечего брать: выход, ничего не обновлял.'; exit 0 }
+    }
 
     $selected = @()
     if ($mode -eq '1') {
         $selected = @($allTargets)
+    }
+    elseif ($mode -eq 'prepared') {
+        # Обновить подготовленным: ровно то, что загружено при подготовке.
+        $selected = @($preparedSelected)
     }
     elseif ($mode -eq 'epf') {
         $selected = @()
@@ -3304,10 +3516,10 @@ else {
 
     # Внешние обработки - отдельным списком после расширений. «Все» и «Только обработки» - отмечены все,
     # «Выбранные» - ни одной. В «как есть» обработки не трогаются.
-    if ($mode -ne 'asis' -and $processingsPending.Count -gt 0) {
+    if ($mode -ne 'asis' -and -not $Prepare -and $processingsPending.Count -gt 0) {
         $procLabels = @($processingsPending | ForEach-Object { '{0} ({1})  {2}' -f $_.ObjName, $_.Title, $_.Text })
         $procPreselected = @()
-        if ($mode -eq '1' -or $mode -eq 'epf') { $procPreselected = @(0..($processingsPending.Count - 1)) }
+        if ($mode -eq '1' -or $mode -eq 'epf' -or $mode -eq 'prepared') { $procPreselected = @(0..($processingsPending.Count - 1)) }
         $procPicked = Select-UiMany -Header ("Какие внешние обработки записать в {0}" -f $script:ProdBase) -Items $procLabels -Preselected $procPreselected
         if ($null -eq $procPicked) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
         $selectedProcessings = @($procPicked | Sort-Object | ForEach-Object { $processingsPending[$_] })
@@ -3339,9 +3551,30 @@ else {
         }
     }
 
+    if ($mode -eq 'prepared') {
+        # Что было и что стало - из подготовки: версии, резервная копия (снята до загрузки), выгрузки для отчёта.
+        foreach ($entry in $selected) {
+            $item = $preparedByName[$entry.Name]
+            $entry.Status = [string](Get-JsonValue $item 'status' 'changed')
+            $entry.ProdVersion = [string](Get-JsonValue $item 'oldVersion' '')
+            $entry.TempVersion = [string](Get-JsonValue $item 'newVersion' '')
+            $entry.ProdPresent = ($entry.Status -ne 'new')
+            $entry.Backup = [string](Get-JsonValue $item 'backup' '')
+            $entry.NewFile = [string](Get-JsonValue $item 'newFile' '')
+            $entry.Loaded = $true
+            $entry.OldDir = ''
+            $entry.NewDir = ''
+            $keptDir = [string](Get-JsonValue $item 'oldDir' '')
+            if ($keptDir -and (Test-Path -LiteralPath $keptDir)) { $entry.OldDir = $keptDir }
+            $keptDir = [string](Get-JsonValue $item 'newDir' '')
+            if ($keptDir -and (Test-Path -LiteralPath $keptDir)) { $entry.NewDir = $keptDir }
+        }
+    }
     # Порядок - как в DeployExtensions (нижний слой первым).
     Write-Host ''
     if ($mode -eq 'asis') { Write-Line ("Обновляю конфигурацию БД {0} как есть: {1}" -f $script:ProdBase, (@($selected | ForEach-Object { $_.Name }) -join ', ')) 'Cyan' }
+    elseif ($Prepare) { Write-Line ("Готовлю обновление {0} (загрузка в конфигурацию без применения): {1}" -f $script:ProdBase, (@($selected | ForEach-Object { $_.Name }) -join ', ')) 'Cyan' }
+    elseif ($mode -eq 'prepared') { Write-Line ("Обновляю {0} подготовленным: {1}" -f $script:ProdBase, (@($selected | ForEach-Object { $_.Name }) -join ', ')) 'Cyan' }
     elseif ($selected.Count -gt 0) { Write-Line ("Обновляю в {0}: {1}" -f $script:ProdBase, (@($selected | ForEach-Object { $_.Name }) -join ', ')) 'Cyan' }
     if ($selectedProcessings.Count -gt 0) { Write-Line ("Внешние обработки в {0}: {1}" -f $script:ProdBase, (@($selectedProcessings | ForEach-Object { $_.ObjName }) -join ', ')) 'Cyan' }
 
@@ -3349,6 +3582,7 @@ else {
     $riskAccepted = $false
     if ($gateRisks.Count -gt 0) {
         $question = "Обновить {0}, хотя {1}? Красное из гейта попадёт в отчёт с пометкой «проверить работоспособность»." -f $script:ProdBase, ($gateRisks -join '; ')
+        if ($Prepare) { $question = "Готовить обновление {0}, хотя {1}? Новые версии загрузятся в конфигурацию рабочей (без применения)." -f $script:ProdBase, ($gateRisks -join '; ') }
         $sure = Confirm-Ui -Question $question -Yes 'Да, обновлять' -No 'Нет, выйти'
         if ($sure -ne $true) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
         $riskAccepted = $true
@@ -3361,7 +3595,7 @@ $hour = (Get-Date).Hour
 $inDenied = $false
 if ($deniedFrom -gt $deniedTo) { $inDenied = ($hour -ge $deniedFrom -or $hour -lt $deniedTo) }
 else { $inDenied = ($hour -ge $deniedFrom -and $hour -lt $deniedTo) }
-if ($inDenied) { throw ("сейчас {0}: с {1}:00 до {2}:00 рабочую базу не обновляем" -f (Get-Date -Format 'HH:mm'), $deniedFrom, $deniedTo) }
+if ($inDenied -and -not $Prepare) { throw ("сейчас {0}: с {1}:00 до {2}:00 рабочую базу не обновляем" -f (Get-Date -Format 'HH:mm'), $deniedFrom, $deniedTo) }
 
 Write-Host ("  Это рабочая база. Чтобы продолжить, набери её имя ({0}) и Enter:" -f $script:ProdBase) -ForegroundColor Yellow
 $typedName = Read-UiText -Prompt ("Это рабочая база. Чтобы продолжить, набери её имя ({0})" -f $script:ProdBase)
@@ -3374,18 +3608,19 @@ Write-RunLog 'Подтверждено именем базы'
 
 # План обновления для ci.exe: шаги, которые пойдут, если ничего не упадёт.
 $planSteps = New-Object System.Collections.Generic.List[string]
-if ($selected.Count -gt 0) { $planSteps.Add('Подготовка рабочей базы') }
-foreach ($planEntry in $selected) {
+if ($selected.Count -gt 0 -and -not $Prepare) { $planSteps.Add('Подготовка рабочей базы') }
+foreach ($planEntry in @($selected | Where-Object { $mode -ne 'prepared' })) {
     $planSteps.Add(("Выгрузить {0} из {1}" -f $planEntry.Name, $script:ProdBase))
     if ($mode -ne 'asis' -and $mode -ne 'rollback') { $planSteps.Add(("Выгрузить {0} из {1}" -f $planEntry.Name, $script:TempBase)) }
 }
-if ($mode -ne 'asis') {
+if ($mode -ne 'asis' -and $mode -ne 'prepared') {
     foreach ($planEntry in $selected) {
         if ($planEntry.ProdPresent) { $planSteps.Add(("Резервная копия {0}" -f $planEntry.Name)) }
         if ($mode -ne 'rollback') { $planSteps.Add(("Взять {0} из {1}" -f $planEntry.Name, $script:TempBase)) }
     }
     foreach ($planEntry in $selected) { $planSteps.Add(("Загрузить {0} в {1}" -f $planEntry.Name, $script:ProdBase)) }
 }
+if (-not $Prepare) {
 foreach ($planEntry in $selected) { $planSteps.Add(("Обновить конфигурацию БД {0}" -f $planEntry.Name)) }
 foreach ($planProc in $selectedProcessings) { $planSteps.Add((Get-ProcessingStepTitle $planProc)) }
 if ($selected.Count -gt 0) {
@@ -3394,13 +3629,14 @@ if ($selected.Count -gt 0) {
     $planSteps.Add('Самопроверка на чтение')
 }
 $planSteps.Add('Статья в базу знаний')
+}
 Send-UiPlan -StepNames $planSteps.ToArray()
 
 # Отсюда и до конца блокировки рабочей базы снимаются обязательно: в finally в конце скрипта (он выполняется
 # и при exit, и по Ctrl+C) и в trap.
 # Только внешние обработки - монопольный доступ не нужен: блокировки не ставятся и в конце не снимаются
 # (снятие снимает и чужие блокировки), пользователи работают дальше.
-$needExclusive = ($selected.Count -gt 0)
+$needExclusive = ($selected.Count -gt 0 -and -not $Prepare)
 if ($needExclusive) { $script:ProdLocksArmed = $true }
 try {
 
@@ -3579,7 +3815,8 @@ if ($needExclusive) {
 }
 else {
     Write-Host ''
-    Write-Line ("Только внешние обработки: блокировки {0} не нужны, пользователи работают дальше." -f $script:ProdBase)
+    if ($Prepare) { Write-Line ("Подготовка: блокировки {0} не ставятся, сеансы не завершаются - пользователи работают дальше на применённых версиях." -f $script:ProdBase) }
+    else { Write-Line ("Только внешние обработки: блокировки {0} не нужны, пользователи работают дальше." -f $script:ProdBase) }
 }
 
 #endregion
@@ -3595,16 +3832,38 @@ $touched = New-Object System.Collections.Generic.List[object]
 # Внешние обработки, которые этот запуск записал в справочник рабочей или снял оттуда (для отката и deploy.json).
 $touchedProcessings = New-Object System.Collections.Generic.List[object]
 
+if ($Prepare -and $null -ne $prepared) {
+    # Повторная подготовка: в конфигурации рабочей лежат загруженные, не применённые версии прошлой подготовки.
+    # Резервная копия и выгрузка сняли бы их, а не применённые, поэтому сначала прошлая подготовка отменяется.
+    Write-Host ''
+    Write-Line ("Прошлая подготовка от {0} ({1}): отменяю её, потом готовлю заново" -f (Get-JsonValue $prepared 'timeText' '?'), (Get-PreparedText $prepared)) 'Cyan'
+    if (-not (Undo-PreparedExtensions -Items @(Get-PreparedItems $prepared))) { throw ("прошлую подготовку отменить не удалось (см. выше): новая не начата, {0} оставлен" -f $preparedPath) }
+    Remove-Item -LiteralPath $preparedPath -Force
+    $prepared = $null
+}
+if ($mode -eq 'prepared') {
+    # Резервные копии подготовки - в папку этого запуска: по его deploy.json работает откат обновления.
+    foreach ($entry in $selected) {
+        if ($entry.Backup) {
+            $backupCopy = Join-Path $beforeDir (Split-Path -Leaf $entry.Backup)
+            Copy-Item -LiteralPath $entry.Backup -Destination $backupCopy -Force
+            $entry.Backup = $backupCopy
+        }
+        $touched.Add($entry)
+    }
+    Write-Line ("  загрузки нет: новые версии загружены в конфигурацию {0} при подготовке {1}; обновляю конфигурацию БД" -f $script:ProdBase, $preparedWhen)
+}
+
 # Выгрузки в файлы для отчёта об изменениях и для отката «как есть». Конфигуратору рабочей никто не мешает
 # (открытый закрыт выше), пользователи - нет: монопольный доступ выгрузкам и резервным копиям не нужен, поэтому
 # при предупреждении пользователей они идут, пока те сохраняются. Не выгрузилось - не беда: отчёт будет без
 # разницы по объектам.
-if ($selected.Count -gt 0) {
+if ($selected.Count -gt 0 -and $mode -ne 'prepared') {
     Write-Host ''
     Write-Host 'Выгрузки для отчёта об изменениях:'
 }
 $snapshotRoot = Join-Path $script:RunDir 'prod-before'
-foreach ($entry in $selected) {
+foreach ($entry in @($selected | Where-Object { $mode -ne 'prepared' })) {
     $prodTitle = "Выгрузить {0} из {1}" -f $entry.Name, $script:ProdBase
     if ($mode -eq 'asis') {
         # Было - выгрузка рабочей с прошлого обновления (до ручной загрузки), стало - рабочая сейчас.
@@ -3624,6 +3883,9 @@ foreach ($entry in $selected) {
     # (Status = unknown), и тогда без этого резервной копии перед загрузкой не делалось бы - отката не было бы.
     if ($dump.Ok) { $entry.ProdPresent = $true }
     elseif ($dump.Absent) { $entry.ProdPresent = $false }
+    # Подготовка: в рабочей его нет - значит, новое (сравнение через внешнее соединение могло сказать иначе);
+    # отмена подготовки такое удаляет по имени.
+    if ($Prepare -and $dump.Absent) { $entry.Status = 'new' }
     if ($dump.Ok) { Write-Line ("[OK]   {0}" -f $prodTitle) 'Green' }
     elseif ($dump.Absent) { Write-Line ("[OK]   {0}: в рабочей его нет" -f $prodTitle) 'Green' }
     else { Write-Line ("[WARN] {0}: {1}" -f $prodTitle, $dump.Detail) 'Yellow' }
@@ -3648,7 +3910,7 @@ if ($mode -eq 'asis') {
     foreach ($entry in $selected) { $touched.Add($entry) }
     Write-Line '  загрузки нет: обновляю конфигурацию БД тем, что уже загружено в рабочую'
 }
-foreach ($entry in @($selected | Where-Object { $mode -ne 'asis' })) {
+foreach ($entry in @($selected | Where-Object { $mode -ne 'asis' -and $mode -ne 'prepared' })) {
     if (-not $entry.ProdPresent -and $entry.Status -eq 'unknown' -and $mode -ne 'rollback') {
         # Есть ли расширение в рабочей - неизвестно (ни COM, ни выгрузка не ответили). Грузить без резервной
         # копии нельзя: откатить будет не к чему.
@@ -3681,10 +3943,38 @@ foreach ($entry in @($selected | Where-Object { $mode -ne 'asis' })) {
     Write-Line ("[OK]   Взять {0} из {1}: {2} с" -f $entry.Name, $script:TempBase, $result.Seconds) 'Green'
 }
 
+if ($Prepare -and -not $failed) {
+    # Выгрузки «было» и «стало» - в папку подготовки: к обновлению зеркала могут уйти вперёд, а отчёт об изменениях
+    # и версии строятся по ним. Не скопировалось - остаётся путь к зеркалу, подготовке это не мешает.
+    foreach ($entry in $selected) {
+        try {
+            if ($entry.OldDir -and (Test-Path -LiteralPath $entry.OldDir)) {
+                $keptRoot = Join-Path $script:RunDir 'prod-before'
+                New-Item -ItemType Directory -Path $keptRoot -Force | Out-Null
+                Copy-Item -LiteralPath $entry.OldDir -Destination (Join-Path $keptRoot $entry.Name) -Recurse -Force
+                $entry.OldDir = Join-Path $keptRoot $entry.Name
+            }
+            if ($entry.NewDir -and (Test-Path -LiteralPath $entry.NewDir)) {
+                $keptRoot = Join-Path $script:RunDir 'temp-new'
+                New-Item -ItemType Directory -Path $keptRoot -Force | Out-Null
+                Copy-Item -LiteralPath $entry.NewDir -Destination (Join-Path $keptRoot $entry.Name) -Recurse -Force
+                $entry.NewDir = Join-Path $keptRoot $entry.Name
+            }
+        }
+        catch { Write-Line ("  выгрузки {0} в папку подготовки не скопировались: {1}; отчёт возьмёт зеркало" -f $entry.Name, $_.Exception.Message) 'Yellow' }
+    }
+}
+if ($Prepare -and -not $failed) {
+    # Записывается до первой загрузки, как незаконченная: оборвётся посреди загрузки (окно закрыли, питание) -
+    # «Обновить одним проходом» и откат не пойдут, пока подготовку не отменят или не повторят.
+    $preparedGate = ''
+    if ($null -ne $lastRun) { $preparedGate = [string]$lastRun.Name }
+    Save-PreparedState -Entries $selected -Partial $true -TempStates $tempStates -GateRun $preparedGate -ReadProd $false
+}
 # Дальше рабочая меняется: при предупреждении пользователей - дождаться закрытия базы.
 if (-not $failed -and $null -ne $script:WarnLockAt) { Wait-ProdWarnLock }
 
-if (-not $failed -and $mode -ne 'asis') {
+if (-not $failed -and $mode -ne 'asis' -and $mode -ne 'prepared') {
     foreach ($entry in $selected) {
         $result = Invoke-Designer -BaseName $script:ProdBase -Command @('/LoadCfg', ('"{0}"' -f $entry.NewFile), '-Extension', $entry.Name) `
             -LogName ("load_{0}.log" -f $entry.Name) -TimeoutSec $timeoutLoadSec -Title ("Загрузить {0} в {1}" -f $entry.Name, $script:ProdBase)
@@ -3697,6 +3987,35 @@ if (-not $failed -and $mode -ne 'asis') {
     }
 }
 
+if ($Prepare) {
+    # Подготовка кончается здесь: новые версии в конфигурации рабочей, конфигурация БД не обновлялась. Дальше -
+    # «Обновить подготовленным» или «Отменить подготовку»; блокировок не было - снимать нечего.
+    Write-Host ''
+    if ($failed) {
+        if (Test-Path -LiteralPath $preparedPath) {
+            # Загрузка начиналась: что-то из выбранного уже в конфигурации рабочей (не применено).
+            Write-Line ("Подготовка не прошла, а в конфигурацию {0} уже загружалось (не применено): {1}" -f $script:ProdBase, (@($selected | ForEach-Object { $_.Name }) -join ', ')) 'Red'
+            # Без ответа дальше не идём: решение важное.
+            $undoNow = $null
+            while ($null -eq $undoNow) {
+                $undoNow = Confirm-Ui -Question 'Вернуть расширения к применённым версиям? (Нет - оставить загруженным, не применяя)' -Yes 'Вернуть' -No 'Оставить'
+            }
+            if ($undoNow -and (Undo-PreparedExtensions -Items $selected)) {
+                Remove-Item -LiteralPath $preparedPath -Force
+                Write-Line ("ИТОГ: подготовка не прошла, расширения {0} возвращены к применённым версиям." -f $script:ProdBase) 'Red'
+            }
+            else { Write-Line ("ИТОГ: подготовка не закончена. В конфигурации {0} остались загруженные, не применённые версии: «Отменить подготовку» или «Подготовить заново»." -f $script:ProdBase) 'Red' }
+        }
+        else { Write-Line ("ИТОГ: подготовка не прошла, в конфигурации {0} ничего не изменено." -f $script:ProdBase) 'Red' }
+        exit 1
+    }
+    Save-PreparedState -Entries $selected -Partial $false -TempStates $tempStates -GateRun $preparedGate -ReadProd ([bool]$prodStates.Ok)
+    Write-Line ("ИТОГ: подготовлено. В конфигурацию {0} загружены, но не применены: {1}." -f $script:ProdBase, (@($selected | ForEach-Object { $_.Name }) -join ', ')) 'Green'
+    Write-Line '  Пользователи работают на прежних версиях. Дальше - «Обновить рабочую подготовленным» (в разрешённые часы) или «Отменить подготовку».'
+    Write-Line ("  До обновления не нажимать «Обновить конфигурацию базы данных» в конфигураторе {0}: подготовленное применится сразу." -f $script:ProdBase) 'Yellow'
+    Write-Line ("  Резервные копии: {0}" -f $beforeDir)
+    exit 0
+}
 # Конфигурация БД обновляется после загрузки всех расширений.
 if (-not $failed) {
     foreach ($entry in $selected) {
@@ -4024,11 +4343,13 @@ if ($outcome -eq 'updated') {
 $reportTitle = "Обновление расширений {0} от {1}" -f $script:ProdBase, (Get-Date -Format 'dd.MM.yyyy HH:mm')
 if ($mode -eq 'asis') { $reportTitle = "Обновление конфигурации БД {0} как есть от {1}" -f $script:ProdBase, (Get-Date -Format 'dd.MM.yyyy HH:mm') }
 if ($mode -eq 'epf') { $reportTitle = "Обновление внешних обработок {0} от {1}" -f $script:ProdBase, (Get-Date -Format 'dd.MM.yyyy HH:mm') }
+if ($mode -eq 'prepared') { $reportTitle = "Обновление расширений {0} подготовленным от {1}" -f $script:ProdBase, (Get-Date -Format 'dd.MM.yyyy HH:mm') }
 if ($mode -eq 'rollback') { $reportTitle = "Откат расширений {0} к состоянию до обновления {1}, от {2}" -f $script:ProdBase, $rollbackOf, (Get-Date -Format 'dd.MM.yyyy HH:mm') }
 $outcomeNames = @{ updated = 'обновлено'; failed = 'обновление не прошло'; rolledBack = 'обновление откачено'; rollbackFailed = 'откат прошёл не полностью' }
 $html = New-Object System.Text.StringBuilder
 [void]$html.Append('<html><head><meta charset="utf-8"></head><body>')
 [void]$html.Append(('<h1>{0}</h1>' -f (ConvertTo-Html $reportTitle)))
+if ($mode -eq 'prepared') { [void]$html.Append(('<p>{0}</p>' -f (ConvertTo-Html ("Новые версии загружены в конфигурацию рабочей базы при подготовке {0} (пользователи при этом работали); сейчас обновлена конфигурация базы данных." -f $preparedWhen)))) }
 if ($mode -eq 'asis') { [void]$html.Append('<p>Расширения загружены в конфигурацию рабочей базы руками; скрипт только обновил конфигурацию базы данных и проверил.</p>') }
 [void]$html.Append(('<p>Из {0} в {1}. Итог: <b>{2}</b>. Выполнил: {3}. Папка запуска: {4}.</p>' -f (ConvertTo-Html $script:TempBase), (ConvertTo-Html $script:ProdBase), (ConvertTo-Html $outcomeNames[$outcome]), (ConvertTo-Html $env:USERNAME), (ConvertTo-Html $script:RunDir)))
 if ($riskAccepted) {
@@ -4183,6 +4504,10 @@ if ($outcome -eq 'updated') {
     }
 }
 
+# Обновили подготовленным или откатили его - подготовки больше нет. Не прошло и не откатывали - остаётся:
+# «Обновить подготовленным» можно повторить, подготовку - отменить.
+if ($mode -eq 'prepared' -and $outcome -ne 'failed' -and (Test-Path -LiteralPath $preparedPath)) { Remove-Item -LiteralPath $preparedPath -Force }
+
 Clear-ProdLocks
 
 $summary = New-Object System.Collections.Generic.List[string]
@@ -4228,6 +4553,7 @@ $record = [ordered]@{
     mode         = $mode
     outcome      = $outcome
     rollbackOf   = $rollbackOf
+    preparedRun  = $preparedRunId
     gate         = $recordGate
     riskAccepted = $riskAccepted
     risks        = @($gateRisks)

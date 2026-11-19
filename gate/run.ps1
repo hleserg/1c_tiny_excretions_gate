@@ -4080,6 +4080,27 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         if ([string](Get-Setting $cfg 'UpdateRepo' '')) { $menu.Add([pscustomobject]@{ Key = 'update'; Label = ('Обновить гейт из GitHub (стоит {0})' -f $script:GateVersion) }) }
         if (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1')) {
             $menu.Add([pscustomobject]@{ Key = 'deploy'; Label = 'Обновить рабочую базу (deploy)' })
+            # Обновление в два приёма (deploy.ps1 -Prepare/-ApplyPrepared/-CancelPrepared): подготовка - без блокировок,
+            # пользователи работают; что подготовлено - в deploy\prepared.json.
+            $preparedFile = Join-Path (Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))) 'prepared.json'
+            $preparedState = $null
+            $preparedBroken = $false
+            if (Test-Path -LiteralPath $preparedFile) {
+                try { $preparedState = [System.IO.File]::ReadAllText($preparedFile, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json }
+                catch { $preparedBroken = $true }
+            }
+            if ($null -eq $preparedState -and -not $preparedBroken) {
+                $menu.Add([pscustomobject]@{ Key = 'prepare'; Label = 'Подготовить обновление рабочей: копии и загрузка без применения, пользователи работают' })
+            }
+            else {
+                $preparedNames = @(foreach ($preparedItem in @(Get-UiField $preparedState 'extensions' @())) { [string](Get-UiField $preparedItem 'name' '') }) -join ', '
+                $preparedTime = [string](Get-UiField $preparedState 'timeText' '?')
+                if ($null -ne $preparedState -and -not [bool](Get-UiField $preparedState 'partial' $false)) {
+                    $menu.Add([pscustomobject]@{ Key = 'applyprep'; Label = ('Обновить рабочую подготовленным ({0}; подготовлено {1})' -f $preparedNames, $preparedTime) })
+                }
+                $menu.Add([pscustomobject]@{ Key = 'prepare'; Label = 'Подготовить заново (прошлая подготовка отменяется)' })
+                $menu.Add([pscustomobject]@{ Key = 'cancelprep'; Label = 'Отменить подготовку рабочей: вернуть расширения к применённым версиям' })
+            }
             $menu.Add([pscustomobject]@{ Key = 'basestate'; Label = 'Показать состояние баз: блокировки и сеансы' })
             $menu.Add([pscustomobject]@{ Key = 'cmpext'; Label = 'Сравнить расширения: рабочая и temp' })
             $menu.Add([pscustomobject]@{ Key = 'cmpepf'; Label = 'Сравнить внешние обработки: рабочая и temp' })
@@ -4114,6 +4135,20 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         if ($choice -eq 'deploy') {
             if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') }
             exit $LASTEXITCODE
+        }
+        if ($choice -eq 'applyprep') {
+            if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -ApplyPrepared -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') -ApplyPrepared }
+            exit $LASTEXITCODE
+        }
+        if ($choice -eq 'prepare' -or $choice -eq 'cancelprep') {
+            # Подготовка и её отмена: без блокировок и сеансов рабочей - и обратно в меню, там появится
+            # «Обновить рабочую подготовленным».
+            $prepareArgs = @{ Prepare = ($choice -eq 'prepare'); CancelPrepared = ($choice -eq 'cancelprep') }
+            if ($UiChannel) { $prepareArgs['UiChannel'] = $UiChannel }
+            try { & (Join-Path $Root 'deploy.ps1') @prepareArgs }
+            catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+            Wait-UiAcknowledge
+            continue
         }
         if ($choice -eq 'rollback') {
             if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -Rollback -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') -Rollback }

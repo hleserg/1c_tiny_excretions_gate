@@ -1771,6 +1771,134 @@ $tests = @(
         }
     },
     @{
+        Name = 'deploy-prepare-apply'
+        Text = 'обновление в два приёма: подготовка - копии и загрузка без блокировок, сеансов и обновления БД; «подготовленным» - без загрузки, БД обновлена, блокировки сняты, подготовки больше нет'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-ComState -Sessions @(@{ id = 5; base = 'erp_base'; app = '1CV8C'; user = 'Пользователь'; host = 'pc1' })
+            $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Prepare' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Подготовка обновления erp_base'; Item = '^Подготовить все' },
+                $deployRiskAnswer, $deployNameAnswer)
+            Check-DeployCommon $first -LocksExpected $false
+            Check ($first.ExitCode -eq 0) ("подготовка: код возврата {0}, ждали 0" -f $first.ExitCode)
+            $preparedFile = Join-Path $sb 'deploy\prepared.json'
+            Check (Test-Path -LiteralPath $preparedFile) 'подготовка не записала deploy\prepared.json'
+            Check ((Get-Calls $first @('/DumpCfg', 'fake\erp_base', '\before\erp_base_Адаптация_')).Count -eq 1) 'подготовка не сняла резервную копию Адаптация'
+            Check ((Get-Calls $first @('/LoadCfg', '-Extension Адаптация', 'fake\erp_base')).Count -eq 1) 'подготовка не загрузила Адаптация в рабочую ровно один раз'
+            Check ((Get-Calls $first @('/UpdateDBCfg')).Count -eq 0) 'подготовка обновила конфигурацию БД'
+            Check (@($first.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'подготовка меняла блокировки или завершала сеансы'
+            Check ($null -eq (Get-DeployRecord $sb)) 'подготовка записала deploy.json: в истории обновлений её быть не должно'
+            if (-not (Test-Path -LiteralPath $preparedFile)) { return }
+            $state = [System.IO.File]::ReadAllText($preparedFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+            Check (-not [bool]$state.partial) 'подготовка записана как незаконченная'
+            $item = @($state.extensions)[0]
+            Check ($item.name -eq 'Адаптация' -and $item.backup -and (Test-Path -LiteralPath $item.backup)) ("в prepared.json нет резервной копии Адаптация: {0}" -f $item.backup)
+            Check ($item.tempHash -eq 'h2' -and $item.prodHash -eq 'h1') ("хеш-суммы подготовки {0} / {1}, ждали h2 / h1" -f $item.tempHash, $item.prodHash)
+
+            Start-Sleep -Seconds 2
+            Reset-FakeState $sb
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ApplyPrepared' -Answers @(
+                $deployRiskAnswer, $deployNameAnswer,
+                @{ Kind = 'one'; Header = 'В erp_base есть сеансы'; Item = 'Поставить блокировку' })
+            Check-DeployCommon $r
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0) '«подготовленным» что-то загружало'
+            Check ((Get-Calls $r @('/DumpCfg', 'fake\erp_base')).Count -eq 0) '«подготовленным» снимало резервную копию: она сняла бы загруженную версию'
+            Check ((Get-Calls $r @('/UpdateDBCfg', '-Extension Адаптация', 'fake\erp_base')).Count -eq 1) 'конфигурация БД рабочей не обновлена'
+            Check (@($r.ComLog | Where-Object { $_ -match 'TerminateSession 5$' }).Count -eq 1) 'сеанс рабочей не завершён'
+            Check (@($r.ComLog | Where-Object { $_ -match 'UpdateInfoBase erp_base .*sessionsDenied=1' }).Count -gt 0) 'блокировку начала сеансов не ставили'
+            Check (-not (Test-Path -LiteralPath $preparedFile)) 'после обновления подготовленным prepared.json остался'
+            $record = Get-DeployRecord $sb
+            if ($null -eq $record) { Check $false 'нет deploy.json'; return }
+            Check ($record.mode -eq 'prepared' -and $record.outcome -eq 'updated') ("режим {0}, итог {1}, ждали prepared, updated" -f $record.mode, $record.outcome)
+            Check ($record.preparedRun -eq $state.runId) ("подготовка в deploy.json {0}, ждали {1}" -f $record.preparedRun, $state.runId)
+            $ext = @($record.extensions)
+            Check ($ext.Count -eq 1 -and $ext[0].name -eq 'Адаптация') 'в deploy.json нет Адаптация'
+            if ($ext.Count -eq 1) { Check ($ext[0].backup -and (Test-Path -LiteralPath (Join-Path $record.Dir $ext[0].backup))) ("резервной копии нет в папке запуска (откату нечем): {0}" -f $ext[0].backup) }
+        }
+    },
+    @{
+        Name = 'deploy-prepare-guard-cancel'
+        Text = 'пока есть подготовка, одним проходом не обновляем; temp изменили - «подготовленным» переспрашивает; отмена подготовки грузит резервную копию без обновления БД и блокировок'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Prepare' -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Подготовка обновления erp_base'; Item = '^Подготовить все' },
+                $deployRiskAnswer, $deployNameAnswer)
+            Check ($first.ExitCode -eq 0) ("подготовка: код возврата {0}, ждали 0" -f $first.ExitCode)
+            $preparedFile = Join-Path $sb 'deploy\prepared.json'
+            if (-not (Test-Path -LiteralPath $preparedFile)) { Check $false 'подготовка не записала deploy\prepared.json'; return }
+
+            Start-Sleep -Seconds 2
+            Reset-FakeState $sb
+            $single = Invoke-Script -Sandbox $sb -Script 'deploy.ps1'
+            Check ($single.ExitCode -eq 1) ("один проход при подготовке: код возврата {0}, ждали 1" -f $single.ExitCode)
+            Check (@($single.Output | Where-Object { $_ -match '^Остановлено: Обновление одним проходом сейчас нельзя' }).Count -eq 1) 'один проход не объяснил, что мешает подготовка'
+            Check ($single.Unexpected.Count -eq 0) ("один проход задал вопросы: " + ($single.Unexpected -join ' | '))
+            Check ((Get-Calls $single @('fake\erp_base', '/DumpCfg')).Count -eq 0 -and (Get-Calls $single @('fake\erp_base', '/LoadCfg')).Count -eq 0) 'один проход при подготовке трогал рабочую'
+
+            Start-Sleep -Seconds 2
+            Reset-FakeState $sb
+            $changed = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ApplyPrepared' -Com (New-ComState -TempHash 'h3') -Answers @(
+                @{ Kind = 'confirm'; Header = 'После подготовки было изменено'; Yes = $false })
+            Check ($changed.ExitCode -eq 0) ("отказ обновлять подготовленным: код возврата {0}, ждали 0" -f $changed.ExitCode)
+            Check ($changed.Unexpected.Count -eq 0 -and $changed.UnusedAnswers -eq 0) 'temp изменён после подготовки, а вопроса не было'
+            Check ((Get-Calls $changed @('/UpdateDBCfg')).Count -eq 0) 'после отказа конфигурация БД обновлена'
+            Check (Test-Path -LiteralPath $preparedFile) 'после отказа подготовка пропала'
+
+            Start-Sleep -Seconds 2
+            Reset-FakeState $sb
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CancelPrepared' -Answers @(
+                @{ Kind = 'confirm'; Header = 'Вернуть расширения erp_base к применённым версиям'; Yes = $true })
+            Check-DeployCommon $r -LocksExpected $false
+            Check ($r.ExitCode -eq 0) ("отмена подготовки: код возврата {0}, ждали 0" -f $r.ExitCode)
+            $loads = (Get-Calls $r @('/LoadCfg', '-Extension Адаптация', 'fake\erp_base'))
+            Check ($loads.Count -eq 1) ("отмена: загрузок Адаптация в рабочую {0}, ждали 1 (резервная копия)" -f $loads.Count)
+            if ($loads.Count -eq 1) { Check ($loads[0].Line.Contains('\before\erp_base_Адаптация_')) 'отмена грузила не резервную копию' }
+            Check ((Get-Calls $r @('/UpdateDBCfg')).Count -eq 0) 'отмена подготовки обновила конфигурацию БД'
+            Check ((Get-Calls $r @('/DeleteCfg')).Count -eq 0) 'отмена подготовки удаляла расширение'
+            Check (@($r.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'подготовка или её отмена меняли блокировки или завершали сеансы'
+            Check (-not (Test-Path -LiteralPath $preparedFile)) 'после отмены prepared.json остался'
+        }
+    },
+    @{
+        Name = 'menu-prod-prepare'
+        Text = 'меню гейта: «Подготовить обновление рабочей» ведёт подготовку и возвращается в меню; там появляются «Обновить рабочую подготовленным» и «Отменить подготовку»'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $r = Invoke-Script -Sandbox $sb -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Подготовить обновление рабочей' },
+                @{ Kind = 'one'; Header = 'Подготовка обновления erp_base'; Item = '^Подготовить все' },
+                $deployRiskAnswer, $deployNameAnswer,
+                @{ Kind = 'one'; Header = 'Посмотрел'; Item = '^Вернуться в меню' },
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Отменить подготовку рабочей' },
+                @{ Kind = 'confirm'; Header = 'Вернуть расширения erp_base к применённым версиям'; Yes = $true },
+                @{ Kind = 'one'; Header = 'Посмотрел'; Item = '^Вернуться в меню' },
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            Check ($r.UnusedAnswers -eq 0) ("тест ждал вопросов, а их не было: {0}" -f $r.UnusedAnswers)
+            Check (@($r.Output | Where-Object { $_ -match '^Остановлено: |ParserError' }).Count -eq 0) 'скрипт упал'
+            # Пункты меню - в вопросах «@@ui:»: после подготовки второе меню предлагает обновить подготовленным.
+            $menus = @(foreach ($line in @($r.Output | Where-Object { $_.StartsWith('@@ui:') })) {
+                    $uiEvent = $null
+                    try { $uiEvent = $line.Substring(5) | ConvertFrom-Json } catch { $uiEvent = $null }
+                    if ($null -ne $uiEvent -and [string]$uiEvent.kind -eq 'one' -and ([string]$uiEvent.header).StartsWith('Гейт расширений')) { , @($uiEvent.items | ForEach-Object { [string]$_ }) }
+                })
+            Check ($menus.Count -eq 3) ("меню гейта показано {0} раз, ждали 3" -f $menus.Count)
+            if ($menus.Count -eq 3) {
+                Check (@($menus[0] | Where-Object { $_.StartsWith('Обновить рабочую подготовленным') }).Count -eq 0) 'до подготовки меню предлагает обновить подготовленным'
+                Check (@($menus[1] | Where-Object { $_.StartsWith('Обновить рабочую подготовленным (Адаптация') }).Count -eq 1) 'после подготовки в меню нет «Обновить рабочую подготовленным»'
+                Check (@($menus[1] | Where-Object { $_.StartsWith('Подготовить заново') }).Count -eq 1) 'после подготовки в меню нет «Подготовить заново»'
+                Check (@($menus[2] | Where-Object { $_.StartsWith('Обновить рабочую подготовленным') }).Count -eq 0) 'после отмены подготовки меню предлагает обновить подготовленным'
+            }
+            Check ((Get-Calls $r @('/UpdateDBCfg')).Count -eq 0) 'подготовка и отмена из меню обновили конфигурацию БД'
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'deploy\prepared.json'))) 'после отмены из меню prepared.json остался'
+        }
+    },
+    @{
         Name = 'deploy-compare-extensions'
         Text = '«Сравнить расширения»: одинаковые - по COM без выгрузки, отличающиеся - выгрузка обеих баз и разница по процедурам; в базах ничего не меняется'
         Run = {
