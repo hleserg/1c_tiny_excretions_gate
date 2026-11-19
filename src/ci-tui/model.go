@@ -81,6 +81,9 @@ type model struct {
 	// restartAfter - и сразу открыть ci заново: в папке гейта уже новый ci.exe.
 	closeAfter   bool
 	restartAfter bool
+	// planOps - план колонки шагов прислан как план долгих операций (событие plan с ops): шаги закрывает
+	// событие step, узла «Вердикт» нет.
+	planOps bool
 }
 
 func newModel(baseDir, script string, extra []string) model {
@@ -244,7 +247,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		ev := msg.ev
 		switch ev.Kind {
 		case "plan":
-			m.setPlan(ev.Steps, ev.Parallel)
+			m.setPlan(ev.Steps, ev.Parallel, ev.Ops)
 			return m, m.syncOverall()
 		case "reset":
 			m.resetRun()

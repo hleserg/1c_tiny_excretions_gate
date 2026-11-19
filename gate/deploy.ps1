@@ -2638,6 +2638,8 @@ function Invoke-GitExport {
     $processingsText = 'нет'
     if ($tracked.HasProcessings) { $processingsText = 'все из справочника' }
     Write-Line ("Выгружаю из {0} в файлы: расширения {1}; обработки {2}" -f $script:TempBase, (Get-NonEmpty (@($tracked.Extensions) -join ', ') 'нет'), $processingsText) 'Cyan'
+    # Колонка шагов ci.exe: выгрузки расширений видны заранее, серыми (названия - заголовки самих операций).
+    Send-UiPlan -StepNames @(@($tracked.Extensions) | ForEach-Object { 'Выгрузить {0} из {1}' -f $_, $script:TempBase }) -Operations
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$tracked.HasProcessings
     foreach ($item in $snapshot.Missing) { Write-Line ("  в {0} нет: {1} - в git остаётся как есть" -f $script:TempBase, $item) 'Yellow' }
     # Без @(): функция возвращает массив запятой, @() завернул бы его ещё раз.
@@ -3068,6 +3070,11 @@ function Invoke-GitTypical {
         return
     }
     Write-Line ("  выгружаю типовую {0} в файлы: {1} (первый раз - надолго; на диске {2} свободно {3} ГБ)" -f $script:TempBase, $dump, $drive.Name, $freeGb)
+    # Колонка шагов ci.exe: весь путь типовой виден заранее. Названия - заголовки операций ниже; шаг, которого не
+    # было (коммит уже сделан прошлым запуском), останется «не выполнялся».
+    Send-UiPlan -Operations -StepNames @(
+        ('Выгрузить типовую {0} в файлы' -f $script:TempBase), 'Типовая: git fetch (что сейчас в GitHub)', 'Типовая: git add (файлы - в pack)',
+        'Типовая: git commit', 'Типовая: git repack (сжать объекты перед отправкой)', 'Типовая: git push (отправка в GitHub)')
     Update-TypicalDump -Dir $dump
     # Больше 50 МБ GitHub не любит (больше 100 МБ - не примет): такие файлы - мимо git, их список - в README.
     $dumpFull = [System.IO.Path]::GetFullPath($dump).TrimEnd('\', '/')

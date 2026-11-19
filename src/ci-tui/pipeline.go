@@ -50,6 +50,7 @@ func (m *model) resetRun() {
 	m.parallel = nil
 	m.sub = nil
 	m.planned = false
+	m.planOps = false
 	m.overall = newOverallBar()
 	m.verdict = ""
 	m.eta = nil
@@ -58,12 +59,28 @@ func (m *model) resetRun() {
 // setPlan - событие plan: заменяет трубу планом. Отметки, пришедшие раньше плана, сохраняются.
 // parallel - шаги, которые идут параллельно остальным (проверка конфигурации в фоне): их результат может прийти
 // раньше их места в плане и ничего не говорит о шагах перед ними.
-func (m *model) setPlan(names []string, parallel []string) {
+func (m *model) setPlan(names []string, parallel []string, ops bool) {
 	old := m.pipe
 	m.pipe = nil
 	m.parallel = map[string]bool{}
 	for _, n := range parallel {
 		m.parallel[n] = true
+	}
+	m.planOps = ops
+	if ops {
+		// План долгих операций (выгрузка в git, типовая): сделанное до него остаётся как было, со своим временем,
+		// прежние серые шаги заменяются новыми; вердикта у таких действий нет.
+		for _, n := range old {
+			if n.status != nodePending {
+				m.pipe = append(m.pipe, n)
+			}
+		}
+		for _, n := range names {
+			m.pipe = append(m.pipe, pipeNode{name: n, planned: true})
+		}
+		m.planned = true
+		m.touchActive()
+		return
 	}
 	for _, n := range names {
 		m.pipe = append(m.pipe, pipeNode{name: n, planned: true})
@@ -155,7 +172,8 @@ func (m *model) markResult(status, text string) {
 
 // addOperation - итог долгой операции (событие step) в колонку шагов, когда плана шагов у действия нет.
 func (m *model) addOperation(title, status string, elapsed float64) {
-	if m.planned || title == "" {
+	// Обычный план (прогон гейта, обновление рабочей) ведут сам план и строки [OK]/[FAIL]: событие step не в счёт.
+	if (m.planned && !m.planOps) || title == "" {
 		return
 	}
 	switch status {
@@ -168,7 +186,23 @@ func (m *model) addOperation(title, status string, elapsed float64) {
 	if elapsed > 0 {
 		started = now.Add(-time.Duration(elapsed * float64(time.Second)))
 	}
-	m.pipe = append(m.pipe, pipeNode{name: title, status: status, started: started, finished: now})
+	node := pipeNode{name: title, status: status, started: started, finished: now}
+	if m.planned {
+		// План долгих операций: серый шаг с этим названием закрывается итогом; операции не из плана встают перед
+		// первым серым.
+		if j := m.findPending(title); j >= 0 {
+			m.closeBefore(j)
+			node.name, node.planned = m.pipe[j].name, true
+			m.pipe[j] = node
+		} else if at := m.firstPending(); at >= 0 {
+			m.pipe = append(m.pipe[:at], append([]pipeNode{node}, m.pipe[at:]...)...)
+		} else {
+			m.pipe = append(m.pipe, node)
+		}
+		m.touchActive()
+		return
+	}
+	m.pipe = append(m.pipe, node)
 	m.touchActive()
 }
 
