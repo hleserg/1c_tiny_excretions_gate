@@ -114,7 +114,8 @@ function Reset-FakeState {
 function Find-Answer {
     # Ответ на вопрос скрипта: первое неиспользованное правило с тем же видом и подходящим заголовком.
     # Правило: Kind, Header (регулярное выражение), и одно из Item (номер первого пункта, подходящего
-    # под выражение), Index, Indexes, Yes, Text, Cancel.
+    # под выражение), Index, Indexes, Yes, Text, Cancel. Wait - не отвечать: вопрос с проверкой (Poll)
+    # снимет сам скрипт.
     param($Question, $Rules, $Used)
     for ($i = 0; $i -lt $Rules.Count; $i++) {
         if ($Used.Contains($i)) { continue }
@@ -123,6 +124,7 @@ function Find-Answer {
         if ($rule.ContainsKey('Header') -and ([string]$Question.header) -notmatch $rule.Header) { continue }
         [void]$Used.Add($i)
         $answer = @{}
+        if ($rule.ContainsKey('Wait')) { return @{ wait = $true } }
         if ($rule.ContainsKey('Cancel')) { $answer['cancel'] = $true }
         if ($rule.ContainsKey('Item')) {
             $items = @($Question.items)
@@ -200,6 +202,7 @@ function Invoke-Script {
             $unexpected.Add(('{0}: {1}' -f $message.kind, $message.header))
             $answer = @{ cancel = $true }
         }
+        if ($answer.ContainsKey('wait')) { continue }
         $answerFile = Join-Path $channel ('a-{0}.json' -f $message.id)
         [System.IO.File]::WriteAllText($answerFile + '.tmp', (ConvertTo-Json -InputObject $answer -Compress), $utf8)
         Move-Item -LiteralPath ($answerFile + '.tmp') -Destination $answerFile -Force
@@ -1423,6 +1426,71 @@ $tests = @(
             Check (@($r.ComLog | Where-Object { $_ -match 'TerminateSession 6$' }).Count -eq 0) 'завершён сеанс тестовой базы'
             Check (@($r.ComLog | Where-Object { $_ -match 'UpdateInfoBase erp_base .*sessionsDenied=1' }).Count -gt 0) 'блокировку начала сеансов не ставили'
             Check ((Get-Calls $r @('/UpdateDBCfg', '-Extension Адаптация', 'fake\erp_base')).Count -eq 1) 'конфигурация БД рабочей не обновлена'
+        }
+    },
+    @{
+        Name = 'deploy-sessions-warn'
+        Text = 'обновление: в рабочей сеанс, «предупредить» - блокировка сеансов с будущего времени и сообщением, выгрузки до закрытия, потом сеанс завершён и загрузка'
+        Run = {
+            param($Name)
+            $config = $deployConfig.Clone()
+            $config['DeployWarnMinutes'] = 0.1
+            $sb = New-Sandbox $Name -Config $config
+            $com = New-ComState -Sessions @(@{ id = 5; base = 'erp_base'; app = '1CV8C'; user = 'Пользователь'; host = 'pc1' }, @{ id = 6; base = 'erp_temp_test'; app = '1CV8C'; user = 'Тест'; host = 'pc2' })
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить выбранные' },
+                @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
+                $deployRiskAnswer, $deployNameAnswer,
+                @{ Kind = 'one'; Header = 'В erp_base есть сеансы'; Item = '^Предупредить пользователей' },
+                @{ Kind = 'one'; Header = 'Пользователи erp_base предупреждены'; Wait = $true })
+            Check-DeployCommon $r
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            $lock = @($r.ComLog | Where-Object { $_ -match 'UpdateInfoBase erp_base .*sessionsDenied=1' } | Select-Object -First 1)
+            Check ($lock.Count -eq 1) 'блокировку начала сеансов не ставили'
+            if ($lock.Count -eq 1) {
+                $fromSec = [int]([regex]::Match($lock[0], 'deniedFromSec=(-?\d+)').Groups[1].Value)
+                Check ($fromSec -gt 0) ("блокировка начала сеансов не с будущего времени: начало через {0} с" -f $fromSec)
+                Check ($lock[0] -match 'message=.*Сохраните работу') ("в блокировке нет предупреждения пользователям: {0}" -f $lock[0])
+            }
+            Check (@($r.Questions | Where-Object { $_ -match 'Пользователи erp_base предупреждены' }).Count -eq 1) 'не было ожидания закрытия базы'
+            Check (@($r.ComLog | Where-Object { $_ -match 'TerminateSession 5$' }).Count -eq 1) 'сеанс рабочей не завершён после предупреждения'
+            Check (@($r.ComLog | Where-Object { $_ -match 'TerminateSession 6$' }).Count -eq 0) 'завершён сеанс тестовой базы'
+            Check ((Get-Calls $r @('/LoadCfg', '-Extension Адаптация', 'fake\erp_base')).Count -eq 1) 'Адаптация не загружена в рабочую'
+            Check ((Get-Calls $r @('/UpdateDBCfg', '-Extension Адаптация', 'fake\erp_base')).Count -eq 1) 'конфигурация БД рабочей не обновлена'
+            # Выгрузки и резервная копия - до завершения сеанса (пока пользователи сохраняются), загрузка - после.
+            $text = @($r.Output) -join "`n"
+            $backupAt = $text.IndexOf('[OK]   Резервная копия Адаптация')
+            $closedAt = $text.IndexOf('Закрытие рабочей базы:')
+            $loadAt = $text.IndexOf('[OK]   Загрузить Адаптация в erp_base')
+            Check ($backupAt -ge 0 -and $closedAt -gt $backupAt) 'резервная копия не до закрытия базы'
+            Check ($closedAt -ge 0 -and $loadAt -gt $closedAt) 'загрузка в рабочую не после закрытия базы'
+            if ($null -ne $r.ComState) { Check (-not [bool]$r.ComState.bases.erp_base.sessionsDenied) 'блокировка начала сеансов осталась' }
+        }
+    },
+    @{
+        Name = 'deploy-sessions-warn-cancel'
+        Text = 'обновление: отмена во время предупреждения пользователей - в рабочую ничего не загружено, блокировки сняты'
+        Run = {
+            param($Name)
+            $config = $deployConfig.Clone()
+            $config['DeployWarnMinutes'] = 5
+            $sb = New-Sandbox $Name -Config $config
+            $com = New-ComState -Sessions @(@{ id = 5; base = 'erp_base'; app = '1CV8C'; user = 'Пользователь'; host = 'pc1' })
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить выбранные' },
+                @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
+                $deployRiskAnswer, $deployNameAnswer,
+                @{ Kind = 'one'; Header = 'В erp_base есть сеансы'; Item = '^Предупредить пользователей' },
+                @{ Kind = 'one'; Header = 'Пользователи erp_base предупреждены'; Item = '^Отмена' })
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            Check ($r.ExitCode -eq 1) ("код возврата {0}, ждали 1" -f $r.ExitCode)
+            Check ((Get-Calls $r @('/LoadCfg', 'fake\erp_base')).Count -eq 0) 'после отмены что-то загружено в рабочую'
+            Check ((Get-Calls $r @('/UpdateDBCfg', 'fake\erp_base')).Count -eq 0) 'после отмены обновляли конфигурацию БД рабочей'
+            Check (@($r.ComLog | Where-Object { $_ -match 'TerminateSession 5$' }).Count -eq 0) 'после отмены завершён сеанс пользователя'
+            if ($null -ne $r.ComState) {
+                Check (-not [bool]$r.ComState.bases.erp_base.sessionsDenied) 'после отмены осталась блокировка начала сеансов'
+                Check (-not [bool]$r.ComState.bases.erp_base.scheduledJobsDenied) 'после отмены осталась блокировка регламентных заданий'
+            }
         }
     },
     @{

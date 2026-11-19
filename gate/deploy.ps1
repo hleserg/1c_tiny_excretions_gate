@@ -457,6 +457,62 @@ function Read-BaseInfoAgain {
     throw ("база {0} пропала из списка баз кластера" -f $BaseName)
 }
 
+function Wait-ProdWarnLock {
+    # Вариант «Предупредить пользователей» в вопросе о сеансах: блокировка начала сеансов стоит с будущего
+    # времени, пользователи видят предупреждение, а deploy делает то, что рабочую не меняет (выгрузки,
+    # резервные копии, взять из temp). Загрузке и обновлению БД нужна закрытая база: здесь дождаться начала
+    # блокировки (или пока все выйдут сами), дать клиентам закрыться самим, оставшиеся сеансы завершить.
+    # Раньше времени (все вышли или «не ждать») начало блокировки переносится на сейчас - иначе в базу можно
+    # было бы войти посреди обновления.
+    $lockAt = [datetime]$script:WarnLockAt
+    $script:WarnLockAt = $null
+    # Клиенты БСП проверяют блокировку раз в минуту: после её начала - минута с запасом, чтобы закрылись сами,
+    # но не дольше самого предупреждения.
+    $graceSec = [Math]::Min(70, [Math]::Max(3, [int]($deployWarnMinutes * 60)))
+    $script:WarnLockStart = $lockAt
+    $script:WarnDeadline = $lockAt.AddSeconds($graceSec)
+    $script:WarnLink = Connect-ClusterAgent
+    $script:WarnShown = ''
+    Write-Host ''
+    Write-Host 'Закрытие рабочей базы:'
+    $header = "Пользователи {0} предупреждены: в {1} база закрывается, в {2} оставшиеся сеансы deploy завершит сам; все выйдут раньше - продолжит сразу. Или:" -f `
+        $script:ProdBase, $lockAt.ToString('HH:mm'), $script:WarnDeadline.ToString('HH:mm:ss')
+    $answer = Read-UiChoice -Header $header -Dock -Keys @('1', '2') -CancelKey '2' -Labels @(
+        'Не ждать: закрыть базу и завершить сеансы сейчас',
+        'Отмена: в рабочую ничего не загружать, блокировки снять') -Poll {
+        $list = @(Get-BaseSessions $script:WarnLink $script:ProdBase)
+        $late = ((Get-Date) -ge $script:WarnDeadline)
+        if (@($list | Where-Object { $_.IsError }).Count -gt 0) { if ($late) { return 'time' }; return '' }
+        $users = @($list | Where-Object { -not $_.IsDesigner })
+        if ($users.Count -eq 0) { return 'empty' }
+        if ($late) { return 'time' }
+        $minutesLeft = [int][Math]::Ceiling(($script:WarnLockStart - (Get-Date)).TotalMinutes)
+        $shown = "база закрыта, сеансов осталось: {0}" -f $users.Count
+        if ($minutesLeft -gt 0) { $shown = "до закрытия {0} мин, сеансов: {1}" -f $minutesLeft, $users.Count }
+        if ($shown -ne $script:WarnShown) { $script:WarnShown = $shown; Write-Host ('  ' + $shown) -ForegroundColor DarkGray }
+        return ''
+    }
+    if ($answer -eq '2') { throw ("обновление {0} отменено во время предупреждения пользователей: в рабочую ничего не загружено" -f $script:ProdBase) }
+    if ($answer -eq 'empty') { Write-Line ("  в {0} сеансов не осталось" -f $script:ProdBase) 'Green' }
+    if ($answer -eq 'time') { Write-Line ("  {0}: завершаю оставшиеся сеансы" -f (Get-Date -Format 'HH:mm')) }
+    if ((Get-Date) -lt $lockAt) {
+        try {
+            $target = Get-BaseInfo -Link $script:WarnLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+            $infoBase = $target.InfoBase
+            $infoBase.DeniedFrom = (Get-Date).AddMinutes(-30)
+            $infoBase.DeniedMessage = ("Идёт обновление расширений, база заблокирована до {0}" -f ([datetime]$script:WarnLockUntil).ToString('HH:mm'))
+            $target.Process.UpdateInfoBase($infoBase)
+            Write-Line '  блокировка начала сеансов действует с этой минуты' 'Green'
+            Write-RunLog 'Начало блокировки сеансов перенесено на сейчас'
+        }
+        catch {
+            Write-Line ("  перенести начало блокировки на сейчас не смог: {0}; жду {1}" -f $_.Exception.Message, $lockAt.ToString('HH:mm')) 'Yellow'
+            while ((Get-Date) -lt $lockAt) { Test-UiStop; Start-Sleep -Seconds 3 }
+        }
+    }
+    foreach ($line in @(Stop-BaseSessions -Link $script:WarnLink -BaseName $script:ProdBase)) { Write-Line ('  ' + $line) }
+}
+
 function Clear-ProdLocks {
     # Снимает с рабочей базы блокировку регламентных заданий и блокировку начала сеансов - обе, кто бы их
     # ни поставил (кроме чужой блокировки сеансов с другим кодом, см. KeepForeignSessionLock). Потом читает
@@ -613,6 +669,13 @@ $deniedFrom = [int](Get-Setting $cfg 'DeployDeniedFrom' 22)
 $deniedTo = [int](Get-Setting $cfg 'DeployDeniedTo' 2)
 $sessionLockHours = [int](Get-Setting $cfg 'SessionLockHours' 2)
 if ($sessionLockHours -lt 1) { $sessionLockHours = 1 }
+# Предупреждение пользователей рабочей перед обновлением: за сколько минут до начала блокировки сеансов.
+# Клиенты БСП это время показывают предупреждение и в назначенный час закрываются сами, deploy тем
+# временем делает выгрузки и резервные копии. 0 - без предупреждения.
+$deployWarnMinutes = [double](Get-Setting $cfg 'DeployWarnMinutes' 10)
+if ($deployWarnMinutes -lt 0) { $deployWarnMinutes = 0 }
+$script:WarnLockAt = $null
+$script:WarnLockUntil = $null
 $prodSelfCheckForms = [bool](Get-Setting $cfg 'ProdSelfCheckForms' $false)
 $prodSelfCheckTimeoutMin = [int](Get-Setting $cfg 'ProdSelfCheckTimeoutMin' 60)
 # Сколько ждать ответа на «оставить или откатить» после проверок на рабочей. Нет ответа - обновление
@@ -3311,7 +3374,11 @@ if ($needExclusive) {
     }
 
     function Set-ProdSessionLock {
-        param($Target)
+        # Блокировка начала сеансов рабочей. StartAt - начало в будущем (предупреждение пользователям): до него
+        # сеансы пускаются, клиенты БСП раз в минуту видят блокировку, показывают предупреждение со временем
+        # и в это время закрываются сами; оставшихся перед загрузкой завершает Wait-ProdWarnLock. Без StartAt -
+        # сразу (начало на 30 минут назад: часы сервера и этой машины могут расходиться).
+        param($Target, $StartAt = $null)
         if ($null -eq $Target) { Write-Line '  блокировку начала сеансов поставить не смог (нет входа в свойства базы): сеансы могут вернуться' 'Yellow'; return }
         $infoBase = $Target.InfoBase
         if ([bool]$infoBase.SessionsDenied) {
@@ -3321,19 +3388,36 @@ if ($needExclusive) {
                 throw ("в {0} уже стоит чужая блокировка сеансов с другим кодом: впиши его в UnlockCode или сними блокировку" -f $script:ProdBase)
             }
             Write-Line '  блокировка начала сеансов уже стоит (код тот же); в конце обновления сниму её'
+            if ($null -ne $StartAt) {
+                Write-Line '  предупреждать не буду: блокировка уже стоит; оставшиеся сеансы завершу перед загрузкой'
+                $script:WarnLockAt = Get-Date
+            }
             return
         }
         if ([string]::IsNullOrEmpty($script:UnlockCode)) { $script:UnlockCode = '123'; Write-Line '  UnlockCode пустой: код разрешения входа на этот запуск - 123' }
-        $until = (Get-Date).AddHours($sessionLockHours)
-        $infoBase.DeniedFrom = (Get-Date).AddMinutes(-30)
+        $start = Get-Date
+        if ($null -ne $StartAt) { $start = [datetime]$StartAt }
+        $until = $start.AddHours($sessionLockHours)
+        if ($null -eq $StartAt) {
+            $infoBase.DeniedFrom = (Get-Date).AddMinutes(-30)
+            $infoBase.DeniedMessage = ("Идёт обновление расширений, база заблокирована до {0}" -f $until.ToString('HH:mm'))
+        }
+        else {
+            $infoBase.DeniedFrom = $start
+            $infoBase.DeniedMessage = ("Обновление программы: в {0} база закрывается (не дольше чем до {1}). Сохраните работу и выйдите из программы до {0}." -f $start.ToString('HH:mm'), $until.ToString('HH:mm'))
+        }
         $infoBase.DeniedTo = $until
-        $infoBase.DeniedMessage = ("Идёт обновление расширений, база заблокирована до {0}" -f $until.ToString('HH:mm'))
         $infoBase.PermissionCode = $script:UnlockCode
         $infoBase.SessionsDenied = $true
         $Target.Process.UpdateInfoBase($infoBase)
         if (-not [bool](Read-BaseInfoAgain $Target $script:ProdBase).SessionsDenied) { throw 'блокировка сеансов не записалась' }
         $script:SessionLockCode = $script:UnlockCode
-        Write-Line ("  поставил блокировку начала сеансов до {0}; сниму в конце" -f $until.ToString('HH:mm')) 'Green'
+        if ($null -eq $StartAt) { Write-Line ("  поставил блокировку начала сеансов до {0}; сниму в конце" -f $until.ToString('HH:mm')) 'Green'; return }
+        $script:WarnLockAt = $start
+        $script:WarnLockUntil = $until
+        Write-Line ("  поставил блокировку начала сеансов с {0} до {1}: пользователи видят предупреждение, в {0} их программы закроются сами; сниму в конце" -f $start.ToString('HH:mm'), $until.ToString('HH:mm')) 'Green'
+        Write-Line '  пока они сохраняются - выгрузки и резервные копии; загрузка в рабочую - после закрытия'
+        Write-RunLog ("Предупреждение пользователей: блокировка начала сеансов с {0}" -f $start.ToString('HH:mm:ss'))
     }
 
     # Другие сеансы рабочей базы. Обновлению БД нужен монопольный доступ.
@@ -3346,11 +3430,19 @@ if ($needExclusive) {
         Write-Line ("  в {0} есть сеансы: {1}" -f $script:ProdBase, $others.Count) 'Yellow'
         foreach ($entry in $others) { Write-Line ('    ' + $entry.Text) 'Yellow' }
         $script:LastSessionCount = $others.Count
-        $answer = Read-UiChoice -Header ("В {0} есть сеансы: {1}. Можно дождаться, пока закончатся сами, или:" -f $script:ProdBase, $others.Count) `
-            -Keys @('1', '2', '3') -CancelKey '2' -Labels @(
+        $sessionKeys = @('1', '2', '3')
+        $sessionLabels = @(
             'Продолжить так (обновление БД может упереться в монопольную блокировку)',
             'Выйти',
-            ("Поставить блокировку начала сеансов на {0} ч, завершить сеансы и продолжить" -f $sessionLockHours)) -Poll {
+            ("Поставить блокировку начала сеансов на {0} ч, завершить сеансы и продолжить" -f $sessionLockHours))
+        $sessionDefault = ''
+        if ($deployWarnMinutes -gt 0) {
+            $sessionKeys += '4'
+            $sessionLabels += ("Предупредить пользователей и закрыть базу через {0} мин; пока они сохраняются - выгрузки и резервные копии, оставшиеся сеансы завершить перед загрузкой" -f $deployWarnMinutes)
+            $sessionDefault = '4'
+        }
+        $answer = Read-UiChoice -Header ("В {0} есть сеансы: {1}. Можно дождаться, пока закончатся сами, или:" -f $script:ProdBase, $others.Count) `
+            -Keys $sessionKeys -CancelKey '2' -DefaultKey $sessionDefault -Labels $sessionLabels -Poll {
             $now = @(Get-BaseSessions $prepLink $script:ProdBase)
             if (@($now | Where-Object { $_.IsError }).Count -gt 0) { return '' }
             if ($now.Count -eq 0) { return 'empty' }
@@ -3365,6 +3457,13 @@ if ($needExclusive) {
         if ($answer -eq '3') {
             Set-ProdSessionLock $prepTarget
             foreach ($line in @(Stop-BaseSessions -Link $prepLink -BaseName $script:ProdBase)) { Write-Line ('  ' + $line) }
+        }
+        if ($answer -eq '4') {
+            if ($null -eq $prepTarget) {
+                Write-Line '  предупредить пользователей не могу (нет входа в свойства базы): оставшиеся сеансы завершу перед загрузкой' 'Yellow'
+                $script:WarnLockAt = Get-Date
+            }
+            else { Set-ProdSessionLock $prepTarget -StartAt ((Get-Date).AddSeconds($deployWarnMinutes * 60)) }
         }
         if ($answer -eq '1') { Write-Line '  продолжаю с сеансами в базе' }
     }
@@ -3387,8 +3486,10 @@ $touched = New-Object System.Collections.Generic.List[object]
 # Внешние обработки, которые этот запуск записал в справочник рабочей или снял оттуда (для отката и deploy.json).
 $touchedProcessings = New-Object System.Collections.Generic.List[object]
 
-# Выгрузки в файлы для отчёта об изменениях и для отката «как есть». Здесь рабочая база уже заблокирована
-# нами, конфигуратору никто не мешает. Не выгрузилось - не беда: отчёт будет без разницы по объектам.
+# Выгрузки в файлы для отчёта об изменениях и для отката «как есть». Конфигуратору рабочей никто не мешает
+# (открытый закрыт выше), пользователи - нет: монопольный доступ выгрузкам и резервным копиям не нужен, поэтому
+# при предупреждении пользователей они идут, пока те сохраняются. Не выгрузилось - не беда: отчёт будет без
+# разницы по объектам.
 if ($selected.Count -gt 0) {
     Write-Host ''
     Write-Host 'Выгрузки для отчёта об изменениях:'
@@ -3470,6 +3571,9 @@ foreach ($entry in @($selected | Where-Object { $mode -ne 'asis' })) {
     Set-StatSize -Ext $entry.Name -Path $newFile
     Write-Line ("[OK]   Взять {0} из {1}: {2} с" -f $entry.Name, $script:TempBase, $result.Seconds) 'Green'
 }
+
+# Дальше рабочая меняется: при предупреждении пользователей - дождаться закрытия базы.
+if (-not $failed -and $null -ne $script:WarnLockAt) { Wait-ProdWarnLock }
 
 if (-not $failed -and $mode -ne 'asis') {
     foreach ($entry in $selected) {

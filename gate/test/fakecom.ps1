@@ -143,9 +143,13 @@ function New-FakeComProcess {
         $list = New-Object System.Collections.Generic.List[object]
         foreach ($property in $state.bases.PSObject.Properties) {
             $base = $property.Value
+            $from = $null
+            $to = $null
+            if ($base.PSObject.Properties['deniedFrom'] -and [string]$base.deniedFrom) { $from = [datetime]$base.deniedFrom }
+            if ($base.PSObject.Properties['deniedTo'] -and [string]$base.deniedTo) { $to = [datetime]$base.deniedTo }
             $list.Add([pscustomobject]@{
                     Name = $property.Name; ScheduledJobsDenied = [bool]$base.scheduledJobsDenied; SessionsDenied = [bool]$base.sessionsDenied
-                    PermissionCode = [string]$base.permissionCode; DeniedMessage = [string]$base.deniedMessage; DeniedFrom = $null; DeniedTo = $null
+                    PermissionCode = [string]$base.permissionCode; DeniedMessage = [string]$base.deniedMessage; DeniedFrom = $from; DeniedTo = $to
                 })
         }
         return , $list.ToArray()
@@ -159,8 +163,17 @@ function New-FakeComProcess {
         $base | Add-Member -NotePropertyName sessionsDenied -NotePropertyValue ([bool]$InfoBase.SessionsDenied) -Force
         $base | Add-Member -NotePropertyName permissionCode -NotePropertyValue ([string]$InfoBase.PermissionCode) -Force
         $base | Add-Member -NotePropertyName deniedMessage -NotePropertyValue ([string]$InfoBase.DeniedMessage) -Force
+        # Начало и конец блокировки сеансов: в состоянии - текстом, в журнале - начало в секундах от сейчас
+        # (больше нуля - блокировка с будущего времени, предупреждение пользователям) и сообщение.
+        $fromText = ''
+        $toText = ''
+        $fromSec = ''
+        if ($null -ne $InfoBase.DeniedFrom) { $fromText = ([datetime]$InfoBase.DeniedFrom).ToString('s'); $fromSec = [string][int](([datetime]$InfoBase.DeniedFrom) - (Get-Date)).TotalSeconds }
+        if ($null -ne $InfoBase.DeniedTo) { $toText = ([datetime]$InfoBase.DeniedTo).ToString('s') }
+        $base | Add-Member -NotePropertyName deniedFrom -NotePropertyValue $fromText -Force
+        $base | Add-Member -NotePropertyName deniedTo -NotePropertyValue $toText -Force
         Save-FakeComState $this.StateFile $state
-        Write-FakeComLog $this.StateFile ("UpdateInfoBase {0} scheduledJobsDenied={1} sessionsDenied={2}" -f $InfoBase.Name, [int][bool]$InfoBase.ScheduledJobsDenied, [int][bool]$InfoBase.SessionsDenied)
+        Write-FakeComLog $this.StateFile ("UpdateInfoBase {0} scheduledJobsDenied={1} sessionsDenied={2} deniedFromSec={3} message={4}" -f $InfoBase.Name, [int][bool]$InfoBase.ScheduledJobsDenied, [int][bool]$InfoBase.SessionsDenied, $fromSec, [string]$InfoBase.DeniedMessage)
     }
     return $process
 }
