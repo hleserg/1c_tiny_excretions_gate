@@ -2444,6 +2444,21 @@ function Get-GitChangeLines {
     return , @($lines.ToArray())
 }
 
+function Get-GitFileLines {
+    # Изменения по файлам: «~ путь» (изменён), «+ путь» (новый), «- путь» (удалён); не больше Limit строк, остальное -
+    # числом. Дополняет строки по папкам (Get-GitChangeLines): на экране видно не только сколько, но и что.
+    param($Changes, [int]$Limit = 10)
+    $lines = New-Object System.Collections.Generic.List[string]
+    $list = @($Changes | Sort-Object Path)
+    foreach ($change in @($list | Select-Object -First $Limit)) {
+        $mark = '~'
+        if ($change.Kind -eq 'add') { $mark = '+' } elseif ($change.Kind -eq 'delete') { $mark = '-' }
+        $lines.Add(('{0} {1}' -f $mark, $change.Path))
+    }
+    if ($list.Count -gt $Limit) { $lines.Add(('... и ещё файлов: {0}' -f ($list.Count - $Limit))) }
+    return , @($lines.ToArray())
+}
+
 function New-GitVerifiedCommit {
     # Коммит изменений поверх Parent и проверка: в дереве нового коммита каждый файл с тем же хешем, что на диске,
     # удалённых нет. Не сошлось - исключение, ветки не двигаются.
@@ -2666,9 +2681,12 @@ function Invoke-GitImport {
     # правками он идёт, если правки есть.
     $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes -Ignore @('processings/manifest.json')
     if ($drift.Count -gt 0) { $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes }
+    # Итог сверки - на экран и когда правок нет: иначе по выводу не понять, чем кончилась проверка.
+    if ($drift.Count -eq 0) { Write-Line ("  правок нет: {0} совпадает с коммитом {1}" -f $script:TempBase, $knownName) 'Green' }
     if ($drift.Count -gt 0) {
         Write-Line ("В {0} есть правки, которых нет в git (коммит {1}):" -f $script:TempBase, $knownName) 'Yellow'
         foreach ($line in (Get-GitChangeLines $drift)) { Write-Line ('  ' + $line) 'Yellow' }
+        foreach ($line in (Get-GitFileLines $drift)) { Write-Line ('    ' + $line) 'Yellow' }
         $driftBase = $known
         if (-not $driftBase) { $driftBase = $head.Sha }
         if ($Unattended) {
@@ -2738,6 +2756,22 @@ function Invoke-GitImport {
         return 0
     }
     $what = @($toLoad | ForEach-Object { if ($_.Kind -eq 'extension') { 'расширение ' + $_.Name } else { 'обработка ' + $_.Name } }) -join ', '
+    # Что изменит загрузка - на экран до вопроса: файлы main против того, что в temp сейчас. Вопрос после ответа с
+    # экрана уходит, а по выводу должно быть видно, что и почему грузилось.
+    $incoming = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in $toLoad) {
+        foreach ($path in @($headFiles.Keys)) {
+            if (-not ([string]$path).StartsWith($entry.Prefix, [System.StringComparison]::Ordinal)) { continue }
+            if (-not $localShas.ContainsKey($path)) { $incoming.Add([pscustomobject]@{ Path = [string]$path; Kind = 'add' }) }
+            elseif ([string]$localShas[$path] -ne [string]$headFiles[$path]) { $incoming.Add([pscustomobject]@{ Path = [string]$path; Kind = 'change' }) }
+        }
+        foreach ($path in @($localShas.Keys)) {
+            if (([string]$path).StartsWith($entry.Prefix, [System.StringComparison]::Ordinal) -and -not $headFiles.ContainsKey($path)) { $incoming.Add([pscustomobject]@{ Path = [string]$path; Kind = 'delete' }) }
+        }
+    }
+    Write-Line ("Загрузка изменит в {0} ({1}, коммит {2}, против того, что в базе сейчас):" -f $script:TempBase, $Setup.Branch, (Get-GitShort $head.Sha)) 'Cyan'
+    foreach ($line in (Get-GitChangeLines $incoming)) { Write-Line ('  ' + $line) }
+    foreach ($line in (Get-GitFileLines $incoming)) { Write-Line ('    ' + $line) }
     if ($Unattended) { Write-Line ("Загружаю в {0} из {1} (коммит {2}): {3}" -f $script:TempBase, $Setup.Branch, (Get-GitShort $head.Sha), $what) 'Cyan' }
     else {
         $answer = Confirm-Ui -Question ("Загрузить в {0} из {1} (коммит {2}): {3} - прогоном гейта?" -f $script:TempBase, $Setup.Branch, (Get-GitShort $head.Sha), $what) -Yes 'Загрузить' -No 'Отмена'
