@@ -4204,6 +4204,8 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         $picked = Select-UiOne -Header ("Гейт расширений: {0} на {1}" -f $script:Base, $script:Server) -Items @($menu | ForEach-Object { $_.Label }) -Notes $notes
         if ($picked -lt 0) { $choice = 'exit' } else { $choice = $menu[$picked].Key }
         if ($choice -eq 'exit') { Write-Host 'Выход.'; exit 0 }
+        # Экран ci.exe - с чистого листа: шаги и вердикт прошлого действия не должны висеть над следующим.
+        Send-UiReset
         if ($choice -eq 'deploy') {
             if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') }
             exit $LASTEXITCODE
