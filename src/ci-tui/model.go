@@ -56,6 +56,7 @@ type model struct {
 	lines     []string
 	steps     []step
 	pipe      []pipeNode
+	parallel  map[string]bool // шаги плана, которые идут параллельно остальным (событие plan)
 	planned   bool
 	overall   progress.Model
 	barTitle  string
@@ -236,7 +237,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		ev := msg.ev
 		switch ev.Kind {
 		case "plan":
-			m.setPlan(ev.Steps)
+			m.setPlan(ev.Steps, ev.Parallel)
 			return m, m.syncOverall()
 		case "subplan":
 			m.setSubPlan(ev)

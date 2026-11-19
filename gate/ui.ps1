@@ -35,20 +35,24 @@ function Send-UiEvent {
 }
 
 function Send-UiPlan {
-    # План прогона для ci.exe: имена шагов в том порядке, в каком они пойдут. ci.exe рисует их серым
-    # и отмечает по строкам [OK]/[WARN]/[FAIL]/[SKIP]. Без ci.exe ничего не делает.
-    param([string[]]$StepNames)
+    # План прогона для ci.exe: шаги по порядку. Parallel - шаги, которые идут параллельно остальным (проверка
+    # конфигурации в фоне): их итог может прийти раньше их места в плане, и шаги перед ними при этом не пропущены.
+    param([string[]]$StepNames, [string[]]$Parallel = @())
     if (-not $script:UiChannelDir) { return }
-    Send-UiEvent @{ kind = 'plan'; steps = @($StepNames) }
+    Send-UiEvent @{ kind = 'plan'; steps = @($StepNames); parallel = @($Parallel | Where-Object { $_ }) }
 }
 
 function Send-UiSubPlan {
     # Шаги внутри длинного шага (самопроверка): ci.exe рисует их вторым трубопроводом рядом с первым.
     # Blocks - строки «сделано/всего/ОК/ошибок/внимание/пропусков|имя» (заголовок части журнала, @@block).
+    # Known - что из ошибок, предупреждений и пропусков шага уже есть в эталоне: «имя шага -> три числа».
+    # ci.exe красит шаг только по новому, известное показывает отдельно - как это посчитает вердикт.
     # Шлётся только когда что-то поменялось. Без ci.exe ничего не делает.
-    param([string]$Title, [string]$Current, [string]$Task, [string[]]$Blocks)
+    param([string]$Title, [string]$Current, [string]$Task, [string[]]$Blocks, $Known = $null)
     if (-not $script:UiChannelDir) { return }
-    $signature = $Title + '#' + $Current + '#' + $Task + '#' + ($Blocks -join ';')
+    $knownText = ''
+    if ($null -ne $Known) { $knownText = (@($Known.Keys | Sort-Object | ForEach-Object { '{0}={1}' -f $_, (@($Known[$_]) -join '/') }) -join ';') }
+    $signature = $Title + '#' + $Current + '#' + $Task + '#' + ($Blocks -join ';') + '#' + $knownText
     if ($signature -eq $script:UiSubPlanSent) { return }
     $script:UiSubPlanSent = $signature
     $list = New-Object System.Collections.Generic.List[object]
@@ -57,10 +61,15 @@ function Send-UiSubPlan {
         if ($bar -lt 0) { continue }
         $numbers = @($line.Substring(0, $bar) -split '/' | ForEach-Object { $value = 0; [void][int]::TryParse($_, [ref]$value); $value })
         while ($numbers.Count -lt 6) { $numbers += 0 }
-        $list.Add(@{ name = $line.Substring($bar + 1); done = $numbers[0]; total = $numbers[1]; ok = $numbers[2]; err = $numbers[3]; warn = $numbers[4]; skip = $numbers[5] })
+        $name = $line.Substring($bar + 1)
+        $knownNumbers = @(0, 0, 0)
+        if ($null -ne $Known -and $Known.ContainsKey($name)) { $knownNumbers = @($Known[$name]) }
+        $list.Add(@{ name = $name; done = $numbers[0]; total = $numbers[1]; ok = $numbers[2]; err = $numbers[3]; warn = $numbers[4]; skip = $numbers[5]
+                knownErr = [int]$knownNumbers[0]; knownWarn = [int]$knownNumbers[1]; knownSkip = [int]$knownNumbers[2] })
     }
     Send-UiEvent @{ kind = 'subplan'; title = $Title; current = $Current; text = $Task; blocks = @($list.ToArray()) }
 }
+
 
 function Get-UiField {
     # Поле ответа ci.exe; если его нет - значение по умолчанию (StrictMode не даёт читать отсутствующее).

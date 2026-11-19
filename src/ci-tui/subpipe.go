@@ -20,6 +20,28 @@ type subBlock struct {
 	Err   int    `json:"err"`
 	Warn  int    `json:"warn"`
 	Skip  int    `json:"skip"`
+	// Из них уже в эталоне (известные): гейт сверяет записи с эталоном по тексту, как в вердикте.
+	KnownErr  int `json:"knownErr"`
+	KnownWarn int `json:"knownWarn"`
+	KnownSkip int `json:"knownSkip"`
+}
+
+func knownPart(all, known int) int {
+	if known < 0 {
+		return 0
+	}
+	if known > all {
+		return all
+	}
+	return known
+}
+
+// Новое относительно эталона: по нему красится шаг - так экран показывает то же, что скажет вердикт.
+func (b subBlock) newErr() int  { return b.Err - knownPart(b.Err, b.KnownErr) }
+func (b subBlock) newWarn() int { return b.Warn - knownPart(b.Warn, b.KnownWarn) }
+func (b subBlock) newSkip() int { return b.Skip - knownPart(b.Skip, b.KnownSkip) }
+func (b subBlock) known() int {
+	return knownPart(b.Err, b.KnownErr) + knownPart(b.Warn, b.KnownWarn) + knownPart(b.Skip, b.KnownSkip)
 }
 
 type subState struct {
@@ -53,9 +75,9 @@ func blockIcon(b subBlock, active bool, frame int) string {
 	case active:
 		c := pulseColors[(frame/2)%len(pulseColors)]
 		return lipgloss.NewStyle().Foreground(c).Bold(true).Render("●")
-	case b.Err > 0:
+	case b.newErr() > 0:
 		return styleBadBold.Render("×")
-	case b.Warn > 0:
+	case b.newWarn() > 0:
 		return styleWarnBold.Render("!")
 	case b.Total > 0 && b.Done >= b.Total:
 		return styleOkBold.Render("√")
@@ -83,9 +105,9 @@ func miniBar(done, total, width int, st lipgloss.Style) string {
 
 func blockStyle(b subBlock) lipgloss.Style {
 	switch {
-	case b.Err > 0:
+	case b.newErr() > 0:
 		return styleBad
-	case b.Warn > 0:
+	case b.newWarn() > 0:
 		return styleWarn
 	case b.Total > 0 && b.Done >= b.Total:
 		return styleOk
@@ -99,14 +121,17 @@ func blockCounters(b subBlock) string {
 	if b.Ok > 0 {
 		parts = append(parts, styleOk.Render(fmt.Sprintf("ок %d", b.Ok)))
 	}
-	if b.Err > 0 {
-		parts = append(parts, styleBadBold.Render(fmt.Sprintf("ошиб %d", b.Err)))
+	if n := b.newErr(); n > 0 {
+		parts = append(parts, styleBadBold.Render(fmt.Sprintf("ошиб %d", n)))
 	}
-	if b.Warn > 0 {
-		parts = append(parts, styleWarn.Render(fmt.Sprintf("вним %d", b.Warn)))
+	if n := b.newWarn(); n > 0 {
+		parts = append(parts, styleWarn.Render(fmt.Sprintf("вним %d", n)))
 	}
-	if b.Skip > 0 {
-		parts = append(parts, styleDim.Render(fmt.Sprintf("проп %d", b.Skip)))
+	if n := b.newSkip(); n > 0 {
+		parts = append(parts, styleDim.Render(fmt.Sprintf("проп %d", n)))
+	}
+	if n := b.known(); n > 0 {
+		parts = append(parts, styleDim.Render(fmt.Sprintf("изв %d", n)))
 	}
 	return strings.Join(parts, " ")
 }
@@ -117,13 +142,14 @@ func (m model) viewSub(width, height int) string {
 	var lines []string
 	head := styleSection.Render("Внутри: ")
 	lines = append(lines, strings.Split(hang(head, s.title, width, styleText), "\n")...)
-	done, total, ok, errs, warn := 0, 0, 0, 0, 0
+	done, total, ok, errs, warn, known := 0, 0, 0, 0, 0, 0
 	for _, b := range s.blocks {
 		done += b.Done
 		total += b.Total
 		ok += b.Ok
-		errs += b.Err
-		warn += b.Warn
+		errs += b.newErr()
+		warn += b.newWarn()
+		known += b.known()
 	}
 	pct := 0
 	if total > 0 {
@@ -137,6 +163,9 @@ func (m model) viewSub(width, height int) string {
 	}
 	if warn > 0 {
 		tot += "  " + styleWarnBold.Render(fmt.Sprintf("внимание %d", warn))
+	}
+	if known > 0 {
+		tot += "  " + styleDim.Render(fmt.Sprintf("известных %d", known))
 	}
 	lines = append(lines, tot)
 	if s.task != "" {

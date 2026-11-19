@@ -42,9 +42,15 @@ func isPseudoStep(name string) bool {
 }
 
 // setPlan - событие plan: заменяет трубу планом. Отметки, пришедшие раньше плана, сохраняются.
-func (m *model) setPlan(names []string) {
+// parallel - шаги, которые идут параллельно остальным (проверка конфигурации в фоне): их результат может прийти
+// раньше их места в плане и ничего не говорит о шагах перед ними.
+func (m *model) setPlan(names []string, parallel []string) {
 	old := m.pipe
 	m.pipe = nil
+	m.parallel = map[string]bool{}
+	for _, n := range parallel {
+		m.parallel[n] = true
+	}
 	for _, n := range names {
 		m.pipe = append(m.pipe, pipeNode{name: n, planned: true})
 	}
@@ -108,7 +114,11 @@ func (m *model) markResult(status, text string) {
 		m.touchActive()
 		return
 	}
-	m.closeBefore(j)
+	// Параллельный шаг закончился раньше своего места в плане: шаги перед ним ещё идут, закрывать их нельзя
+	// (иначе текущий шаг становится «не выполнялся», а активным - «Вердикт»).
+	if !m.parallel[m.pipe[j].name] {
+		m.closeBefore(j)
+	}
 	generic := !samePrefix(text, m.pipe[j].name) // «Канареечный вход» на весь план «Канареечный вход: …»
 	for i := j; i < len(m.pipe); i++ {
 		if (i > j && m.pipe[i].status != nodePending) || m.pipe[i].name == verdictNode {
@@ -129,11 +139,16 @@ func (m *model) markResult(status, text string) {
 	m.touchActive()
 }
 
-// markProgress - движок начал шаг с таким заголовком: всё серое до него закрывается.
+// markProgress - движок начал шаг с таким заголовком: всё серое до него закрывается. Шаг, уже посчитанный
+// невыполненным (результат более позднего шага пришёл раньше), открывается снова: он и есть текущий.
 func (m *model) markProgress(title string) {
 	j := m.findPending(title)
 	if j < 0 {
 		return
+	}
+	if m.pipe[j].status == nodeNotRun {
+		m.pipe[j].status = nodePending
+		m.pipe[j].finished = time.Time{}
 	}
 	m.closeBefore(j)
 	m.touchActive()
