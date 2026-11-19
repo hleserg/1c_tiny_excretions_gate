@@ -804,7 +804,7 @@ $tests = @(
     },
     @{
         Name = 'gate-selfcheck-known-tiles'
-        Text = 'экран хода самопроверки: предупреждение, которое уже есть в эталоне, уходит в «известные» своего шага (сверка по тексту), новая ошибка - нет; параллельная проверка конфигурации названа в плане'
+        Text = 'экран хода самопроверки: предупреждение, которое уже есть в эталоне, уходит в «известные» своего шага (сверка по тексту), новая ошибка - нет; параллельная проверка конфигурации названа в плане; сеансам «до» и «после» переданы свои заголовок и пояснение экрана'
         Run = {
             param($Name)
             $sb = New-Sandbox $Name
@@ -850,6 +850,11 @@ $tests = @(
             # Обработке - то же файлом known.txt в папке сеанса «после»; читать его просит часть tiles=1 параметра запуска.
             $tilesCalls = Get-Calls $r @('ENTERPRISE', 'selfcheck', 'tiles=1')
             Check ($tilesCalls.Count -ge 1) 'обработку не попросили читать known.txt (tiles=1)'
+            # Шапка экрана в окне 1С: гейт называет сеанс и зачем он (caption=, why=) - «до» и «после» по-разному.
+            $captionBefore = Get-Calls $r @('ENTERPRISE', 'selfcheck', 'caption=Самопроверка до загрузки комплекта;why=Комплект ещё не загружен')
+            Check ($captionBefore.Count -ge 1) 'сеансу «до» не переданы заголовок и пояснение экрана (caption=, why=)'
+            $captionAfter = Get-Calls $r @('ENTERPRISE', 'selfcheck', 'caption=Самопроверка после загрузки комплекта;why=Комплект загружен')
+            Check ($captionAfter.Count -ge 1) 'сеансу «после» не переданы заголовок и пояснение экрана (caption=, why=)'
             $knownFiles = @(Get-ChildItem -LiteralPath $r.RunDir -Recurse -Filter 'known.txt' -File | Where-Object { ([System.IO.File]::ReadAllText($_.FullName, $utf8)).Contains('0/1/0|Метаданные и права') })
             Check ($knownFiles.Count -ge 1) 'в known.txt нет строки «0/1/0|Метаданные и права»'
         }

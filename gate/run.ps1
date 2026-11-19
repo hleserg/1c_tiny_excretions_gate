@@ -4870,6 +4870,33 @@ function Save-SelfCheckLastState {
     }
 }
 
+function Get-SelfCheckScreenText {
+    # Шапка экрана хода в окне 1С: что это за сеанс самопроверки и зачем он запущен - по имени шага прогона.
+    # Обработка сама этого не знает: у неё один заголовок на все случаи. Caption - заголовок, Why - пояснение
+    # под ним. В тексте не бывает «;» и кавычек: по «;» делится параметр запуска, кавычки его закрывают.
+    param([string]$Title, [int]$StartFrom)
+    $caption = $Title
+    $why = ''
+    if ($StartFrom -ge 999999) {
+        $why = 'Заданий нет: гейт читает только сведения о базе - та ли она, что была в прерванном прогоне'
+    }
+    elseif ($Title -eq 'Самопроверка до загрузки') {
+        $caption = 'Самопроверка до загрузки комплекта'
+        $why = 'Комплект ещё не загружен: снимаю состояние базы как есть - с ним сравнится самопроверка после загрузки'
+    }
+    elseif ($Title -eq 'Самопроверка после загрузки') {
+        $caption = 'Самопроверка после загрузки комплекта'
+        $why = 'Комплект загружен: проверяю базу с ним - новое относительно эталона попадёт в вердикт'
+    }
+    elseif ($Title -eq 'Самопроверка') {
+        $caption = 'Самопроверка базы как есть'
+        $why = 'Комплекта нет: проверяю базу в нынешнем состоянии - новое относительно эталона попадёт в вердикт'
+    }
+    if ($StartFrom -gt 0 -and $StartFrom -lt 999999 -and $why) { $why += (', продолжение с задания {0}' -f ($StartFrom + 1)) }
+    $clean = { param([string]$Text) ([regex]::Replace($Text, '[;"\r\n]', ' ')).Trim() }
+    return [pscustomobject]@{ Caption = (& $clean $caption); Why = (& $clean $why) }
+}
+
 function Invoke-SelfCheckSession {
     # Один сеанс обработки «Выполнить после обновления» в режиме автозапуска.
     # Чем кончился: result - обработка записала итог; exited - клиент закрылся без итога;
@@ -4897,6 +4924,10 @@ function Invoke-SelfCheckSession {
         try { [System.IO.File]::WriteAllText($knownFile, '', $Utf8Bom); $knownState.Written = ''; $launch.Add('tiles=1') } catch { }
     }
     if ($StartFrom -gt 0) { $launch.Add(("start={0}" -f $StartFrom)) }
+    # Шапка экрана в окне 1С: что за сеанс и зачем (части caption= и why=; обработка, которая их не знает, пропускает).
+    $screenText = Get-SelfCheckScreenText -Title $Title -StartFrom $StartFrom
+    if ($screenText.Caption) { $launch.Add(("caption={0}" -f $screenText.Caption)) }
+    if ($screenText.Why) { $launch.Add(("why={0}" -f $screenText.Why)) }
     # Шаг «Обмены»: режим, лимиты очереди узла и набор объектов прогона «до» (тот же набор для «после»).
     if ($exchangeMode -eq 'Light') { $launch.Add('exchmode=light') }
     $launch.Add(("exchq={0}/{1}" -f $exchangeQueuePerType, $exchangeQueueTotal))
