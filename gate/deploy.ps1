@@ -3064,13 +3064,27 @@ function Invoke-GitTypical {
     $title = '{0} ({1}) {2}' -f $info.Synonym, $info.Name, $info.Version
     if (-not $state['version'] -and $state['commit']) {
         # Коммит есть, а версии при нём нет: до 20.11.2026 версия могла прочитаться пустой (свойства COM 1С), выгрузка
-        # и коммит при этом прошли. Дописываю прочитанную версию к тому коммиту, выгрузку не повторяю.
-        $state['name'] = $info.Name
-        $state['version'] = $info.Version
-        $state['time'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-        [System.IO.File]::WriteAllText($statePath, (ConvertTo-Json -InputObject $state), $Utf8Bom)
-        Write-Line ("  типовая {0}: в {1} коммит {2} записан без версии - дописал версию {3}, выгружать нечего." -f $title, $repo, (Get-GitShort $state['commit']), $info.Version) 'Green'
-        return
+        # и коммит при этом прошли. Версию того коммита - из его Configuration.xml (repo.git цел, даже если выгрузку
+        # удалили): та же, что в temp, - дописываю её, выгрузку не повторяю. Другая или не прочиталась (temp могли
+        # обновить после того запуска) - обычный путь: вопрос и выгрузка.
+        $committed = ''
+        $gitDir = Join-Path $typicalRoot 'repo.git'
+        if (Test-Path -LiteralPath (Join-Path $gitDir 'HEAD')) {
+            $git = Get-PortableGit -ToolsDir (Resolve-RootPath 'tools') -Exe ([string](Get-Setting $cfg 'GitExe' ''))
+            $show = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $typicalRoot -Arguments @('show', ($state['commit'] + ':Configuration.xml')) -AllowFail
+            if ($show.ExitCode -eq 0 -and $show.Output -match '<Version>([^<]*)</Version>') { $committed = $Matches[1].Trim() }
+        }
+        if ($committed -and $committed -eq $info.Version) {
+            $state['name'] = $info.Name
+            $state['version'] = $info.Version
+            $state['time'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            [System.IO.File]::WriteAllText($statePath, (ConvertTo-Json -InputObject $state), $Utf8Bom)
+            Write-Line ("  типовая {0}: в {1} коммит {2} записан без версии, в нём та же версия - дописал её, выгружать нечего." -f $title, $repo, (Get-GitShort $state['commit'])) 'Green'
+            return
+        }
+        $seen = $committed
+        if (-not $seen) { $seen = 'не прочитал' }
+        Write-Line ("  в {0} коммит {1} записан без версии; версия в нём - {2}, в {3} - {4}: выгружаю как новую." -f $repo, (Get-GitShort $state['commit']), $seen, $script:TempBase, $info.Version) 'Yellow'
     }
     if ($state['version'] -eq $info.Version -and $state['commit']) {
         Write-Line ("  типовая {0} уже в {1} (коммит {2}): выгружать нечего." -f $title, $repo, (Get-GitShort $state['commit'])) 'Green'
