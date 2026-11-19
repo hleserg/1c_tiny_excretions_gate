@@ -533,6 +533,30 @@ func selfcheckRun(s selfcheck, dir, known string, start int) {
 			}
 		}
 	}
+	// Шаги - как в настоящей обработке: в заголовке каждой части строка @@block на каждый шаг (а не только на
+	// текущий) со счётом по уже выполненным заданиям: сделано/всего/ОК/ошибок/внимание/пропусков|имя.
+	type stepBlock struct {
+		name                                string
+		done, total, ok, errs, warns, skips int
+	}
+	blocks := []*stepBlock{}
+	blockOf := map[string]*stepBlock{}
+	for _, t := range tasks {
+		b := blockOf[t.Step]
+		if b == nil {
+			b = &stepBlock{name: t.Step}
+			blockOf[t.Step] = b
+			blocks = append(blocks, b)
+		}
+		b.total++
+	}
+	blockLines := func() string {
+		out := ""
+		for _, b := range blocks {
+			out += fmt.Sprintf("@@block=%d/%d/%d/%d/%d/%d|%s\n", b.done, b.total, b.ok, b.errs, b.warns, b.skips, b.name)
+		}
+		return out
+	}
 	pieces := 0
 	previous := []string{"[ИНФО] Самопроверка (подставная 1С)"}
 	var previousSnaps map[string]string
@@ -541,9 +565,23 @@ func selfcheckRun(s selfcheck, dir, known string, start int) {
 			return
 		}
 		pieces++
-		head := fmt.Sprintf("@@n=%d\n@@total=%d\n@@key=%s\n@@title=%s\n@@step=%s\n@@block=%d/%d/0/0/0/0|%s\n@@journal\n", n, len(tasks), t.Key, t.Title, t.Step, n, len(tasks), t.Step)
+		head := fmt.Sprintf("@@n=%d\n@@total=%d\n@@key=%s\n@@title=%s\n@@step=%s\n", n, len(tasks), t.Key, t.Title, t.Step) + blockLines() + "@@journal\n"
 		writeUTF8(fmt.Sprintf("%sp%06d.txt", dir, pieces), head+journal(previous)+snaps(previousSnaps))
 		count(t.Lines)
+		b := blockOf[t.Step]
+		b.done++
+		for _, l := range t.Lines {
+			switch {
+			case strings.HasPrefix(l, "[ОК]"):
+				b.ok++
+			case strings.HasPrefix(l, "[ОШИБКА]"):
+				b.errs++
+			case strings.HasPrefix(l, "[ВНИМАНИЕ]"):
+				b.warns++
+			case strings.HasPrefix(l, "[ПРОПУСК]"):
+				b.skips++
+			}
+		}
 		previous = t.Lines
 		previousSnaps = t.Snapshots
 		if s.Sleep > 0 {

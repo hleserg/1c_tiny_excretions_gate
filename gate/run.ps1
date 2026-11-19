@@ -761,6 +761,71 @@ function ConvertTo-SelfCheckRecords {
     return $records.ToArray()
 }
 
+function Read-SelfCheckKnown {
+    # Записи эталона самопроверки множеством - для экрана хода: какие ошибки, предупреждения и пропуски уже
+    # известны. Приводятся так же, как в Compare-SelfCheck. Эталона нет - $null.
+    param([string]$ReferenceFile)
+    if (-not $ReferenceFile -or -not (Test-Path -LiteralPath $ReferenceFile)) { return $null }
+    $known = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($line in [System.IO.File]::ReadAllLines($ReferenceFile, [System.Text.Encoding]::UTF8)) {
+        if ($null -ne $line) { [void]$known.Add((Format-SelfCheckText $line.TrimStart([char]0xFEFF))) }
+    }
+    return , $known
+}
+
+function Add-SelfCheckKnownCounts {
+    # Экран хода самопроверки: сколько ошибок, предупреждений и пропусков каждого шага уже есть в эталоне.
+    # Сверка - по тексту записи, как в вердикте (Compare-SelfCheck), а не по числу: новая ошибка на месте
+    # прежней должна остаться красной. State: Known - множество эталона, ByStep - «шаг -> три числа»,
+    # Pieces - сколько частей журнала уже разобрано, Key и Step - задание, которое объявила последняя из них.
+    # Строки части относятся к заданию, объявленному предыдущей частью. Последняя часть берётся, когда ей больше
+    # двух секунд (или итог уже записан): её могут ещё дописывать.
+    param($State, [object[]]$Files, [bool]$Finished)
+    if ($null -eq $State -or $null -eq $State.Known) { return }
+    while ($State.Pieces -lt $Files.Count) {
+        $file = $Files[$State.Pieces]
+        $isLast = ($State.Pieces -eq $Files.Count - 1)
+        if ($isLast -and -not $Finished -and ((Get-Date) - $file.LastWriteTime).TotalSeconds -lt 2) { break }
+        $piece = $null
+        try { $piece = Read-SelfCheckPiece $file.FullName } catch { break }
+        if (-not $piece.Complete) { break }
+        foreach ($record in @(ConvertTo-SelfCheckRecords -Key $State.Key -Lines $piece.Body)) {
+            $slot = -1
+            if ($record.StartsWith('[ОШИБКА]', [System.StringComparison]::Ordinal)) { $slot = 0 }
+            elseif ($record.StartsWith('[ВНИМАНИЕ]', [System.StringComparison]::Ordinal)) { $slot = 1 }
+            elseif ($record.StartsWith('[ПРОПУСК]', [System.StringComparison]::Ordinal)) { $slot = 2 }
+            if ($slot -lt 0 -or -not $State.Known.Contains((Format-SelfCheckText $record))) { continue }
+            if (-not $State.ByStep.ContainsKey($State.Step)) { $State.ByStep[$State.Step] = @(0, 0, 0) }
+            $State.ByStep[$State.Step][$slot]++
+        }
+        if ($piece.Header.ContainsKey('key')) {
+            $State.Key = [string]$piece.Header['key']
+            $State.Step = [string](Get-Setting $piece.Header 'step' '')
+        }
+        else { $State.Key = '(конец)'; $State.Step = '' }
+        $State.Pieces++
+    }
+}
+
+
+function Write-SelfCheckKnownFile {
+    # Известное по шагам - обработке самопроверки: её экран в окне 1С красит карточку шага только по новому.
+    # Файл known.txt в папке сеанса, строка на шаг: «ошибок/внимание/пропусков|имя шага». Пишется, когда
+    # изменился, через временный файл: обработка читает его в начале каждого задания. Не записался
+    # (обработка как раз читает) - запишется в следующий раз.
+    param($State, [string]$Path)
+    if ($null -eq $State -or $null -eq $State.Known) { return }
+    $text = (@($State.ByStep.Keys | Sort-Object | ForEach-Object { '{0}|{1}' -f (@($State.ByStep[$_]) -join '/'), $_ }) -join "`r`n")
+    if ($text -ceq [string]$State.Written) { return }
+    try {
+        [System.IO.File]::WriteAllText(($Path + '.tmp'), ($text + "`r`n"), $Utf8Bom)
+        Move-Item -LiteralPath ($Path + '.tmp') -Destination $Path -Force
+        $State.Written = $text
+    }
+    catch { }
+}
+
+
 function Compare-SelfCheck {
     # Сравнивает записи самопроверки с эталоном. Новое - то, чего в эталоне нет.
     param([string[]]$Current, [string]$ReferenceFile)
@@ -4823,6 +4888,14 @@ function Invoke-SelfCheckSession {
     if ($selfCheckSkipDocs) { $launch.Add(("skip={0}" -f $selfCheckSkipDocs)) }
     if ($selfCheckNotOlder) { $launch.Add(("notolder={0}" -f $selfCheckNotOlder)) }
     if ($Known) { $launch.Add(("known={0}" -f $Known)) }
+    # Что из найденного уже в эталоне - для экранов хода: шаг красится только по новому (Add-SelfCheckKnownCounts).
+    # ci.exe получает это событием subplan, обработка (её экран в окне 1С) - файлом known.txt: читать его просит
+    # часть tiles=1; обработка, которая этой части не знает, её пропускает.
+    $knownState = @{ Known = (Read-SelfCheckKnown $selfCheckReferenceFile); ByStep = @{}; Pieces = 0; Key = '(начало)'; Step = ''; Written = $null }
+    $knownFile = Join-Path $OutDir 'known.txt'
+    if ($null -ne $knownState.Known) {
+        try { [System.IO.File]::WriteAllText($knownFile, '', $Utf8Bom); $knownState.Written = ''; $launch.Add('tiles=1') } catch { }
+    }
     if ($StartFrom -gt 0) { $launch.Add(("start={0}" -f $StartFrom)) }
     # Шаг «Обмены»: режим, лимиты очереди узла и набор объектов прогона «до» (тот же набор для «после»).
     if ($exchangeMode -eq 'Light') { $launch.Add('exchmode=light') }
@@ -4884,7 +4957,8 @@ function Invoke-SelfCheckSession {
                     $progress = "задание {0} из {1}: {2}" -f ($done + 1), $total, $lastPiece.Header['title']
                 }
                 if ($lastPiece.Blocks.Count -gt 0) {
-                    Send-UiSubPlan -Title $Title -Current ([string]$lastPiece.Header['step']) -Task ([string]$lastPiece.Header['title']) -Blocks $lastPiece.Blocks
+                    try { Add-SelfCheckKnownCounts -State $knownState -Files $files -Finished $false; Write-SelfCheckKnownFile -State $knownState -Path $knownFile } catch { }
+                    Send-UiSubPlan -Title $Title -Current ([string]$lastPiece.Header['step']) -Task ([string]$lastPiece.Header['title']) -Blocks $lastPiece.Blocks -Known $knownState.ByStep
                 }
             }
             catch { }
@@ -6018,12 +6092,18 @@ if (-not $processingOnly -and ($runSelfCheck -or $SkipSelfCheck)) {
     if ($runCoverage -and -not $SkipSelfCheck) { $planSteps.Add('Карта покрытия') }
 }
 if ($runUnitTests -and -not $processingOnly) { $planSteps.Add('Модульные тесты') }
-# Параллельная проверка конфигурации кончается последней - перед вердиктом.
+# Параллельная проверка конфигурации кончается последней - перед вердиктом. Её итог может появиться и раньше
+# (шагу понадобился конфигуратор - гейт её дождался): экрану она названа параллельной, чтобы ранний итог
+# не закрывал шаги, которые ещё идут.
+$planParallel = @()
 if ($parallelCheckConfig -and -not $processingOnly -and -not $SkipChecks) {
-    foreach ($planKey in @(@($checkOnly | ForEach-Object { [string]$_ }) + @('all') | Select-Object -First 1)) { $planSteps.Add(("Проверка конфигурации ({0})" -f $planKey)) }
+    foreach ($planKey in @(@($checkOnly | ForEach-Object { [string]$_ }) + @('all') | Select-Object -First 1)) {
+        $planSteps.Add(("Проверка конфигурации ({0})" -f $planKey))
+        $planParallel += ("Проверка конфигурации ({0})" -f $planKey)
+    }
 }
 foreach ($planName in $planSteps) { $script:RunPlanExpected[$planName] = [double](Get-ExpectedStepSeconds $planName) }
-Send-UiPlan -StepNames $planSteps.ToArray()
+Send-UiPlan -StepNames $planSteps.ToArray() -Parallel $planParallel
 
 # 0. Подготовка базы. Блокировка регламентных заданий ставится всегда и остаётся: у копии рабочей базы
 # рабочее расписание (закрытие месяца ночью, обмены), и фоновое задание срывает обновление БД.

@@ -803,6 +803,58 @@ $tests = @(
         }
     },
     @{
+        Name = 'gate-selfcheck-known-tiles'
+        Text = 'экран хода самопроверки: предупреждение, которое уже есть в эталоне, уходит в «известные» своего шага (сверка по тексту), новая ошибка - нет; параллельная проверка конфигурации названа в плане'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            # Задания идут с паузой: гейт смотрит части журнала раз в три секунды и должен успеть их разобрать.
+            $tasks = {
+                param([string[]]$RightsLines)
+                return @(
+                    @{ key = 'Окружение'; title = 'Окружение и расширения'; step = 'Окружение'; lines = @('[ОК] Обработка запущена под полными правами') },
+                    @{ key = 'Права'; title = 'Метаданные и права'; step = 'Метаданные и права'; lines = $RightsLines },
+                    @{ key = 'Узлы'; title = 'Узлы обмена'; step = 'Узлы обмена'; lines = @('[ОК] Узлы опознаны') },
+                    @{ key = 'Настройки'; title = 'Регистр настроек'; step = 'Регистр настроек'; lines = @('[ОК] Настройки читаются') },
+                    @{ key = 'Конец'; title = 'Блокировки'; step = 'Блокировки'; lines = @('[ОК] Блокировки проверены') }
+                )
+            }
+            $knownLine = '[ВНИМАНИЕ] Роль подрядчика без права чтения: 3 объекта'
+            $fake = @{ selfcheck = @(
+                    @{ tasks = (& $tasks @('[ОК] Права проверены', $knownLine)); sleep = 3 },
+                    @{ tasks = (& $tasks @('[ОК] Права проверены', '[ВНИМАНИЕ] Роль подрядчика без права чтения: 4 объекта', '[ОШИБКА] Роль без права записи нового регистра')); sleep = 3; fingerprint = 'после' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check (-not $r.TimedOut) ("не уложился в {0} с" -f $TimeoutSec)
+            Check (@($r.Output | Where-Object { $_ -match '^Остановлено: |Разбор прогона не получился|ParserError' }).Count -eq 0) 'скрипт упал'
+            $events = @(foreach ($line in @($r.Output | Where-Object { $_.StartsWith('@@ui:') })) {
+                    $uiEvent = $null
+                    try { $uiEvent = $line.Substring(5) | ConvertFrom-Json } catch { $uiEvent = $null }
+                    if ($null -ne $uiEvent) { $uiEvent }
+                })
+            $plans = @($events | Where-Object { [string]$_.kind -eq 'plan' })
+            Check ($plans.Count -ge 1) 'нет события plan'
+            if ($plans.Count -ge 1) { Check (@($plans[0].parallel) -contains 'Проверка конфигурации (all)') ("параллельная проверка конфигурации не названа в плане: {0}" -f (@($plans[0].parallel) -join ', ')) }
+            # «После»: предупреждение из эталона («до» записало его; число в тексте другое - приведение то же) - известное,
+            # ошибки в эталоне нет - она новая.
+            $after = @($events | Where-Object { [string]$_.kind -eq 'subplan' -and ([string]$_.title).StartsWith('Самопроверка после загрузки') })
+            Check ($after.Count -gt 0) 'нет событий subplan самопроверки после загрузки'
+            $seen = @(foreach ($item in $after) { foreach ($block in @($item.blocks)) { if ([string]$block.name -eq 'Метаданные и права' -and [int]$block.knownWarn -gt 0) { $block } } })
+            Check ($seen.Count -gt 0) 'известное предупреждение шага «Метаданные и права» до экрана не дошло'
+            if ($seen.Count -gt 0) {
+                $last = $seen[$seen.Count - 1]
+                Check ([int]$last.knownWarn -eq 1 -and [int]$last.knownErr -eq 0) ("известных у шага: предупреждений {0}, ошибок {1}; ждали 1 и 0" -f $last.knownWarn, $last.knownErr)
+            }
+            $other = @(foreach ($item in $after) { foreach ($block in @($item.blocks)) { if ([string]$block.name -ne 'Метаданные и права' -and ([int]$block.knownWarn + [int]$block.knownErr + [int]$block.knownSkip) -gt 0) { $block } } })
+            Check ($other.Count -eq 0) 'известное приписано чужому шагу'
+            # Обработке - то же файлом known.txt в папке сеанса «после»; читать его просит часть tiles=1 параметра запуска.
+            $tilesCalls = Get-Calls $r @('ENTERPRISE', 'selfcheck', 'tiles=1')
+            Check ($tilesCalls.Count -ge 1) 'обработку не попросили читать known.txt (tiles=1)'
+            $knownFiles = @(Get-ChildItem -LiteralPath $r.RunDir -Recurse -Filter 'known.txt' -File | Where-Object { ([System.IO.File]::ReadAllText($_.FullName, $utf8)).Contains('0/1/0|Метаданные и права') })
+            Check ($knownFiles.Count -ge 1) 'в known.txt нет строки «0/1/0|Метаданные и права»'
+        }
+    },
+    @{
         Name = 'gate-exchange-snapshot-lastupdate'
         Text = 'обмены: в сообщениях сдвинулись только даты LastUpdate (в разобранном XML и в обрезанном) - зелёный, разницы снимков нет'
         Run = {

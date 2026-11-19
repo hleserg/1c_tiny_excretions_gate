@@ -27,6 +27,7 @@ type uiEvent struct {
 	Notes       []string   `json:"notes"`
 	Items       []string   `json:"items"`
 	Steps       []string   `json:"steps"`
+	Parallel    []string   `json:"parallel"`
 	Groups      []string   `json:"groups"`
 	Value       string     `json:"value"`
 	Secret      bool       `json:"secret"`
