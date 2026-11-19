@@ -42,6 +42,15 @@ function Send-UiPlan {
     Send-UiEvent @{ kind = 'plan'; steps = @($StepNames); parallel = @($Parallel | Where-Object { $_ }) }
 }
 
+function Send-UiReset {
+    # Экран прогона в ci.exe - с чистого листа: шаги, колонка «Внутри шага», общая полоса и плашка вердикта прошлого
+    # действия убираются. Шлёт меню, когда человек выбрал следующее действие: иначе до своего плана новый скрипт
+    # (обновление рабочей, сравнение) показывал бы шаги и вердикт прошлого прогона гейта. Без ci.exe ничего не делает.
+    if (-not $script:UiChannelDir) { return }
+    $script:UiSubPlanSent = ''
+    Send-UiEvent @{ kind = 'reset' }
+}
+
 function Send-UiSubPlan {
     # Шаги внутри длинного шага (самопроверка): ci.exe рисует их вторым трубопроводом рядом с первым.
     # Blocks - строки «сделано/всего/ОК/ошибок/внимание/пропусков|имя» (заголовок части журнала, @@block).
@@ -248,18 +257,24 @@ function Select-UiOne {
 }
 
 function Select-UiMany {
-    # Несколько пунктов. Возвращает номера отмеченных (с нуля); $null - отмена. Пустой выбор не принимается.
+    # Несколько пунктов. Возвращает номера отмеченных (с нуля); $null - отмена. Пустой выбор не принимается,
+    # если нет AllowEmpty; с ним Enter без отметок - ответ «ни одного»: пустой массив (не $null - это отмена).
+    # Вызывать без @(): пустой массив возвращается запятой.
     # Groups - на каждый пункт имена расширений через «|»: пункты с общим именем взаимоисключающие, отметка
     # одного снимает отметку с другого (в ci.exe и в консоли).
-    param([string]$Header, [string[]]$Items, [int[]]$Preselected = @(), [string[]]$Notes = @(), [string[]]$Groups = @())
+    param([string]$Header, [string[]]$Items, [int[]]$Preselected = @(), [string[]]$Notes = @(), [string[]]$Groups = @(), [switch]$AllowEmpty)
     if ($Items.Count -eq 0) { return $null }
     if ($script:UiChannelDir) {
         $question = @{ kind = 'many'; header = $Header; items = @($Items); preselected = @($Preselected); notes = @($Notes | Where-Object { $_ }) }
         if ($Groups.Count -eq $Items.Count) { $question['groups'] = @($Groups) }
+        if ($AllowEmpty) { $question['allowEmpty'] = $true }
         $answer = Request-UiAnswer -Question $question
         if ([bool](Get-UiField $answer 'cancel' $false)) { return $null }
         $picked = @(@(Get-UiField $answer 'indexes' @()) | ForEach-Object { [int]$_ } | Where-Object { $_ -ge 0 -and $_ -lt $Items.Count } | Sort-Object -Unique)
-        if ($picked.Count -eq 0) { return $null }
+        if ($picked.Count -eq 0) {
+            if ($AllowEmpty) { return , ([int[]]@()) }
+            return $null
+        }
         return [int[]]$picked
     }
     $shown = [Math]::Min($Items.Count, $script:UiKeys.Count)
@@ -269,7 +284,8 @@ function Select-UiMany {
         Write-Host ''
         Write-Host ('  ' + $Header)
         foreach ($note in $Notes) { if ($note) { Write-Host ('  ' + $note) -ForegroundColor DarkGray } }
-        Write-Host '  Клавиша ставит и снимает отметку, Enter - старт, 0 - отмена:'
+        if ($AllowEmpty) { Write-Host '  Клавиша ставит и снимает отметку, Enter - дальше (можно без отметок), 0 - отмена:' }
+        else { Write-Host '  Клавиша ставит и снимает отметку, Enter - старт, 0 - отмена:' }
         for ($i = 0; $i -lt $shown; $i++) {
             $box = '[ ]'
             if ($marks.Contains($i)) { $box = '[x]' }
@@ -278,6 +294,7 @@ function Select-UiMany {
         $key = [Console]::ReadKey($true)
         if ($key.Key -eq [ConsoleKey]::Enter) {
             if ($marks.Count -gt 0) { return [int[]]@($marks | Sort-Object) }
+            if ($AllowEmpty) { return , ([int[]]@()) }
             Write-Host '  Ничего не отмечено.' -ForegroundColor Yellow
             continue
         }

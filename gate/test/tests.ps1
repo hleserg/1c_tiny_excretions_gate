@@ -1942,6 +1942,47 @@ $tests = @(
         }
     },
     @{
+        Name = 'deploy-prepared-processings-none'
+        Text = '«обновить подготовленным», а обработки temp и рабочей различаются: в вопросе ничего не отмечено и пустой выбор разрешён; Enter без отметок - расширение обновлено, ни одна обработка не записана'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '2' $printNew)) -ProdProcessings @((New-PrintProcessing '1' $printOld))
+            $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Prepare' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Подготовка обновления erp_base'; Item = '^Подготовить все' },
+                $deployRiskAnswer, $deployNameAnswer)
+            Check-DeployCommon $first -LocksExpected $false
+            Check ($first.ExitCode -eq 0) ("подготовка: код возврата {0}, ждали 0" -f $first.ExitCode)
+            Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\prepared.json')) 'подготовка не записала deploy\prepared.json'
+            Start-Sleep -Seconds 2
+            Reset-FakeState $sb
+            # Пустой выбор обработок: Enter без отметок.
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ApplyPrepared' -Com $com -Answers @(
+                @{ Kind = 'many'; Header = 'Какие внешние обработки записать'; Indexes = @() },
+                $deployRiskAnswer, $deployNameAnswer)
+            Check-DeployCommon $r
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0: {1}" -f $r.ExitCode, (($r.Output | Select-Object -Last 3) -join ' | '))
+            $asked = @(foreach ($line in @($r.Output | Where-Object { $_.StartsWith('@@ui:') })) {
+                    $uiEvent = $null
+                    try { $uiEvent = $line.Substring(5) | ConvertFrom-Json } catch { $uiEvent = $null }
+                    if ($null -ne $uiEvent -and [string]$uiEvent.kind -eq 'many' -and ([string]$uiEvent.header).StartsWith('Какие внешние обработки записать')) { $uiEvent }
+                })
+            Check ($asked.Count -eq 1) ("вопрос об обработках задан {0} раз, ждали 1" -f $asked.Count)
+            if ($asked.Count -eq 1) {
+                Check (@($asked[0].preselected).Count -eq 0) 'в режиме «подготовленным» обработки отмечены заранее: подготовка их не касалась'
+                Check ($null -ne $asked[0].PSObject.Properties['allowEmpty'] -and [bool]$asked[0].allowEmpty) 'вопрос об обработках не разрешает пустой выбор (allowEmpty)'
+            }
+            Check ((Get-Calls $r @('/UpdateDBCfg', '-Extension Адаптация', 'fake\erp_base')).Count -eq 1) 'конфигурация БД рабочей не обновлена'
+            Check ((Get-Calls $r @('regepf')).Count -eq 0) 'при пустом выборе обработка записывалась в рабочую'
+            Check (@($r.Output | Where-Object { $_ -match 'не отмечено ни одной - не трогаю' }).Count -eq 1) 'не сказано, что обработки не тронуты'
+            $record = Get-DeployRecord $sb
+            if ($null -eq $record) { Check $false 'нет deploy.json'; return }
+            Check ($record.mode -eq 'prepared' -and $record.outcome -eq 'updated') ("режим {0}, итог {1}, ждали prepared, updated" -f $record.mode, $record.outcome)
+            Check (@($record.extensions).Count -eq 1 -and @($record.extensions)[0].name -eq 'Адаптация') 'в deploy.json нет Адаптация'
+            Check (@($record.processings).Count -eq 0) ("в deploy.json записаны обработки: {0}" -f (@($record.processings | ForEach-Object { $_.name }) -join ', '))
+        }
+    },
+    @{
         Name = 'deploy-prepare-guard-cancel'
         Text = 'пока есть подготовка, одним проходом не обновляем; temp изменили - «подготовленным» переспрашивает; отмена подготовки грузит резервную копию без обновления БД и блокировок'
         Run = {
@@ -1988,7 +2029,7 @@ $tests = @(
     },
     @{
         Name = 'menu-prod-prepare'
-        Text = 'меню гейта: «Подготовить обновление рабочей» ведёт подготовку и возвращается в меню; там появляются «Обновить рабочую подготовленным» и «Отменить подготовку»'
+        Text = 'меню гейта: перед выбранным действием - событие reset для ci.exe (шаги и вердикт прошлого прогона убираются); «Подготовить обновление рабочей» ведёт подготовку и возвращается в меню; там появляются «Обновить рабочую подготовленным» и «Отменить подготовку»'
         Run = {
             param($Name)
             $sb = New-Sandbox $Name -Config $deployConfig
@@ -2011,6 +2052,10 @@ $tests = @(
                     if ($null -ne $uiEvent -and [string]$uiEvent.kind -eq 'one' -and ([string]$uiEvent.header).StartsWith('Гейт расширений')) { , @($uiEvent.items | ForEach-Object { [string]$_ }) }
                 })
             Check ($menus.Count -eq 3) ("меню гейта показано {0} раз, ждали 3" -f $menus.Count)
+            # Перед каждым выбранным действием меню просит ci.exe убрать шаги и вердикт прошлого (событие reset);
+            # «Выход» - без него. Здесь действий два: подготовка и её отмена.
+            $resets = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_ -match '"kind"\s*:\s*"reset"' })
+            Check ($resets.Count -eq 2) ("событий reset для ci.exe {0}, ждали 2 (по одному на выбранное действие меню)" -f $resets.Count)
             if ($menus.Count -eq 3) {
                 Check (@($menus[0] | Where-Object { $_.StartsWith('Обновить рабочую подготовленным') }).Count -eq 0) 'до подготовки меню предлагает обновить подготовленным'
                 Check (@($menus[1] | Where-Object { $_.StartsWith('Обновить рабочую подготовленным (Адаптация') }).Count -eq 1) 'после подготовки в меню нет «Обновить рабочую подготовленным»'

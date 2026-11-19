@@ -17,6 +17,30 @@ func nodeStatus(m *model, name string) string {
 	return "нет шага"
 }
 
+// Событие reset (в меню выбрано следующее действие): шаги и вердикт прошлого прогона с экрана уходят.
+func TestResetClearsPreviousRun(t *testing.T) {
+	m := planModel()
+	m.markProgress("Правила обмена")
+	m.appendLine("[FAIL] Модульные тесты")
+	m.appendLine("ВЕРДИКТ: КРАСНЫЙ")
+	if m.verdict == "" || len(m.pipe) == 0 || len(m.steps) == 0 {
+		t.Fatalf("подготовка теста: вердикт %q, труба %d, шаги %d", m.verdict, len(m.pipe), len(m.steps))
+	}
+	m.resetRun()
+	if m.verdict != "" || len(m.pipe) != 0 || len(m.steps) != 0 || m.planned || m.sub != nil || m.eta != nil {
+		t.Fatalf("после reset остался прошлый прогон: вердикт %q, труба %d, шаги %d, план %v", m.verdict, len(m.pipe), len(m.steps), m.planned)
+	}
+	// Журнал справа остаётся: reset - не очистка экрана.
+	if len(m.lines) != 2 {
+		t.Fatalf("reset тронул журнал: строк %d", len(m.lines))
+	}
+	// Новый план после reset - с чистого листа.
+	m.setPlan([]string{"Сохранить текущее"}, nil)
+	if got := nodeStatus(m, "Сохранить текущее"); got != nodePending {
+		t.Fatalf("шаг нового плана: %q", got)
+	}
+}
+
 // Параллельная проверка конфигурации кончилась раньше своего места в плане: шаги перед ней остаются в работе.
 func TestParallelResultKeepsEarlierSteps(t *testing.T) {
 	m := planModel("Проверка конфигурации (all)")
