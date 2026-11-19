@@ -42,9 +42,14 @@ function Send-UiEvent {
 function Send-UiPlan {
     # План прогона для ci.exe: шаги по порядку. Parallel - шаги, которые идут параллельно остальным (проверка
     # конфигурации в фоне): их итог может прийти раньше их места в плане, и шаги перед ними при этом не пропущены.
-    param([string[]]$StepNames, [string[]]$Parallel = @())
+    # Operations - план долгих операций действия без вердикта (выгрузка в git, типовая): шаги - заголовки операций,
+    # их итог и время приходят событием step (Write-UiOperationResult), узла «Вердикт» нет, сделанное до этого плана
+    # остаётся в колонке. Такой план можно прислать ещё раз - когда стало известно, что будет дальше.
+    param([string[]]$StepNames, [string[]]$Parallel = @(), [switch]$Operations)
     if (-not $script:UiChannelDir) { return }
-    Send-UiEvent @{ kind = 'plan'; steps = @($StepNames); parallel = @($Parallel | Where-Object { $_ }) }
+    $plan = @{ kind = 'plan'; steps = @($StepNames); parallel = @($Parallel | Where-Object { $_ }) }
+    if ($Operations) { $plan['ops'] = $true }
+    Send-UiEvent $plan
 }
 
 function Send-UiReset {

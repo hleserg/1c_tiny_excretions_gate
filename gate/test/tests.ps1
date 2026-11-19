@@ -3041,6 +3041,10 @@ $tests = @(
                 Check (@($first.Output | Where-Object { $_ -match '^\s+готово за \d+:\d\d$' }).Count -gt 0) 'у долгих операций нет строки итога «готово за ...»'
                 $stepEvents = @($first.Output | Where-Object { $_.StartsWith('@@ui:') -and $_ -match '"kind"\s*:\s*"step"' })
                 Check (@($stepEvents | Where-Object { $_ -match 'git add' -and $_ -match '"status"\s*:\s*"OK"' }).Count -eq 1) ('события step с итогом git add для колонки шагов: ' + @($stepEvents | Where-Object { $_ -match 'git add' }).Count)
+                # Будущие шаги видны заранее: план операций (ops) - выгрузки расширений, потом весь путь типовой.
+                $opsPlans = @($first.Output | Where-Object { $_.StartsWith('@@ui:') -and $_ -match '"kind"\s*:\s*"plan"' -and $_ -match '"ops"\s*:\s*true' })
+                Check (@($opsPlans | Where-Object { $_ -match 'Типовая: git push' -and $_ -match 'Типовая: git add' -and $_ -match 'Выгрузить типовую' }).Count -eq 1) ('планов операций типовой для колонки шагов: ' + @($opsPlans | Where-Object { $_ -match 'git push' }).Count)
+                Check (@($opsPlans | Where-Object { $_ -match 'Выгрузить .+ из erp_temp_test' -and $_ -notmatch 'git push' }).Count -eq 1) ('планов выгрузки расширений для колонки шагов: ' + @($opsPlans | Where-Object { $_ -notmatch 'git push' }).Count)
                 $tree = @(& $gitExe --git-dir=$bare ls-tree -r --name-only main 2>&1 | ForEach-Object { [string]$_ })
                 foreach ($path in @('README.md', 'Configuration.xml', 'Catalogs/Items.xml', 'CommonModules/Common/Ext/Module.bsl')) { Check ($tree -contains $path) ("в репозитории типовой нет {0}: {1}" -f $path, ($tree -join ' ')) }
                 Check ($tree -notcontains 'ConfigDumpInfo.xml') 'ConfigDumpInfo.xml попал в репозиторий типовой'
