@@ -2942,10 +2942,26 @@ function Get-ComConfigInfo {
                 while ($null -ne $connectError.InnerException) { $connectError = $connectError.InnerException }
                 throw ([string]$connectError.Message)
             }
-            $metadata = $connection.Metadata
+            # Свойства - поздним связыванием (IDispatch), мимо PowerShell: у объектов 1С нет описания типов, и PowerShell
+            # их свойства иногда не видит - отдаёт $null без ошибки (20.11.2026 так пришли пустые имя и версия типовой).
+            # Подставной COM тестов - обычные объекты PowerShell.
+            $get = {
+                param($Object, [string]$Name)
+                if ($null -eq $Object) { throw ("нет объекта, у которого брать «{0}»" -f $Name) }
+                if (-not [Runtime.InteropServices.Marshal]::IsComObject($Object)) { return , ($Object.$Name) }
+                $comType = [type]::GetType('System.__ComObject')
+                if ($null -eq $comType) { $comType = $Object.GetType() }
+                try { return , ($comType.InvokeMember($Name, [System.Reflection.BindingFlags]::GetProperty, $null, $Object, $null)) }
+                catch {
+                    $memberError = $_.Exception
+                    while ($null -ne $memberError.InnerException) { $memberError = $memberError.InnerException }
+                    throw ("{0}: {1}" -f $Name, [string]$memberError.Message)
+                }
+            }
+            $metadata = & $get $connection 'Metadata'
             # Массивом: Invoke-UiBackground берёт у результата .PSObject.BaseObject, а у одиночного pscustomobject
             # там голый объект без свойств.
-            return , @([pscustomobject]@{ Name = [string]$metadata.Name; Synonym = [string]$metadata.Synonym; Version = [string]$metadata.Version })
+            return , @([pscustomobject]@{ Name = [string](& $get $metadata 'Name'); Synonym = [string](& $get $metadata 'Synonym'); Version = [string](& $get $metadata 'Version') })
         }
         finally {
             foreach ($comObject in @($connection, $connector)) {
@@ -2964,7 +2980,14 @@ function Get-ComConfigInfo {
         return [pscustomobject]@{ Ok = $false; Error = $message; Name = ''; Synonym = ''; Version = '' }
     }
     $info = @($call.Result)[0]
-    return [pscustomobject]@{ Ok = $true; Error = ''; Name = [string]$info.Name; Synonym = [string]$info.Synonym; Version = [string]$info.Version }
+    $name = [string]$info.Name
+    $version = [string]$info.Version
+    # Пустые имя или версия - не прочитал, а не «версия пустая»: с пустой версией сравнение «та же, что в прошлый раз»
+    # совпало бы и после обновления типовой.
+    if (-not $name -or -not $version) {
+        return [pscustomobject]@{ Ok = $false; Error = ("внешнее соединение вернуло пустые имя или версию конфигурации (имя «{0}», версия «{1}»)" -f $name, $version); Name = ''; Synonym = ''; Version = '' }
+    }
+    return [pscustomobject]@{ Ok = $true; Error = ''; Name = $name; Synonym = [string]$info.Synonym; Version = $version }
 }
 
 function Update-TypicalDump {
@@ -3039,6 +3062,16 @@ function Invoke-GitTypical {
     $info = Get-ComConfigInfo -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
     if (-not $info.Ok) { Write-Line ("  версию конфигурации {0} не прочитал: {1}. Типовую не выгружаю." -f $script:TempBase, $info.Error) 'Yellow'; return }
     $title = '{0} ({1}) {2}' -f $info.Synonym, $info.Name, $info.Version
+    if (-not $state['version'] -and $state['commit']) {
+        # Коммит есть, а версии при нём нет: до 20.11.2026 версия могла прочитаться пустой (свойства COM 1С), выгрузка
+        # и коммит при этом прошли. Дописываю прочитанную версию к тому коммиту, выгрузку не повторяю.
+        $state['name'] = $info.Name
+        $state['version'] = $info.Version
+        $state['time'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        [System.IO.File]::WriteAllText($statePath, (ConvertTo-Json -InputObject $state), $Utf8Bom)
+        Write-Line ("  типовая {0}: в {1} коммит {2} записан без версии - дописал версию {3}, выгружать нечего." -f $title, $repo, (Get-GitShort $state['commit']), $info.Version) 'Green'
+        return
+    }
     if ($state['version'] -eq $info.Version -and $state['commit']) {
         Write-Line ("  типовая {0} уже в {1} (коммит {2}): выгружать нечего." -f $title, $repo, (Get-GitShort $state['commit'])) 'Green'
         return

@@ -3125,6 +3125,29 @@ $tests = @(
         }
     },
     @{
+        Name = 'git-typical-noversion'
+        Text = 'типовая в git: в typical.json коммит без версии (до 20.11.2026 версия читалась пустой - свойства COM 1С) - версия дописывается к тому коммиту, без вопроса и без выгрузки'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name -Extra @{ TypicalRepo = 'owner/typical'; TypicalMinFreeGB = 1 }
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
+            $com.bases.erp_temp_test['config'] = @{ name = 'ERP'; synonym = 'ERP завода'; version = '2.5.22.149' }
+            $typicalRoot = Join-Path $sb 'git\typical'
+            New-Item -ItemType Directory -Path $typicalRoot -Force | Out-Null
+            $stateFile = Join-Path $typicalRoot 'typical.json'
+            $sha = '98182d7aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+            [System.IO.File]::WriteAllText($stateFile, (ConvertTo-Json -InputObject ([ordered]@{ repo = 'owner/typical'; name = ''; version = ''; commit = $sha; time = '2026-11-20 02:10:00' })), $utf8)
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers $gitBootstrapAnswers
+            Check-DeployCommon $r -LocksExpected $false
+            Check ($r.Unexpected.Count -eq 0) ("коммит без версии - а вопросы: " + ($r.Unexpected -join ' | '))
+            Check (@($r.Output | Where-Object { $_ -match 'типовая ERP завода \(ERP\) 2\.5\.22\.149: .*без версии - дописал версию' }).Count -eq 1) 'не сказано, что версия дописана'
+            $rDumps = Get-Calls $r @('/DumpConfigToFiles')
+            Check (@($rDumps | Where-Object { -not $_.Line.Contains('-Extension') }).Count -eq 0) 'коммит без версии: типовая выгружалась заново'
+            $state = [System.IO.File]::ReadAllText($stateFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+            Check ($state.version -eq '2.5.22.149' -and $state.name -eq 'ERP' -and $state.commit -eq $sha) ("typical.json после дописывания: версия «{0}», имя «{1}», коммит «{2}»" -f $state.version, $state.name, $state.commit)
+        }
+    },
+    @{
         Name = 'git-portable-download'
         Text = 'портативный git: нет tools\git - последний MinGit 64 бита (не busybox) из релизов git-for-windows, сверка sha256 с digest релиза, распаковка в tools\git; второй раз не скачивает; не та сумма - отказ, tools\git не появляется'
         Run = {
