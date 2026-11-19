@@ -349,7 +349,7 @@ function Check-Verdict {
 $cfeName = 'erp_temp_Адаптация_20261117.cfe'
 $errorTasks = @(
     @{ key = 'Окружение'; title = 'Окружение и расширения'; step = 'Окружение'; lines = @('[ОК] Обработка запущена под полными правами') },
-    @{ key = 'КомпиляцияМодулей|Общий|Адаптация_ОбщийСервер'; title = 'Компиляция Адаптация_ОбщийСервер'; step = 'КомпиляцияМодулей'; lines = @('[ОШИБКА] Адаптация_ОбщийСервер не компилируется: тест') }
+    @{ key = 'КомпиляцияМодулей/ОбщийМодуль|Адаптация_ОбщийСервер'; title = 'ОбщийМодуль.Адаптация_ОбщийСервер'; step = 'КомпиляцияМодулей'; lines = @('[ОШИБКА] ОбщийМодуль.Адаптация_ОбщийСервер: не компилируется: тест') }
 )
 $epfDump = '<?xml version="1.0" encoding="UTF-8"?><MetaDataObject><ExternalDataProcessor uuid="1"><Properties><Name>Печать</Name></Properties></ExternalDataProcessor></MetaDataObject>'
 
@@ -968,6 +968,76 @@ $tests = @(
                 Check (@($new | Where-Object { $_ -match 'регламентное\|Адаптация\|Адаптация_Чистка' }).Count -eq 1) 'регламентное задание не в новом непокрытом'
                 Check (@($new | Where-Object { $_ -match 'ЗаказКлиента' }).Count -eq 0) 'покрытый перехват попал в новое непокрытое'
             }
+        }
+    },
+    @{
+        Name = 'gate-coverage-sources'
+        Text = 'карта покрытия: компиляция в настоящем формате ключей (КомпиляцияМодулей/ОбщийМодуль|Имя, .../Менеджер|Документы.Имя) - compiled; свой общий модуль - в карте (вызван шагом - covered, только компилируется - compiled, ничем - none); перехват правил обмена на отправку - covered выгрузкой, на загрузку - нет, но covered указанием «покрывает:»; подписка на все документы и подписка без источников - covered; изменён перехват на загрузку без проверки - жёлтый'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $adopted = { param([string]$Kind, [string]$ObjectName) ('<MetaDataObject><{0}><Properties><ObjectBelonging>Adopted</ObjectBelonging><Name>{1}</Name></Properties></{0}></MetaDataObject>' -f $Kind, $ObjectName) }
+            $own = { param([string]$ObjectName) ('<MetaDataObject><CommonModule><Properties><Name>{0}</Name></Properties></CommonModule></MetaDataObject>' -f $ObjectName) }
+            $exchangeModule = "&После(`"ПКО_Документ_РеализацияТоваровУслуг_Отправка_ПриКонвертацииДанныхXDTO`")`nПроцедура А1()`nКонецПроцедуры`n" +
+                "&После(`"ПКО_Документ_ПоступлениеТоваров_Получение_ПриКонвертацииДанныхXDTO`")`nПроцедура А2()`nКонецПроцедуры`n" +
+                "&После(`"ПОД_Справочник_Номенклатура_Получение_ПриОбработке`")`nПроцедура А3()`nКонецПроцедуры"
+            $dump = @{
+                'CommonModules/Адаптация_Свой.xml' = (& $own 'Адаптация_Свой'); 'CommonModules/Адаптация_Свой/Ext/Module.bsl' = 'Процедура А() Экспорт КонецПроцедуры'
+                'CommonModules/Адаптация_Вызываемый.xml' = (& $own 'Адаптация_Вызываемый'); 'CommonModules/Адаптация_Вызываемый/Ext/Module.bsl' = 'Функция ЗначениеНастройки() Экспорт КонецФункции'
+                'CommonModules/Адаптация_Ничей.xml' = (& $own 'Адаптация_Ничей'); 'CommonModules/Адаптация_Ничей/Ext/Module.bsl' = 'Процедура Б() Экспорт КонецПроцедуры'
+                'CommonModules/ОбщегоНазначенияСервер.xml' = (& $adopted 'CommonModule' 'ОбщегоНазначенияСервер')
+                'CommonModules/ОбщегоНазначенияСервер/Ext/Module.bsl' = "&После(`"ЗаписатьНастройку`")`nПроцедура Адаптация_ЗаписатьНастройку()`nКонецПроцедуры"
+                'Documents/ЗаказКлиента.xml' = (& $adopted 'Document' 'ЗаказКлиента')
+                'Documents/ЗаказКлиента/Ext/ManagerModule.bsl' = "&Перед(`"ПриОпределенииНастроек`")`nПроцедура Адаптация_ПриОпределенииНастроек()`nКонецПроцедуры"
+                'CommonModules/МенеджерОбменаЧерезУниверсальныйФормат.xml' = (& $adopted 'CommonModule' 'МенеджерОбменаЧерезУниверсальныйФормат')
+                'CommonModules/МенеджерОбменаЧерезУниверсальныйФормат/Ext/Module.bsl' = $exchangeModule
+                'EventSubscriptions/Адаптация_ВсеДокументы.xml' = '<MetaDataObject><EventSubscription><Properties><Name>Адаптация_ВсеДокументы</Name><Source><v8:Type>cfg:DocumentObject</v8:Type></Source><Handler>CommonModule.Адаптация_Свой.ПередЗаписью</Handler></Properties></EventSubscription></MetaDataObject>'
+                'EventSubscriptions/Адаптация_БезИсточников.xml' = '<MetaDataObject><EventSubscription><Properties><Name>Адаптация_БезИсточников</Name><Source/><Handler>CommonModule.Адаптация_Свой.ПриЗаписи</Handler></Properties></EventSubscription></MetaDataObject>'
+            }
+            $tasks = @(
+                @{ key = 'Окружение'; title = 'Окружение и расширения'; step = 'Окружение'; lines = @('[ОК] Обработка запущена под полными правами') },
+                @{ key = 'КомпиляцияМодулей/ОбщийМодуль|Адаптация_Свой'; title = 'ОбщийМодуль.Адаптация_Свой'; step = 'КомпиляцияМодулей'; lines = @('[ОК] ОбщийМодуль.Адаптация_Свой: компилируется') },
+                @{ key = 'КомпиляцияМодулей/ОбщийМодуль|ОбщегоНазначенияСервер'; title = 'ОбщийМодуль.ОбщегоНазначенияСервер'; step = 'КомпиляцияМодулей'; lines = @('[ОК] ОбщийМодуль.ОбщегоНазначенияСервер: компилируется') },
+                @{ key = 'КомпиляцияМодулей/Менеджер|Документы.ЗаказКлиента'; title = 'Документы.ЗаказКлиента, модуль менеджера'; step = 'КомпиляцияМодулей'; lines = @('[ОК] Документы.ЗаказКлиента, модуль менеджера: компилируется') },
+                @{ key = 'ОперацииСДокументами|Документ.РеализацияТоваровУслуг'; title = 'Операции: РеализацияТоваровУслуг'; step = 'ОперацииСДокументами'; lines = @('[ОК] Документ.РеализацияТоваровУслуг: новый, проверка заполнения, запись копии') },
+                @{ key = 'Настройки'; title = 'Настройки'; step = 'Настройки'; lines = @('[ОК] Адаптация_Вызываемый.ЗначениеНастройки: настройка читается') },
+                @{ key = 'ЗащитаЗагрузки'; title = 'Защита загрузки'; step = 'ЗащитаЗагрузки'; lines = @('[ОК] Загрузка от узла прочитана без записи; покрывает: ОбщийМодуль.МенеджерОбменаЧерезУниверсальныйФормат.ПОД_Справочник_Номенклатура_Получение_ПриОбработке') },
+                @{ key = 'Обмены'; title = 'Обмены'; step = 'Обмены'; lines = @('[ОК] Обмены, Бухгалтерия: Документ.СписаниеДС: сообщение обмена сформировано без ошибок'); snapshots = @{ ('выгрузка|Бухгалтерия|Документ.СписаниеДС|' + $exchangeUid) = 'ok' } })
+            $first = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ selfcheck = @(@{ tasks = $tasks }); dumps = @{ 'Адаптация' = $dump } }
+            Check-Common $first
+            if (-not $first.RunDir) { return }
+            $map = @{}
+            foreach ($line in [System.IO.File]::ReadAllLines((Join-Path $first.RunDir 'coverage.txt'), $utf8)) { $parts = $line.TrimStart([char]0xFEFF).Split("`t"); if ($parts.Count -ge 2) { $map[$parts[1]] = $parts[0] } }
+            $expect = [ordered]@{
+                'модуль|Адаптация|ОбщийМодуль.Адаптация_Свой' = 'compiled'
+                'модуль|Адаптация|ОбщийМодуль.Адаптация_Вызываемый' = 'covered'
+                'модуль|Адаптация|ОбщийМодуль.Адаптация_Ничей' = 'none'
+                'перехват|Адаптация|ОбщийМодуль.ОбщегоНазначенияСервер|модуль|ЗаписатьНастройку' = 'compiled'
+                'перехват|Адаптация|Документ.ЗаказКлиента|модуль менеджера|ПриОпределенииНастроек' = 'compiled'
+                'перехват|Адаптация|ОбщийМодуль.МенеджерОбменаЧерезУниверсальныйФормат|модуль|ПКО_Документ_РеализацияТоваровУслуг_Отправка_ПриКонвертацииДанныхXDTO' = 'covered'
+                'перехват|Адаптация|ОбщийМодуль.МенеджерОбменаЧерезУниверсальныйФормат|модуль|ПКО_Документ_ПоступлениеТоваров_Получение_ПриКонвертацииДанныхXDTO' = 'none'
+                'перехват|Адаптация|ОбщийМодуль.МенеджерОбменаЧерезУниверсальныйФормат|модуль|ПОД_Справочник_Номенклатура_Получение_ПриОбработке' = 'covered'
+                'подписка|Адаптация|Адаптация_ВсеДокументы' = 'covered'
+                'подписка|Адаптация|Адаптация_БезИсточников' = 'covered'
+            }
+            foreach ($key in @($expect.Keys)) {
+                $got = '(нет в карте)'
+                if ($map.ContainsKey($key)) { $got = $map[$key] }
+                Check ($got -eq $expect[$key]) ("{0}: {1}, ждали {2}" -f $key, $got, $expect[$key])
+            }
+            # Эталон перехватов правил обмена - этот прогон; во втором меняется перехват на загрузку, а загрузку никто не проверяет.
+            $baseline = Join-Path $sb 'baseline\erp_temp_test'
+            New-Item -ItemType Directory -Path $baseline -Force | Out-Null
+            Copy-Item -LiteralPath (Join-Path $first.RunDir 'exchange-rules.state.txt') -Destination (Join-Path $baseline 'exchange-rules.state.txt') -Force
+            Copy-Item -LiteralPath (Join-Path $first.RunDir 'exchange-rules.findings.txt') -Destination (Join-Path $baseline 'exchange-rules.findings.txt') -Force
+            Copy-Item -LiteralPath (Join-Path $first.RunDir 'coverage.txt') -Destination (Join-Path $baseline 'coverage.txt') -Force
+            $dump['CommonModules/МенеджерОбменаЧерезУниверсальныйФормат/Ext/Module.bsl'] = $exchangeModule.Replace("Процедура А2()`nКонецПроцедуры", "Процедура А2()`n	Сообщить(1);`nКонецПроцедуры")
+            Start-Sleep -Seconds 2
+            Reset-FakeState $sb
+            $second = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ selfcheck = @(@{ tasks = $tasks; fingerprint = 'второй' }); dumps = @{ 'Адаптация' = $dump } }
+            Check-Common $second
+            $step = Get-Step $second 'Карта покрытия'
+            Check ($null -ne $step -and $step.status -eq 'WARN' -and [string]$step.detail -match 'перехват правил обмена на загрузку, а загрузку ничто не проверяло.*ПоступлениеТоваров_Получение') ("карта покрытия: изменённый перехват на загрузку без проверки не жёлтый: " + $(if ($null -ne $step) { [string]$step.detail } else { 'шага нет' }))
         }
     },
     @{

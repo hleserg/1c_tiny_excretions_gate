@@ -2008,14 +2008,19 @@ function Add-GitProcessingSnapshot {
     }
     $kept = [ordered]@{}
     $dumpedCount = 0
-    foreach ($item in @($items | Where-Object { $_.File } | Sort-Object @{ Expression = { [string]$folders[[string]$_.Ref] } })) {
+    $withFile = @($items | Where-Object { $_.File } | Sort-Object @{ Expression = { [string]$folders[[string]$_.Ref] } })
+    # Сколько выгружать конфигуратором (не с прошлого раза) - чтобы в строке хода было «N из M».
+    $isFresh = { param($Entry) $entryFolder = [string]$folders[[string]$Entry.Ref]; ($cache.Contains($entryFolder) -and $cache[$entryFolder] -eq ('{0}|{1}' -f $Entry.Hash, $script:V8) -and (Test-Path -LiteralPath (Join-Path (Join-Path $Root $entryFolder) ($Entry.ObjName + '.xml')))) }
+    $toDump = @($withFile | Where-Object { -not (& $isFresh $_) }).Count
+    if ($toDump -gt 0) { Write-Line ("  обработок {0} с файлом {1}: выгрузить в файлы {2}, остальные - с прошлого раза" -f $BaseName, $withFile.Count, $toDump) }
+    foreach ($item in $withFile) {
         $folder = [string]$folders[[string]$item.Ref]
         $dir = Join-Path $Root $folder
         $key = '{0}|{1}' -f $item.Hash, $script:V8
-        if (-not ($cache.Contains($folder) -and $cache[$folder] -eq $key -and (Test-Path -LiteralPath (Join-Path $dir ($item.ObjName + '.xml'))))) {
-            $dumped = Get-ProcessingDump -File $item.File -Dir $dir -Title ("Выгрузить в файлы {0} из {1}" -f $folder, $Source)
-            if (-not $dumped) { throw ("обработка {0} ({1}) из {2} не выгрузилась в файлы, см. run.log" -f $folder, $item.Title, $BaseName) }
+        if (-not (& $isFresh $item)) {
             $dumpedCount++
+            $dumped = Get-ProcessingDump -File $item.File -Dir $dir -Title ("Выгрузить в файлы {0} из {1} ({2} из {3})" -f $folder, $Source, $dumpedCount, $toDump)
+            if (-not $dumped) { throw ("обработка {0} ({1}) из {2} не выгрузилась в файлы, см. run.log" -f $folder, $item.Title, $BaseName) }
         }
         $kept[$folder] = $key
         Add-GitSnapshotFiles -Files $Files -Dir $dir -Prefix ('processings/' + $folder + '/')

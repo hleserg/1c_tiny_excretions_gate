@@ -305,6 +305,23 @@ func (m model) connector(next pipeNode, active bool) string {
 	return styleOk.Render("│")
 }
 
+// timeText - сколько прошло с начала скрипта и (у прогона, если скрипт умеет оценить) сколько осталось:
+// «прошло 1:02:03 · осталось ~12:34+». «+» - есть шаги без статистики. Скрипт не идёт - пусто.
+func (m model) timeText() string {
+	if !m.running || m.started.IsZero() {
+		return ""
+	}
+	text := "прошло " + formatDuration(time.Since(m.started).Seconds())
+	if m.eta != nil {
+		left := m.eta.seconds - time.Since(m.eta.at).Seconds()
+		text += " · осталось ~" + formatDuration(left)
+		if m.eta.unknown > 0 {
+			text += "+"
+		}
+	}
+	return text
+}
+
 func (m model) viewPipe(width, height int) string {
 	var b strings.Builder
 	done := 0
@@ -315,17 +332,7 @@ func (m model) viewPipe(width, height int) string {
 	}
 	head := styleSection.Render("Шаги прогона")
 	if len(m.pipe) > 0 {
-		countText := fmt.Sprintf("%d/%d", done, len(m.pipe))
-		// Сколько осталось всего прогона: оценка скрипта, дальше тикает по часам. «+» - есть шаги без статистики.
-		if m.eta != nil && m.running {
-			left := m.eta.seconds - time.Since(m.eta.at).Seconds()
-			etaText := "~" + formatDuration(left)
-			if m.eta.unknown > 0 {
-				etaText += "+"
-			}
-			countText = etaText + "  " + countText
-		}
-		count := styleDim.Render(countText)
+		count := styleDim.Render(fmt.Sprintf("%d/%d", done, len(m.pipe)))
 		gap := width - lipgloss.Width(head) - lipgloss.Width(count)
 		if gap < 1 {
 			gap = 1
@@ -333,6 +340,11 @@ func (m model) viewPipe(width, height int) string {
 		head += strings.Repeat(" ", gap) + count
 	}
 	b.WriteString(head + "\n")
+	// Сколько прошло с начала и сколько осталось - отдельной строкой: в узкую колонку рядом с заголовком не влезает.
+	timeLine := m.timeText()
+	if timeLine != "" {
+		b.WriteString(hang("", timeLine, width, styleDim) + "\n")
+	}
 	if len(m.pipe) == 0 {
 		if m.prog != nil {
 			b.WriteString(hang(styleAccent.Render(m.spin.View())+" ", m.prog.title, width, styleText) + "\n")
@@ -344,6 +356,9 @@ func (m model) viewPipe(width, height int) string {
 	b.WriteString(m.overall.View() + " " + styleDim.Render(fmt.Sprintf("%3d%%", int(m.pipeFraction()*100))) + "\n")
 
 	rows := height - 2
+	if timeLine != "" {
+		rows -= strings.Count(hang("", timeLine, width, styleDim), "\n") + 1
+	}
 	active := -1
 	if m.running {
 		active = m.firstPending()

@@ -1024,7 +1024,50 @@ $CoverageSourceTypes = @{
     ChartOfCharacteristicTypesObject = 'ПланВидовХарактеристик'; ExchangePlanObject = 'ПланОбмена'
     BusinessProcessObject = 'БизнесПроцесс'; TaskObject = 'Задача'; DocumentManager = 'Документ'; CatalogManager = 'Справочник'
 }
-$CoverageObjectRegex = New-Object System.Text.RegularExpressions.Regex('(Документ|Справочник|РегистрСведений|РегистрНакопления|РегистрБухгалтерии|ПланВидовХарактеристик|ПланОбмена|БизнесПроцесс|Задача|Обработка|Отчет)\.[\wА-Яа-яЁё]+')
+$CoverageObjectRegex = New-Object System.Text.RegularExpressions.Regex('(?<![\wА-Яа-яЁё])(Документ|Справочник|РегистрСведений|РегистрНакопления|РегистрБухгалтерии|ПланВидовХарактеристик|ПланОбмена|БизнесПроцесс|Задача|Обработка|Отчет|ОбщийМодуль)\.[\wА-Яа-яЁё]+')
+# Имена коллекций (Документы.Х - так пишет полные имена ядро самопроверки) и английские виды (CommonModule.Х - так
+# пишут @Проверяет тестов) -> вид в единственном числе, как в полном имени объекта.
+$CoverageKindAliases = @{
+    'Документы' = 'Документ'; 'Справочники' = 'Справочник'; 'РегистрыСведений' = 'РегистрСведений'; 'РегистрыНакопления' = 'РегистрНакопления'
+    'РегистрыБухгалтерии' = 'РегистрБухгалтерии'; 'РегистрыРасчета' = 'РегистрРасчета'; 'ПланыВидовХарактеристик' = 'ПланВидовХарактеристик'
+    'ПланыСчетов' = 'ПланСчетов'; 'ПланыВидовРасчета' = 'ПланВидовРасчета'; 'ПланыОбмена' = 'ПланОбмена'; 'БизнесПроцессы' = 'БизнесПроцесс'
+    'Задачи' = 'Задача'; 'Обработки' = 'Обработка'; 'Отчеты' = 'Отчет'; 'Перечисления' = 'Перечисление'; 'Константы' = 'Константа'
+    'ЖурналыДокументов' = 'ЖурналДокументов'; 'ОбщиеМодули' = 'ОбщийМодуль'; 'ОбщиеФормы' = 'ОбщаяФорма'
+    'CommonModule' = 'ОбщийМодуль'; 'Document' = 'Документ'; 'Catalog' = 'Справочник'; 'InformationRegister' = 'РегистрСведений'
+    'AccumulationRegister' = 'РегистрНакопления'; 'AccountingRegister' = 'РегистрБухгалтерии'; 'CalculationRegister' = 'РегистрРасчета'
+    'DataProcessor' = 'Обработка'; 'Report' = 'Отчет'; 'ExchangePlan' = 'ПланОбмена'; 'ChartOfCharacteristicTypes' = 'ПланВидовХарактеристик'
+    'ChartOfAccounts' = 'ПланСчетов'; 'BusinessProcess' = 'БизнесПроцесс'; 'Task' = 'Задача'; 'Enum' = 'Перечисление'; 'Constant' = 'Константа'
+    'CommonForm' = 'ОбщаяФорма'; 'DocumentJournal' = 'ЖурналДокументов'
+}
+$CoverageKindAliasRegex = New-Object System.Text.RegularExpressions.Regex(('(?<![\wА-Яа-яЁё])(' + ((@($CoverageKindAliases.Keys | Sort-Object -Property Length -Descending) | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')\.'))
+# Шаги самопроверки, которые пишут в базу (в отменяемой транзакции): после них сработала подписка «на всё».
+$CoverageWriteSteps = @('ПерепроведениеДокументов', 'ОперацииСДокументами', 'ОперацииСоСправочниками', 'ОтменаПроведенияДокументов')
+# Перехваты правил обмена на загрузку: шаг «Обмены» только выгружает, их он не задевает.
+$ExchangeReceiveRegex = New-Object System.Text.RegularExpressions.Regex('_Получение|^ПроизвестиЧтениеДанных$|ПередЗаписьюПолученныхДанных|ПослеЗагрузки|ОткрытьФайлЗагрузки|ЗагрузитьДанные|ВыполнитьЗагрузкуДанных|ЧтениеДанных')
+
+function ConvertTo-CoverageText {
+    # Имена коллекций и английские виды в тексте - в единственное число: «Документы.Х», «Document.Х» -> «Документ.Х».
+    param([string]$Text)
+    return $CoverageKindAliasRegex.Replace($Text, { param($found) $CoverageKindAliases[$found.Groups[1].Value] + '.' })
+}
+
+function Get-CoverageHints {
+    # «Что проверяется» из явных указаний: в записи самопроверки - «покрывает: Вид.Объект.Метод, ...» (так пакет
+    # говорит, что его шаг прогнал, например, загрузку данных), в тесте - @Проверяет. Указание: Object (Вид.Имя) и
+    # Method (может быть пустым). Вид - в единственном числе, английские виды и коллекции приводятся.
+    param([string[]]$Texts, [string]$Source)
+    $hints = New-Object System.Collections.Generic.List[object]
+    foreach ($text in @($Texts)) {
+        if (-not $text) { continue }
+        foreach ($piece in ([string]$text -split '[,;\r\n]')) {
+            $clean = (ConvertTo-CoverageText $piece.Trim()).Trim().TrimEnd('.')
+            $found = [regex]::Match($clean, '^([\wА-Яа-яЁё]+)\.([\wА-Яа-яЁё]+)(?:\.([\wА-Яа-яЁё]+))?')
+            if (-not $found.Success) { continue }
+            $hints.Add([pscustomobject]@{ Object = ('{0}.{1}' -f $found.Groups[1].Value, $found.Groups[2].Value); Method = $found.Groups[3].Value; Source = $Source })
+        }
+    }
+    return , $hints.ToArray()
+}
 
 function Get-CoverageItems {
     # Что добавило расширение - по его выгрузке в файлы. Элемент: Key (для сравнения прогонов), Kind, Text,
@@ -1064,18 +1107,21 @@ function Get-CoverageItems {
                 $found = $annotationRegex.Match($lines[$i])
                 if (-not $found.Success) { continue }
                 $intercepts++
+                $isExchangeRule = (Test-ExchangeRuleMethod -Module $name -Target $found.Groups[2].Value -TypeName $typeName)
+                $direction = ''
+                if ($isExchangeRule) { $direction = 'send'; if ($ExchangeReceiveRegex.IsMatch($found.Groups[2].Value)) { $direction = 'receive' } }
                 $items.Add([pscustomobject]@{
                         Key = ('перехват|{0}|{1}|{2}|{3}' -f $Extension, $object, $part, $found.Groups[2].Value)
                         Kind = 'перехват'; Text = ('{0}, {1}: &{2}("{3}")' -f $object, $part, $found.Groups[1].Value, $found.Groups[2].Value)
-                        Objects = @($object); Module = $module
-                        ExchangeRule = (Test-ExchangeRuleMethod -Module $name -Target $found.Groups[2].Value -TypeName $typeName)
+                        Objects = @($object); Module = $module; Target = $found.Groups[2].Value
+                        ExchangeRule = $isExchangeRule; ExchangeDirection = $direction
                     })
             }
             if ($formName -and $intercepts -eq 0) {
                 # Модуль формы без перехватов: свои обработчики событий формы.
                 $items.Add([pscustomobject]@{
                         Key = ('форма|{0}|{1}|{2}' -f $Extension, $object, $formName); Kind = 'форма'
-                        Text = ('{0}, {1}: свои обработчики' -f $object, $part); Objects = @($object); Module = ''
+                        Text = ('{0}, {1}: свои обработчики' -f $object, $part); Objects = @($object); Module = ''; Target = ''
                     })
             }
             continue
@@ -1083,71 +1129,154 @@ function Get-CoverageItems {
         if ($rest -ne '') { continue }
         # Файл описания объекта (<Вид>/<Имя>.xml).
         $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
-        if ($parts[0] -eq 'Documents' -or $parts[0] -eq 'Catalogs' -or $parts[0] -like '*Registers') {
-            if ($text -notmatch '<ObjectBelonging>\s*Adopted\s*</ObjectBelonging>') {
-                $items.Add([pscustomobject]@{
-                        Key = ('объект|{0}|{1}' -f $Extension, $object); Kind = 'объект'
-                        Text = ('{0}: новый объект расширения' -f $object); Objects = @($object); Module = ''
-                    })
-            }
+        $own = ($text -notmatch '<ObjectBelonging>\s*Adopted\s*</ObjectBelonging>')
+        if ($own -and ($parts[0] -eq 'Documents' -or $parts[0] -eq 'Catalogs' -or $parts[0] -like '*Registers' -or $parts[0] -eq 'DataProcessors' -or $parts[0] -eq 'Reports')) {
+            $items.Add([pscustomobject]@{
+                    Key = ('объект|{0}|{1}' -f $Extension, $object); Kind = 'объект'
+                    Text = ('{0}: новый объект расширения' -f $object); Objects = @($object); Module = ''; Target = ''
+                })
+        }
+        elseif ($own -and $parts[0] -eq 'CommonModules') {
+            # Свой общий модуль: задет, если его вызвал шаг самопроверки (имя модуля в записи) или тест; иначе - только компиляция.
+            $items.Add([pscustomobject]@{
+                    Key = ('модуль|{0}|{1}' -f $Extension, $object); Kind = 'модуль'
+                    Text = ('{0}: свой общий модуль' -f $object); Objects = @($object); Module = $name; Target = ''
+                })
         }
     }
     # Подписки на события и регламентные задания: в выгрузке это EventSubscriptions/<Имя>.xml и ScheduledJobs/<Имя>.xml.
     foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $Dir 'EventSubscriptions') -Filter '*.xml' -File -ErrorAction SilentlyContinue)) {
         $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
         $sources = New-Object System.Collections.Generic.List[string]
-        foreach ($match in [regex]::Matches($text, '<v8:Type>\s*(?:cfg:)?(\w+)\.([\wА-Яа-яЁё]+)\s*</v8:Type>')) {
+        foreach ($match in [regex]::Matches($text, '<v8:Type>\s*(?:cfg:)?(\w+)(?:\.([\wА-Яа-яЁё]+))?\s*</v8:Type>')) {
             $kind = $match.Groups[1].Value
-            if ($CoverageSourceTypes.ContainsKey($kind)) { $sources.Add(('{0}.{1}' -f $CoverageSourceTypes[$kind], $match.Groups[2].Value)) }
+            if (-not $CoverageSourceTypes.ContainsKey($kind)) { continue }
+            # Без имени (DocumentObject) - все объекты этого вида.
+            if ($match.Groups[2].Value) { $sources.Add(('{0}.{1}' -f $CoverageSourceTypes[$kind], $match.Groups[2].Value)) }
+            else { $sources.Add(('{0}.*' -f $CoverageSourceTypes[$kind])) }
         }
         $handler = [regex]::Match($text, '<Handler>\s*([^<]+?)\s*</Handler>').Groups[1].Value
         $subscription = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
         $sourceText = 'источники: все объекты'
         if ($sources.Count -gt 0) { $sourceText = 'источники: ' + (@($sources | Select-Object -First 5) -join ', ') }
+        # Обработчик CommonModule.Модуль.Метод - для указаний тестов.
+        $handlerObject = ''
+        $handlerMethod = ''
+        $handlerFound = [regex]::Match((ConvertTo-CoverageText $handler), '^([\wА-Яа-яЁё]+\.[\wА-Яа-яЁё]+)\.([\wА-Яа-яЁё]+)$')
+        if ($handlerFound.Success) { $handlerObject = $handlerFound.Groups[1].Value; $handlerMethod = $handlerFound.Groups[2].Value }
         $items.Add([pscustomobject]@{
                 Key = ('подписка|{0}|{1}' -f $Extension, $subscription); Kind = 'подписка'
-                Text = ('Подписка {0} -> {1}, {2}' -f $subscription, $handler, $sourceText); Objects = $sources.ToArray(); Module = ''
+                Text = ('Подписка {0} -> {1}, {2}' -f $subscription, $handler, $sourceText); Objects = $sources.ToArray(); Module = ''; Target = ''
+                HandlerObject = $handlerObject; HandlerMethod = $handlerMethod
             })
     }
     foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $Dir 'ScheduledJobs') -Filter '*.xml' -File -ErrorAction SilentlyContinue)) {
         $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
         $method = [regex]::Match($text, '<MethodName>\s*([^<]+?)\s*</MethodName>').Groups[1].Value
         $job = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+        $jobObject = ''
+        $jobMethod = ''
+        $jobFound = [regex]::Match((ConvertTo-CoverageText $method), '^([\wА-Яа-яЁё]+\.[\wА-Яа-яЁё]+)\.([\wА-Яа-яЁё]+)$')
+        if ($jobFound.Success) { $jobObject = $jobFound.Groups[1].Value; $jobMethod = $jobFound.Groups[2].Value }
         $items.Add([pscustomobject]@{
                 Key = ('регламентное|{0}|{1}' -f $Extension, $job); Kind = 'регламентное'
-                Text = ('Регламентное задание {0} -> {1}: самопроверка регламентные задания не выполняет' -f $job, $method); Objects = @(); Module = ''
+                Text = ('Регламентное задание {0} -> {1}: самопроверка регламентные задания не выполняет' -f $job, $method); Objects = @(); Module = ''; Target = ''
+                HandlerObject = $jobObject; HandlerMethod = $jobMethod
             })
     }
     return , $items.ToArray()
 }
 
 function Measure-Coverage {
-    # Чем задета каждая доработка в самопроверке. Уровни: covered - объект побывал в задании самопроверки, кроме
-    # компиляции (операции, перепроведение, формы, обмены...); compiled - общий модуль только компилируется;
-    # none - ничем не задета. Records - записи самопроверки «[ВИД] ключ :: текст».
-    # Перехват правил обмена (ExchangeRule) задет, только если шаг «Обмены» что-то выгрузил: ExchangeRan.
-    param([object[]]$Items, [string[]]$Records, [bool]$ExchangeRan = $false)
+    # Чем задета каждая доработка в самопроверке. Уровни: covered - проверяется, compiled - модуль только
+    # компилируется, none - ничем не задета. Records - записи самопроверки «[ВИД] ключ :: текст».
+    # Чем covered:
+    # - объект побывал в задании самопроверки, кроме компиляции (операции, перепроведение, формы...);
+    # - общий модуль назван в записи («Модуль.Метод»: шаг его вызвал);
+    # - явное указание (Hints): «покрывает: Вид.Объект.Метод» в записи самопроверки или @Проверяет теста;
+    # - перехват правил обмена на отправку - шаг «Обмены» что-то выгрузил (ExchangeRan); на загрузку - только указанием:
+    #   шаг «Обмены» только выгружает;
+    # - подписка «на все объекты» - самопроверка что-то записывала.
+    # Полные имена в записях ядро пишет и коллекциями (Документы.Х), и видом (Документ.Х): приводятся к виду.
+    param([object[]]$Items, [string[]]$Records, [bool]$ExchangeRan = $false, [object[]]$Hints = @())
     $exercised = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $compiled = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($record in $Records) {
-        $keyMatch = [regex]::Match($record, '^\[[^\]]+\] (.*?) :: ')
-        $key = $keyMatch.Groups[1].Value
-        if ($key.StartsWith('КомпиляцияМодулей|')) {
-            foreach ($piece in $key.Split('|')) { if ($piece) { [void]$compiled.Add($piece) } }
+    $plain = New-Object System.Text.StringBuilder
+    $hintTexts = New-Object System.Collections.Generic.List[string]
+    $wrote = $false
+    foreach ($raw in $Records) {
+        $record = ConvertTo-CoverageText ([string]$raw)
+        $parts = [regex]::Match($record, '^\[([^\]]+)\] (.*?) :: (.*)$')
+        $kind = $parts.Groups[1].Value
+        $key = $parts.Groups[2].Value
+        $hintFound = [regex]::Match($parts.Groups[3].Value, '(?i)покрывает:\s*(.+)$')
+        if ($hintFound.Success) { $hintTexts.Add($hintFound.Groups[1].Value) }
+        if ($key -eq 'КомпиляцияМодулей' -or $key.StartsWith('КомпиляцияМодулей/') -or $key.StartsWith('КомпиляцияМодулей|')) {
+            # «КомпиляцияМодулей/ОбщийМодуль|Имя», «.../Менеджер|Документ.Имя» (так пишет ядро); прежний вид - «КомпиляцияМодулей|Общий|Имя».
+            $pieces = @($key.Substring('КомпиляцияМодулей'.Length).TrimStart('/', '|').Split('|') | Where-Object { $_ })
+            if ($pieces.Count -ge 2) {
+                $name = $pieces[$pieces.Count - 1]
+                [void]$compiled.Add($name)
+                if ($pieces[0] -eq 'ОбщийМодуль' -or $pieces[0] -eq 'Общий') { [void]$compiled.Add('ОбщийМодуль.' + $name) }
+            }
             foreach ($match in $CoverageObjectRegex.Matches($record)) { [void]$compiled.Add($match.Value) }
             continue
         }
+        if ($kind -ne 'ПРОПУСК') {
+            foreach ($step in $CoverageWriteSteps) { if ($key -eq $step -or $key.StartsWith($step + '/') -or $key.StartsWith($step + '|')) { $wrote = $true } }
+        }
+        [void]$plain.AppendLine($record)
         foreach ($match in $CoverageObjectRegex.Matches($record)) { [void]$exercised.Add($match.Value) }
     }
+    $plainText = $plain.ToString()
+    $recordHints = Get-CoverageHints -Texts $hintTexts.ToArray() -Source 'самопроверка'
+    $allHints = @(@($Hints) + @($recordHints) | Where-Object { $null -ne $_ })
+    $mentioned = @{}
     $result = New-Object System.Collections.Generic.List[object]
     foreach ($item in $Items) {
         $level = 'none'
+        $note = ''
         $isExchangeRule = ($null -ne $item.PSObject.Properties['ExchangeRule'] -and [bool]$item.ExchangeRule)
-        if ($isExchangeRule -and $ExchangeRan) { $level = 'covered' }
-        foreach ($object in @($item.Objects)) { if ($level -eq 'none' -and -not $isExchangeRule -and $exercised.Contains([string]$object)) { $level = 'covered'; break } }
+        $direction = ''
+        if ($null -ne $item.PSObject.Properties['ExchangeDirection']) { $direction = [string]$item.ExchangeDirection }
+        $target = ''
+        if ($null -ne $item.PSObject.Properties['Target']) { $target = [string]$item.Target }
+        $handlerObject = ''
+        $handlerMethod = ''
+        if ($null -ne $item.PSObject.Properties['HandlerObject']) { $handlerObject = [string]$item.HandlerObject; $handlerMethod = [string]$item.HandlerMethod }
+        foreach ($hint in $allHints) {
+            $hit = $false
+            foreach ($object in @($item.Objects)) {
+                if ([string]$object -ieq $hint.Object -and (-not $hint.Method -or -not $target -or $hint.Method -ieq $target)) { $hit = $true }
+            }
+            if ($handlerObject -and $hint.Object -ieq $handlerObject -and (-not $hint.Method -or $hint.Method -ieq $handlerMethod)) { $hit = $true }
+            if ($hit) { $level = 'covered'; $note = (' (проверяет {0})' -f $hint.Source); break }
+        }
+        if ($level -eq 'none' -and $isExchangeRule) {
+            if ($direction -ne 'receive' -and $ExchangeRan) { $level = 'covered' }
+        }
+        elseif ($level -eq 'none') {
+            foreach ($object in @($item.Objects)) {
+                $object = [string]$object
+                if ($object.EndsWith('.*')) {
+                    $prefix = $object.Substring(0, $object.Length - 1)
+                    foreach ($seen in $exercised) { if ($seen.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { $level = 'covered'; break } }
+                }
+                elseif ($exercised.Contains($object)) { $level = 'covered' }
+                if ($level -eq 'covered') { break }
+            }
+            if ($level -eq 'none' -and $item.Kind -eq 'подписка' -and @($item.Objects).Count -eq 0 -and $wrote) { $level = 'covered'; $note = ' (срабатывает на любой записи)' }
+            if ($level -eq 'none' -and $item.Module) {
+                $module = [string]$item.Module
+                if (-not $mentioned.ContainsKey($module)) {
+                    $mentioned[$module] = [regex]::IsMatch($plainText, ('(?<![\wА-Яа-яЁё])' + [regex]::Escape($module) + '\.'), [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                }
+                if ($mentioned[$module]) { $level = 'covered' }
+            }
+        }
         if ($level -eq 'none' -and $item.Module -and $compiled.Contains([string]$item.Module)) { $level = 'compiled' }
         if ($level -eq 'none') { foreach ($object in @($item.Objects)) { if ($compiled.Contains([string]$object)) { $level = 'compiled'; break } } }
-        $result.Add([pscustomobject]@{ Key = $item.Key; Kind = $item.Kind; Text = $item.Text; Level = $level })
+        $result.Add([pscustomobject]@{ Key = $item.Key; Kind = $item.Kind; Text = ($item.Text + $note); Level = $level })
     }
     return , $result.ToArray()
 }
@@ -1216,7 +1345,20 @@ function Invoke-CoverageStep {
     foreach ($extension in @($script:ExtensionDumps.Dirs.Keys)) {
         foreach ($item in (Get-CoverageItems -Dir $script:ExtensionDumps.Dirs[$extension] -Extension $extension)) { $allItems.Add($item) }
     }
-    $measured = Measure-Coverage -Items $allItems.ToArray() -Records $Records -ExchangeRan $ExchangeRan
+    # Модульные тесты: @Проверяет включённого теста - доработка проверяется (итог теста - в шаге «Модульные тесты»).
+    $testHints = New-Object System.Collections.Generic.List[object]
+    if (@($unitTestExtensions).Count -gt 0) {
+        try {
+            $catalogs = Get-UtCatalogs
+            foreach ($catalog in $catalogs) {
+                foreach ($test in @($catalog.Tests | Where-Object { -not $_.Disabled -and $_.Checks })) {
+                    foreach ($hint in (Get-CoverageHints -Texts @([string]$test.Checks) -Source ('тест ' + $test.Key))) { $testHints.Add($hint) }
+                }
+            }
+        }
+        catch { Write-RunLog ("Карта покрытия: каталог тестов не прочитан: {0}" -f $_.Exception.Message) }
+    }
+    $measured = Measure-Coverage -Items $allItems.ToArray() -Records $Records -ExchangeRan $ExchangeRan -Hints $testHints.ToArray()
     $coverageFile = Join-Path $RunDir 'coverage.txt'
     Write-CoverageFile -Items $measured -Path $coverageFile
     $reference = Read-CoverageFile $coverageReferenceFile
@@ -1229,6 +1371,16 @@ function Invoke-CoverageStep {
     }
     [System.IO.File]::WriteAllLines((Join-Path $RunDir 'coverage.new.txt'), [string[]]@($newUncovered | ForEach-Object { '{0}{1}{2}{1}{3}' -f $_.Level, "`t", $_.Key, $_.Text }), $Utf8Bom)
 
+    # Изменён перехват правил обмена на загрузку (R3), а загрузку ничто не проверяло: шаг «Обмены» только выгружает.
+    $receiveUnchecked = New-Object System.Collections.Generic.List[string]
+    foreach ($change in @($script:ExchangeRulesChanged)) {
+        if ([string]$change -notmatch '^(изменён|новый) перехват: ') { continue }
+        $changeTarget = [regex]::Match([string]$change, '&[\wА-Яа-яЁё]+\("([^"]+)"\)').Groups[1].Value
+        if (-not $changeTarget -or -not $ExchangeReceiveRegex.IsMatch($changeTarget)) { continue }
+        $checked = @($measured | Where-Object { $_.Level -eq 'covered' -and $_.Key.StartsWith('перехват|') -and $_.Key.EndsWith('|' + $changeTarget) -and ([string]$change).Contains($_.Key.Split('|')[2]) })
+        if ($checked.Count -eq 0) { $receiveUnchecked.Add([string]$change) }
+    }
+
     $covered = @($measured | Where-Object { $_.Level -eq 'covered' }).Count
     $compiledOnly = @($measured | Where-Object { $_.Level -eq 'compiled' }).Count
     $none = @($measured | Where-Object { $_.Level -eq 'none' }).Count
@@ -1236,11 +1388,13 @@ function Invoke-CoverageStep {
     if ($null -eq $reference) { $detail += '; эталона карты ещё нет, этот прогон станет им' }
     else { $detail += ("; нового непокрытого {0}" -f $newUncovered.Count) }
     if ($newUncovered.Count -gt 0) { $detail += ('. Новое непокрытое: ' + (@($newUncovered | Select-Object -First 3 | ForEach-Object { $_.Text }) -join ' | ')) }
+    if ($testHints.Count -gt 0) { $detail += ("; указаний тестов (@Проверяет) {0}" -f $testHints.Count) }
+    if ($receiveUnchecked.Count -gt 0) { $detail += ('. Изменён перехват правил обмена на загрузку, а загрузку ничто не проверяло (шаг «Обмены» только выгружает): ' + (@($receiveUnchecked | Select-Object -First 3) -join ' | ')) }
     $detail += '; карта - coverage.txt'
     if ($problems.Count -gt 0) { $detail += ('. ' + ($problems -join ' | ')) }
 
     $status = 'OK'
-    if ($newUncovered.Count -gt 0 -or $problems.Count -gt 0) { $status = 'WARN' }
+    if ($newUncovered.Count -gt 0 -or $problems.Count -gt 0 -or $receiveUnchecked.Count -gt 0) { $status = 'WARN' }
     if ($status -eq 'OK') { Copy-Item -LiteralPath $coverageFile -Destination $coverageReferenceFile -Force }
     Add-StepResult -Name $stepName -Status $status -Detail $detail -Log $coverageFile
 }

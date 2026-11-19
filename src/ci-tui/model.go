@@ -65,6 +65,7 @@ type model struct {
 	follow    bool
 	prog      *progressState
 	eta       *runEta
+	started   time.Time
 	bar       progress.Model
 	spin      spinner.Model
 	dialog    *dialog
@@ -219,6 +220,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.eng = msg.eng
 		m.running = true
+		m.started = time.Now()
 		m.exitCode = 0
 		m.exitErr = nil
 		m.stopAsked = time.Time{}
