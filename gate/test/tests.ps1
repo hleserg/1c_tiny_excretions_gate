@@ -3263,6 +3263,7 @@ $tests = @(
 
 # Тесты площадки (приватный репозиторий): файл подключается точкой и возвращает массив тестов; ему доступны
 # песочница, запуск скрипта и проверки отсюда.
+$tests = @($tests) + @(. (Join-Path $here 'deploy-contract.tests.ps1'))
 if ($Extra) { $tests = @($tests) + @(. $Extra) }
 
 $selected = @($tests | Where-Object { -not $Only -or $_.Name -like "*$Only*" })

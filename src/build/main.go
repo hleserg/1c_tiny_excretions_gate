@@ -554,7 +554,7 @@ func goBuild(dir, out, ldflags string) []byte {
 func buildGate() []entry {
 	gate := filepath.Join(root, "gate")
 	version := "Версия " + placeholder + "."
-	scripts := []string{"run.ps1", "deploy.ps1", "nightly.ps1", "report.ps1", "settings.ps1", "stats.ps1", "ui.ps1", "unittests.ps1", "unittests-cli.ps1", "update.ps1", "publish.ps1", "github.ps1", "check.ps1", "test/tests.ps1", "test/fakecom.ps1"}
+	scripts := []string{"run.ps1", "deploy.ps1", "nightly.ps1", "report.ps1", "settings.ps1", "stats.ps1", "ui.ps1", "unittests.ps1", "unittests-cli.ps1", "update.ps1", "publish.ps1", "github.ps1", "check.ps1", "test/tests.ps1", "test/fakecom.ps1", "test/deploy-contract.tests.ps1"}
 	stamped := map[string]bool{"run.ps1": true, "deploy.ps1": true, "nightly.ps1": true, "report.ps1": true, "settings.ps1": true, "stats.ps1": true, "unittests-cli.ps1": true, "update.ps1": true, "publish.ps1": true, "github.ps1": true, "test/tests.ps1": true, "test/fakecom.ps1": true}
 	var files []entry
 	texts := map[string]string{}
