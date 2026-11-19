@@ -37,6 +37,8 @@ type uiEvent struct {
 	Preselected []int      `json:"preselected"`
 	AllowEmpty  bool       `json:"allowEmpty"` // вопрос many: Enter без отметок - ответ «ни одного», а не отказ
 	Restart     bool       `json:"restart"`    // событие close: после выхода открыть ci заново (новый ci.exe)
+	Sections    []string   `json:"sections"`   // вопрос one: заголовок группы перед пунктом, "" - нет; по одному на пункт
+	Keys        []string   `json:"keys"`       // вопрос one: своя клавиша пункта (1-9, a-z) вместо порядковой; по одной на пункт
 	Yes         string     `json:"yes"`
 	No          string     `json:"no"`
 	Lines       []string   `json:"lines"`

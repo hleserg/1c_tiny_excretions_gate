@@ -4120,6 +4120,19 @@ if (-not $Tests) { Invoke-RunPublish -Pending }
 $menuKeys = @($PSBoundParameters.Keys | Where-Object { $_ -ne 'UiChannel' })
 if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-UiCanAsk)) {
     $choice = ''
+    # Слоты меню: порядок строк - порядок пунктов на экране, у пункта - группа и своя клавиша. Клавиша не зависит от
+    # того, какие условные пункты сейчас показаны (inbox пуст, прогон зелёный, подготовки нет): «d» - всегда
+    # «Обновить рабочую базу». Новый пункт меню - новая строка здесь (клавиши - из 1-9, a-z, без повторов).
+    $menuSlots = @(
+        @('kit', 'Тестовая база', '1'), @('asis', 'Тестовая база', '2'), @('resume', 'Тестовая база', '3'),
+        @('gitimport', 'Тестовая база', '4'), @('gitexport', 'Тестовая база', '5'), @('accept', 'Тестовая база', '6'),
+        @('runs', 'Тестовая база', '7'), @('tests', 'Тестовая база', '8'),
+        @('precheck', 'Рабочая база', '9'), @('applyprep', 'Рабочая база', 'a'), @('prepare', 'Рабочая база', 'b'),
+        @('cancelprep', 'Рабочая база', 'c'), @('deploy', 'Рабочая база', 'd'), @('rollback', 'Рабочая база', 'e'),
+        @('basestate', 'Рабочая база', 'f'),
+        @('cmpext', 'Сравнить и забрать', 'g'), @('cmpepf', 'Сравнить и забрать', 'h'), @('pullext', 'Сравнить и забрать', 'i'),
+        @('pullepf', 'Сравнить и забрать', 'j'), @('gitprod', 'Сравнить и забрать', 'k'),
+        @('settings', 'Гейт', 'l'), @('update', 'Гейт', 'm'), @('stats', 'Гейт', 'n'), @('comcheck', 'Гейт', 'o'), @('exit', 'Гейт', 'p'))
     while ($true) {
         # inbox - заново на каждом круге меню: «Подтянуть из рабочей» кладёт туда новое.
         $inboxList = New-Object System.Collections.Generic.List[object]
@@ -4147,10 +4160,10 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         $menu.Add([pscustomobject]@{ Key = 'runs'; Label = 'Результаты последних прогонов' })
         if ($unitTestExtensions.Count -gt 0) { $menu.Add([pscustomobject]@{ Key = 'tests'; Label = ('Модульные тесты: список, прогон, новый тест, забрать из {0}' -f $script:Base) }) }
         $menu.Add([pscustomobject]@{ Key = 'stats'; Label = 'Статистика длительностей: план и факт' })
-        $menu.Add([pscustomobject]@{ Key = 'settings'; Label = 'Настройки (config.psd1)' })
+        $menu.Add([pscustomobject]@{ Key = 'settings'; Label = 'Настройки гейта' })
         if ([string](Get-Setting $cfg 'UpdateRepo' '')) { $menu.Add([pscustomobject]@{ Key = 'update'; Label = ('Обновить гейт из GitHub (стоит {0})' -f $script:GateVersion) }) }
         if (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1')) {
-            $menu.Add([pscustomobject]@{ Key = 'deploy'; Label = 'Обновить рабочую базу (deploy)' })
+            $menu.Add([pscustomobject]@{ Key = 'deploy'; Label = 'Обновить рабочую базу' })
             # Обновление в два приёма (deploy.ps1 -Prepare/-ApplyPrepared/-CancelPrepared): подготовка - без блокировок,
             # пользователи работают; что подготовлено - в deploy\prepared.json.
             $preparedFile = Join-Path (Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))) 'prepared.json'
@@ -4176,7 +4189,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             $menu.Add([pscustomobject]@{ Key = 'comcheck'; Label = ('Проверка внешнего соединения (COM) с {0}: как читаются расширения, только читает' -f $script:Base) })
             $menu.Add([pscustomobject]@{ Key = 'cmpext'; Label = 'Сравнить расширения: рабочая и temp' })
             $menu.Add([pscustomobject]@{ Key = 'cmpepf'; Label = 'Сравнить внешние обработки: рабочая и temp' })
-            $menu.Add([pscustomobject]@{ Key = 'precheck'; Label = 'Проверка рабочей перед обновлением (только читает): что изменит загрузка, каких настроек нет' })
+            $menu.Add([pscustomobject]@{ Key = 'precheck'; Label = 'Проверка рабочей перед обновлением: что изменит загрузка, каких настроек нет (только читает)' })
             $menu.Add([pscustomobject]@{ Key = 'rollback'; Label = 'Откатить рабочую базу' })
             $menu.Add([pscustomobject]@{ Key = 'pullext'; Label = 'Подтянуть расширения из рабочей (в inbox)' })
             $menu.Add([pscustomobject]@{ Key = 'pullepf'; Label = 'Подтянуть обработки из рабочей (в inbox)' })
@@ -4201,8 +4214,25 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             catch { $notes += 'ночной прогон: nightly\last.json не читается' }
         }
         if ($usable.Count -eq 0) { $notes += 'в inbox нет обновлений расширений и обработок: прогон с обновлением недоступен' }
-        $picked = Select-UiOne -Header ("Гейт расширений: {0} на {1}" -f $script:Base, $script:Server) -Items @($menu | ForEach-Object { $_.Label }) -Notes $notes
-        if ($picked -lt 0) { $choice = 'exit' } else { $choice = $menu[$picked].Key }
+        # На экран - в порядке слотов: группа за группой, заголовок группы - у её первого показанного пункта.
+        $menuShown = New-Object System.Collections.Generic.List[object]
+        $menuSections = New-Object System.Collections.Generic.List[string]
+        $menuKeys = New-Object System.Collections.Generic.List[string]
+        $menuGroup = ''
+        foreach ($slot in $menuSlots) {
+            foreach ($entry in @($menu | Where-Object { $_.Key -eq $slot[0] })) {
+                $menuShown.Add($entry)
+                if ($slot[1] -ne $menuGroup) { $menuSections.Add([string]$slot[1]) } else { $menuSections.Add('') }
+                $menuGroup = [string]$slot[1]
+                $menuKeys.Add([string]$slot[2])
+            }
+        }
+        if ($menuShown.Count -ne $menu.Count) {
+            $slotNames = @($menuSlots | ForEach-Object { $_[0] })
+            throw ('у пункта меню нет слота в $menuSlots: {0}' -f (@($menu | Where-Object { $slotNames -notcontains $_.Key } | ForEach-Object { $_.Key }) -join ', '))
+        }
+        $picked = Select-UiOne -Header ("Гейт расширений: {0} на {1}" -f $script:Base, $script:Server) -Items @($menuShown | ForEach-Object { $_.Label }) -Notes $notes -Sections $menuSections.ToArray() -Keys $menuKeys.ToArray()
+        if ($picked -lt 0) { $choice = 'exit' } else { $choice = $menuShown[$picked].Key }
         if ($choice -eq 'exit') { Write-Host 'Выход.'; exit 0 }
         # Экран ci.exe - с чистого листа: шаги и вердикт прошлого действия не должны висеть над следующим.
         Send-UiReset

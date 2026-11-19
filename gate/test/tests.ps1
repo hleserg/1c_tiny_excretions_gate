@@ -2165,6 +2165,78 @@ $tests = @(
         }
     },
     @{
+        Name = 'menu-groups'
+        Text = 'меню гейта: пункты по группам (заголовок - у первого пункта группы), у пункта своя клавиша, и она не меняется, когда появляется условный пункт («Прогон с обновлением из inbox»)'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            # Вопрос меню из вывода скрипта: пункты, заголовки групп и клавиши.
+            $getMenu = {
+                param($Result)
+                foreach ($line in @($Result.Output | Where-Object { $_.StartsWith('@@ui:') })) {
+                    $uiEvent = $null
+                    try { $uiEvent = $line.Substring(5) | ConvertFrom-Json } catch { $uiEvent = $null }
+                    if ($null -ne $uiEvent -and [string]$uiEvent.kind -eq 'one' -and ([string]$uiEvent.header).StartsWith('Гейт расширений')) { return $uiEvent }
+                }
+                return $null
+            }
+            $keyOf = {
+                param($Menu, [string]$Pattern)
+                $labels = @($Menu.items | ForEach-Object { [string]$_ })
+                $keys = @($Menu.keys | ForEach-Object { [string]$_ })
+                for ($i = 0; $i -lt $labels.Count; $i++) { if ($labels[$i] -match $Pattern) { return $keys[$i] } }
+                return ''
+            }
+            $r = Invoke-Script -Sandbox $sb -Answers @(@{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            Check ($r.UnusedAnswers -eq 0) ("тест ждал вопросов, а их не было: {0}" -f $r.UnusedAnswers)
+            Check (@($r.Output | Where-Object { $_ -match '^Остановлено: |ParserError' }).Count -eq 0) ('скрипт упал: ' + ((@($r.Output | Where-Object { $_ -match '^Остановлено: ' }) | Select-Object -First 1) -join ''))
+            $menu = & $getMenu $r
+            Check ($null -ne $menu) 'вопроса меню гейта нет'
+            if ($null -ne $menu) {
+                $labels = @($menu.items | ForEach-Object { [string]$_ })
+                $names = @($menu.PSObject.Properties | ForEach-Object { $_.Name })
+                Check (($names -contains 'sections') -and ($names -contains 'keys')) 'в вопросе меню нет заголовков групп или клавиш'
+                if (($names -contains 'sections') -and ($names -contains 'keys')) {
+                    $sections = @($menu.sections | ForEach-Object { [string]$_ })
+                    $keys = @($menu.keys | ForEach-Object { [string]$_ })
+                    Check ($sections.Count -eq $labels.Count -and $keys.Count -eq $labels.Count) ("пунктов {0}, заголовков {1}, клавиш {2} - должно быть поровну" -f $labels.Count, $sections.Count, $keys.Count)
+                    Check ((@($sections | Where-Object { $_ }) -join ' | ') -eq 'Тестовая база | Рабочая база | Сравнить и забрать | Гейт') ("группы: {0}" -f (@($sections | Where-Object { $_ }) -join ' | '))
+                    Check ($sections.Count -gt 0 -and [bool]$sections[0]) 'у первого пункта меню нет заголовка группы'
+                    Check (@($keys | Sort-Object -Unique).Count -eq $keys.Count) ("клавиши повторяются: {0}" -f ($keys -join ''))
+                    Check (@($keys | Where-Object { $_ -notmatch '^[1-9a-z]$' }).Count -eq 0) ("клавиши не из 1-9, a-z: {0}" -f ($keys -join ' '))
+                    Check ($labels[$labels.Count - 1] -eq 'Выход') ("последний пункт - «{0}», ждали «Выход»" -f $labels[$labels.Count - 1])
+                    Check ((& $keyOf $menu '^Прогон на том, что есть в базе$') -eq '2') ("«Прогон на том, что есть в базе»: клавиша «{0}», ждали «2»" -f (& $keyOf $menu '^Прогон на том, что есть в базе$'))
+                    Check ((& $keyOf $menu '^Обновить рабочую базу$') -eq 'd') ("«Обновить рабочую базу»: клавиша «{0}», ждали «d»" -f (& $keyOf $menu '^Обновить рабочую базу$'))
+                    Check ((& $keyOf $menu '^Откатить рабочую базу$') -eq 'e') ("«Откатить рабочую базу»: клавиша «{0}», ждали «e»" -f (& $keyOf $menu '^Откатить рабочую базу$'))
+                    Check ((& $keyOf $menu '^Настройки гейта$') -eq 'l') ("«Настройки гейта»: клавиша «{0}», ждали «l»" -f (& $keyOf $menu '^Настройки гейта$'))
+                    Check ((& $keyOf $menu '^Прогон с обновлением из inbox') -eq '') 'в пустом inbox есть пункт «Прогон с обновлением из inbox»'
+                    # Группа «Рабочая база» идёт раньше «Сравнить и забрать»: проверка перед обновлением - выше сравнения.
+                    $precheckAt = [array]::IndexOf($labels, @($labels | Where-Object { $_ -match '^Проверка рабочей перед обновлением' } | Select-Object -First 1)[0])
+                    $compareAt = [array]::IndexOf($labels, @($labels | Where-Object { $_ -match '^Сравнить расширения' } | Select-Object -First 1)[0])
+                    Check ($precheckAt -ge 0 -and $compareAt -gt $precheckAt) ("порядок: проверка рабочей {0}, сравнение {1}" -f $precheckAt, $compareAt)
+                    if ($precheckAt -ge 0 -and $compareAt -ge 0) {
+                        Check ($sections[$precheckAt] -eq 'Рабочая база') 'группа «Рабочая база» начинается не с проверки перед обновлением'
+                        Check ($sections[$compareAt] -eq 'Сравнить и забрать') 'группа «Сравнить и забрать» начинается не со сравнения расширений'
+                    }
+                }
+            }
+            # В inbox появилось обновление: новый пункт - первым, со своей клавишей «1», остальные клавиши те же.
+            $null = Add-InboxFile $sb $cfeName
+            $k = Invoke-Script -Sandbox $sb -Answers @(@{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
+            Check ($k.Unexpected.Count -eq 0) ("с обновлением в inbox: неожиданные вопросы: " + ($k.Unexpected -join ' | '))
+            $menuKit = & $getMenu $k
+            Check ($null -ne $menuKit) 'с обновлением в inbox: вопроса меню гейта нет'
+            if ($null -ne $menuKit -and @($menuKit.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'keys') {
+                Check ((& $keyOf $menuKit '^Прогон с обновлением из inbox') -eq '1') ("«Прогон с обновлением из inbox»: клавиша «{0}», ждали «1»" -f (& $keyOf $menuKit '^Прогон с обновлением из inbox'))
+                Check ([string]@($menuKit.items)[0] -match '^Прогон с обновлением из inbox') ("первый пункт - «{0}»" -f [string]@($menuKit.items)[0])
+                Check ([string]@($menuKit.sections)[0] -eq 'Тестовая база') 'заголовок группы не у первого показанного пункта'
+                Check ((& $keyOf $menuKit '^Прогон на том, что есть в базе$') -eq '2') 'клавиша «Прогон на том, что есть в базе» сдвинулась, когда появился пункт inbox'
+                Check ((& $keyOf $menuKit '^Обновить рабочую базу$') -eq 'd') 'клавиша «Обновить рабочую базу» сдвинулась, когда появился пункт inbox'
+            }
+        }
+    },
+    @{
         Name = 'deploy-designer-busy-retry'
         Text = 'deploy: конфигуратор рабочей занят на выгрузке - вопрос, «закрыть отсюда» завершает только конфигуратор рабочей, выгрузка повторяется'
         Run = {

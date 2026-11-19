@@ -4,7 +4,8 @@
 #
 # Канал интерфейса ci.exe (ключ -UiChannel <папка>). Скрипт запущен из ci.exe, его вывод читает ci.exe.
 # Всё, что надо показать особо, скрипт пишет строками «@@ui:{json}»: ход шага (progress, progress-end),
-# заголовок в рамке (title), вопрос (one, many, confirm, text, view) с номером id. Ответ ci.exe кладёт
+# заголовок в рамке (title), вопрос (one, many, confirm, text, view) с номером id; у вопроса one могут быть
+# заголовки групп (sections) и свои клавиши пунктов (keys), по одному на пункт. Ответ ci.exe кладёт
 # в папку канала файлом a-<id>.json: {"cancel":..,"index":..,"indexes":[..],"yes":..,"text":".."}.
 # Если вопрос ждёт события (закроют конфигуратор, уйдут сеансы) и оно случилось, скрипт пишет
 # {"kind":"cancel","id":..} и идёт дальше. Файл stop в папке канала - просьба остановиться: скрипт
@@ -240,10 +241,19 @@ function Get-UiKeyIndex {
 function Select-UiOne {
     # Один пункт из списка. Возвращает номер пункта (с нуля) или -1, если выбор отменили (Esc, 0).
     # Danger - номера опасных пунктов (откат рабочей): в ci.exe они в красной рамке с ▲!, в консоли - красные, с «!!!».
-    param([string]$Header, [string[]]$Items, [string[]]$Notes = @(), [int[]]$Danger = @())
+    # Sections - заголовки групп, по одному на пункт: непустой - с этого пункта начинается группа (строка-заголовок
+    # перед ним, выбрать её нельзя). Keys - своя клавиша у каждого пункта (из 1-9, a-z) вместо порядковой: клавиша
+    # пункта не зависит от того, какие пункты показаны сейчас (меню гейта). Оба действуют, только если их столько
+    # же, сколько пунктов.
+    param([string]$Header, [string[]]$Items, [string[]]$Notes = @(), [int[]]$Danger = @(), [string[]]$Sections = @(), [string[]]$Keys = @())
     if ($Items.Count -eq 0) { return -1 }
+    $hasSections = ($Sections.Count -eq $Items.Count)
+    $hasKeys = ($Keys.Count -eq $Items.Count)
     if ($script:UiChannelDir) {
-        $answer = Request-UiAnswer -Question @{ kind = 'one'; header = $Header; items = @($Items); notes = @($Notes | Where-Object { $_ }); danger = @($Danger) }
+        $question = @{ kind = 'one'; header = $Header; items = @($Items); notes = @($Notes | Where-Object { $_ }); danger = @($Danger) }
+        if ($hasSections) { $question['sections'] = @($Sections) }
+        if ($hasKeys) { $question['keys'] = @($Keys) }
+        $answer = Request-UiAnswer -Question $question
         if ([bool](Get-UiField $answer 'cancel' $false)) { return -1 }
         $index = [int](Get-UiField $answer 'index' -1)
         if ($index -ge 0 -and $index -lt $Items.Count) { return $index }
@@ -254,9 +264,13 @@ function Select-UiOne {
     Write-Host ('  ' + $Header)
     foreach ($note in $Notes) { if ($note) { Write-Host ('  ' + $note) -ForegroundColor DarkGray } }
     $shown = [Math]::Min($Items.Count, $script:UiKeys.Count)
+    if ($hasKeys) { $shown = $Items.Count }
     for ($i = 0; $i -lt $shown; $i++) {
-        if ($Danger -contains $i) { Write-Host ("    {0} - {1}" -f $script:UiKeys[$i], $shownItems[$i]) -ForegroundColor Red }
-        else { Write-Host ("    {0} - {1}" -f $script:UiKeys[$i], $shownItems[$i]) }
+        if ($hasSections -and $Sections[$i]) { Write-Host ('  ' + $Sections[$i].ToUpper()) -ForegroundColor Cyan }
+        $itemKey = $script:UiKeys[$i]
+        if ($hasKeys) { $itemKey = $Keys[$i] }
+        if ($Danger -contains $i) { Write-Host ("    {0} - {1}" -f $itemKey, $shownItems[$i]) -ForegroundColor Red }
+        else { Write-Host ("    {0} - {1}" -f $itemKey, $shownItems[$i]) }
     }
     Write-Host '    0 - отмена'
     Write-Host -NoNewline '  Выбор: '
@@ -264,6 +278,13 @@ function Select-UiOne {
         $keyInfo = [Console]::ReadKey($true)
         if ([string]$keyInfo.KeyChar -eq '0') { Write-Host '0'; return -1 }
         $index = Get-UiKeyIndex $keyInfo
+        if ($hasKeys) {
+            # Свои клавиши: нажатая клавиша - в её букву (в любой раскладке), буква - в пункт.
+            if ($index -lt 0) { continue }
+            $index = [array]::IndexOf($Keys, $script:UiKeys[$index])
+            if ($index -ge 0) { Write-Host $Keys[$index]; return $index }
+            continue
+        }
         if ($index -ge 0 -and $index -lt $shown) { Write-Host $script:UiKeys[$index]; return $index }
     }
 }
