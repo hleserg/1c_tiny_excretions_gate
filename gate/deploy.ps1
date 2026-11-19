@@ -18,6 +18,11 @@
     .\deploy.ps1 -PullExtensions / -PullProcessings
         Положить в inbox расширения (внешние обработки) рабочей базы, которые отличаются от temp.
 
+    .\deploy.ps1 -ProdPreCheck
+        Проверка рабочей базы перед обновлением: «Выполнить после обновления» в режиме precheck - то же, что кнопка
+        «Проверка перед обновлением (только чтение)» в её форме. Что изменит загрузка комплекта и каких настроек
+        не хватает. Рабочую только читает: ни блокировок, ни записи.
+
     .\deploy.ps1 -GitExport / -GitImport
         Репозиторий расширений (ExtensionsRepo, раздел 5.23): выгрузить temp в git - первый раз коммитом в main,
         потом правки temp веткой temp/<время> и pull request; загрузить из git - проверка правок temp и обычный
@@ -56,6 +61,8 @@ param(
     # Сравнить temp и рабочую и показать разницу: расширения (по выгрузкам в файлы) или внешние обработки. Только чтение.
     [switch]$CompareExtensions,
     [switch]$CompareProcessings,
+    # Проверка рабочей перед обновлением («Выполнить после обновления», режим precheck). Рабочую только читает.
+    [switch]$ProdPreCheck,
     # Репозиторий расширений (ExtensionsRepo): выгрузить temp в git или загрузить из git в temp. Рабочую не трогает.
     [switch]$GitExport,
     [switch]$GitImport,
@@ -702,12 +709,12 @@ Initialize-Stats -Dir (Resolve-RootPath ([string](Get-Setting $cfg 'StatsDir' 's
 $deployRoot = Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))
 $mirrorRoot = Join-Path $deployRoot 'mirror'
 $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
-$viewOnly = ($BaseState -or $CompareExtensions -or $CompareProcessings -or $GitExport -or $GitImport -or $GitProd -or $GitTypical)
+$viewOnly = ($BaseState -or $CompareExtensions -or $CompareProcessings -or $ProdPreCheck -or $GitExport -or $GitImport -or $GitProd -or $GitTypical)
 if ($viewOnly) {
     # Показать состояние или сравнить - не запуск обновления: своей папки запуска нет (в истории обновлений его не видно),
     # журнал - в deploy\state\run.log, каждый раз заново.
     $viewName = 'state'
-    if ($CompareExtensions) { $viewName = 'compare-ext' } elseif ($CompareProcessings) { $viewName = 'compare-epf' } elseif ($GitExport -or $GitImport -or $GitProd -or $GitTypical) { $viewName = 'git' }
+    if ($CompareExtensions) { $viewName = 'compare-ext' } elseif ($CompareProcessings) { $viewName = 'compare-epf' } elseif ($ProdPreCheck) { $viewName = 'precheck' } elseif ($GitExport -or $GitImport -or $GitProd -or $GitTypical) { $viewName = 'git' }
     $script:RunDir = Join-Path $deployRoot $viewName
     New-Item -ItemType Directory -Path $script:RunDir -Force | Out-Null
     $script:RunLogPath = Join-Path $script:RunDir 'run.log'
@@ -1274,7 +1281,9 @@ function Export-Processings {
 
 function Invoke-ProdClient {
     # Тонкий клиент рабочей базы с внешней обработкой; ждём файл $DoneFile не дольше $TimeoutSec.
-    param([string]$Epf, [string]$Parameter, [string]$DoneFile, [int]$TimeoutSec, [string]$Title)
+    # StartFile - отметка «обработка открылась и поняла параметр запуска»: нет её за StartTimeoutSec - дальше не ждём
+    # (вход не удался или сборка обработки этого режима не знает); в ответе Started.
+    param([string]$Epf, [string]$Parameter, [string]$DoneFile, [int]$TimeoutSec, [string]$Title, [string]$StartFile = '', [int]$StartTimeoutSec = 0)
     $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword) + @(
         '/DisableStartupDialogs', '/DisableStartupMessages', '/Execute', ('"{0}"' -f $Epf), ('/C"{0}"' -f $Parameter))
     $argLine = $argList -join ' '
@@ -1290,6 +1299,7 @@ function Invoke-ProdClient {
     $total = 0
     $detail = ''
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec -and -not (Test-Path -LiteralPath $DoneFile) -and -not $process.HasExited) {
+        if ($StartFile -and $StartTimeoutSec -gt 0 -and $watch.Elapsed.TotalSeconds -ge $StartTimeoutSec -and -not (Test-Path -LiteralPath $StartFile)) { break }
         if ($watch.Elapsed.TotalSeconds -ge $nextLook) {
             $nextLook = $watch.Elapsed.TotalSeconds + 3
             $last = @(Get-ChildItem -LiteralPath $outDir -Filter 'p*.txt' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^p\d{6}\.txt$' } | Sort-Object Name | Select-Object -Last 1)
@@ -1326,7 +1336,8 @@ function Invoke-ProdClient {
     $statStatus = 'TIMEOUT'
     if ($done) { $statStatus = 'OK' }
     Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status $statStatus -Size ([Math]::Max(0, $total))
-    return [pscustomobject]@{ Done = $done; Seconds = [int]$watch.Elapsed.TotalSeconds }
+    $started = ($done -or -not $StartFile -or (Test-Path -LiteralPath $StartFile))
+    return [pscustomobject]@{ Done = $done; Seconds = [int]$watch.Elapsed.TotalSeconds; Started = $started }
 }
 
 function Invoke-ProdProcessing {
@@ -1643,6 +1654,104 @@ if ($BaseState) {
     $stateLink = Connect-ClusterAgent
     Show-BaseState -Link $stateLink -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
     Show-BaseState -Link $stateLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+    exit 0
+}
+
+function Get-ToolSourceHash {
+    # Отпечаток выгрузки обработки в файлы: <Имя>.xml и папка <Имя>, путь и хеш каждого файла.
+    # Слово в слово та же функция в run.ps1 и deploy.ps1 (их сверяет тест deploy-prod-precheck): отпечаток один на оба скрипта.
+    param([string]$Xml)
+    $sourceRoot = Split-Path -Parent $Xml
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $files = @(Get-Item -LiteralPath $Xml)
+    $dir = Join-Path $sourceRoot ([System.IO.Path]::GetFileNameWithoutExtension($Xml))
+    if (Test-Path -LiteralPath $dir) { $files += @(Get-ChildItem -LiteralPath $dir -Recurse -File) }
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($file in @($files | Sort-Object FullName)) {
+        $relative = $file.FullName.Substring($sourceRoot.Length + 1).Replace('\', '/')
+        $lines.Add(('{0}={1}' -f $relative, [System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($file.FullName))).Replace('-', '')))
+    }
+    return [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes(($lines -join "`n")))).Replace('-', '')
+}
+
+function Update-SelfCheckEpf {
+    # Обработка самопроверки - из исходников поставки tools\src, как её собирает гейт перед прогоном (run.ps1,
+    # Update-GateTools): после обновления гейта и до первого прогона на диске ещё прежняя сборка, а нужный режим мог
+    # появиться только в новой. Собирает конфигуратор тестовой базы - рабочая для этого не открывается.
+    # Не собралась - работаем с прежней.
+    $xml = Join-Path (Resolve-RootPath 'tools\src') 'ВыполнитьПослеОбновления.xml'
+    if (-not (Test-Path -LiteralPath $xml)) { return }
+    $hash = Get-ToolSourceHash $xml
+    $marker = $selfCheckEpf + '.source.txt'
+    $built = ''
+    if (Test-Path -LiteralPath $marker) { $built = ([System.IO.File]::ReadAllText($marker)).Trim() }
+    if ((Test-Path -LiteralPath $selfCheckEpf) -and $built -eq $hash) { return }
+    Write-Line '  обработка самопроверки собрана не из текущей поставки: собираю заново (конфигуратор тестовой базы)'
+    $newFile = [System.IO.Path]::ChangeExtension($selfCheckEpf, '.new.epf')
+    if (Test-Path -LiteralPath $newFile) { Remove-Item -LiteralPath $newFile -Force }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $selfCheckEpf) -Force | Out-Null
+    $result = Invoke-Designer -BaseName $script:TempBase -Command @('/LoadExternalDataProcessorOrReportFromFiles', ('"{0}"' -f $xml), ('"{0}"' -f $newFile)) `
+        -LogName 'build_tool_ВыполнитьПослеОбновления.log' -TimeoutSec $timeoutLoadSec -Title 'Собрать обработку самопроверки из поставки'
+    if ($result.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $newFile)) {
+        Write-Line ("  обработка самопроверки из поставки не собралась (код {0}): {1}. Беру прежнюю." -f $result.ExitCode, $result.Text) 'Yellow'
+        return
+    }
+    if (Test-Path -LiteralPath $selfCheckEpf) { Copy-Item -LiteralPath $selfCheckEpf -Destination ($selfCheckEpf + '.old') -Force }
+    Move-Item -LiteralPath $newFile -Destination $selfCheckEpf -Force
+    [System.IO.File]::WriteAllText($marker, $hash, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Line ("  обработка самопроверки собрана из поставки: {0} (прежняя - {0}.old)" -f $selfCheckEpf) 'Green'
+}
+
+if ($ProdPreCheck) {
+    # Проверка рабочей перед обновлением: клиент рабочей базы с обработкой самопроверки в режиме precheck. Обработка
+    # выполняет два шага - «Окружение» и «ПередОбновлением» (их пишет пакет сценариев базы) - и только читает.
+    # Здесь - ни блокировок, ни завершения сеансов, ни конфигуратора рабочей.
+    Write-Line ("ПРОВЕРКА {0} ПЕРЕД ОБНОВЛЕНИЕМ, {1}" -f $script:ProdBase, (Get-Date -Format 'dd.MM.yyyy HH:mm:ss')) 'Cyan'
+    Write-Line '  Только чтение: в базу ничего не пишется, блокировки не ставятся, сеансы не трогаются.'
+    Update-SelfCheckEpf
+    if (-not (Test-Path -LiteralPath $selfCheckEpf)) { throw ("нет обработки самопроверки: {0}" -f $selfCheckEpf) }
+    $preDir = Join-Path $script:RunDir 'out'
+    if (Test-Path -LiteralPath $preDir) { Remove-Item -LiteralPath $preDir -Recurse -Force }
+    New-Item -ItemType Directory -Path $preDir -Force | Out-Null
+    $preJournalCopy = Join-Path $script:RunDir 'precheck.txt'
+    if (Test-Path -LiteralPath $preJournalCopy) { Remove-Item -LiteralPath $preJournalCopy -Force }
+    $preTimeoutSec = 900
+    $client = Invoke-ProdClient -Epf $selfCheckEpf -Parameter ("precheck;out={0}" -f $preDir) -DoneFile (Join-Path $preDir 'result.txt') `
+        -TimeoutSec $preTimeoutSec -Title 'Проверка перед обновлением' -StartFile (Join-Path $preDir 'started.txt') -StartTimeoutSec $canaryTimeoutSec
+    if (-not $client.Started) {
+        throw ("обработка в {0} не начала проверку за {1} с. Либо вход не удался (пользователь, пароль, блокировка начала сеансов), либо обработка {2} собрана до появления этого режима: запусти любой прогон гейта - он пересоберёт её из поставки" -f $script:ProdBase, $canaryTimeoutSec, $selfCheckEpf)
+    }
+    if (-not $client.Done) { throw ("проверка не закончилась за {0} мин; что успела записать - в {1}" -f [int]($preTimeoutSec / 60), $preDir) }
+    $preResult = Read-KeyValueFile (Join-Path $preDir 'result.txt')
+    $preStatus = [string](Get-Setting $preResult 'status' '')
+    if ($preStatus -ne 'done') { throw ("обработка ответила «{0}»: {1}" -f $preStatus, (Get-Setting $preResult 'message' '')) }
+    $preJournal = Join-Path $preDir 'precheck.txt'
+    if (-not (Test-Path -LiteralPath $preJournal)) { throw ("обработка ответила «done», а журнала проверки нет: {0}" -f $preJournal) }
+    $preLines = @([System.IO.File]::ReadAllLines($preJournal, [System.Text.Encoding]::UTF8))
+    [System.IO.File]::WriteAllLines($preJournalCopy, [string[]]$preLines, $Utf8Bom)
+    # Журнал - на экран целиком: записи ОШИБКА красным, ВНИМАНИЕ жёлтым; строки продолжения - цветом своей записи.
+    $preTagRegex = New-Object System.Text.RegularExpressions.Regex('^\s*(?:\d\d:\d\d:\d\d )?\[(ОК|ОШИБКА|ВНИМАНИЕ|ПРОПУСК|ИНФО)\]')
+    $preCounts = @{ 'ОК' = 0; 'ОШИБКА' = 0; 'ВНИМАНИЕ' = 0; 'ПРОПУСК' = 0; 'ИНФО' = 0 }
+    $preColor = 'Gray'
+    Write-Host ''
+    foreach ($line in $preLines) {
+        $text = ([string]$line).TrimStart([char]0xFEFF)
+        $found = $preTagRegex.Match($text)
+        if ($found.Success) {
+            $tag = $found.Groups[1].Value
+            $preCounts[$tag] = $preCounts[$tag] + 1
+            $preColor = 'Gray'
+            if ($tag -ceq 'ОШИБКА') { $preColor = 'Red' } elseif ($tag -ceq 'ВНИМАНИЕ' -or $tag -ceq 'ПРОПУСК') { $preColor = 'Yellow' }
+        }
+        elseif ($text.StartsWith('===')) { $preColor = 'Cyan' }
+        elseif (-not $text.StartsWith($SelfCheckIndent, [System.StringComparison]::Ordinal)) { $preColor = 'Gray' }
+        Write-Line ('  ' + $text) $preColor
+    }
+    Write-Host ''
+    $preTotal = 'ошибок {0}, предупреждений {1}, пропусков {2}' -f $preCounts['ОШИБКА'], $preCounts['ВНИМАНИЕ'], $preCounts['ПРОПУСК']
+    $preTotalColor = 'Green'
+    if ($preCounts['ОШИБКА'] -gt 0) { $preTotalColor = 'Red' } elseif ($preCounts['ВНИМАНИЕ'] + $preCounts['ПРОПУСК'] -gt 0) { $preTotalColor = 'Yellow' }
+    Write-Line ("Проверка {0} перед обновлением: {1}. В базе ничего не изменено. Журнал: {2}" -f $script:ProdBase, $preTotal, $preJournalCopy) $preTotalColor
     exit 0
 }
 

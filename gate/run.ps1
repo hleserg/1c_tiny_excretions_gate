@@ -4083,6 +4083,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             $menu.Add([pscustomobject]@{ Key = 'basestate'; Label = 'Показать состояние баз: блокировки и сеансы' })
             $menu.Add([pscustomobject]@{ Key = 'cmpext'; Label = 'Сравнить расширения: рабочая и temp' })
             $menu.Add([pscustomobject]@{ Key = 'cmpepf'; Label = 'Сравнить внешние обработки: рабочая и temp' })
+            $menu.Add([pscustomobject]@{ Key = 'precheck'; Label = 'Проверка рабочей перед обновлением (только читает): что изменит загрузка, каких настроек нет' })
             $menu.Add([pscustomobject]@{ Key = 'rollback'; Label = 'Откатить рабочую базу' })
             $menu.Add([pscustomobject]@{ Key = 'pullext'; Label = 'Подтянуть расширения из рабочей (в inbox)' })
             $menu.Add([pscustomobject]@{ Key = 'pullepf'; Label = 'Подтянуть обработки из рабочей (в inbox)' })
@@ -4123,6 +4124,15 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             $compareArgs = @{ CompareExtensions = ($choice -eq 'cmpext'); CompareProcessings = ($choice -eq 'cmpepf') }
             if ($UiChannel) { $compareArgs['UiChannel'] = $UiChannel }
             try { & (Join-Path $Root 'deploy.ps1') @compareArgs }
+            catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+            Wait-UiAcknowledge
+            continue
+        }
+        if ($choice -eq 'precheck') {
+            # Только чтение: «Выполнить после обновления» в рабочей в режиме precheck - и обратно в меню.
+            try {
+                if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -ProdPreCheck -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') -ProdPreCheck }
+            }
             catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
             Wait-UiAcknowledge
             continue
@@ -4454,15 +4464,16 @@ function Invoke-Designer {
 
 function Get-ToolSourceHash {
     # Отпечаток выгрузки обработки в файлы: <Имя>.xml и папка <Имя>, путь и хеш каждого файла.
+    # Слово в слово та же функция в run.ps1 и deploy.ps1 (их сверяет тест deploy-prod-precheck): отпечаток один на оба скрипта.
     param([string]$Xml)
-    $root = Split-Path -Parent $Xml
+    $sourceRoot = Split-Path -Parent $Xml
     $sha = [System.Security.Cryptography.SHA256]::Create()
     $files = @(Get-Item -LiteralPath $Xml)
-    $dir = Join-Path $root ([System.IO.Path]::GetFileNameWithoutExtension($Xml))
+    $dir = Join-Path $sourceRoot ([System.IO.Path]::GetFileNameWithoutExtension($Xml))
     if (Test-Path -LiteralPath $dir) { $files += @(Get-ChildItem -LiteralPath $dir -Recurse -File) }
     $lines = New-Object System.Collections.Generic.List[string]
     foreach ($file in @($files | Sort-Object FullName)) {
-        $relative = $file.FullName.Substring($root.Length + 1).Replace('\', '/')
+        $relative = $file.FullName.Substring($sourceRoot.Length + 1).Replace('\', '/')
         $lines.Add(('{0}={1}' -f $relative, [System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($file.FullName))).Replace('-', '')))
     }
     return [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes(($lines -join "`n")))).Replace('-', '')

@@ -9,7 +9,8 @@
 // и задержку. /DumpCfg и /DumpConfigToFiles создают файл и каталог, /LoadExternalDataProcessorOrReportFromFiles -
 // файл обработки, /DumpExternalDataProcessorOrReportToFiles - корневой XML и модуль объекта, если код возврата 0.
 //
-// Тонкий клиент (ENTERPRISE): режим - первое слово /C. canary, selfcheck (с start= - с этого задания), regepf, unregepf, kbarticle
+// Тонкий клиент (ENTERPRISE): режим - первое слово /C. canary, selfcheck (с start= - с этого задания), regepf, unregepf, kbarticle,
+// precheck (проверка перед обновлением: started.txt, precheck.txt, result.txt)
 // отвечают файлами так же, как настоящие обработки. Список ответов режима - по вызовам: первый вызов
 // берёт первый элемент, следующие - следующие, последний повторяется. RunUnitTests=<файл настроек> - как YAxUnit:
 // лог, отчёт jUnit и файл кода возврата из настроек; тесты - из сценария unittests.
@@ -103,6 +104,16 @@ type unitRun struct {
 	Hang       float64 `json:"hang"`
 }
 
+// precheck - ответ режима precheck. Lines - строки журнала (пусто - журнал по умолчанию); NoStart - сборка обработки
+// режима не знает: форма открыта и ждёт, файлов нет; NoResult - отметка запуска есть, итога нет.
+type precheck struct {
+	Lines    []string `json:"lines"`
+	Status   string   `json:"status"`
+	Message  string   `json:"message"`
+	NoStart  bool     `json:"nostart"`
+	NoResult bool     `json:"noresult"`
+}
+
 type scenario struct {
 	Designer  []designerRule `json:"designer"`
 	Canary    []canary       `json:"canary"`
@@ -110,6 +121,7 @@ type scenario struct {
 	Regepf    []processing   `json:"regepf"`
 	Unregepf  []processing   `json:"unregepf"`
 	Kbarticle []processing   `json:"kbarticle"`
+	Precheck  []precheck     `json:"precheck"`
 	// Выгрузка расширения в файлы (/DumpConfigToFiles): расширение -> путь файла от корня выгрузки -> текст;
 	// основная конфигурация (без -Extension) - ключ "@config"
 	Dumps      map[string]map[string]string `json:"dumps"`
@@ -406,6 +418,12 @@ func client(sc scenario, args []string, state map[string]int) int {
 			u = unitRun{Cases: []unitCase{{Module: "ОМ_Пример", Method: "Тест", Status: "ok"}}}
 		}
 		unitRun1(u, p["config"])
+	case "precheck":
+		c, ok := pick(sc.Precheck, state, "precheck")
+		if !ok {
+			c = precheck{}
+		}
+		precheckRun(c, dirOf(p["out"]))
 	case "regepf", "unregepf", "kbarticle":
 		list := sc.Regepf
 		if mode == "unregepf" {
@@ -540,6 +558,42 @@ func selfcheckRun(s selfcheck, dir, known string, start int) {
 	}
 	writeUTF8(dir+"result.txt", fmt.Sprintf("status=%s\nversion=20261117.999999\nfingerprint=%s\npieces=%d\nwriteerrors=0\nok=%d\nerrors=%d\nwarnings=%d\nskipped=%d",
 		status, fingerprint, pieces, ok, errs, warns, skips))
+}
+
+// precheckRun - как режим precheck обработки «Выполнить после обновления»: отметка запуска, журнал двух шагов, итог.
+func precheckRun(c precheck, dir string) {
+	if c.NoStart {
+		time.Sleep(time.Hour)
+	}
+	writeUTF8(dir+"started.txt", "started=20261117.999999")
+	if c.NoResult {
+		time.Sleep(time.Hour)
+	}
+	lines := c.Lines
+	if len(lines) == 0 {
+		lines = []string{
+			"Проверка перед обновлением (только чтение), сборка обработки 20261117.999999, 19.11.2026 18:00:00",
+			"",
+			"=== Окружение и расширения ===",
+			"18:00:01 [ИНФО]     Имя базы: erp_base - не похоже на тестовую",
+			"18:00:01 [ОК]       Обработка запущена под полными правами",
+			"--- шаг занял 10 мс; ОК: 1, ошибок: 0, внимание: 0, пропусков: 0",
+			"",
+			"=== Перед обновлением: что изменит загрузка комплекта (только чтение) ===",
+			"18:00:02 [ИНФО]     Шаг только читает и выполняется в любой базе.",
+			"18:00:02 [ОК]       Значений, которые очистит обновление, в данных нет.",
+		}
+	}
+	writeUTF8(dir+"precheck.txt", strings.Join(lines, "\n"))
+	status := c.Status
+	if status == "" {
+		status = "done"
+	}
+	result := []string{"status=" + status, "version=20261117.999999", "fingerprint=", "pieces=0", "writeerrors=0"}
+	if c.Message != "" {
+		result = append(result, "message="+c.Message)
+	}
+	writeUTF8(dir+"result.txt", strings.Join(result, "\n"))
 }
 
 func processingRun(mode string, r processing, dir string, p map[string]string) {

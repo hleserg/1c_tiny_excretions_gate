@@ -1680,6 +1680,96 @@ $tests = @(
         }
     },
     @{
+        Name = 'deploy-prod-precheck'
+        Text = '«Проверка рабочей перед обновлением»: обработка самопроверки пересобрана из поставки конфигуратором temp, клиент рабочей в режиме precheck, журнал на экране и в файле, счёт ошибок и предупреждений; в рабочей ничего не меняется; второй раз обработка не пересобирается'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $src = Join-Path $sb 'tools\src'
+            New-Item -ItemType Directory -Path (Join-Path $src 'ВыполнитьПослеОбновления\Ext') -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $src 'ВыполнитьПослеОбновления.xml'), '<MetaDataObject><ExternalDataProcessor><Properties><Name>ВыполнитьПослеОбновления</Name></Properties></ExternalDataProcessor></MetaDataObject>', $utf8)
+            [System.IO.File]::WriteAllText((Join-Path $src 'ВыполнитьПослеОбновления\Ext\ObjectModule.bsl'), 'Процедура А() КонецПроцедуры', $utf8)
+            $journal = @(
+                'Проверка перед обновлением (только чтение), сборка обработки 20261117.999999, 19.11.2026 18:00:00',
+                '=== Перед обновлением: что изменит загрузка комплекта (только чтение) ===',
+                '18:00:02 [ИНФО]     Кнопка «Создать настройки»: настройка будет создана',
+                '18:00:02 [ВНИМАНИЕ] В регистре есть значения, которые очистит новый тип поля:',
+                ((' ' * 20) + 'Документ.Пример: записей 3'),
+                '18:00:03 [ОШИБКА]   Регистр: проверку выполнить не удалось')
+            $fake = @{ precheck = @(@{ lines = $journal }) }
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ProdPreCheck' -Fake $fake -Com (New-ComState)
+            Check-DeployCommon $r -LocksExpected $false
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            $text = $r.Output -join "`n"
+            Check ($text -match 'ПРОВЕРКА erp_base ПЕРЕД ОБНОВЛЕНИЕМ') 'нет заголовка проверки'
+            Check ($text -match 'настройка будет создана') 'журнала проверки нет на экране'
+            Check ($text -match 'Документ\.Пример: записей 3') 'нет строки продолжения журнала'
+            Check ($text -match 'ошибок 1, предупреждений 1, пропусков 0') 'нет итога «ошибок 1, предупреждений 1, пропусков 0»'
+            # Обработку собирает конфигуратор temp; конфигуратор рабочей не открывается вообще.
+            $builds = Get-Calls $r @('/LoadExternalDataProcessorOrReportFromFiles')
+            Check ($builds.Count -eq 1 -and $builds[0].Line.Contains('fake\erp_temp_test')) ("сборок обработки самопроверки {0}, ждали одну конфигуратором temp" -f $builds.Count)
+            Check (@($r.Calls | Where-Object { $_.Line.Contains('DESIGNER') -and $_.Line.Contains('fake\erp_base') }).Count -eq 0) 'проверка открывала конфигуратор рабочей'
+            $epf = Join-Path $sb 'tools\ВыполнитьПослеОбновления.epf'
+            Check (([System.IO.File]::ReadAllText($epf) -match '^FAKEEPF') -and (Test-Path -LiteralPath ($epf + '.source.txt'))) 'обработка самопроверки не собрана из поставки'
+            Check ((Get-Calls $r @('ENTERPRISE', 'precheck', 'fake\erp_base')).Count -eq 1) 'клиент рабочей в режиме precheck не запускался'
+            Check ((Get-Calls $r @('ENTERPRISE', 'selfcheck')).Count -eq 0) 'запускалась полная самопроверка'
+            Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0 -and (Get-Calls $r @('/UpdateDBCfg')).Count -eq 0) 'проверка что-то загружала'
+            Check (@($r.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'проверка меняла блокировки или сеансы'
+            Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\precheck\precheck.txt')) 'нет журнала deploy\precheck\precheck.txt'
+            $runDirs = @(Get-ChildItem -LiteralPath (Join-Path $sb 'deploy') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8}-\d{6}$' })
+            Check ($runDirs.Count -eq 0) 'проверка создала папку запуска обновления'
+            Reset-FakeState $sb
+            $again = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ProdPreCheck' -Fake $fake -Com (New-ComState)
+            Check-DeployCommon $again -LocksExpected $false
+            Check ((Get-Calls $again @('/LoadExternalDataProcessorOrReportFromFiles')).Count -eq 0) 'вторая проверка снова собирала обработку'
+            Check ((Get-Calls $again @('ENTERPRISE', 'precheck', 'fake\erp_base')).Count -eq 1) 'вторая проверка не запустила клиент рабочей'
+            # Отпечаток исходников считают оба скрипта: функции должны совпадать слово в слово, иначе обработка
+            # пересобиралась бы по кругу - то гейтом, то проверкой.
+            $hashPattern = '(?s)function Get-ToolSourceHash \{.*?\n\}'
+            $inRun = [regex]::Match([System.IO.File]::ReadAllText((Join-Path $sb 'run.ps1'), $utf8), $hashPattern).Value
+            $inDeploy = [regex]::Match([System.IO.File]::ReadAllText((Join-Path $sb 'deploy.ps1'), $utf8), $hashPattern).Value
+            Check ($inRun -and $inRun -eq $inDeploy) 'Get-ToolSourceHash в run.ps1 и deploy.ps1 разошлись: отпечаток обработок должен быть один'
+        }
+    },
+    @{
+        Name = 'deploy-prod-precheck-old-epf'
+        Text = '«Проверка рабочей перед обновлением»: обработка режима не знает (отметки запуска нет) - до конца не ждёт, клиент снят, причина названа; в рабочей ничего не меняется'
+        Run = {
+            param($Name)
+            $config = $deployConfig.Clone()
+            $config['CanaryTimeoutSec'] = 5
+            $sb = New-Sandbox $Name -Config $config
+            $fake = @{ precheck = @(@{ nostart = $true }) }
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ProdPreCheck' -Fake $fake -Com (New-ComState)
+            Check (-not $r.TimedOut) ("не уложился в {0} с" -f $TimeoutSec)
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            Check ($r.ExitCode -eq 1) ("код возврата {0}, ждали 1" -f $r.ExitCode)
+            $text = $r.Output -join "`n"
+            Check ($text -match 'не начала проверку за 5 с') 'нет причины «не начала проверку»'
+            Check ($text -match 'пересоберёт её из поставки') 'нет подсказки про сборку обработки'
+            Check ($r.Seconds -lt 90) ("ждал зависший клиент: {0} с" -f $r.Seconds)
+            Check (@($r.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'проверка меняла блокировки или сеансы'
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'deploy\precheck\precheck.txt'))) 'журнал проверки появился, хотя проверки не было'
+        }
+    },
+    @{
+        Name = 'menu-prod-precheck'
+        Text = 'меню гейта: «Проверка рабочей перед обновлением» запускает проверку рабочей и возвращается в меню по кнопке'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $r = Invoke-Script -Sandbox $sb -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Проверка рабочей перед обновлением' },
+                @{ Kind = 'one'; Header = 'Посмотрел'; Item = '^Вернуться в меню' },
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            Check ($r.UnusedAnswers -eq 0) ("тест ждал вопросов, а их не было: {0}" -f $r.UnusedAnswers)
+            Check (@($r.Output | Where-Object { $_ -match 'ПРОВЕРКА erp_base ПЕРЕД ОБНОВЛЕНИЕМ' }).Count -eq 1) 'проверка из меню не запустилась'
+            Check (@($r.Output | Where-Object { $_ -match 'В базе ничего не изменено' }).Count -eq 1) 'нет итога проверки'
+            Check ((Get-Calls $r @('ENTERPRISE', 'precheck', 'fake\erp_base')).Count -eq 1) 'клиент рабочей в режиме precheck не запускался'
+        }
+    },
+    @{
         Name = 'deploy-compare-extensions'
         Text = '«Сравнить расширения»: одинаковые - по COM без выгрузки, отличающиеся - выгрузка обеих баз и разница по процедурам; в базах ничего не меняется'
         Run = {
