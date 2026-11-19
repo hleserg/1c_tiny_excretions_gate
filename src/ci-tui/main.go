@@ -6,10 +6,12 @@ package main
 // ci -status (deploy -StatusOnly).
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 
@@ -45,6 +47,46 @@ func findBaseDir(explicit string) (string, error) {
 }
 
 func hideChildWindow(cmd *exec.Cmd) {}
+
+// restartTarget - какой ci.exe запускать при перезапуске после обновления гейта: тот, что лежит в папке гейта
+// (работающий установщик переименовал в ci.exe.old, новый положил рядом); нет его - тот же файл, что работает.
+func restartTarget(baseDir, self string) string {
+	for _, candidate := range []string{filepath.Join(baseDir, "ci.exe"), self} {
+		if candidate == "" {
+			continue
+		}
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// restartSelf открывает ci заново в этом же окне и ждёт его: после обновления гейта работает ещё прежний ci.exe,
+// а в папке гейта лежит новый. Заменить себя другим процессом в Windows нельзя, поэтому прежний процесс остаётся
+// ждать новый и выходит с его кодом.
+func restartSelf(baseDir string, args []string) int {
+	self, _ := os.Executable()
+	exe := restartTarget(baseDir, self)
+	if exe == "" {
+		fmt.Fprintln(os.Stderr, "ci: не нашёл ci.exe в папке гейта. Запусти ci заново.")
+		return 1
+	}
+	cmd := exec.Command(exe, args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	// Ctrl+C в окне приходит обоим процессам: этот только ждёт и сам по нему не выходит.
+	signal.Ignore(os.Interrupt)
+	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return exitErr.ExitCode()
+		}
+		fmt.Fprintln(os.Stderr, "ci: новый ci.exe не запустился:", err)
+		fmt.Fprintln(os.Stderr, "Запусти ci заново.")
+		return 1
+	}
+	return 0
+}
 
 // defaultFontSize - высота шрифта консоли по умолчанию: 20, или из переменной CI_FONT.
 func defaultFontSize() int {
@@ -102,6 +144,10 @@ func main() {
 			_ = fm.eng.requestStop()
 		}
 		restoreFont()
+		if fm.restartAfter && !fm.running && fm.exitCode == 0 {
+			// Гейт обновлён, человек выбрал «Перезапустить ci»: шрифт консоли уже возвращён, новый ci поставит свой.
+			os.Exit(restartSelf(baseDir, os.Args[1:]))
+		}
 		os.Exit(fm.exitCode)
 	}
 }

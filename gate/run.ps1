@@ -4282,16 +4282,29 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             continue
         }
         if ($choice -eq 'update') {
-            # update.ps1: релизы GitHub, выбрать, поставить. Код 10 - поставлен: скрипты на диске уже новые, меню - заново.
+            # update.ps1: релизы GitHub, выбрать, поставить. Код 10 - поставлен: скрипты и ci.exe на диске уже новые,
+            # а работают прежние. Меню здесь больше не открывается: в ci.exe - перезапустить его или закрыть (событие
+            # close, новый ci.exe - в этом же окне), в консоли - выйти.
             $updateArgs = @{}
             if ($UiChannel) { $updateArgs['UiChannel'] = $UiChannel }
             & (Join-Path $Root 'update.ps1') @updateArgs
             $updateCode = $LASTEXITCODE
-            Wait-UiAcknowledge
             if ($updateCode -eq 10) {
-                Write-Host 'Гейт обновлён: перезапусти ci (закрой окно и открой снова).' -ForegroundColor Green
+                if ($UiChannel) {
+                    $afterUpdate = Read-UiChoice -Header 'Гейт обновлён, а работает ещё прежний. Что дальше?' -Keys @('1', '2') -Labels @('Перезапустить ci: новый откроется в этом же окне', 'Закрыть ci') -CancelKey '2' -DefaultKey '1' -Dock
+                    Send-UiClose -Restart:($afterUpdate -eq '1')
+                    if ($afterUpdate -eq '1') { Write-Host 'Гейт обновлён: перезапускаю ci.' -ForegroundColor Green }
+                    else { Write-Host 'Гейт обновлён: закрываю ci, новый - при следующем запуске.' -ForegroundColor Green }
+                    # Эту строку видно, только если ci.exe события close не знает (он старше этой кнопки).
+                    Write-Host 'Если окно ci осталось на этом экране - закрой его и открой снова.' -ForegroundColor DarkGray
+                }
+                else {
+                    Wait-UiAcknowledge -Label 'Закрыть'
+                    Write-Host 'Гейт обновлён: запусти гейт заново.' -ForegroundColor Green
+                }
                 exit 0
             }
+            Wait-UiAcknowledge
             continue
         }
         if ($choice -eq 'settings') {

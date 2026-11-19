@@ -36,6 +36,7 @@ type uiEvent struct {
 	Blocks      []subBlock `json:"blocks"`
 	Preselected []int      `json:"preselected"`
 	AllowEmpty  bool       `json:"allowEmpty"` // вопрос many: Enter без отметок - ответ «ни одного», а не отказ
+	Restart     bool       `json:"restart"`    // событие close: после выхода открыть ci заново (новый ci.exe)
 	Yes         string     `json:"yes"`
 	No          string     `json:"no"`
 	Lines       []string   `json:"lines"`
