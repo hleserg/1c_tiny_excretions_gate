@@ -647,7 +647,8 @@ $tests = @(
             Reset-FakeState $sb
             $changed = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep'
             Check-Common $changed; Check-Verdict $changed 'GREEN' 0
-            $builds = @(Get-Calls $changed @('/LoadExternalDataProcessorOrReportFromFiles'))
+            # Без @(): Get-Calls отдаёт массив запятой, @() завернул бы его ещё раз.
+            $builds = Get-Calls $changed @('/LoadExternalDataProcessorOrReportFromFiles')
             Check ($builds.Count -eq 1 -and $builds[0].Line -match 'ВыполнитьПослеОбновления') ("после правки исходников самопроверки собиралось: " + (@($builds | ForEach-Object { $_.Line }) -join ' | '))
         }
     },
@@ -2289,7 +2290,9 @@ $tests = @(
                 foreach ($path in @('README.md', 'Configuration.xml', 'Catalogs/Items.xml', 'CommonModules/Common/Ext/Module.bsl')) { Check ($tree -contains $path) ("в репозитории типовой нет {0}: {1}" -f $path, ($tree -join ' ')) }
                 Check ($tree -notcontains 'ConfigDumpInfo.xml') 'ConfigDumpInfo.xml попал в репозиторий типовой'
                 $firstSha = [string](& $gitExe --git-dir=$bare rev-parse main 2>&1)
-                $dumpCalls = @(Get-Calls $first @('/DumpConfigToFiles') | Where-Object { -not $_.Line.Contains('-Extension') })
+                # Get-Calls отдаёт массив запятой: сначала в переменную, потом в конвейер (иначе в Where-Object придёт весь массив разом).
+                $firstDumps = Get-Calls $first @('/DumpConfigToFiles')
+                $dumpCalls = @($firstDumps | Where-Object { -not $_.Line.Contains('-Extension') })
                 Check ($dumpCalls.Count -eq 1 -and -not $dumpCalls[0].Line.Contains('-update')) ("выгрузка типовой: " + (@($dumpCalls | ForEach-Object { $_.Line }) -join ' | '))
                 $stateFile = Join-Path $sb 'git\typical\typical.json'
                 Check ((Test-Path -LiteralPath $stateFile) -and (([System.IO.File]::ReadAllText($stateFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json).version -eq '2.5.22.149')) 'typical.json без версии типовой'
@@ -2298,7 +2301,8 @@ $tests = @(
                 Check-DeployCommon $same -LocksExpected $false
                 Check ($same.Unexpected.Count -eq 0) ("та же версия типовой - а вопросы: " + ($same.Unexpected -join ' | '))
                 Check (@($same.Output | Where-Object { $_ -match 'типовая .*уже в owner/typical' }).Count -eq 1) 'та же версия типовой: не сказано «уже в»'
-                Check (@(Get-Calls $same @('/DumpConfigToFiles') | Where-Object { -not $_.Line.Contains('-Extension') }).Count -eq 0) 'та же версия типовой: выгружалась заново'
+                $sameDumps = Get-Calls $same @('/DumpConfigToFiles')
+                Check (@($sameDumps | Where-Object { -not $_.Line.Contains('-Extension') }).Count -eq 0) 'та же версия типовой: выгружалась заново'
                 $com.bases.erp_temp_test['config']['version'] = '2.5.23.10'
                 $dumps['@config']['CommonModules/Common/Ext/Module.bsl'] = 'Процедура Б() КонецПроцедуры'
                 Reset-FakeState $sb
@@ -2308,7 +2312,8 @@ $tests = @(
                 $nextSha = [string](& $gitExe --git-dir=$bare rev-parse main 2>&1)
                 $parent = [string](& $gitExe --git-dir=$bare rev-parse 'main~1' 2>&1)
                 Check ($nextSha -ne $firstSha -and $parent -eq $firstSha) ("новая версия типовой не легла коммитом поверх прежнего: {0} -> {1}, родитель {2}" -f $firstSha, $nextSha, $parent)
-                $updateCalls = @(Get-Calls $next @('/DumpConfigToFiles', '-update') | Where-Object { -not $_.Line.Contains('-Extension') })
+                $nextDumps = Get-Calls $next @('/DumpConfigToFiles', '-update')
+                $updateCalls = @($nextDumps | Where-Object { -not $_.Line.Contains('-Extension') })
                 Check ($updateCalls.Count -eq 1) 'новая версия типовой выгружалась не с -update'
             }
             finally {
