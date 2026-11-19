@@ -2498,7 +2498,9 @@ function Get-ComConfigInfo {
                 throw ([string]$connectError.Message)
             }
             $metadata = $connection.Metadata
-            return [pscustomobject]@{ Name = [string]$metadata.Name; Synonym = [string]$metadata.Synonym; Version = [string]$metadata.Version }
+            # Массивом: Invoke-UiBackground берёт у результата .PSObject.BaseObject, а у одиночного pscustomobject
+            # там голый объект без свойств.
+            return , @([pscustomobject]@{ Name = [string]$metadata.Name; Synonym = [string]$metadata.Synonym; Version = [string]$metadata.Version })
         }
         finally {
             foreach ($comObject in @($connection, $connector)) {
