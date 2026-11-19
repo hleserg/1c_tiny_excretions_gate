@@ -153,6 +153,25 @@ func (m *model) markResult(status, text string) {
 	m.touchActive()
 }
 
+// addOperation - итог долгой операции (событие step) в колонку шагов, когда плана шагов у действия нет.
+func (m *model) addOperation(title, status string, elapsed float64) {
+	if m.planned || title == "" {
+		return
+	}
+	switch status {
+	case "OK", "WARN", "FAIL", "SKIP":
+	default:
+		return
+	}
+	now := time.Now()
+	started := now
+	if elapsed > 0 {
+		started = now.Add(-time.Duration(elapsed * float64(time.Second)))
+	}
+	m.pipe = append(m.pipe, pipeNode{name: title, status: status, started: started, finished: now})
+	m.touchActive()
+}
+
 // markProgress - движок начал шаг с таким заголовком: всё серое до него закрывается. Шаг, уже посчитанный
 // невыполненным (результат более позднего шага пришёл раньше), открывается снова: он и есть текущий.
 func (m *model) markProgress(title string) {

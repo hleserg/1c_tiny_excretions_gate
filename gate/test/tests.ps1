@@ -3037,6 +3037,10 @@ $tests = @(
                 $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = $dumps } -Com $com -Answers ($gitBootstrapAnswers + @(@{ Kind = 'confirm'; Header = 'Выгрузить и типовую'; Yes = $true }))
                 Check-DeployCommon $first -LocksExpected $false
                 Check ($first.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($first.Unexpected -join ' | '))
+                # Итог каждой долгой операции - строкой под её «начато» и событием step для колонки шагов ci.exe.
+                Check (@($first.Output | Where-Object { $_ -match '^\s+готово за \d+:\d\d$' }).Count -gt 0) 'у долгих операций нет строки итога «готово за ...»'
+                $stepEvents = @($first.Output | Where-Object { $_.StartsWith('@@ui:') -and $_ -match '"kind"\s*:\s*"step"' })
+                Check (@($stepEvents | Where-Object { $_ -match 'git add' -and $_ -match '"status"\s*:\s*"OK"' }).Count -eq 1) ('события step с итогом git add для колонки шагов: ' + @($stepEvents | Where-Object { $_ -match 'git add' }).Count)
                 $tree = @(& $gitExe --git-dir=$bare ls-tree -r --name-only main 2>&1 | ForEach-Object { [string]$_ })
                 foreach ($path in @('README.md', 'Configuration.xml', 'Catalogs/Items.xml', 'CommonModules/Common/Ext/Module.bsl')) { Check ($tree -contains $path) ("в репозитории типовой нет {0}: {1}" -f $path, ($tree -join ' ')) }
                 Check ($tree -notcontains 'ConfigDumpInfo.xml') 'ConfigDumpInfo.xml попал в репозиторий типовой'

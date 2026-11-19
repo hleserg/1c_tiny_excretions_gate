@@ -252,6 +252,11 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "close":
 			m.closeAfter = true
 			m.restartAfter = ev.Restart
+		case "step":
+			// Долгая операция кончилась. У действия без своего плана шагов (выгрузка в git, типовая, сравнения)
+			// она встаёт в колонку шагов с итогом и временем; с планом колонку ведут план и строки [OK]/[FAIL].
+			m.addOperation(ev.Title, ev.Status, ev.Elapsed)
+			return m, m.syncOverall()
 		case "subplan":
 			m.setSubPlan(ev)
 			m.layout()

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -197,5 +198,38 @@ func TestRestartTarget(t *testing.T) {
 	}
 	if got := restartTarget(filepath.Join(dir, "нет"), ""); got != "" {
 		t.Fatalf("ни одного файла: ждали пусто, получили %q", got)
+	}
+}
+
+// Событие step: у действия без плана шагов долгие операции копятся в колонке шагов с итогом и временем; при плане
+// колонку ведёт план, событие её не трогает.
+func TestStepEventWithoutPlan(t *testing.T) {
+	m := newModel("", "", nil)
+	m.running = true
+	for _, ev := range []uiEvent{
+		{Kind: "step", Title: "Типовая: git add (файлы - в pack)", Status: "OK", Elapsed: 367},
+		{Kind: "step", Title: "Типовая: git fetch (что сейчас в GitHub)", Status: "WARN", Elapsed: 1},
+		{Kind: "step", Title: "Типовая: git push (отправка в GitHub)", Status: "FAIL", Elapsed: 725},
+		{Kind: "step", Title: "", Status: "OK"},
+		{Kind: "step", Title: "Мусор", Status: "чужое"},
+	} {
+		next, _ := m.update(eventMsg{ev: ev})
+		m = next.(model)
+	}
+	if len(m.pipe) != 3 {
+		t.Fatalf("в колонке шагов %d операций, ждали 3", len(m.pipe))
+	}
+	if m.pipe[0].status != "OK" || m.pipe[1].status != "WARN" || m.pipe[2].status != "FAIL" {
+		t.Fatalf("итоги операций: %q %q %q", m.pipe[0].status, m.pipe[1].status, m.pipe[2].status)
+	}
+	if got := m.pipe[0].finished.Sub(m.pipe[0].started).Round(time.Second); got != 367*time.Second {
+		t.Fatalf("длительность первой операции %v, ждали 6m7s", got)
+	}
+	// С планом шагов событие step колонку не меняет.
+	planned := planModel()
+	before := len(planned.pipe)
+	planned.addOperation("Выгрузить расширение в файлы", "OK", 30)
+	if len(planned.pipe) != before {
+		t.Fatalf("при плане шагов событие step добавило шаг: было %d, стало %d", before, len(planned.pipe))
 	}
 }

@@ -10,6 +10,8 @@
 # Если вопрос ждёт события (закроют конфигуратор, уйдут сеансы) и оно случилось, скрипт пишет
 # {"kind":"cancel","id":..} и идёт дальше. Файл stop в папке канала - просьба остановиться: скрипт
 # останавливается через свою обычную обработку ошибки (trap, finally), со снятием блокировок.
+# {"kind":"step","title":..,"status":"OK|WARN|FAIL","elapsed":..} - долгая операция кончилась: ci.exe ставит её в
+# колонку шагов с итогом и временем, если у действия нет своего плана шагов.
 # {"kind":"close","restart":..} - просьба к ci.exe закрыться, когда скрипт кончится без ошибки, а с restart - и
 # сразу открыться заново (после обновления гейта: в папке уже новый ci.exe).
 
@@ -52,6 +54,28 @@ function Send-UiReset {
     if (-not $script:UiChannelDir) { return }
     $script:UiSubPlanSent = ''
     Send-UiEvent @{ kind = 'reset' }
+}
+
+function Write-UiOperationResult {
+    # Итог долгой операции - строкой под её «... начато в»: готово или нет, за сколько и что за ошибка. В ci.exe она
+    # же встаёт в колонку шагов с итогом и временем, если у действия нет своего плана шагов (выгрузка в git, типовая,
+    # сравнения): событие step. Status: OK, FAIL или WARN (кончилась не нулём, но вызывающему это можно).
+    param([string]$Title, [string]$Status = 'OK', [double]$Seconds = 0, [string]$Problem = '')
+    if (-not $Title) { return }
+    $whole = [int][Math]::Floor($Seconds)
+    $time = '{0}:{1:00}' -f [int][Math]::Floor($whole / 60), ($whole % 60)
+    if ($whole -ge 3600) { $time = '{0}:{1:00}:{2:00}' -f [int][Math]::Floor($whole / 3600), [int][Math]::Floor(($whole % 3600) / 60), ($whole % 60) }
+    $detail = ''
+    if ($Problem) {
+        $detail = [regex]::Replace($Problem, '\s+', ' ').Trim()
+        if ($null -ne (Get-Command Get-MaskedLine -ErrorAction SilentlyContinue)) { $detail = Get-MaskedLine $detail }
+        if ($detail.Length -gt 300) { $detail = $detail.Substring(0, 300) + '...' }
+        $detail = ': ' + $detail
+    }
+    if ($Status -eq 'OK') { Write-Host ('       готово за {0}' -f $time) -ForegroundColor DarkGreen }
+    elseif ($Status -eq 'WARN') { Write-Host ('       кончилось за {0}{1}' -f $time, $detail) -ForegroundColor DarkYellow }
+    else { Write-Host ('       не вышло за {0}{1}' -f $time, $detail) -ForegroundColor Red }
+    if ($script:UiChannelDir) { Send-UiEvent @{ kind = 'step'; title = $Title; status = $Status; elapsed = $whole } }
 }
 
 function Send-UiClose {

@@ -204,7 +204,8 @@ function Get-MaskedLine {
 
 function Invoke-V8 {
     # Запускает 1С и ждёт завершения не дольше таймаута. По таймауту процесс снимается.
-    param([string]$Exe, [string[]]$Arguments, [int]$TimeoutSec, [string]$Title = '')
+    # NoResultLine - строку итога операции («готово за ...») напишет вызывающий: у него есть текст ошибки из лога 1С.
+    param([string]$Exe, [string[]]$Arguments, [int]$TimeoutSec, [string]$Title = '', [switch]$NoResultLine)
     $argLine = $Arguments -join ' '
     Write-RunLog ("> {0} {1}" -f (Split-Path -Leaf $Exe), (Get-MaskedLine $argLine))
     if ($Title) {
@@ -225,6 +226,14 @@ function Invoke-V8 {
         $statStatus = 'FAIL'
         if (-not $finished) { $statStatus = 'TIMEOUT' } elseif ($exitCode -eq 0) { $statStatus = 'OK' }
         Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status $statStatus
+        if (-not $NoResultLine) {
+            $problem = ''
+            if (-not $finished) { $problem = 'не уложилось в {0} мин, процесс снят' -f [int]($TimeoutSec / 60) }
+            elseif ($exitCode -ne 0) { $problem = 'код {0}' -f $exitCode }
+            $resultStatus = 'FAIL'
+            if ($statStatus -eq 'OK') { $resultStatus = 'OK' }
+            Write-UiOperationResult -Title $Title -Status $resultStatus -Seconds $seconds -Problem $problem
+        }
     }
     return [pscustomobject]@{ ExitCode = $exitCode; TimedOut = (-not $finished); Seconds = $seconds }
 }
@@ -299,8 +308,17 @@ function Invoke-Designer {
     $argList = @('DESIGNER') + @(Get-ConnectionArgs -BaseName $BaseName -User $user -Password $password) +
         @('/DisableStartupDialogs', '/DisableStartupMessages') + $Command + @('/Out', ('"{0}"' -f $logPath))
     while ($true) {
-        $result = Invoke-V8 -Exe $script:V8 -Arguments $argList -TimeoutSec $TimeoutSec -Title $Title
+        $result = Invoke-V8 -Exe $script:V8 -Arguments $argList -TimeoutSec $TimeoutSec -Title $Title -NoResultLine
         $lines = @(Read-V8Log $logPath)
+        if ($Title) {
+            # Итог операции - сразу под её строкой «начато»: готово или нет, за сколько и что написал конфигуратор.
+            $problem = ''
+            if ($result.TimedOut) { $problem = 'не уложилось в {0} мин, процесс снят' -f [int]($TimeoutSec / 60) }
+            elseif ($result.ExitCode -ne 0) { $problem = 'код {0}: {1}' -f $result.ExitCode, ((@($lines | Where-Object { $_ }) | Select-Object -First 3) -join ' ') }
+            $resultStatus = 'OK'
+            if ($problem) { $resultStatus = 'FAIL' }
+            Write-UiOperationResult -Title $Title -Status $resultStatus -Seconds $result.Seconds -Problem $problem
+        }
         if ($result.ExitCode -eq 0 -or $result.TimedOut -or -not (Test-DesignerBusy $lines)) { break }
         if (-not (Resolve-DesignerBusy -BaseName $BaseName -Title (Get-NonEmptyTitle $Title $LogName))) { break }
     }
