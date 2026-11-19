@@ -1,0 +1,36 @@
+name: Регрессии гейта
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  contracts:
+    name: Проверка выбора версии, отката и результатов
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/fake1c/go.mod
+          cache: false
+      - name: Собрать подставную 1С
+        working-directory: src/fake1c
+        run: go build -o ../../gate/test/fake1c.exe .
+      - name: Запустить регрессионные тесты в песочницах
+        shell: powershell
+        run: |
+          & ./gate/test/tests.ps1 -Only 'review-' -Extra (Resolve-Path ./gate/test/review-contracts.ps1).Path -TimeoutSec 600
+          exit $LASTEXITCODE
+      - name: Сохранить результаты
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: review-contracts
+          path: gate/test/last-run.txt
+          if-no-files-found: warn
