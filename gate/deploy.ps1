@@ -3666,7 +3666,7 @@ else {
         # Обновить подготовленным: что загружено при подготовке, то и применяется. Сверка: temp и рабочая с тех пор
         # не менялись (по хеш-суммам через внешнее соединение, если они читаются).
         if ($null -eq $prepared) { throw 'подготовленного обновления нет: сначала «Подготовить обновление рабочей»' }
-        if ([bool](Get-JsonValue $prepared 'partial' $false)) { throw 'подготовка не закончена (часть расширений не загрузилась): «Отменить подготовку» или «Подготовить заново»' }
+        if ([bool](Get-JsonValue $prepared 'partial' $false)) { throw 'подготовка не закончена (часть расширений не загрузилась): «Отменить подготовку рабочей» или «Подготовить обновление рабочей» заново' }
         if ([string](Get-JsonValue $prepared 'base' '') -ne $script:ProdBase) { throw ("подготовлено для базы {0}, а рабочая сейчас {1}" -f (Get-JsonValue $prepared 'base' '?'), $script:ProdBase) }
         $preparedRunId = [string](Get-JsonValue $prepared 'runId' '')
         $preparedWhen = [string](Get-JsonValue $prepared 'timeText' '')
@@ -3698,7 +3698,7 @@ else {
         }
         if ($preparedChanged.Count -gt 0) {
             foreach ($line in $preparedChanged) { Write-Line ('  ' + $line) 'Yellow' }
-            $go = Confirm-Ui -Question ("После подготовки было изменено: {0}. Обновить {1} подготовленным всё равно? Надёжнее - «Подготовить заново»." -f ($preparedChanged -join '; '), $script:ProdBase) -Yes 'Да, обновлять подготовленным' -No 'Нет, выйти'
+            $go = Confirm-Ui -Question ("После подготовки было изменено: {0}. Обновить {1} подготовленным всё равно? Надёжнее - «Подготовить обновление рабочей» заново." -f ($preparedChanged -join '; '), $script:ProdBase) -Yes 'Да, обновлять подготовленным' -No 'Нет, выйти'
             if ($go -ne $true) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
             Write-RunLog ('Обновление подготовленным несмотря на: ' + ($preparedChanged -join '; '))
         }
@@ -4262,7 +4262,7 @@ if ($Prepare) {
                 Remove-Item -LiteralPath $preparedPath -Force
                 Write-Line ("ИТОГ: подготовка не прошла, расширения {0} возвращены к применённым версиям." -f $script:ProdBase) 'Red'
             }
-            else { Write-Line ("ИТОГ: подготовка не закончена. В конфигурации {0} остались загруженные, не применённые версии: «Отменить подготовку» или «Подготовить заново»." -f $script:ProdBase) 'Red' }
+            else { Write-Line ("ИТОГ: подготовка не закончена. В конфигурации {0} остались загруженные, не применённые версии: «Отменить подготовку рабочей» или «Подготовить обновление рабочей» заново." -f $script:ProdBase) 'Red' }
         }
         else { Write-Line ("ИТОГ: подготовка не прошла, в конфигурации {0} ничего не изменено." -f $script:ProdBase) 'Red' }
         exit 1

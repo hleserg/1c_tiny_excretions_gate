@@ -5,7 +5,7 @@
 # Канал интерфейса ci.exe (ключ -UiChannel <папка>). Скрипт запущен из ci.exe, его вывод читает ci.exe.
 # Всё, что надо показать особо, скрипт пишет строками «@@ui:{json}»: ход шага (progress, progress-end),
 # заголовок в рамке (title), вопрос (one, many, confirm, text, view) с номером id; у вопроса one могут быть
-# заголовки групп (sections) и свои клавиши пунктов (keys), по одному на пункт. Ответ ci.exe кладёт
+# заголовки групп (sections), свои клавиши пунктов (keys) и пояснения серым (hints), по одному на пункт. Ответ ci.exe кладёт
 # в папку канала файлом a-<id>.json: {"cancel":..,"index":..,"indexes":[..],"yes":..,"text":".."}.
 # Если вопрос ждёт события (закроют конфигуратор, уйдут сеансы) и оно случилось, скрипт пишет
 # {"kind":"cancel","id":..} и идёт дальше. Файл stop в папке канала - просьба остановиться: скрипт
@@ -243,16 +243,19 @@ function Select-UiOne {
     # Danger - номера опасных пунктов (откат рабочей): в ci.exe они в красной рамке с ▲!, в консоли - красные, с «!!!».
     # Sections - заголовки групп, по одному на пункт: непустой - с этого пункта начинается группа (строка-заголовок
     # перед ним, выбрать её нельзя). Keys - своя клавиша у каждого пункта (из 1-9, a-z) вместо порядковой: клавиша
-    # пункта не зависит от того, какие пункты показаны сейчас (меню гейта). Оба действуют, только если их столько
-    # же, сколько пунктов.
-    param([string]$Header, [string[]]$Items, [string[]]$Notes = @(), [int[]]$Danger = @(), [string[]]$Sections = @(), [string[]]$Keys = @())
+    # пункта не зависит от того, какие пункты показаны сейчас (меню гейта). Hints - пояснение пункта: переменное
+    # (какой прогон, какая версия) и подробности серым рядом с подписью, сама подпись при этом не меняется; пустое -
+    # нет. Все три действуют, только если их столько же, сколько пунктов.
+    param([string]$Header, [string[]]$Items, [string[]]$Notes = @(), [int[]]$Danger = @(), [string[]]$Sections = @(), [string[]]$Keys = @(), [string[]]$Hints = @())
     if ($Items.Count -eq 0) { return -1 }
     $hasSections = ($Sections.Count -eq $Items.Count)
     $hasKeys = ($Keys.Count -eq $Items.Count)
+    $hasHints = ($Hints.Count -eq $Items.Count)
     if ($script:UiChannelDir) {
         $question = @{ kind = 'one'; header = $Header; items = @($Items); notes = @($Notes | Where-Object { $_ }); danger = @($Danger) }
         if ($hasSections) { $question['sections'] = @($Sections) }
         if ($hasKeys) { $question['keys'] = @($Keys) }
+        if ($hasHints) { $question['hints'] = @($Hints) }
         $answer = Request-UiAnswer -Question $question
         if ([bool](Get-UiField $answer 'cancel' $false)) { return -1 }
         $index = [int](Get-UiField $answer 'index' -1)
@@ -269,8 +272,11 @@ function Select-UiOne {
         if ($hasSections -and $Sections[$i]) { Write-Host ('  ' + $Sections[$i].ToUpper()) -ForegroundColor Cyan }
         $itemKey = $script:UiKeys[$i]
         if ($hasKeys) { $itemKey = $Keys[$i] }
-        if ($Danger -contains $i) { Write-Host ("    {0} - {1}" -f $itemKey, $shownItems[$i]) -ForegroundColor Red }
-        else { Write-Host ("    {0} - {1}" -f $itemKey, $shownItems[$i]) }
+        $itemHint = ''
+        if ($hasHints -and $Hints[$i]) { $itemHint = '  ' + $Hints[$i] }
+        if ($Danger -contains $i) { Write-Host -NoNewline ("    {0} - {1}" -f $itemKey, $shownItems[$i]) -ForegroundColor Red }
+        else { Write-Host -NoNewline ("    {0} - {1}" -f $itemKey, $shownItems[$i]) }
+        Write-Host $itemHint -ForegroundColor DarkGray
     }
     Write-Host '    0 - отмена'
     Write-Host -NoNewline '  Выбор: '

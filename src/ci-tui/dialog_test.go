@@ -236,3 +236,44 @@ func TestOneSectionsScroll(t *testing.T) {
 		t.Fatal("заголовок группы первого видимого пункта стоит не над ним")
 	}
 }
+
+// Пояснения пунктов: подпись не меняется, переменное - серым рядом; не влезло в строку - под подписью, и щелчок
+// по строке пояснения выбирает тот же пункт.
+func TestOneHints(t *testing.T) {
+	ev := uiEvent{Kind: "one", ID: 1, Header: "Гейт расширений",
+		Items: []string{"Прогон на том, что есть в базе", "Продолжить прогон с упавшего шага", "Обновить гейт из GitHub", "Выход"},
+		Hints: []string{"", "20261119-211941 (красный / Адаптация 20261119.203826, оставлен)", "стоит 20261120.002435", ""}}
+	wide := ansi.Strip(newDialog(ev, 120, 40).View())
+	for _, want := range []string{"2 Продолжить прогон с упавшего шага  20261119-211941 (красный", "3 Обновить гейт из GitHub  стоит 20261120.002435", "1 Прогон на том, что есть в базе", "4 Выход"} {
+		if !strings.Contains(wide, want) {
+			t.Fatalf("широкое окно: нет %q:\n%s", want, wide)
+		}
+	}
+	// Узкое окно: пояснение второго пункта не влезает рядом - уходит под подпись, подпись остаётся как есть.
+	m := ask(testModel(64, 40), ev)
+	screen := ansi.Strip(m.View())
+	if !strings.Contains(screen, "2 Продолжить прогон с упавшего шага") || strings.Contains(screen, "шага  20261119") {
+		t.Fatalf("узкое окно: подпись второго пункта не отдельной строкой:\n%s", screen)
+	}
+	hx, hy := onScreen(t, m, "20261119-211941")
+	_, ly := onScreen(t, m, "Продолжить прогон с упавшего шага")
+	if hy != ly+1 {
+		t.Fatalf("пояснение на строке %d, подпись на %d: ждали пояснение сразу под подписью", hy, ly)
+	}
+	m = mouse(m, hx+2, hy, tea.MouseButtonLeft)
+	if m.dialog != nil || !strings.Contains(lastLine(m), "Продолжить прогон с упавшего шага") {
+		t.Fatalf("щелчок по строке пояснения не выбрал пункт (журнал: %q)", lastLine(m))
+	}
+	// Перенесённое пояснение занимает строки окна: пунктов влезает меньше.
+	narrow := newDialog(uiEvent{Kind: "one", Header: "Меню", Items: ev.Items, Hints: ev.Hints}, 64, 13)
+	if rows := narrow.itemRows(1); rows < 2 {
+		t.Fatalf("пункт с перенесённым пояснением: строк %d, ждали больше одной", rows)
+	}
+	if end := narrow.windowEnd(0); end >= len(ev.Items) {
+		t.Fatalf("в окно из трёх строк влезло пунктов %d: перенос пояснения не посчитан", end)
+	}
+	// Без пояснений - как раньше.
+	if strings.Contains(ansi.Strip(newDialog(uiEvent{Kind: "one", Header: "Меню", Items: ev.Items}, 120, 40).View()), "стоит") {
+		t.Fatal("пояснение показано, хотя hints нет")
+	}
+}

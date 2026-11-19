@@ -83,6 +83,25 @@ func hang(prefix string, text string, width int, st lipgloss.Style) string {
 	return b.String()
 }
 
+// hangHint - пункт списка с пояснением: подпись в своём стиле, пояснение серым. Влезает в строку - рядом с подписью,
+// не влезает - строками под ней, с тем же отступом. Без пояснения - как hang.
+func hangHint(prefix, text, hint string, width int, st lipgloss.Style) string {
+	if hint == "" {
+		return hang(prefix, text, width, st)
+	}
+	pw := lipgloss.Width(prefix)
+	room := max(10, width-pw)
+	if lipgloss.Width(text)+2+lipgloss.Width(hint) <= room {
+		return prefix + st.Render(text) + "  " + styleDim.Render(hint)
+	}
+	var b strings.Builder
+	b.WriteString(hang(prefix, text, width, st))
+	for _, part := range wrapWords(hint, room) {
+		b.WriteString("\n" + strings.Repeat(" ", pw) + styleDim.Render(part))
+	}
+	return b.String()
+}
+
 // wrapBlock - простой перенос текста по словам (для строк хода и подсказок).
 func wrapBlock(text string, width int, st lipgloss.Style) string {
 	parts := wrapWords(text, max(10, width))

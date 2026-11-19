@@ -2587,7 +2587,7 @@ function Show-RecentRuns {
             $canAccept = ($null -ne $acceptable -and $acceptable.Dir.FullName -eq $runPath)
             if ($canAccept) { $actions.Add([pscustomobject]@{ Key = 'accept'; Label = 'Принять новое этого прогона в эталон (станет известным)' }) }
             $resumeTarget = Get-ResumeTargetDir
-            if ($resumeTarget -and [System.IO.Path]::GetFullPath($resumeTarget).TrimEnd('\') -eq [System.IO.Path]::GetFullPath($runPath).TrimEnd('\') -and (Get-ResumeMenuLabel $resumeTarget)) {
+            if ($resumeTarget -and [System.IO.Path]::GetFullPath($resumeTarget).TrimEnd('\') -eq [System.IO.Path]::GetFullPath($runPath).TrimEnd('\') -and (Get-ResumeMenuHint $resumeTarget)) {
                 $actions.Add([pscustomobject]@{ Key = 'resume'; Label = 'Продолжить прогон с упавшего шага…' })
             }
             $actions.Add([pscustomobject]@{ Key = 'back'; Label = 'Назад к списку' })
@@ -2861,9 +2861,17 @@ function Get-ResumeTargetDir {
     return $dir
 }
 
-function Get-ResumeMenuLabel {
-    # Пункт меню «Продолжить прогон»: последний прогон этой базы не зелёный и записан гейтом с продолжением.
-    # Пусто - пункта нет. Можно ли на самом деле и с какого шага, считает Get-ResumePlan, когда пункт выбран.
+function New-MenuItem {
+    # Пункт меню гейта: Key - что делать (строка таблицы $menuSlots), Label - подпись, она не меняется; Hint -
+    # переменное и подробности, их показывают серым рядом с подписью.
+    param([string]$Key, [string]$Label, [string]$Hint = '')
+    return [pscustomobject]@{ Key = $Key; Label = $Label; Hint = $Hint }
+}
+
+function Get-ResumeMenuHint {
+    # Пояснение пункта меню «Продолжить прогон с упавшего шага»: какой прогон и чем кончился. Пункт есть, если
+    # последний прогон этой базы не зелёный и записан гейтом с продолжением; пусто - пункта нет. Можно ли на самом
+    # деле и с какого шага, считает Get-ResumePlan, когда пункт выбран.
     param([string]$Dir)
     if (-not $Dir) { return '' }
     $record = Read-RunRecord $Dir
@@ -2872,7 +2880,7 @@ function Get-ResumeMenuLabel {
         if ([string](Get-UiField $record.Verdict 'verdict' '') -eq 'GREEN') { return '' }
         if ([string](Get-UiField $record.Verdict 'kitDecision' '') -eq 'rollbackFailed') { return '' }
     }
-    return ('Продолжить прогон {0} с упавшего шага ({1})' -f $record.Name, (Get-RunListText $record.Verdict))
+    return ('{0} ({1})' -f $record.Name, (Get-RunListText $record.Verdict))
 }
 
 function Get-InboxList {
@@ -4139,31 +4147,33 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         if (Test-Path -LiteralPath $inboxDir) { Add-InboxItems -Dir $inboxDir -Depth 0 -Items $inboxList }
         $usable = @($inboxList | Where-Object { $_.Usable })
         $unusable = @($inboxList | Where-Object { -not $_.Usable })
+        # Подпись пункта не меняется; переменное (сколько в inbox, какой прогон, какая версия, что подготовлено) и
+        # подробности - в пояснении: его показывают серым рядом с подписью.
         $menu = New-Object System.Collections.Generic.List[object]
-        if ($usable.Count -gt 0) { $menu.Add([pscustomobject]@{ Key = 'kit'; Label = ("Прогон с обновлением из inbox ({0})" -f $usable.Count) }) }
-        $menu.Add([pscustomobject]@{ Key = 'asis'; Label = 'Прогон на том, что есть в базе' })
+        if ($usable.Count -gt 0) { $menu.Add((New-MenuItem 'kit' 'Прогон с обновлением из inbox' ('обновлений в inbox: {0}' -f $usable.Count))) }
+        $menu.Add((New-MenuItem 'asis' 'Прогон на том, что есть в базе'))
         # Последний прогон не зелёный - его можно продолжить с упавшего шага, не гоняя всё заново.
         $resumeDir = Get-ResumeTargetDir
-        $resumeLabel = Get-ResumeMenuLabel $resumeDir
-        if ($resumeLabel) { $menu.Add([pscustomobject]@{ Key = 'resume'; Label = $resumeLabel }) }
+        $resumeHint = Get-ResumeMenuHint $resumeDir
+        if ($resumeHint) { $menu.Add((New-MenuItem 'resume' 'Продолжить прогон с упавшего шага' $resumeHint)) }
         # Расширения и обработки через git (deploy.ps1 -GitImport/-GitExport, раздел 5.23).
         $gitRepo = [string](Get-Setting $cfg 'ExtensionsRepo' '')
         if ($gitRepo -and (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1'))) {
-            $menu.Add([pscustomobject]@{ Key = 'gitimport'; Label = ('Загрузить из git в {0} ({1})' -f $script:Base, $gitRepo) })
-            $menu.Add([pscustomobject]@{ Key = 'gitexport'; Label = ('Выгрузить {0} в git: правки temp - веткой и pull request' -f $script:Base) })
-            $menu.Add([pscustomobject]@{ Key = 'gitprod'; Label = ('Снимок внешних обработок рабочей в git (ветка {0}, рабочую только читает)' -f [string](Get-Setting $cfg 'ExtensionsProdBranch' 'prod')) })
+            $menu.Add((New-MenuItem 'gitimport' 'Загрузить из git' ('в {0} из {1}' -f $script:Base, $gitRepo)))
+            $menu.Add((New-MenuItem 'gitexport' 'Выгрузить temp в git' ('правки {0} - веткой и pull request' -f $script:Base)))
+            $menu.Add((New-MenuItem 'gitprod' 'Снимок внешних обработок рабочей в git' ('ветка {0}, рабочую только читает' -f [string](Get-Setting $cfg 'ExtensionsProdBranch' 'prod'))))
         }
         $acceptable = Get-AcceptableRun
         if ($null -ne $acceptable) {
-            $menu.Add([pscustomobject]@{ Key = 'accept'; Label = ('Принять новое последнего прогона в эталон ({0}, {1})' -f $acceptable.Dir.Name, (Get-RunListText $acceptable.Verdict)) })
+            $menu.Add((New-MenuItem 'accept' 'Принять новое последнего прогона в эталон' ('{0}, {1}' -f $acceptable.Dir.Name, (Get-RunListText $acceptable.Verdict))))
         }
-        $menu.Add([pscustomobject]@{ Key = 'runs'; Label = 'Результаты последних прогонов' })
-        if ($unitTestExtensions.Count -gt 0) { $menu.Add([pscustomobject]@{ Key = 'tests'; Label = ('Модульные тесты: список, прогон, новый тест, забрать из {0}' -f $script:Base) }) }
-        $menu.Add([pscustomobject]@{ Key = 'stats'; Label = 'Статистика длительностей: план и факт' })
-        $menu.Add([pscustomobject]@{ Key = 'settings'; Label = 'Настройки гейта' })
-        if ([string](Get-Setting $cfg 'UpdateRepo' '')) { $menu.Add([pscustomobject]@{ Key = 'update'; Label = ('Обновить гейт из GitHub (стоит {0})' -f $script:GateVersion) }) }
+        $menu.Add((New-MenuItem 'runs' 'Результаты последних прогонов'))
+        if ($unitTestExtensions.Count -gt 0) { $menu.Add((New-MenuItem 'tests' 'Модульные тесты' ('список, прогон, новый тест, забрать из {0}' -f $script:Base))) }
+        $menu.Add((New-MenuItem 'stats' 'Статистика длительностей' 'план и факт'))
+        $menu.Add((New-MenuItem 'settings' 'Настройки гейта'))
+        if ([string](Get-Setting $cfg 'UpdateRepo' '')) { $menu.Add((New-MenuItem 'update' 'Обновить гейт из GitHub' ('стоит {0}' -f $script:GateVersion))) }
         if (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1')) {
-            $menu.Add([pscustomobject]@{ Key = 'deploy'; Label = 'Обновить рабочую базу' })
+            $menu.Add((New-MenuItem 'deploy' 'Обновить рабочую базу' 'за один заход, без подготовки'))
             # Обновление в два приёма (deploy.ps1 -Prepare/-ApplyPrepared/-CancelPrepared): подготовка - без блокировок,
             # пользователи работают; что подготовлено - в deploy\prepared.json.
             $preparedFile = Join-Path (Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))) 'prepared.json'
@@ -4174,27 +4184,27 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
                 catch { $preparedBroken = $true }
             }
             if ($null -eq $preparedState -and -not $preparedBroken) {
-                $menu.Add([pscustomobject]@{ Key = 'prepare'; Label = 'Подготовить обновление рабочей: копии и загрузка без применения, пользователи работают' })
+                $menu.Add((New-MenuItem 'prepare' 'Подготовить обновление рабочей' 'копии и загрузка без применения, пользователи работают'))
             }
             else {
                 $preparedNames = @(foreach ($preparedItem in @(Get-UiField $preparedState 'extensions' @())) { [string](Get-UiField $preparedItem 'name' '') }) -join ', '
                 $preparedTime = [string](Get-UiField $preparedState 'timeText' '?')
                 if ($null -ne $preparedState -and -not [bool](Get-UiField $preparedState 'partial' $false)) {
-                    $menu.Add([pscustomobject]@{ Key = 'applyprep'; Label = ('Обновить рабочую подготовленным ({0}; подготовлено {1})' -f $preparedNames, $preparedTime) })
+                    $menu.Add((New-MenuItem 'applyprep' 'Обновить рабочую подготовленным' ('{0}; подготовлено {1}' -f $preparedNames, $preparedTime)))
                 }
-                $menu.Add([pscustomobject]@{ Key = 'prepare'; Label = 'Подготовить заново (прошлая подготовка отменяется)' })
-                $menu.Add([pscustomobject]@{ Key = 'cancelprep'; Label = 'Отменить подготовку рабочей: вернуть расширения к применённым версиям' })
+                $menu.Add((New-MenuItem 'prepare' 'Подготовить обновление рабочей' 'заново: прошлая подготовка отменяется'))
+                $menu.Add((New-MenuItem 'cancelprep' 'Отменить подготовку рабочей' 'вернуть расширения к применённым версиям'))
             }
-            $menu.Add([pscustomobject]@{ Key = 'basestate'; Label = 'Показать состояние баз: блокировки и сеансы' })
-            $menu.Add([pscustomobject]@{ Key = 'comcheck'; Label = ('Проверка внешнего соединения (COM) с {0}: как читаются расширения, только читает' -f $script:Base) })
-            $menu.Add([pscustomobject]@{ Key = 'cmpext'; Label = 'Сравнить расширения: рабочая и temp' })
-            $menu.Add([pscustomobject]@{ Key = 'cmpepf'; Label = 'Сравнить внешние обработки: рабочая и temp' })
-            $menu.Add([pscustomobject]@{ Key = 'precheck'; Label = 'Проверка рабочей перед обновлением: что изменит загрузка, каких настроек нет (только читает)' })
-            $menu.Add([pscustomobject]@{ Key = 'rollback'; Label = 'Откатить рабочую базу' })
-            $menu.Add([pscustomobject]@{ Key = 'pullext'; Label = 'Подтянуть расширения из рабочей (в inbox)' })
-            $menu.Add([pscustomobject]@{ Key = 'pullepf'; Label = 'Подтянуть обработки из рабочей (в inbox)' })
+            $menu.Add((New-MenuItem 'basestate' 'Показать состояние баз' 'блокировки и сеансы'))
+            $menu.Add((New-MenuItem 'comcheck' 'Проверка внешнего соединения (COM)' ('с {0}: как читаются расширения, только читает' -f $script:Base)))
+            $menu.Add((New-MenuItem 'cmpext' 'Сравнить расширения' 'рабочая и temp'))
+            $menu.Add((New-MenuItem 'cmpepf' 'Сравнить внешние обработки' 'рабочая и temp'))
+            $menu.Add((New-MenuItem 'precheck' 'Проверка рабочей перед обновлением' 'что изменит загрузка, каких настроек нет; только читает'))
+            $menu.Add((New-MenuItem 'rollback' 'Откатить рабочую базу'))
+            $menu.Add((New-MenuItem 'pullext' 'Подтянуть расширения из рабочей' 'в inbox'))
+            $menu.Add((New-MenuItem 'pullepf' 'Подтянуть обработки из рабочей' 'в inbox'))
         }
-        $menu.Add([pscustomobject]@{ Key = 'exit'; Label = 'Выход' })
+        $menu.Add((New-MenuItem 'exit' 'Выход'))
         $notes = @()
         # Итог ночного прогона (nightly.ps1) - первой строкой: его смотрят утром.
         $nightlyLast = Join-Path $Root 'nightly\last.json'
@@ -4231,7 +4241,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             $slotNames = @($menuSlots | ForEach-Object { $_[0] })
             throw ('у пункта меню нет слота в $menuSlots: {0}' -f (@($menu | Where-Object { $slotNames -notcontains $_.Key } | ForEach-Object { $_.Key }) -join ', '))
         }
-        $picked = Select-UiOne -Header ("Гейт расширений: {0} на {1}" -f $script:Base, $script:Server) -Items @($menuShown | ForEach-Object { $_.Label }) -Notes $notes -Sections $menuSections.ToArray() -Keys $menuKeys.ToArray()
+        $picked = Select-UiOne -Header ("Гейт расширений: {0} на {1}" -f $script:Base, $script:Server) -Items @($menuShown | ForEach-Object { $_.Label }) -Notes $notes -Sections $menuSections.ToArray() -Keys $menuKeys.ToArray() -Hints @($menuShown | ForEach-Object { [string]$_.Hint })
         if ($picked -lt 0) { $choice = 'exit' } else { $choice = $menuShown[$picked].Key }
         if ($choice -eq 'exit') { Write-Host 'Выход.'; exit 0 }
         # Экран ci.exe - с чистого листа: шаги и вердикт прошлого действия не должны висеть над следующим.

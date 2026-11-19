@@ -115,6 +115,33 @@ func (d *dialog) keyItem(s string) int {
 	return -1
 }
 
+// innerWidth - ширина текста внутри окна вопроса.
+func (d *dialog) innerWidth() int {
+	return max(30, min(d.width-6, 110))
+}
+
+// itemHint - пояснение пункта i (вопрос one с hints): переменное и подробности серым рядом с подписью, сама
+// подпись при этом не меняется; "" - нет.
+func (d *dialog) itemHint(i int) string {
+	if d.ev.Kind != "one" || d.docked() || len(d.ev.Hints) != len(d.ev.Items) || i < 0 || i >= len(d.ev.Items) {
+		return ""
+	}
+	return d.ev.Hints[i]
+}
+
+// itemRows - сколько строк занимает пункт i в списке выбора одного: длинная подпись и пояснение, не влезшее в
+// строку, переносятся. Опасный пункт (рамка) и отметки считаются одной строкой, как раньше.
+func (d *dialog) itemRows(i int) int {
+	if d.ev.Kind != "one" || d.docked() || d.isDanger(i) || i < 0 || i >= len(d.ev.Items) {
+		return 1
+	}
+	prefix := "  "
+	if k := d.itemKey(i); k != "" {
+		prefix += k + " "
+	}
+	return lipgloss.Height(hangHint(prefix, d.ev.Items[i], d.itemHint(i), d.innerWidth(), lipgloss.NewStyle()))
+}
+
 // sectionTitle - заголовок группы, которая начинается с пункта i (вопрос one с sections); "" - нет.
 func (d *dialog) sectionTitle(i int) string {
 	if d.ev.Kind != "one" || d.docked() || len(d.ev.Sections) != len(d.ev.Items) || i < 0 || i >= len(d.ev.Items) {
@@ -133,14 +160,15 @@ func (d *dialog) sectionOf(i int) string {
 	return ""
 }
 
-// windowEnd - до какого пункта (не включая) список влезает в окно, если первый видимый - offset. Пункт - строка,
-// заголовок группы - ещё одна; над первым видимым пунктом заголовок его группы стоит всегда.
+// windowEnd - до какого пункта (не включая) список влезает в окно, если первый видимый - offset. Пункт - строка
+// (с переносами - больше, itemRows), заголовок группы - ещё одна; над первым видимым пунктом заголовок его
+// группы стоит всегда.
 func (d *dialog) windowEnd(offset int) int {
 	rows := d.visibleRows()
 	used := 0
 	i := offset
 	for ; i < len(d.ev.Items); i++ {
-		cost := 1
+		cost := d.itemRows(i)
 		if (i == offset && d.sectionOf(i) != "") || (i != offset && d.sectionTitle(i) != "") {
 			cost++
 		}
@@ -533,7 +561,7 @@ func (d *dialog) selected() []int {
 }
 
 func (d *dialog) View() string {
-	inner := max(30, min(d.width-6, 110))
+	inner := d.innerWidth()
 	var b strings.Builder
 	header := d.ev.Header
 	if header == "" && d.ev.Kind == "view" {
@@ -608,7 +636,7 @@ func (d *dialog) View() string {
 				prefix = styleCursor.Render("› ") + mark
 				st = styleSelected
 			}
-			row := hang(prefix, text, inner, st)
+			row := hangHint(prefix, text, d.itemHint(i), inner, st)
 			b.WriteString(row + "\n")
 			d.hits = append(d.hits, hitArea{y0: top, y1: top + lipgloss.Height(row), index: i})
 		}
