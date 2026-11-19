@@ -1764,7 +1764,8 @@ $tests = @(
                 @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
             Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
             Check ($r.UnusedAnswers -eq 0) ("тест ждал вопросов, а их не было: {0}" -f $r.UnusedAnswers)
-            Check (@($r.Output | Where-Object { $_ -match 'ПРОВЕРКА erp_base ПЕРЕД ОБНОВЛЕНИЕМ' }).Count -eq 1) 'проверка из меню не запустилась'
+            # -cmatch: без учёта регистра под выражение подходит и итоговая строка «Проверка ... перед обновлением: ошибок ...».
+            Check (@($r.Output | Where-Object { $_ -cmatch 'ПРОВЕРКА erp_base ПЕРЕД ОБНОВЛЕНИЕМ' }).Count -eq 1) 'проверка из меню не запустилась'
             Check (@($r.Output | Where-Object { $_ -match 'В базе ничего не изменено' }).Count -eq 1) 'нет итога проверки'
             Check ((Get-Calls $r @('ENTERPRISE', 'precheck', 'fake\erp_base')).Count -eq 1) 'клиент рабочей в режиме precheck не запускался'
         }
