@@ -779,6 +779,55 @@ $tests = @(
         }
     },
     @{
+        Name = 'review-report-junit'
+        Text = 'JUnit всего прогона: ошибки, пропуски и эталон по шагам, XML-символы, повтор и отдельный отчёт YAxUnit'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $dir = Join-Path $sb 'runs/20260101-101010'
+            $units = Join-Path $dir 'unittests'
+            $null = New-Item -ItemType Directory -Path $units -Force
+            [IO.File]::WriteAllText((Join-Path $units 'junit.xml'), 'original', $utf8Bom)
+            $steps = @(
+                @{name='Самопроверка'; status='FAIL'; detail='новых ошибок'; seconds=2},
+                @{name='Проверка конфигурации'; status='FAIL'; detail='новых замечаний'; log='C:\gate\checkconfig.log'; seconds=3},
+                @{name='Правила обмена'; status='WARN'; detail='новое правило'; seconds=1},
+                @{name='Загрузка'; status='SKIP'; detail='отменено'; seconds=0},
+                @{name='Соединение'; status='FAIL'; detail=('обрыв' + [char]3); seconds=1}
+            )
+            $meta = @{runId='20260101-101010'; baseKey='unit'; verdict='RED'; steps=$steps}
+            [IO.File]::WriteAllText((Join-Path $dir 'verdict.json'), ($meta | ConvertTo-Json -Depth 5), $utf8Bom)
+            $newError = '[ОШИБКА] Документ :: Ошибка <данные> & "строка"'
+            $known = '[ОШИБКА] Печать :: Известное'
+            $skip = '[ПРОПУСК] Обмен :: Без данных'
+            [IO.File]::WriteAllLines((Join-Path $dir 'selfcheck-after.norm.txt'), [string[]]@($newError, $known, $skip), $utf8Bom)
+            [IO.File]::WriteAllLines((Join-Path $dir 'selfcheck-after.new.txt'), [string[]]@($newError, $skip), $utf8Bom)
+            $fatal = '{Модуль()}: ошибка'
+            $handler = 'Документ: Отсутствует обработчик события'
+            [IO.File]::WriteAllLines((Join-Path $dir 'checkconfig.norm.txt'), [string[]]@($fatal, $handler, 'Уже принято'), $utf8Bom)
+            [IO.File]::WriteAllLines((Join-Path $dir 'checkconfig.new.txt'), [string[]]@($fatal, $handler), $utf8Bom)
+            $warning = '[ВНИМАНИЕ] сообщение'
+            [IO.File]::WriteAllLines((Join-Path $dir 'exchange-rules.txt'), [string[]]@($warning, '[ИНФО] правило R3'), $utf8Bom)
+            [IO.File]::WriteAllLines((Join-Path $dir 'exchange-rules.new.txt'), [string[]]@($warning), $utf8Bom)
+            $report = Join-Path $sb 'report.ps1'
+            & $report -RunDir $dir -Quiet
+            $out = Join-Path $dir 'junit.xml'
+            [xml]$xml = [IO.File]::ReadAllText($out)
+            Check ($xml.testsuites.tests -eq '10' -and $xml.testsuites.failures -eq '3' -and $xml.testsuites.skipped -eq '4') 'не совпали итоговые счётчики JUnit'
+            Check ($xml.testsuites.time -eq '7' -and $xml.SelectNodes('//testsuite').Count -eq 5) 'потеряли шаг или длительность'
+            Check (@($xml.SelectNodes('//testcase[failure]') | Where-Object { $_.name -ceq $newError }).Count -eq 1) 'испортился текст новой ошибки'
+            Check (@($xml.SelectNodes('//testcase[system-out]') | Where-Object { $_.name -ceq $known }).Count -eq 1) 'известная ошибка не отмечена эталоном'
+            Check (@($xml.SelectNodes('//testcase[skipped]') | Where-Object { $_.name -ceq $handler }).Count -eq 1) 'жёлтая запись стала красной вместе с соседней'
+            Check ($xml.SelectSingleNode('//testcase[@name="Соединение"]/failure').InnerText -ceq ('обрыв' + [char]0xFFFD)) 'потеряна причина сбоя без записей'
+            $empty = @{runId='20260101-101010'; baseKey='unit'; verdict='GREEN'; steps=@(@{name='Вход';status='OK';detail='ok';seconds=1})}
+            [IO.File]::WriteAllText((Join-Path $dir 'verdict.json'), ($empty | ConvertTo-Json -Depth 5), $utf8Bom)
+            & $report -RunDir $dir -Quiet
+            [xml]$updated = [IO.File]::ReadAllText($out)
+            Check ($updated.testsuites.tests -eq '1' -and $updated.testsuites.failures -eq '0') 'повтор не заменил старый итог'
+            Check ([IO.File]::ReadAllText((Join-Path $units 'junit.xml')) -ceq 'original') 'затронут вложенный JUnit YAxUnit'
+        }
+    },
+    @{
         Name = 'gate-kit-requires-backups'
         Text = 'в комплекте два расширения, для второго ошибка DumpCfg или код 0 без файла: гейт не грузит ни одно'
         Run = {
@@ -1877,7 +1926,7 @@ $tests = @(
         Text = 'ночной прогон: run.ps1 «как есть» без вопросов, итог в nightly\last.json, утром он в меню гейта'
         Run = {
             param($Name)
-            $sb = New-Sandbox $Name
+            $sb = New-Sandbox $Name -Config @{ NightlyDeniedFrom = 0; NightlyDeniedTo = 0 }
             $r = Invoke-Script -Sandbox $sb -Script 'nightly.ps1'
             Check (-not $r.TimedOut) 'ночной прогон не уложился'
             Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
@@ -1893,6 +1942,20 @@ $tests = @(
             $menu = Invoke-Script -Sandbox $sb -Answers @(@{ Kind = 'one'; Header = '^Гейт расширений'; Item = '^Выход$' })
             Check ($menu.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($menu.Unexpected -join ' | '))
             Check (@($menu.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('ночной прогон') -and $_.Contains('ЗЕЛЁНЫЙ') }).Count -gt 0) 'в меню гейта нет итога ночного прогона'
+        }
+    },
+    @{
+        Name = 'review-nightly-runtime-denied'
+        Text = 'ночной запуск в запрещённые часы пишет NONE и не обращается к 1С, даже если задание стартовало с опозданием'
+        Run = {
+            param($Name)
+            $hour = (Get-Date).Hour
+            $sb = New-Sandbox $Name -Config @{ NightlyDeniedFrom = (($hour + 23) % 24); NightlyDeniedTo = (($hour + 2) % 24) }
+            $r = Invoke-Script -Sandbox $sb -Script 'nightly.ps1'
+            Check ($r.ExitCode -eq 0 -and -not $r.TimedOut) 'планировщик должен получить успешный пропуск'
+            $last = Get-Content -LiteralPath (Join-Path $sb 'nightly/last.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+            Check ($last.verdict -ceq 'NONE' -and -not $last.runId -and $last.note -match 'запретные часы') 'нет объяснения пропуска'
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'runs'))) 'в запрещённые часы создан прогон'
         }
     },
     @{
@@ -4411,7 +4474,7 @@ $tests = @(
         Text = 'ночной прогон с ExtensionsRepo: сначала «Загрузить из git» без человека - main ушёл вперёд, правок temp нет - прогон гейта с ним без вопросов (-OnNotGreen Keep), он и есть ночной (второго «как есть» нет), итог в nightly\last.json; следующей ночью temp правили - ветка и pull request «выгружено ночью», main не тронут и не грузится, прогон «как есть»'
         Run = {
             param($Name)
-            $sb = New-GitSandbox $Name
+            $sb = New-GitSandbox $Name -Extra @{ NightlyDeniedFrom = 0; NightlyDeniedTo = 0 }
             $gh = Get-FakeGh $sb
             $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
             $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers $gitBootstrapAnswers
