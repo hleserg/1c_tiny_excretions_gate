@@ -54,7 +54,7 @@ function New-Sandbox {
     param([string]$Name, [hashtable]$Config = @{})
     $dir = Join-Path $workRoot $Name
     foreach ($sub in @('bin', 'tools', 'inbox', 'fake')) { New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null }
-    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1')) {
+    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'cluster-target.ps1', 'locks.ps1')) {
         Copy-Item -LiteralPath (Join-Path $ciRoot $script) -Destination $dir
     }
     # Подставной COM для deploy.ps1: скрипт берёт его из test\ рядом с собой, когда задан CI_FAKE_COM.
@@ -4096,6 +4096,7 @@ $tests = @(
 
 # Тесты площадки (приватный репозиторий): файл подключается точкой и возвращает массив тестов; ему доступны
 # песочница, запуск скрипта и проверки отсюда.
+$tests = @($tests) + @(. (Join-Path $here 'deploy-contract.tests.ps1'))
 if ($Extra) { $tests = @($tests) + @(. $Extra) }
 
 $selected = @($tests | Where-Object { -not $Only -or $_.Name -like "*$Only*" })
