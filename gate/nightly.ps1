@@ -71,16 +71,25 @@ function ConvertTo-NightlyTime {
         throw ("время «{0}» не в виде ЧЧ:ММ" -f $Text)
     }
     # ** Хлебников С.Ю. 20261120 Запретные часы ночного прогона - из настроек (по умолчанию 22-02, как было).
-    $nightFrom = [int](Get-NightlySetting 'NightlyDeniedFrom' 22)
-    $nightTo = [int](Get-NightlySetting 'NightlyDeniedTo' 2)
-    $denied = $false
-    if ($nightFrom -gt $nightTo) { $denied = ($parsed.Hour -ge $nightFrom -or $parsed.Hour -lt $nightTo) }
-    elseif ($nightFrom -lt $nightTo) { $denied = ($parsed.Hour -ge $nightFrom -and $parsed.Hour -lt $nightTo) }
-    if ($denied) {
-        throw ("время {0} попадает в часы {1:00}:00-{2:00}:00 (NightlyDeniedFrom/To): в них бэкап и обновление рабочей, ночной прогон там мешает" -f $parsed.ToString('HH:mm'), $nightFrom, $nightTo)
+    if (Test-NightlyDenied $parsed) {
+        throw ("время {0} попадает в часы {1} (NightlyDeniedFrom/To): в них бэкап и обновление рабочей, ночной прогон там мешает" -f $parsed.ToString('HH:mm'), (Get-NightlyDeniedText))
     }
     # ** Хлебников С.Ю. 20261120 конец
     return $parsed
+}
+
+function Test-NightlyDenied {
+    # Попадает ли время в запретные часы ночного прогона (NightlyDeniedFrom..To, по умолчанию 22-02).
+    param([datetime]$At)
+    $nightFrom = [int](Get-NightlySetting 'NightlyDeniedFrom' 22)
+    $nightTo = [int](Get-NightlySetting 'NightlyDeniedTo' 2)
+    if ($nightFrom -gt $nightTo) { return ($At.Hour -ge $nightFrom -or $At.Hour -lt $nightTo) }
+    if ($nightFrom -lt $nightTo) { return ($At.Hour -ge $nightFrom -and $At.Hour -lt $nightTo) }
+    return $false
+}
+
+function Get-NightlyDeniedText {
+    return ('{0:00}:00-{1:00}:00' -f [int](Get-NightlySetting 'NightlyDeniedFrom' 22), [int](Get-NightlySetting 'NightlyDeniedTo' 2))
 }
 
 if ($Install) {
@@ -128,6 +137,17 @@ New-Item -ItemType Directory -Path $nightlyDir -Force | Out-Null
 $started = Get-Date
 $stamp = $started.ToString('yyyyMMdd-HHmmss')
 $logFile = Join-Path $nightlyDir ($stamp + '.log')
+# Задание стартует и с опозданием (компьютер спал - StartWhenAvailable): по расписанию время разрешённое, а на деле
+# уже запретные часы. Тогда ни загрузки из git, ни прогона (#11).
+if (Test-NightlyDenied $started) {
+    $note = ('ночной прогон не запущен: фактический старт {0} - в запретные часы {1} (NightlyDeniedFrom/To), в них бэкап и обновление рабочей' -f $started.ToString('HH:mm'), (Get-NightlyDeniedText))
+    [System.IO.File]::WriteAllLines($logFile, [string[]]@($note), $utf8Bom)
+    $record = [ordered]@{ time = $started.ToString('yyyy-MM-dd HH:mm:ss'); finished = $started.ToString('yyyy-MM-dd HH:mm:ss'); runId = ''; verdict = 'NONE'; exitCode = 0; log = $logFile; note = $note }
+    [System.IO.File]::WriteAllText((Join-Path $nightlyDir 'last.json'), (ConvertTo-Json -InputObject $record), $utf8Bom)
+    [System.IO.File]::AppendAllText((Join-Path $nightlyDir 'history.txt'), ("{0}`t{1}`t{2}`t{3}`r`n" -f $record.time, 'NONE', '', 0), $utf8Bom)
+    Write-Host $note
+    exit 0
+}
 $runsRoot = Join-Path $Root ([string](Get-NightlySetting 'RunsDir' 'runs'))
 if ([System.IO.Path]::IsPathRooted([string](Get-NightlySetting 'RunsDir' 'runs'))) { $runsRoot = [string](Get-NightlySetting 'RunsDir' 'runs') }
 $known = @{}

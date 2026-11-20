@@ -768,6 +768,9 @@ function Resolve-InterruptedLocks {
 $configPath = $Config
 if ([string]::IsNullOrWhiteSpace($configPath)) { $configPath = Join-Path $Root 'config.psd1' }
 if (-not (Test-Path -LiteralPath $configPath)) { throw "Нет файла настроек: $configPath" }
+# Дочерние запуски run.ps1 (принять в эталон, прогон после отката) - с тем же профилем, полным путём (#12).
+$childConfig = @{}
+if ($Config) { $childConfig['Config'] = (Resolve-Path -LiteralPath $configPath).Path }
 
 function Read-DeployConfig {
     # config.psd1 и настройки площадки (config.site.psd1 из поставки) - так же, как в run.ps1: ключа нет в config.psd1
@@ -975,6 +978,32 @@ function Get-JsonValue {
     $property = $Object.PSObject.Properties[$Name]
     if ($null -eq $property -or $null -eq $property.Value) { return $Default }
     return $property.Value
+}
+
+function Get-SelfCheckEvidence {
+    # Что проверил прогон, у которого нет снимка temp (рабочая не была настроена или прогон старый): база и хеш-суммы
+    # расширений из сведений самопроверки «после» (selfcheck-after\tryN\info.txt, последняя целая попытка) - тот же
+    # вид, что checkedState (#7). Обработок в этих сведениях нет: их совпадение не устанавливается.
+    param([string]$Dir)
+    $tries = @(Get-ChildItem -LiteralPath (Join-Path $Dir 'selfcheck-after') -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^try\d+$' } | Sort-Object { [int]$_.Name.Substring(3) } -Descending)
+    foreach ($try in $tries) {
+        $info = Join-Path $try.FullName 'info.txt'
+        if (-not (Test-Path -LiteralPath $info)) { continue }
+        $lines = @([System.IO.File]::ReadAllLines($info, [System.Text.Encoding]::UTF8) | ForEach-Object { $_.TrimStart([char]0xFEFF) })
+        # Без fingerprint= сведения записаны не целиком.
+        if (@($lines | Where-Object { $_.StartsWith('fingerprint=') }).Count -eq 0) { continue }
+        $extensions = [ordered]@{}
+        $base = ''
+        foreach ($line in $lines) {
+            if ($line.StartsWith('base=')) { $base = $line.Substring(5).Trim() }
+            if (-not $line.StartsWith('ext=')) { continue }
+            $parts = $line.Substring(4).Split('|')
+            if ($parts.Count -ge 4 -and $parts[0].Trim()) { $extensions[$parts[0].Trim()] = [pscustomobject]@{ version = $parts[1]; hash = $parts[3].Trim() } }
+        }
+        return [pscustomobject]@{ ok = $true; base = $base; extensions = [pscustomobject]$extensions; processings = $null; fromSelfCheck = $true }
+    }
+    return $null
 }
 
 function Update-Mirror {
@@ -3191,8 +3220,14 @@ function Invoke-GitImport {
     if (-not (Test-Path -LiteralPath $verdictFile)) { Write-Line ("Прогон {0} без итога: состояние git не меняю, temp смотреть по прогону." -f $fresh[0].Name) 'Yellow'; return $runCode }
     $result = [System.IO.File]::ReadAllText($verdictFile, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
     $decision = [string]$result.kitDecision
-    $notLoaded = @(@($result.kitItems) | Where-Object { $null -ne $_.PSObject.Properties['loadTried'] -and $_.loadTried -and -not $_.touched } | ForEach-Object { [string]$_.name })
-    $notLoaded += @(@($result.kitProcessings) | Where-Object { $null -ne $_.PSObject.Properties['tried'] -and $_.tried -and -not $_.touched } | ForEach-Object { [string]$_.name })
+    # temp на main - только если загрузилось всё, что грузили: каждое расширение загружено и обновлено, каждая
+    # обработка собрана и записана (loaded), и итог - этого прогона. Пропущенное после ошибки - тоже не загружено.
+    $loadedItems = @(@($result.kitItems) + @($result.kitProcessings) | Where-Object { $null -ne $_ })
+    $notLoaded = @($loadedItems | Where-Object { $null -eq $_.PSObject.Properties['loaded'] -or -not $_.loaded } | ForEach-Object { [string]$_.name })
+    if ($loadedItems.Count -lt $toLoad.Count) { $notLoaded += ('в прогоне элементов {0} из {1}' -f $loadedItems.Count, $toLoad.Count) }
+    $verdictRun = ''
+    if ($null -ne $result.PSObject.Properties['runId']) { $verdictRun = [string]$result.runId }
+    if ($verdictRun -ne $fresh[0].Name) { $notLoaded += ('итог другого прогона ({0})' -f $verdictRun) }
     if ($decision -eq 'rolledBack' -or $decision -eq 'rollbackFailed') {
         Write-Line ("Комплект из git откачен (прогон {0}): {1} - как до загрузки, состояние git не меняю." -f $fresh[0].Name, $script:TempBase) 'Yellow'
     }
@@ -3642,8 +3677,32 @@ function Get-PreparedText {
     return ($parts -join ', ')
 }
 
+function Get-PreparedRollbackFailedText {
+    # Применение подготовки откатилось не полностью (#10): что вернулось, что нет и что делать. Пусто - не было.
+    param($State)
+    $failure = Get-JsonValue $State 'rollbackFailed' $null
+    if ($null -eq $failure) { return '' }
+    $items = @(Get-JsonValue $failure 'items' @()) -join '; '
+    if (-not $items) { $items = 'по элементам - в журнале запуска' }
+    return ("откат обновления подготовленным {0} (запуск {1}) прошёл не полностью: {2}. Рабочая частично на новых версиях, новые изменения не начинаю. Восстановить - «Откатить рабочую базу» (вернутся объекты с копией), журнал - deploy\{1}" -f $script:ProdBase, (Get-JsonValue $failure 'run' '?'), $items)
+}
+
+function Set-PreparedRollbackFailed {
+    # Неполный откат обновления подготовленным: prepared.json остаётся и получает отметку с итогом по элементам.
+    param([string[]]$Items)
+    $state = Read-PreparedState
+    if ($null -eq $state) { return }
+    $state | Add-Member -NotePropertyName rollbackFailed -NotePropertyValue ([ordered]@{ run = (Split-Path -Leaf $script:RunDir); at = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss'); items = @($Items) }) -Force
+    $next = $preparedPath + '.tmp'
+    [System.IO.File]::WriteAllText($next, (ConvertTo-Json -InputObject $state -Depth 6), $Utf8Bom)
+    [System.IO.File]::Replace($next, $preparedPath, [System.Management.Automation.Language.NullString]::Value)
+    Write-RunLog ("Подготовка отмечена: откат прошёл не полностью ({0})" -f (@($Items) -join '; '))
+}
+
 function Get-PreparedBusyText {
     param([string]$What, $State)
+    $failedText = Get-PreparedRollbackFailedText $State
+    if ($failedText) { return ("{0} сейчас нельзя: {1}" -f $What, $failedText) }
     return ("{0} сейчас нельзя: есть подготовленное обновление от {1} ({2}) - в конфигурацию {3} загружены новые версии, не применённые. Сначала «Обновить рабочую подготовленным» или «Отменить подготовку»." -f $What, (Get-JsonValue $State 'timeText' '?'), (Get-PreparedText $State), $script:ProdBase)
 }
 
@@ -3770,6 +3829,9 @@ if ($writeRun -and (-not $CancelPrepared -or $null -ne $prepared)) {
 if ($CancelPrepared) {
     if (-not (Test-UiCanAsk)) { throw 'отмена подготовки только из консоли или ci.exe' }
     if ($null -eq $prepared) { Write-Line ("Подготовленного обновления {0} нет: отменять нечего." -f $script:ProdBase); exit 0 }
+    # Отмена грузит копии в конфигурацию без обновления БД: после неполного отката это не восстановление (#10).
+    $failedText = Get-PreparedRollbackFailedText $prepared
+    if ($failedText) { throw $failedText }
     Write-Host ''
     Write-Line ("ОТМЕНА ПОДГОТОВКИ {0}" -f $script:ProdBase) 'Cyan'
     Write-Line ("  подготовлено {0}: {1}" -f (Get-JsonValue $prepared 'timeText' '?'), (Get-PreparedText $prepared))
@@ -3938,7 +4000,8 @@ if ($Rollback) {
     # Откат рабочей базы: к состоянию до выбранного обновления, из его резервных копий. Дальше - обычный путь
     # обновления (блокировки, резервные копии текущего состояния, загрузка, обновление БД, лёгкий прогон, отчёт).
     if (-not (Test-UiCanAsk)) { throw 'откат рабочей базы только из консоли или ci.exe: без человека скрипт ничего не откатывает' }
-    if ($null -ne $prepared) { throw (Get-PreparedBusyText 'Откат' $prepared) }
+    # После неполного отката обновления подготовленным откат - и есть восстановление: он разрешён (#10).
+    if ($null -ne $prepared -and -not (Get-PreparedRollbackFailedText $prepared)) { throw (Get-PreparedBusyText 'Откат' $prepared) }
     $ciLines = New-Object System.Collections.Generic.List[string]
     $advice = New-Object System.Collections.Generic.List[object]
     $gateRisks = New-Object System.Collections.Generic.List[string]
@@ -4060,8 +4123,15 @@ else {
         foreach ($candidate in $candidates) {
             $verdictFile = Join-Path $candidate.FullName 'verdict.json'
             if (Test-Path -LiteralPath $verdictFile) {
+                $candidateVerdict = (Get-Content -LiteralPath $verdictFile -Raw -Encoding UTF8) | ConvertFrom-Json
+                # Каталог прогонов общий на несколько тестовых баз: прогон другой базы - не про этот temp (#7).
+                $candidateBase = [string](Get-JsonValue $candidateVerdict 'baseKey' '')
+                if ($candidateBase -and $script:TempBase -and $candidateBase -ine $script:TempBase) {
+                    Write-RunLog ("Прогон {0} - базы {1}, а temp - {2}: не берётся" -f $candidate.Name, $candidateBase, $script:TempBase)
+                    continue
+                }
                 $lastRun = $candidate
-                $lastVerdict = (Get-Content -LiteralPath $verdictFile -Raw -Encoding UTF8) | ConvertFrom-Json
+                $lastVerdict = $candidateVerdict
                 break
             }
         }
@@ -4315,6 +4385,8 @@ else {
     #region Что обновлять
 
     if (-not (Test-UiCanAsk)) { throw 'обновление рабочей базы только из консоли: без человека скрипт ничего не обновляет' }
+    # Прошлый откат подготовленного прошёл не полностью: ни новой подготовки, ни обновления - сначала восстановление (#10).
+    if ($null -ne $prepared -and (Get-PreparedRollbackFailedText $prepared)) { throw (Get-PreparedRollbackFailedText $prepared) }
     if ($null -ne $prepared -and -not $Prepare -and -not $ApplyPrepared) { throw (Get-PreparedBusyText 'Обновление одним проходом' $prepared) }
 
     # Кнопки - всегда, что бы ни показал гейт и сравнение: решает человек.
@@ -4328,6 +4400,8 @@ else {
         # Обновить подготовленным: что загружено при подготовке, то и применяется. Сверка: temp и рабочая с тех пор
         # не менялись (по хеш-суммам через внешнее соединение, если они читаются).
         if ($null -eq $prepared) { throw 'подготовленного обновления нет: сначала «Подготовить обновление рабочей»' }
+        $failedText = Get-PreparedRollbackFailedText $prepared
+        if ($failedText) { throw $failedText }
         if ([bool](Get-JsonValue $prepared 'partial' $false)) { throw 'подготовка не закончена (часть расширений не загрузилась): «Отменить подготовку рабочей» или «Подготовить обновление рабочей» заново' }
         if ([string](Get-JsonValue $prepared 'base' '') -ne $script:ProdBase) { throw ("подготовлено для базы {0}, а рабочая сейчас {1}" -f (Get-JsonValue $prepared 'base' '?'), $script:ProdBase) }
         $preparedRunId = [string](Get-JsonValue $prepared 'runId' '')
@@ -4505,13 +4579,23 @@ else {
     $checkedNote = ''
     if ($null -ne $lastRun -and $mode -ne 'asis') {
         $checked = Get-JsonValue $lastVerdict 'checkedState' $null
+        # Снимка нет или он не снялся - что проверено, видно по сведениям самопроверки «после» этого прогона (#7).
+        if ($null -eq $checked -or -not [bool](Get-JsonValue $checked 'ok' $false)) {
+            $evidence = Get-SelfCheckEvidence $lastRun.FullName
+            if ($null -ne $evidence) { $checked = $evidence; Write-RunLog ("Что проверил прогон {0} - по сведениям самопроверки «после»" -f $lastRun.Name) }
+        }
         if ($null -eq $checked) { $checkedNote = ("проверка этого состава не подтверждена: в прогоне {0} нет снимка temp" -f $lastRun.Name) }
         elseif (-not [bool](Get-JsonValue $checked 'ok' $false)) { $checkedNote = ("проверка этого состава не подтверждена: снимок temp прогона {0} не снялся ({1})" -f $lastRun.Name, [string](Get-JsonValue $checked 'error' '')) }
         else {
             $checkedExt = Get-JsonValue $checked 'extensions' $null
             $checkedProc = Get-JsonValue $checked 'processings' $null
+            $fromSelfCheck = [bool](Get-JsonValue $checked 'fromSelfCheck' $false)
             $mismatch = New-Object System.Collections.Generic.List[string]
             $unconfirmed = New-Object System.Collections.Generic.List[string]
+            $checkedBase = [string](Get-JsonValue $checked 'base' '')
+            if ($checkedBase -and $script:TempBase -and $checkedBase -ine $script:TempBase -and $checkedBase -notlike ('*\' + $script:TempBase)) {
+                $mismatch.Add(("прогон проверял другую базу ({0})" -f $checkedBase))
+            }
             foreach ($checkEntry in $selected) {
                 $nowHash = ''
                 if ($mode -eq 'prepared') { $nowHash = [string](Get-JsonValue $preparedByName[$checkEntry.Name] 'tempHash' '') }
@@ -4524,6 +4608,8 @@ else {
                 if ($nowHash -ne $thenHash) { $mismatch.Add(("{0}: в temp не то, что проверял прогон" -f $checkEntry.Name)) }
             }
             foreach ($checkProc in $selectedProcessings) {
+                # Сведения самопроверки обработок не содержат: совпадение не установлено, но и не расхождение.
+                if ($fromSelfCheck) { $unconfirmed.Add([string]$checkProc.ObjName); continue }
                 $nowItem = @($tempProcExport.Items | Where-Object { $_.ObjName -eq $checkProc.ObjName } | Select-Object -First 1)
                 $thenItem = $null
                 if ($null -ne $checkedProc) { $thenItem = Get-JsonValue $checkedProc $checkProc.ObjName $null }
@@ -4570,7 +4656,7 @@ else {
     }
 }
 
-if ((Test-DeployHourDenied (Get-Date)) -and -not $Prepare) { throw ("сейчас {0}: рабочую базу обновляем только {1}" -f (Get-Date -Format 'HH:mm'), (Get-DeployWindowText)) }
+if ((Test-DeployHourDenied (Get-Date)) -and -not $Prepare) { throw ("сейчас {0} - обновлять рабочую в это время запрещено (DeployDeniedFrom/To): рабочую базу обновляем только {1}" -f (Get-Date -Format 'HH:mm'), (Get-DeployWindowText)) }
 
 # ** Хлебников С.Ю. 20261120 Сводка прямо перед вводом имени: цель, операция, что было и что станет, обработки
 # (и ноль), гейт и причина выпуска - всё, что выше могло уехать за край экрана.
@@ -4604,7 +4690,7 @@ $typedName = Read-UiText -Prompt ("Это рабочая база. Чтобы п
 if ($typedName -cne $script:ProdBase) { throw 'имя базы набрано не так: обновление отменено' }
 Write-RunLog 'Подтверждено именем базы'
 # ** Хлебников С.Ю. 20261120 Пока ждали ввода имени, могло наступить запретное время: сверка ещё раз перед первой записью.
-if ((Test-DeployHourDenied (Get-Date)) -and -not $Prepare) { throw ("пока ждал подтверждения, наступило {0}: рабочую базу обновляем только {1}. В рабочую ничего не записано" -f (Get-Date -Format 'HH:mm'), (Get-DeployWindowText)) }
+if ((Test-DeployHourDenied (Get-Date)) -and -not $Prepare) { throw ("пока ждал подтверждения, наступило {0} - обновлять рабочую в это время запрещено (DeployDeniedFrom/To): рабочую базу обновляем только {1}. В рабочую ничего не записано" -f (Get-Date -Format 'HH:mm'), (Get-DeployWindowText)) }
 
 #endregion
 
@@ -5190,8 +5276,9 @@ if (-not $failed -and $selectedProcessings.Count -gt 0) {
 function Invoke-ProdRollback {
     # Возвращает рабочую базу к резервным копиям: в обратном порядке; новое расширение удаляется по имени.
     # Сначала внешние обработки (их писали последними): прежняя версия - обратно в справочник, новая снимается,
-    # снятая - записывается снова.
+    # снятая - записывается снова. Итог по каждому - в $script:RollbackResults.
     $ok = $true
+    $script:RollbackResults = New-Object System.Collections.Generic.List[string]
     $procList = @($touchedProcessings.ToArray())
     [array]::Reverse($procList)
     foreach ($proc in $procList) {
@@ -5210,11 +5297,12 @@ function Invoke-ProdRollback {
         }
         if ($null -eq $session) {
             Write-Line ("  откат {0}: откатывать не к чему (прежней версии нет, и новой она не отмечена)" -f $proc.ObjName) 'Yellow'
+            $script:RollbackResults.Add(("обработка {0}: не возвращена - откатывать не к чему" -f $proc.ObjName))
             $ok = $false
             continue
         }
-        if ($session.Done -and $session.Status -eq 'done') { Write-Line ("  откат {0}: готово" -f $proc.ObjName) 'Green' }
-        else { Write-Line ("  откат {0} не прошёл: {1}" -f $proc.ObjName, $session.Message) 'Red'; $ok = $false }
+        if ($session.Done -and $session.Status -eq 'done') { Write-Line ("  откат {0}: готово" -f $proc.ObjName) 'Green'; $script:RollbackResults.Add(("обработка {0}: возвращена" -f $proc.ObjName)) }
+        else { Write-Line ("  откат {0} не прошёл: {1}" -f $proc.ObjName, $session.Message) 'Red'; $script:RollbackResults.Add(("обработка {0}: не возвращена - {1}" -f $proc.ObjName, $session.Message)); $ok = $false }
     }
     $list = @($touched.ToArray())
     [array]::Reverse($list)
@@ -5238,6 +5326,7 @@ function Invoke-ProdRollback {
         }
         elseif ($entry.Status -ne 'new') {
             Write-Line ("  откат {0}: откатывать не к чему (прежней выгрузки нет)" -f $entry.Name) 'Yellow'
+            $script:RollbackResults.Add(("{0}: не возвращено - копии нет" -f $entry.Name))
             $ok = $false
             continue
         }
@@ -5246,11 +5335,12 @@ function Invoke-ProdRollback {
             $result = Invoke-Designer -BaseName $script:ProdBase -Command @('/DeleteCfg', '-Extension', $entry.Name) `
                 -LogName ("rollback_delete_{0}.log" -f $entry.Name) -TimeoutSec $timeoutLoadSec -Title ("Откат: удалить новое {0}" -f $entry.Name)
         }
-        if ($result.ExitCode -eq 0) { Write-Line ("  откат {0}: готово" -f $entry.Name) 'Green' }
-        else { Write-Line ("  откат {0} не прошёл: {1}" -f $entry.Name, $result.Text) 'Red'; $ok = $false }
+        if ($result.ExitCode -eq 0) { Write-Line ("  откат {0}: готово" -f $entry.Name) 'Green'; $script:RollbackResults.Add(("{0}: возвращено" -f $entry.Name)) }
+        else { Write-Line ("  откат {0} не прошёл: {1}" -f $entry.Name, $result.Text) 'Red'; $script:RollbackResults.Add(("{0}: не возвращено - {1}" -f $entry.Name, $result.Text)); $ok = $false }
     }
     return $ok
 }
+$script:RollbackResults = New-Object System.Collections.Generic.List[string]
 
 $outcome = 'updated'
 if ($failed) {
@@ -5324,8 +5414,13 @@ if ($outcome -eq 'updated') {
                 $content = @(Get-Content -LiteralPath $canaryFile -Encoding UTF8)
                 $notApplied = @($content | Where-Object { $_ -like 'ext=*|NOT_APPLIED' } | ForEach-Object { ($_.Substring(4) -split '\|')[0] })
                 $status = @($content | Where-Object { $_ -like 'status=*' } | Select-Object -First 1)
+                $extensionError = @($content | Where-Object { $_ -like 'exterror=*' } | Select-Object -First 1)
                 if ($status.Count -eq 0 -or ([string]$status[0]).Substring(7).Trim() -ne 'ok') { Add-Light 'FAIL' 'Канареечный вход' ($content -join ' | ') }
                 elseif ($notApplied.Count -gt 0) { Add-Light 'FAIL' 'Канареечный вход' ("не применились в сеансе: {0}" -f ($notApplied -join ', ')) }
+                elseif ($extensionError.Count -gt 0) {
+                    # Вход удался, а применились ли расширения, неизвестно: список не прочитан (#17).
+                    Add-Light 'WARN' 'Канареечный вход' ("вошёл за {0} с, но применение расширений не проверено: состав расширений не прочитан ({1})" -f $client.Seconds, ([string]$extensionError[0]).Substring(9).Trim())
+                }
                 else { Add-Light 'OK' 'Канареечный вход' ("вошёл за {0} с, расширения применились" -f $client.Seconds) }
             }
         }
@@ -5602,7 +5697,14 @@ if ($outcome -eq 'updated') {
 
 # Обновили подготовленным или откатили его - подготовки больше нет. Не прошло и не откатывали - остаётся:
 # «Обновить подготовленным» можно повторить, подготовку - отменить.
-if ($mode -eq 'prepared' -and $outcome -ne 'failed' -and (Test-Path -LiteralPath $preparedPath)) { Remove-Item -LiteralPath $preparedPath -Force }
+# Откат прошёл не полностью - подготовка остаётся с отметкой: следующий запуск покажет, что рабочую надо восстановить (#10).
+if ($mode -eq 'prepared' -and $outcome -eq 'rollbackFailed' -and (Test-Path -LiteralPath $preparedPath)) { Set-PreparedRollbackFailed -Items @($script:RollbackResults) }
+if ($mode -eq 'prepared' -and $outcome -ne 'failed' -and $outcome -ne 'rollbackFailed' -and (Test-Path -LiteralPath $preparedPath)) { Remove-Item -LiteralPath $preparedPath -Force }
+# Восстановление после неполного отката подготовленного прошло: подготовки больше нет.
+if ($mode -eq 'rollback' -and $outcome -eq 'updated' -and $null -ne $prepared -and (Get-PreparedRollbackFailedText $prepared) -and (Test-Path -LiteralPath $preparedPath)) {
+    Remove-Item -LiteralPath $preparedPath -Force
+    Write-Line ("  подготовка {0} после восстановления снята" -f $script:ProdBase) 'DarkGray'
+}
 
 Clear-ProdLocks
 
@@ -5621,12 +5723,12 @@ if ($outcome -eq 'updated') {
             $acceptNow = Confirm-Ui -Question ("Принять новое прогона {0} (жёлтый) в эталон? Тогда следующий прогон будет считать его известным. Что внутри - report.txt прогона." -f $lastRun.Name) -Yes 'Принять в эталон' -No 'Не принимать' -DefaultNo
             if ($acceptNow -eq $true) {
                 Write-Line ("Принимаю новое прогона {0} в эталон." -f $lastRun.Name)
-                & (Join-Path $Root 'run.ps1') -AcceptBaseline $lastRun.FullName
+                & (Join-Path $Root 'run.ps1') -AcceptBaseline $lastRun.FullName @childConfig
             }
             else { Write-Line ("Эталон не тронут: новое прогона {0} останется новым." -f $lastRun.Name) }
         }
         elseif ($lastVerdictText -eq 'GREEN' -and -not $lastAccepted) {
-            & (Join-Path $Root 'run.ps1') -AcceptBaseline $lastRun.FullName
+            & (Join-Path $Root 'run.ps1') -AcceptBaseline $lastRun.FullName @childConfig
         }
     }
     # Отметка в папке прогона: его комплект выпущен в рабочую этим обновлением (вердикт прогона не меняется).
@@ -5772,7 +5874,7 @@ if ($mode -eq 'rollback' -and $outcome -eq 'updated') {
             Write-Line ("[WARN] {0} снята из справочника рабочей; в temp её снять руками (гейт снимает только то, что записал сам)" -f $proc.ObjName) 'Yellow'
         }
         Write-Line ("Комплект для temp: {0}, файлов {1}. Запускаю гейт." -f $kitDir, $taken) 'Cyan'
-        if ($UiChannel) { & (Join-Path $Root 'run.ps1') -Kit $kitDir -UiChannel $UiChannel } else { & (Join-Path $Root 'run.ps1') -Kit $kitDir }
+        if ($UiChannel) { & (Join-Path $Root 'run.ps1') -Kit $kitDir -UiChannel $UiChannel @childConfig } else { & (Join-Path $Root 'run.ps1') -Kit $kitDir @childConfig }
     }
 }
 if ($outcome -eq 'updated') { exit 0 }

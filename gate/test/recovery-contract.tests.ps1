@@ -72,7 +72,7 @@ exit $LASTEXITCODE
     },
     @{
         Name = 'review-deploy-recovery-denied-time'
-        Text = 'Подготовка, обновление одним проходом и применение подготовки: правильное имя введено на границе окна, до первой записи уже 22:01.'
+        Text = 'Обновление одним проходом и применение подготовки: правильное имя введено на границе окна, до первой записи уже 22:01 - в рабочую ничего не пишется. Подготовка - в любое время (решение владельца 20.11.2026): в 22:01 она идёт.'
         Run = {
             param($Name)
             # Find-Answer вызывается самим тестовым драйвером. Пишем новое время перед передачей настоящего ответа.
@@ -110,6 +110,12 @@ exit $LASTEXITCODE
                 $result = Invoke-Script -Sandbox $sb -Script 'clock-entry.ps1' -Arguments ('-Mode ' + $mode) -Com (New-ComState) -Answers $answers
                 Check (-not $result.TimedOut -and -not $result.Stderr -and $result.Unexpected.Count -eq 0 -and $result.UnusedAnswers -eq 0) ($mode + ': запуск не дошёл до подтверждения штатно')
                 Check ([IO.File]::ReadAllText($clockPath) -eq '22:01') ($mode + ': контрольные часы не пересекли границу')
+                if ($mode -eq 'Prepare') {
+                    # Подготовка грузит в конфигурацию рабочей без применения, пользователи работают: часы её не ограничивают.
+                    Check ((Get-Calls $result @('/LoadCfg', $profile.ProdBase)).Count -ge 1) 'Prepare: подготовка в 22:01 не загрузила новые версии'
+                    Check ((Get-Calls $result @('/UpdateDBCfg', $profile.ProdBase)).Count -eq 0) 'Prepare: подготовка обновила конфигурацию БД рабочей'
+                    continue
+                }
                 foreach ($cmd in @('/LoadCfg', '/LoadConfigFromFiles', '/UpdateDBCfg', '/DeleteCfg')) {
                     Check ((Get-Calls $result @($cmd, $profile.ProdBase)).Count -eq 0) ($mode + ': начат ' + $cmd + ' внутри запретного окна')
                 }

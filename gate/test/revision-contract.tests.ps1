@@ -12,7 +12,7 @@ function Set-RevisionFileGate {
     $entry = Join-Path $Sandbox 'run.ps1'
     Move-Item -LiteralPath $entry -Destination (Join-Path $Sandbox 'gate-under-test.ps1')
     $launcher = @'
-param([string]$Kit, [string]$KitSource, [string]$Config, [string]$UiChannel, [string]$OnNotGreen, [string]$OnSessions)
+param([string]$Kit, [string]$KitSource, [string]$KitBranch, [string]$ActionsDir, [string]$Config, [string]$UiChannel, [string]$OnNotGreen, [string]$OnSessions)
 $PSBoundParameters['Config'] = Join-Path $PSScriptRoot 'gate-file.psd1'
 & (Join-Path $PSScriptRoot 'gate-under-test.ps1') @PSBoundParameters
 exit $LASTEXITCODE
@@ -52,7 +52,8 @@ function Invoke-RevisionPartialImport {
     Check-Common $result
     Check-Verdict $result 'RED' 1
     if ($null -eq $result.Verdict) { return }
-    Check ($result.Verdict.kitSource -eq ('git owner/ext@' + $candidate.Substring(0, 7))) 'гейт проверял другой коммит'
+    # С 20.11 (#36) «Загрузить из git» передаёт полный SHA.
+    Check ($result.Verdict.kitSource -eq ('git owner/ext@' + $candidate)) ('гейт проверял другой коммит: ' + $result.Verdict.kitSource)
     if ($Processing) {
         Check-Step $result 'Собрать Печать из файлов' 'FAIL'
         Check ((Get-Calls $result @('/LoadExternalDataProcessorOrReportFromFiles')).Count -eq 1) 'конфигуратор не дошёл до сборки EPF'
