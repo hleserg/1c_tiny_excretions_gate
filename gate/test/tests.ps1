@@ -1172,6 +1172,55 @@ $tests = @(
         }
     },
     @{
+        Name = 'gate-processing-pipeline'
+        Text = 'следующая сборка завершается во время первой регистрации; сбой сборки не запускает запись второй карточки'
+        Run = {
+            param($Name)
+            foreach ($broken in @($false, $true)) {
+                $sb = New-Sandbox ("{0}-{1}" -f $Name, $broken)
+                $kit = Join-Path $sb 'inbox'
+                $null = Add-InboxFile $sb 'Альфа\Альфа.xml' ($epfDump.Replace('Печать', 'Альфа'))
+                $null = Add-InboxFile $sb 'Бета\Бета.xml' ($epfDump.Replace('Печать', 'Бета'))
+                $fake = @{ regepf = @(@{ status = 'done'; waitBuild = 'Бета' }, @{ status = 'done' }) }
+                if ($broken) {
+                    $fake.regepf = @(@{ status = 'done' })
+                    $fake.designer = @(@{ match = @('/LoadExternalDataProcessorOrReportFromFiles', 'Бета.xml'); exit = 1; log = 'Ошибка сборки' })
+                }
+                $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $kit) -Fake $fake
+                Check-Common $r
+                Check-Step $r 'Записать в справочник Альфа' 'OK'
+                Check ((Get-Calls $r @('/LoadExternalDataProcessorOrReportFromFiles', 'Бета.xml')).Count -eq 1) 'второй файл должен собраться один раз'
+                if ($broken) {
+                    Check-Verdict $r 'RED' 1
+                    Check-Step $r 'Собрать Бета из файлов' 'FAIL'
+                    Check ((Get-Calls $r @('/Cregepf', 'name=Бета')).Count -eq 0) 'запущена запись после ошибки сборки'
+                }
+                else {
+                    Check-Verdict $r 'GREEN' 0
+                    Check-Step $r 'Записать в справочник Бета' 'OK'
+                    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sb 'timeline.ps1') $r.RunDir -Quiet | Out-Null
+                    $text = [System.IO.File]::ReadAllText((Join-Path $r.RunDir 'timeline.txt'), $utf8)
+                    Check ($text.Contains('Фоновая сборка обработок: файлов 1')) 'в разборе нет отдельного времени фоновой сборки'
+                }
+            }
+        }
+    },
+    @{
+        Name = 'gate-processing-form-scope'
+        Text = 'ошибку отдельной именованной формы проверяет диагностический режим; отказ формы входа блокирует в обоих режимах'
+        Run = {
+            param($Name)
+            foreach ($strict in @($false, $true)) {
+                $sb = New-Sandbox ("{0}-{1}" -f $Name, $strict) -Config @{ ProcessingAllForms = $strict }
+                $file = Add-InboxFile $sb 'Печать.epf'
+                $fake = @{ regepf = @(@{ status = 'done'; namedFormErrors = @('Форма.Служебная: не передано основание') }) }
+                $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake $fake
+                Check-Common $r
+                if ($strict) { Check-Verdict $r 'RED' 1 } else { Check-Verdict $r 'GREEN' 0 }
+            }
+        }
+    },
+    @{
         Name = 'gate-mixed-kit'
         Text = 'расширение и обработка вместе: расширение грузится, обработка записывается после него, проверки идут'
         Run = {

@@ -161,6 +161,9 @@ $selfcheckOpen = @{}
 $firstProcess = $null
 $lastForegroundEnd = $runStart
 $waitStart = $null
+$buildCount = 0
+$buildSeconds = 0
+$buildWaited = 0
 $backgroundSeconds = 0
 $backgroundWaited = -1
 for ($index = 0; $index -lt $events.Count; $index++) {
@@ -171,6 +174,7 @@ for ($index = 0; $index -lt $events.Count; $index++) {
         $exe = $pm.Groups[1].Value.ToLowerInvariant()
         $arguments = $pm.Groups[2].Value
         if ($null -eq $firstProcess) { $firstProcess = $event.Time }
+        if ($arguments.EndsWith('(фоновая сборка)')) { continue }
         if ($arguments.EndsWith('(параллельно)')) { $backgroundStart = $event.Time; $backgroundTitle = Get-DesignerTitle $arguments; continue }
         if ($exe -like '1cv8c*') {
             $title = Get-ClientTitle $arguments
@@ -209,6 +213,16 @@ for ($index = 0; $index -lt $events.Count; $index++) {
         if ($null -ne $key) { $title = $key; $start = $selfcheckOpen[$key]; $selfcheckOpen.Remove($key) }
         Add-Interval 'selfcheck' $title $start $event.Time
         $lastForegroundEnd = $event.Time
+        continue
+    }
+    $buildEnd = [regex]::Match($text, '^\s*Фоновая сборка (.+): секунд=(\d+) ждали=(\d+) ')
+    if ($buildEnd.Success) {
+        $buildCount++
+        $seconds = [int]$buildEnd.Groups[2].Value
+        $waited = [Math]::Min($seconds, [int]$buildEnd.Groups[3].Value)
+        $buildSeconds += $seconds
+        $buildWaited += $waited
+        Add-Interval 'designer' $buildEnd.Groups[1].Value $event.Time.AddSeconds(-$waited) $event.Time
         continue
     }
     # Параллельная проверка: начало ожидания и конец (ждали= - у гейта с 20261120.180000).
@@ -421,6 +435,9 @@ foreach ($kind in @($Order + 'gate')) {
     if ($totals[$kind] -le 0) { continue }
     $share = [int][Math]::Round(100 * $totals[$kind] / [Math]::Max(1, $wall))
     $lines.Add(('  {0,8} {1,4}%  {2}' -f (Format-Seconds $totals[$kind]), $share, $Names[$kind]))
+}
+if ($buildCount -gt 0) {
+    $lines.Add(('Фоновая сборка обработок: файлов {0}, время конфигуратора {1}, ожидание {2}, перекрытие с другими шагами {3}' -f $buildCount, (Format-Seconds $buildSeconds), (Format-Seconds $buildWaited), (Format-Seconds ($buildSeconds - $buildWaited))))
 }
 if ($backgroundSeconds -gt 0) {
     $hidden = [Math]::Max(0, $backgroundSeconds - [Math]::Max(0, $backgroundWaited))

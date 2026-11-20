@@ -5919,8 +5919,9 @@ if (-not $failed -and $selectedProcessings.Count -gt 0) {
         $what = 'обновлена'
         if ($proc.IsNew -eq 'yes') { $what = 'добавлена новым элементом' }
         $detail = "{0}, версия {1} -> {2}, форм {3}" -f $what, $(if ($proc.OldVersion) { $proc.OldVersion } else { '-' }), $(if ($proc.NewVersion) { $proc.NewVersion } else { '-' }), (Get-Setting $values 'forms' '?')
+        if ($values.ContainsKey('formprobes')) { $detail += (", выполнено проб форм {0}" -f $values['formprobes']) }
         if ($problems.Count -gt 0) { Write-Line ("[WARN] {0}: {1}. {2}" -f $title, $detail, ($problems -join ' | ')) 'Yellow' }
-        else { Write-Line ("[OK]   {0}: {1}; подключается, формы создаются" -f $title, $detail) 'Green' }
+        else { Write-Line ("[OK]   {0}: {1}; объект подключён, проверка завершена" -f $title, $detail) 'Green' }
     }
 }
 

@@ -90,18 +90,20 @@ type canary struct {
 }
 
 type processing struct {
-	Status     string   `json:"status"`
-	Message    string   `json:"message"`
-	ObjName    string   `json:"objname"`
-	ObjVersion string   `json:"objversion"`
-	OldVersion string   `json:"oldversion"`
-	IsNew      string   `json:"isnew"`
-	Ref        string   `json:"ref"`
-	Check      string   `json:"check"`
-	CheckError string   `json:"checkerror"`
-	FormErrors []string `json:"formerror"`
-	Old        string   `json:"old"`
-	NoResult   bool     `json:"noresult"`
+	Status          string   `json:"status"`
+	Message         string   `json:"message"`
+	ObjName         string   `json:"objname"`
+	ObjVersion      string   `json:"objversion"`
+	OldVersion      string   `json:"oldversion"`
+	IsNew           string   `json:"isnew"`
+	Ref             string   `json:"ref"`
+	Check           string   `json:"check"`
+	CheckError      string   `json:"checkerror"`
+	FormErrors      []string `json:"formerror"`
+	NamedFormErrors []string `json:"namedFormErrors"`
+	WaitBuild       string   `json:"waitBuild"`
+	Old             string   `json:"old"`
+	NoResult        bool     `json:"noresult"`
 }
 
 type unitCase struct {
@@ -898,6 +900,21 @@ func precheckRun(c precheck, dir string) {
 }
 
 func processingRun(mode string, r processing, dir string, p map[string]string) {
+	if r.WaitBuild != "" {
+		// Первая регистрация может закончиться только после сборки следующего файла.
+		built := filepath.Join(dir, "..", "..", r.WaitBuild, r.WaitBuild+".epf")
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, err := os.Stat(built); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				r.Status, r.Message = "failed", "не дождался фоновой сборки"
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
 	writeUTF8(dir+"started.txt", "started=20261117.999999")
 	if r.NoResult {
 		time.Sleep(time.Hour)
@@ -934,6 +951,9 @@ func processingRun(mode string, r processing, dir string, p map[string]string) {
 			"isnew="+isNew, "ref="+ref, "kind=ДополнительнаяОбработка", "commands=1", "forms=1", "check="+check)
 		if r.CheckError != "" {
 			lines = append(lines, "checkerror="+r.CheckError)
+		}
+		if p["allforms"] == "1" {
+			r.FormErrors = append(r.FormErrors, r.NamedFormErrors...)
 		}
 		for _, f := range r.FormErrors {
 			lines = append(lines, "formerror="+f)
