@@ -34,8 +34,8 @@
         БД, внешние обработки, проверки, отчёт. -CancelPrepared: вернуть расширения рабочей к применённым версиям.
 
     .\deploy.ps1 -GitExport / -GitImport
-        Репозиторий расширений (ExtensionsRepo, раздел 5.23): выгрузить temp в git - первый раз коммитом в main,
-        потом правки temp веткой temp/<время> и pull request; загрузить из git - проверка правок temp и обычный
+        Репозиторий расширений (ExtensionsRepo, раздел 5.23): выгрузить temp в git - ветка temp/<время> и pull
+        request, включая первую выгрузку. Загрузить из git - проверка правок temp и обычный
         прогон гейта с тем, что изменилось в main. Рабочую базу не трогает.
 
     Внешние обработки и отчёты справочника «Дополнительные отчёты и обработки» сравниваются так же:
@@ -80,6 +80,9 @@ param(
     [switch]$ProdPreCheck,
     # Диагностика внешнего соединения (COM) с temp: каким способом читаются расширения. Только чтение, только temp.
     [switch]$ComCheck,
+    # Снимок temp для прогона гейта (run.ps1 в конце проверок): хеш-суммы расширений и внешних обработок - в файл
+    # JSON. По нему обновление рабочей сверяет, что в temp то, что проверял прогон. Только чтение, только temp.
+    [string]$SnapshotTemp = '',
     # Репозиторий расширений (ExtensionsRepo): выгрузить temp в git или загрузить из git в temp. Рабочую не трогает.
     [switch]$GitExport,
     [switch]$GitImport,
@@ -103,13 +106,8 @@ if ($UiChannel) {
     $ProgressPreference = 'SilentlyContinue'
 }
 
-# Блокировки рабочей базы. С начала подготовки рабочей базы (после подтверждения) обе - регламентных заданий
-# и начала сеансов - в конце обязательно снимаются, кто бы их ни поставил: при удачном обновлении, при сбое,
-# при остановке и по Ctrl+C. Тестовую базу это не касается. Исключение - чужая блокировка сеансов с другим кодом:
-# с ней скрипт останавливается до обновления и её не трогает.
-$script:ProdLocksArmed = $false
-$script:KeepForeignSessionLock = $false
-$script:SessionLockCode = ''
+# До входа в подготовку у этого запуска нет собственных блокировок.
+$script:ProdLockState = $null
 
 trap {
     Write-Host ''
@@ -117,13 +115,14 @@ trap {
     if ([string]$_.FullyQualifiedErrorId -ne [string]$_.Exception.Message -and $null -ne $_.InvocationInfo) {
         Write-Host ("  {0}" -f ($_.InvocationInfo.PositionMessage -split "`r?`n")[0]) -ForegroundColor DarkGray
     }
-    if ($script:ProdLocksArmed) {
+    if ($null -ne $script:ProdLockState) {
         try { Clear-ProdLocks } catch { Write-Host ("Блокировки снять не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Yellow }
     }
     exit 1
 }
 
 $Root = $PSScriptRoot
+. (Join-Path $Root 'cluster-target.ps1')
 $Utf8Bom = New-Object System.Text.UTF8Encoding($true)
 $TestBasePattern = 'temp|test|copy|tmp|dev|sandbox|stand|тест|копи|стенд|песочниц'
 $SelfCheckLineRegex = New-Object System.Text.RegularExpressions.Regex('^\d\d:\d\d:\d\d \[(ОК|ОШИБКА|ВНИМАНИЕ|ПРОПУСК|ИНФО)\]\s*(.*)$')
@@ -146,15 +145,19 @@ function Get-Setting {
     return $Default
 }
 
+# Значения, которые в выводе и журнале заменяются звёздочками целиком (Get-MaskedLine): код разрешения входа.
+$script:MaskValues = @()
+
 function Write-RunLog {
     param([string]$Text)
     $stamp = Get-Date -Format 'HH:mm:ss'
-    [System.IO.File]::AppendAllText($script:RunLogPath, ("{0} {1}`r`n" -f $stamp, $Text), $Utf8Bom)
+    [System.IO.File]::AppendAllText($script:RunLogPath, ("{0} {1}`r`n" -f $stamp, (Get-MaskedLine $Text)), $Utf8Bom)
 }
 
 function Write-Line {
     # Строка в консоль и в run.log.
     param([string]$Text, [string]$Color = 'Gray')
+    $Text = Get-MaskedLine $Text
     Write-Host $Text -ForegroundColor $Color
     Write-RunLog $Text
 }
@@ -186,13 +189,22 @@ function Get-ConnectionArgs {
 }
 
 function Get-MaskedLine {
+    # Чувствительное - звёздочками, одной обработкой на консоль, run.log и всё, что из них собирается (отчёты, итог
+    # в GitHub): пароль и код разрешения входа в ключах запуска 1С (/P, /UC) и в строке соединения (Pwd=, UC=) и
+    # само значение UnlockCode, где бы оно ни встретилось, - если в нём шесть знаков и больше (короткий код вроде
+    # «0» совпал бы с обычными цифрами текста; он закрыт в ключах и строке соединения).
     param([string]$Line)
-    return [regex]::Replace([regex]::Replace($Line, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"')
+    if (-not $Line) { return $Line }
+    $masked = [regex]::Replace([regex]::Replace($Line, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"')
+    $masked = [regex]::Replace($masked, '(?i)\b(Pwd|UC)="(?:[^"]|"")*"', '$1="***"')
+    foreach ($secret in @($script:MaskValues)) { if ($secret) { $masked = $masked.Replace([string]$secret, '***') } }
+    return $masked
 }
 
 function Invoke-V8 {
     # Запускает 1С и ждёт завершения не дольше таймаута. По таймауту процесс снимается.
-    param([string]$Exe, [string[]]$Arguments, [int]$TimeoutSec, [string]$Title = '')
+    # NoResultLine - строку итога операции («готово за ...») напишет вызывающий: у него есть текст ошибки из лога 1С.
+    param([string]$Exe, [string[]]$Arguments, [int]$TimeoutSec, [string]$Title = '', [switch]$NoResultLine)
     $argLine = $Arguments -join ' '
     Write-RunLog ("> {0} {1}" -f (Split-Path -Leaf $Exe), (Get-MaskedLine $argLine))
     if ($Title) {
@@ -213,6 +225,14 @@ function Invoke-V8 {
         $statStatus = 'FAIL'
         if (-not $finished) { $statStatus = 'TIMEOUT' } elseif ($exitCode -eq 0) { $statStatus = 'OK' }
         Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status $statStatus
+        if (-not $NoResultLine) {
+            $problem = ''
+            if (-not $finished) { $problem = 'не уложилось в {0} мин, процесс снят' -f [int]($TimeoutSec / 60) }
+            elseif ($exitCode -ne 0) { $problem = 'код {0}' -f $exitCode }
+            $resultStatus = 'FAIL'
+            if ($statStatus -eq 'OK') { $resultStatus = 'OK' }
+            Write-UiOperationResult -Title $Title -Status $resultStatus -Seconds $seconds -Problem $problem
+        }
     }
     return [pscustomobject]@{ ExitCode = $exitCode; TimedOut = (-not $finished); Seconds = $seconds }
 }
@@ -287,8 +307,20 @@ function Invoke-Designer {
     $argList = @('DESIGNER') + @(Get-ConnectionArgs -BaseName $BaseName -User $user -Password $password) +
         @('/DisableStartupDialogs', '/DisableStartupMessages') + $Command + @('/Out', ('"{0}"' -f $logPath))
     while ($true) {
-        $result = Invoke-V8 -Exe $script:V8 -Arguments $argList -TimeoutSec $TimeoutSec -Title $Title
+        if ($BaseName -ieq $script:ProdBase -and $Command[0] -in @('/LoadCfg', '/LoadConfigFromFiles', '/DeleteCfg', '/UpdateDBCfg')) {
+            $null = Get-BaseInfo $deployLink $BaseName $user $password
+        }
+        $result = Invoke-V8 -Exe $script:V8 -Arguments $argList -TimeoutSec $TimeoutSec -Title $Title -NoResultLine
         $lines = @(Read-V8Log $logPath)
+        if ($Title) {
+            # Итог операции - сразу под её строкой «начато»: готово или нет, за сколько и что написал конфигуратор.
+            $problem = ''
+            if ($result.TimedOut) { $problem = 'не уложилось в {0} мин, процесс снят' -f [int]($TimeoutSec / 60) }
+            elseif ($result.ExitCode -ne 0) { $problem = 'код {0}: {1}' -f $result.ExitCode, ((@($lines | Where-Object { $_ }) | Select-Object -First 3) -join ' ') }
+            $resultStatus = 'OK'
+            if ($problem) { $resultStatus = 'FAIL' }
+            Write-UiOperationResult -Title $Title -Status $resultStatus -Seconds $result.Seconds -Problem $problem
+        }
         if ($result.ExitCode -eq 0 -or $result.TimedOut -or -not (Test-DesignerBusy $lines)) { break }
         if (-not (Resolve-DesignerBusy -BaseName $BaseName -Title (Get-NonEmptyTitle $Title $LogName))) { break }
     }
@@ -382,6 +414,7 @@ function Connect-ClusterAgent {
     $link = [pscustomobject]@{
         Connector       = $null
         Agent           = $null
+        Server          = $script:Server
         Clusters        = @()
         Errors          = @()
         ClusterUser     = [string](Get-Setting $cfg 'ClusterAdmin' '')
@@ -420,19 +453,24 @@ function Format-ClusterSession {
     return $text
 }
 
+function Get-SessionTarget {
+    param($Link, [string]$BaseName)
+    if ($BaseName -ieq $script:ProdBase) { return (Resolve-ClusterBase $Link $BaseName $script:ProdUser $script:ProdPassword) }
+    if ($BaseName -ieq $script:TempBase) { return (Resolve-ClusterBase $Link $BaseName $script:TempUser $script:TempPassword) }
+    throw ("База {0} отсутствует в текущем профиле." -f $BaseName)
+}
+
 function Get-BaseSessions {
     # Сеансы базы по данным агента: имя базы сравнивается целиком.
     param($Link, [string]$BaseName)
     $list = New-Object System.Collections.Generic.List[object]
-    foreach ($message in @($Link.Errors)) { $list.Add([pscustomobject]@{ Text = $message; IsDesigner = $false; IsError = $true }) }
-    foreach ($cluster in @($Link.Clusters)) {
-        foreach ($session in @($Link.Agent.GetSessions($cluster))) {
-            $sessionBase = ''
-            try { $sessionBase = [string]$session.infoBase.Name } catch { continue }
-            if ($sessionBase -ine $BaseName) { continue }
+    try {
+        $target = Get-SessionTarget $Link $BaseName
+        foreach ($session in @($Link.Agent.GetInfoBaseSessions($target.Cluster, $target.ShortBase))) {
             $list.Add([pscustomobject]@{ Text = (Format-ClusterSession $session); IsDesigner = ([string]$session.AppID -eq 'Designer'); IsError = $false })
         }
     }
+    catch { $list.Add([pscustomobject]@{ Text = $_.Exception.Message; IsDesigner = $false; IsError = $true }) }
     return $list.ToArray()
 }
 
@@ -440,47 +478,26 @@ function Stop-BaseSessions {
     # Завершает сеансы базы. Без -Designers конфигураторы не трогаются, с -Designers - только они.
     param($Link, [string]$BaseName, [switch]$Designers)
     $lines = New-Object System.Collections.Generic.List[string]
-    foreach ($message in @($Link.Errors)) { $lines.Add($message) }
-    if ($null -eq $Link.Agent) { return $lines.ToArray() }
-    foreach ($cluster in @($Link.Clusters)) {
-        foreach ($session in @($Link.Agent.GetSessions($cluster))) {
-            $sessionBase = ''
-            try { $sessionBase = [string]$session.infoBase.Name } catch { continue }
-            if ($sessionBase -ine $BaseName) { continue }
-            $isDesigner = ([string]$session.AppID -eq 'Designer')
-            if ([bool]$Designers -ne $isDesigner) { continue }
-            $description = Format-ClusterSession $session
-            try { $Link.Agent.TerminateSession($cluster, $session); $lines.Add(("{0} - завершён" -f $description)) }
-            catch { $lines.Add(("{0} - не завершился: {1}" -f $description, $_.Exception.Message)) }
-        }
+    $target = Get-SessionTarget $Link $BaseName
+    foreach ($session in @($Link.Agent.GetInfoBaseSessions($target.Cluster, $target.ShortBase))) {
+        $isDesigner = ([string]$session.AppID -eq 'Designer')
+        if ([bool]$Designers -ne $isDesigner) { continue }
+        $description = Format-ClusterSession $session
+        try { $Link.Agent.TerminateSession($target.Cluster, $session); $lines.Add(("{0} - завершён" -f $description)) }
+        catch { $lines.Add(("{0} - не завершился: {1}" -f $description, $_.Exception.Message)) }
     }
     foreach ($line in $lines) { Write-RunLog ('Завершение сеансов: ' + $line) }
     return $lines.ToArray()
 }
 
 function Get-BaseInfo {
-    # Свойства базы в кластере через рабочий процесс: менять их можно только со входом в саму базу.
     param($Link, [string]$BaseName, [string]$User, [string]$Password)
-    if ($null -eq $Link.Agent) { throw (@($Link.Errors) -join '; ') }
-    foreach ($cluster in @($Link.Clusters)) {
-        $processes = @($Link.Agent.GetWorkingProcesses($cluster) | Where-Object { [int]$_.Running -eq 1 })
-        if ($processes.Count -eq 0) { continue }
-        $process = $Link.Connector.ConnectWorkingProcess(("tcp://{0}:{1}" -f $processes[0].HostName, $processes[0].MainPort))
-        $process.AuthenticateAdmin($Link.ClusterUser, $Link.ClusterPassword)
-        $process.AddAuthentication($User, $Password)
-        foreach ($infoBase in @($process.GetInfoBases())) {
-            if ([string]$infoBase.Name -ieq $BaseName) { return [pscustomobject]@{ Process = $process; InfoBase = $infoBase } }
-        }
-    }
-    throw ("в кластере не нашёл базу {0} или нет рабочего процесса" -f $BaseName)
+    return (Get-CurrentClusterBase $Link $BaseName $User $Password)
 }
 
 function Read-BaseInfoAgain {
     param($Target, [string]$BaseName)
-    foreach ($infoBase in @($Target.Process.GetInfoBases())) {
-        if ([string]$infoBase.Name -ieq $BaseName) { return $infoBase }
-    }
-    throw ("база {0} пропала из списка баз кластера" -f $BaseName)
+    return (Read-ClusterBaseAgain $Target $BaseName)
 }
 
 function Wait-ProdWarnLock {
@@ -521,60 +538,38 @@ function Wait-ProdWarnLock {
     if ($answer -eq '2') { throw ("обновление {0} отменено во время предупреждения пользователей: в рабочую ничего не загружено" -f $script:ProdBase) }
     if ($answer -eq 'empty') { Write-Line ("  в {0} сеансов не осталось" -f $script:ProdBase) 'Green' }
     if ($answer -eq 'time') { Write-Line ("  {0}: завершаю оставшиеся сеансы" -f (Get-Date -Format 'HH:mm')) }
-    if ((Get-Date) -lt $lockAt) {
-        try {
-            $target = Get-BaseInfo -Link $script:WarnLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
-            $infoBase = $target.InfoBase
-            $infoBase.DeniedFrom = (Get-Date).AddMinutes(-30)
-            $infoBase.DeniedMessage = ("Идёт обновление расширений, база заблокирована до {0}" -f ([datetime]$script:WarnLockUntil).ToString('HH:mm'))
-            $target.Process.UpdateInfoBase($infoBase)
+    if ($script:ProdLockState.Expected.Count) {
+        $target = Get-BaseInfo -Link $script:WarnLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+        $infoBase = Read-BaseInfoAgain $target $script:ProdBase
+        if (-not (Test-GateSessionLock $script:ProdLockState $infoBase)) {
+            throw 'блокировку начала сеансов изменили во время предупреждения пользователей'
+        }
+        if ((Get-Date) -lt $lockAt) {
+            $until = [datetime]$script:WarnLockUntil
+            $message = "Идёт обновление расширений, база заблокирована до {0}" -f $until.ToString('HH:mm')
+            Set-GateSessionLock $script:ProdLockState $target ((Get-Date).AddMinutes(-30)) $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:ProdBase }
             Write-Line '  блокировка начала сеансов действует с этой минуты' 'Green'
             Write-RunLog 'Начало блокировки сеансов перенесено на сейчас'
-        }
-        catch {
-            Write-Line ("  перенести начало блокировки на сейчас не смог: {0}; жду {1}" -f $_.Exception.Message, $lockAt.ToString('HH:mm')) 'Yellow'
-            while ((Get-Date) -lt $lockAt) { Test-UiStop; Start-Sleep -Seconds 3 }
         }
     }
     foreach ($line in @(Stop-BaseSessions -Link $script:WarnLink -BaseName $script:ProdBase)) { Write-Line ('  ' + $line) }
 }
 
 function Clear-ProdLocks {
-    # Снимает с рабочей базы блокировку регламентных заданий и блокировку начала сеансов - обе, кто бы их
-    # ни поставил (кроме чужой блокировки сеансов с другим кодом, см. KeepForeignSessionLock). Потом читает
-    # свойства базы заново и проверяет. Не получилось - вторая попытка, потом красная строка с тем, что делать руками.
-    if (-not $script:ProdLocksArmed) { return }
-    $script:ProdLocksArmed = $false
+    $state = $script:ProdLockState
+    if ($null -eq $state -or (-not $state.Expected.Count -and -not $state.JobsSet)) { return }
     for ($try = 1; $try -le 2; $try++) {
         try {
             $target = Get-BaseInfo -Link (Connect-ClusterAgent) -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
-            $infoBase = $target.InfoBase
-            $changes = New-Object System.Collections.Generic.List[string]
-            if ([bool]$infoBase.ScheduledJobsDenied) {
-                $infoBase.ScheduledJobsDenied = $false
-                $changes.Add('блокировку регламентных заданий')
-            }
-            if ([bool]$infoBase.SessionsDenied -and -not $script:KeepForeignSessionLock) {
-                $infoBase.SessionsDenied = $false
-                $infoBase.DeniedMessage = ''
-                $infoBase.PermissionCode = ''
-                $changes.Add('блокировку начала сеансов')
-            }
-            if ($changes.Count -gt 0) { $target.Process.UpdateInfoBase($infoBase) }
-            $check = Read-BaseInfoAgain $target $script:ProdBase
-            $left = New-Object System.Collections.Generic.List[string]
-            if ([bool]$check.ScheduledJobsDenied) { $left.Add('регламентных заданий') }
-            if ([bool]$check.SessionsDenied -and -not $script:KeepForeignSessionLock) { $left.Add('начала сеансов') }
-            if ($left.Count -gt 0) { throw ('после записи всё ещё стоит блокировка ' + ($left -join ' и ')) }
-            if ($changes.Count -gt 0) { Write-Line ("Снял с {0}: {1}. Проверил: блокировок нет." -f $script:ProdBase, ($changes -join ' и ')) 'Green' }
-            else { Write-Line ("Блокировок на {0} нет." -f $script:ProdBase) 'Green' }
-            if ($script:KeepForeignSessionLock) { Write-Line ("Чужую блокировку начала сеансов {0} не трогал." -f $script:ProdBase) 'Yellow' }
+            $released = Restore-GateLocks $state $target $true { param($t) Read-BaseInfoAgain $t $script:ProdBase }
+            if ($released) { Write-Line ("Снял с {0}: {1}." -f $script:ProdBase, $released) 'Green' }
             return
         }
         catch {
-            if ($try -lt 2) { Start-Sleep -Seconds 5; continue }
-            Write-Line ("НЕ СНЯЛ блокировки {0}: {1}. Снять руками: консоль кластера - {0} - Свойства - убрать «Блокировка регламентных заданий включена» и «Блокировка начала сеансов включена»." -f $script:ProdBase, $_.Exception.Message) 'Red'
+            if ($try -lt 2 -and ($state.Expected.Count -or $state.JobsSet)) { Start-Sleep -Seconds 5; continue }
+            Write-Line ("НЕ СНЯЛ или не подтвердил снятие блокировок {0}: {1}. Проверь свойства базы в консоли кластера." -f $script:ProdBase, $_.Exception.Message) 'Red'
         }
+        break
     }
 }
 
@@ -609,15 +604,19 @@ $cfg = Read-DeployConfig
 
 # Меню и вопросы (ui.ps1): из ci.exe их рисует ci.exe, без него - консоль. Нужны уже здесь: если в настройках
 # чего-то не хватает, скрипт спрашивает и записывает в config.psd1.
+. (Join-Path $Root 'locks.ps1')
 . (Join-Path $Root 'ui.ps1')
 Initialize-Ui -Channel $UiChannel
 
 $script:Server = [string](Get-Setting $cfg 'Server' '')
 $script:TempBase = [string](Get-Setting $cfg 'Base' '')
 $script:ProdBase = [string](Get-Setting $cfg 'ProdBase' '')
+# ** Хлебников С.Ю. 20261120 Базы - в шапку ci.exe (событие context): видно и в узком окне.
+if ($UiChannel -and $script:ProdBase) { Send-UiEvent @{ kind = 'context'; text = ('рабочая {0} · temp {1}' -f $script:ProdBase, $script:TempBase) } }
 # Код разрешения входа: один и тот же для блокировки рабочей и для всех входов (конфигуратор, внешнее соединение). Пусто - 0.
 $script:UnlockCode = [string](Get-Setting $cfg 'UnlockCode' '0')
 if ([string]::IsNullOrWhiteSpace($script:UnlockCode)) { $script:UnlockCode = '0' }
+if ($script:UnlockCode.Length -ge 6) { $script:MaskValues = @($script:MaskValues) + @($script:UnlockCode) }
 if (-not [string]::IsNullOrEmpty([string](Get-Setting $cfg 'File' ''))) { throw 'Скрипт обновления работает только с базами кластера: в config.psd1 заполнено File.' }
 if (-not $script:Server -or -not $script:TempBase) { throw 'В config.psd1 не заполнены Server и Base.' }
 if (-not $script:ProdBase) {
@@ -693,6 +692,28 @@ foreach ($name in $deployExtensions) {
 }
 $deniedFrom = [int](Get-Setting $cfg 'DeployDeniedFrom' 22)
 $deniedTo = [int](Get-Setting $cfg 'DeployDeniedTo' 2)
+# ** Хлебников С.Ю. 20261120 Часы обновления рабочей - из настроек (DeployDeniedFrom/To): подсказка, проверка перед
+# подтверждением и повторно после него (пока ждали ответа, могло наступить запретное время), конец окна для прогноза.
+function Test-DeployHourDenied {
+    param([datetime]$At)
+    if ($deniedFrom -eq $deniedTo) { return $false }
+    if ($deniedFrom -gt $deniedTo) { return ($At.Hour -ge $deniedFrom -or $At.Hour -lt $deniedTo) }
+    return ($At.Hour -ge $deniedFrom -and $At.Hour -lt $deniedTo)
+}
+function Get-DeployWindowText {
+    # Когда рабочую обновлять можно: с конца запрета до его начала.
+    if ($deniedFrom -eq $deniedTo) { return 'в любое время (DeployDeniedFrom = DeployDeniedTo)' }
+    return ('с {0:00}:00 до {1:00}:00' -f $deniedTo, $deniedFrom)
+}
+function Get-DeployWindowEnd {
+    # Когда кончится разрешённое окно, если сейчас оно идёт: ближайшее начало запрета. $null - запрета нет.
+    param([datetime]$At)
+    if ($deniedFrom -eq $deniedTo) { return $null }
+    $end = $At.Date.AddHours($deniedFrom)
+    if ($end -le $At) { $end = $end.AddDays(1) }
+    return $end
+}
+# ** Хлебников С.Ю. 20261120 конец
 $sessionLockHours = [int](Get-Setting $cfg 'SessionLockHours' 2)
 if ($sessionLockHours -lt 1) { $sessionLockHours = 1 }
 # Предупреждение пользователей рабочей перед обновлением: за сколько минут до начала блокировки сеансов.
@@ -983,6 +1004,7 @@ function Get-ExtensionStates {
     if ($Password -and $message) { $message = $message.Replace($Password, '***') }
     if (-not $call.Ok -or -not ($call.Result -is [hashtable])) {
         if (-not $message) { $message = 'внешнее соединение ничего не вернуло' }
+        if (Test-SessionLockError $message) { $message = 'Начало сеанса с информационной базой запрещено' }
         Write-RunLog ("Расширения {0} через COM не получены: {1}" -f $BaseName, $message)
         return [pscustomobject]@{ Ok = $false; Error = $message; Items = @{} }
     }
@@ -1011,7 +1033,7 @@ function Assert-ProdOpen {
     if ($States.Ok) { return }
     $text = ([string]$States.Error -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 2) -join ' '
     if (Test-SessionLockError $States.Error) {
-        Write-Line ("  {0}: стоит блокировка начала сеансов, и код разрешения у неё не тот, что в UnlockCode ({1}): {2}" -f $script:ProdBase, $script:UnlockCode, $text) 'Red'
+        Write-Line ("  {0}: стоит блокировка начала сеансов, и код разрешения у неё не тот, что в UnlockCode: {1}" -f $script:ProdBase, $text) 'Red'
         Write-Line '  Если блокировку ставил ты - впиши её код в Настройки, Базы, UnlockCode и запусти снова. Или сними её в консоли кластера.' 'Red'
     }
     elseif (Test-AuthError $States.Error) {
@@ -1055,7 +1077,8 @@ function Get-DeployHistory {
         $record = $null
         if (Test-Path -LiteralPath $jsonFile) {
             try { $record = (Get-Content -LiteralPath $jsonFile -Raw -Encoding UTF8) | ConvertFrom-Json } catch { $record = $null }
-            if ($null -eq $record -or [string](Get-JsonValue $record 'outcome' '') -ne 'updated') { continue }
+            # Прерванное (после разбора при старте deploy - 'interrupted') тоже в списке: откат вернёт то, что успело.
+            if ($null -eq $record -or @('updated', 'interrupted') -notcontains [string](Get-JsonValue $record 'outcome' '')) { continue }
             if ([string](Get-JsonValue $record 'base' '') -ne $script:ProdBase) { continue }
         }
         else {
@@ -1108,6 +1131,7 @@ function Get-DeployLabel {
     }
     $flag = ''
     if ([bool](Get-JsonValue $Record 'riskAccepted' $false)) { $flag = ', НЕСМОТРЯ НА ГЕЙТ' }
+    if ([string](Get-JsonValue $Record 'outcome' '') -eq 'interrupted') { $flag += ', ПРЕРВАНО' }
     return ("{0:dd.MM.yyyy HH:mm}  расширений {1}, обработок {2}  ({3}{4}; {5})" -f $when, $extCount, $epfCount, (Get-DeployModeText $Record), $flag, $lightText)
 }
 
@@ -1171,6 +1195,9 @@ function Get-DeployDetailLines {
     if ($null -ne $gate) { $lines.Add(("Гейт перед обновлением: прогон {0}, вердикт {1}" -f (Get-JsonValue $gate 'run' ''), (Get-JsonValue $gate 'verdict' ''))) }
     if ([bool](Get-JsonValue $Record 'riskAccepted' $false)) {
         $lines.Add(("ОБНОВЛЯЛИ НЕСМОТРЯ НА ГЕЙТ: {0}" -f (@(Get-JsonValue $Record 'risks' @()) -join '; ')))
+        $reasonText = [string](Get-JsonValue $Record 'riskReason' '')
+        if (-not $reasonText) { $reasonText = 'не записана' }
+        $lines.Add(("Причина выпуска: {0}" -f $reasonText))
     }
     $light = @(Get-JsonValue $Record 'light' @())
     $lines.Add('Лёгкий прогон после обновления:')
@@ -1403,6 +1430,7 @@ function Invoke-ProdProcessing {
     # OutDir, без неё обработка не заменяется. File - сам .epf/.erf, TextFile - уже base64 (откат из old.b64).
     # unregepf: снять обработку - по имени объекта и ссылке элемента вместе.
     param([string]$Mode, [string]$OutDir, [string]$File = '', [string]$TextFile = '', [string]$Name, [string]$Ref = '', [string]$Title)
+    $null = Get-BaseInfo $deployLink $script:ProdBase $script:ProdUser $script:ProdPassword
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
     $parts = New-Object System.Collections.Generic.List[string]
     $parts.Add($Mode)
@@ -1757,6 +1785,30 @@ function Update-SelfCheckEpf {
     [System.IO.File]::WriteAllText($marker, $hash, (New-Object System.Text.UTF8Encoding($false)))
     Write-Line ("  обработка самопроверки собрана из поставки: {0} (прежняя - {0}.old)" -f $selfCheckEpf) 'Green'
 }
+
+# ** Хлебников С.Ю. 20261120 Снимок «что проверено» (#27): расширения - хеш-сумма конфигурации из базы, обработки -
+# хеш файла справочника. Ошибка - в файле (ok = false), а не исключением: прогон гейта от снимка не зависит.
+if ($SnapshotTemp) {
+    $snapshot = [ordered]@{ time = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss'); base = $script:TempBase; ok = $false; error = ''; extensions = [ordered]@{}; processings = [ordered]@{} }
+    try {
+        $snapStates = Get-ExtensionStates -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
+        if (-not $snapStates.Ok) { throw ('расширения не прочитаны: ' + $snapStates.Error) }
+        foreach ($snapName in @($snapStates.Items.Keys | Sort-Object)) {
+            $snapItem = $snapStates.Items[$snapName]
+            $snapshot.extensions[[string]$snapName] = [ordered]@{ version = [string]$snapItem.Version; hash = [string]$snapItem.Hash }
+        }
+        $snapExport = Export-Processings -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword -Dir (Join-Path $script:RunDir 'snapshot')
+        if (-not $snapExport.Ok) { throw ('обработки не выгружены: ' + $snapExport.Error) }
+        foreach ($snapProc in @($snapExport.Items | Sort-Object ObjName)) {
+            $snapshot.processings[[string]$snapProc.ObjName] = [ordered]@{ version = [string]$snapProc.Version; hash = [string]$snapProc.Hash }
+        }
+        $snapshot.ok = $true
+    }
+    catch { $snapshot.error = [string]$_.Exception.Message }
+    [System.IO.File]::WriteAllText($SnapshotTemp, (ConvertTo-Json -InputObject $snapshot -Depth 5), $Utf8Bom)
+    exit 0
+}
+# ** Хлебников С.Ю. 20261120 конец
 
 if ($ComCheck) {
     # Диагностика внешнего соединения с temp. Чтение расширений через COM на машине гейта не работало: соединение
@@ -2526,9 +2578,8 @@ function Select-GitTracked {
 }
 
 function New-GitTempBranch {
-    # Правки temp - коммитом поверх Base в ветку temp/<время> и pull request в main (NoPull - без него: гейт сам
-    # сливает ветку с main). Temp теперь соответствует этому коммиту. Возвращает Branch, Sha, Number, Url.
-    param($Setup, $State, [string]$Base, $Changes, [switch]$NoPull, [string]$Note = '')
+    # Снимок temp поверх Base. Только новая ветка и PR. Отмечаем снимок в state.json после создания PR.
+    param($Setup, $State, [string]$Base, $Changes, [string]$Note = '')
     $stamp = Get-Date
     $branchName = 'temp/' + $stamp.ToString('yyyyMMdd-HHmmss')
     # Такая ветка уже есть (две выгрузки в одну секунду) - с номером.
@@ -2541,7 +2592,8 @@ function New-GitTempBranch {
     $body = New-Object System.Collections.Generic.List[string]
     $body.Add(("Правки, сделанные прямо в {0}, - выгружены гейтом («Выгрузить temp в git»)." -f $script:TempBase))
     $body.Add('')
-    $body.Add(("Основа - коммит {0}: ему соответствовал {1} после прошлой загрузки или выгрузки." -f $Base, $script:TempBase))
+    $body.Add(("Основа снимка: {0}. Коммит для проверки: {1}." -f $Base, $sha))
+    $body.Add('Перед слиянием проверь разницу и дождись успешных проверок CI для текущей версии PR. Если проверок нет, оставь PR открытым.')
     $body.Add('')
     foreach ($line in $lines) { $body.Add(('- ' + $line)) }
     $body.Add('')
@@ -2555,49 +2607,34 @@ function New-GitTempBranch {
     if (@($Changes).Count -gt 200) { $body.Add(('    … и ещё {0}' -f (@($Changes).Count - 200))) }
     $body.Add('')
     $body.Add('</details>')
+    $title = "Правки temp {0}" -f $stamp.ToString('dd.MM.yyyy HH:mm')
+    if ($Note) { $title += ' (' + $Note + ')' }
+    try {
+        $pull = New-GhPull -Gh $Setup.Gh -Head $branchName -Base $Setup.Branch -Title $title -Body ($body -join "`n")
+    }
+    catch {
+        throw ("Снимок {0} в ветке {1}. Создание PR в {2} не подтверждено. Проверь открытые PR этой ветки на GitHub. Ошибка: {3}" -f $sha, $branchName, $Setup.Branch, $_.Exception.Message)
+    }
     $State['commit'] = $sha
     $State['how'] = 'export'
-    $made = [pscustomobject]@{ Branch = $branchName; Sha = $sha; Number = 0; Url = ''; Body = ($body -join "`n"); Stamp = $stamp }
-    if ($NoPull) {
-        Save-GitState $Setup $State
-        Write-Line ("Правки {0} - в ветке {1}, коммит {2}" -f $script:TempBase, $branchName, (Get-GitShort $sha)) 'Green'
-        return $made
-    }
-    Add-GitTempPull -Setup $Setup -State $State -Made $made -Note $Note
-    Write-Line ("Дальше: посмотреть и слить его в {0} на GitHub, потом «Загрузить из git»." -f $Setup.Branch)
-    return $made
-}
-
-function Add-GitTempPull {
-    # Pull request ветки с правками temp в main; ждём его слияния (pending в state.json).
-    param($Setup, $State, $Made, [string]$Note = '')
-    $title = "Правки temp {0}" -f $Made.Stamp.ToString('dd.MM.yyyy HH:mm')
-    $body = $Made.Body
-    if ($Note) { $title += ' (' + $Note + ')'; $body = ('**' + $Note + '.**' + "`n`n" + $body) }
-    $pull = New-GhPull -Gh $Setup.Gh -Head $Made.Branch -Base $Setup.Branch -Title $title -Body $body
-    $Made.Number = $pull.Number
-    $Made.Url = $pull.Url
-    $State['pendingBranch'] = $Made.Branch
+    $State['pendingBranch'] = $branchName
     $State['pendingNumber'] = $pull.Number
     $State['pendingUrl'] = $pull.Url
-    $State['pendingCommit'] = $Made.Sha
+    $State['pendingCommit'] = $sha
     Save-GitState $Setup $State
-    Write-Line ("Выгрузил: ветка {0}, коммит {1}, pull request #{2}: {3}" -f $Made.Branch, (Get-GitShort $Made.Sha), $pull.Number, $pull.Url) 'Green'
+    Write-Line ("Выгрузил: ветка {0}, коммит {1}, pull request #{2}: {3}" -f $branchName, (Get-GitShort $sha), $pull.Number, $pull.Url) 'Green'
+    Write-Line ("Проверь изменения и дождись зелёного CI в PR. Затем слей его в {0} через Create a merge commit и повтори «Загрузить из git»." -f $Setup.Branch)
+    return [pscustomobject]@{ Branch = $branchName; Sha = $sha; Number = $pull.Number; Url = $pull.Url }
 }
 
 function Invoke-GitExport {
-    # «Выгрузить temp в git»: в репозитории ещё ничего не ведётся - выбор и первый коммит прямо в main;
-    # иначе - сравнение temp с коммитом, которому он соответствует, и правки веткой и pull request.
+    # Первая и последующие выгрузки идут одним путём: снимок в новой ветке и PR.
     param($Setup, $State)
     $head = Get-GhHead -Gh $Setup.Gh -Branch $Setup.Branch
-    if (-not $head.Sha -and -not $head.Empty) { throw ("в {0} нет ветки {1}" -f $Setup.Repo, $Setup.Branch) }
-    $base = ''
-    $baseFiles = @{}
-    if ($head.Sha) {
-        $base = $head.Sha
-        if ([string]$State['commit']) { $base = [string]$State['commit'] }
-        $baseFiles = Get-GhFiles -Gh $Setup.Gh -Commit $base
-    }
+    if (-not $head.Sha) { throw ("В {0} нет ветки {1} для PR. Создай её с начальным коммитом, настрой проверки PR и повтори выгрузку." -f $Setup.Repo, $Setup.Branch) }
+    $base = $head.Sha
+    if ([string]$State['commit']) { $base = [string]$State['commit'] }
+    $baseFiles = Get-GhFiles -Gh $Setup.Gh -Commit $base
     $tracked = Get-GitFolders $baseFiles
     $bootstrap = (@($tracked.Extensions).Count -eq 0) -and -not $tracked.HasProcessings
     if ($bootstrap) {
@@ -2607,6 +2644,8 @@ function Invoke-GitExport {
     $processingsText = 'нет'
     if ($tracked.HasProcessings) { $processingsText = 'все из справочника' }
     Write-Line ("Выгружаю из {0} в файлы: расширения {1}; обработки {2}" -f $script:TempBase, (Get-NonEmpty (@($tracked.Extensions) -join ', ') 'нет'), $processingsText) 'Cyan'
+    # Колонка шагов ci.exe: выгрузки расширений видны заранее, серыми (названия - заголовки самих операций).
+    Send-UiPlan -StepNames @(@($tracked.Extensions) | ForEach-Object { 'Выгрузить {0} из {1}' -f $_, $script:TempBase }) -Operations
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$tracked.HasProcessings
     foreach ($item in $snapshot.Missing) { Write-Line ("  в {0} нет: {1} - в git остаётся как есть" -f $script:TempBase, $item) 'Yellow' }
     # Без @(): функция возвращает массив запятой, @() завернул бы его ещё раз.
@@ -2618,23 +2657,13 @@ function Invoke-GitExport {
     }
     foreach ($line in (Get-GitChangeLines $changes)) { Write-Line ('  ' + $line) }
     if ($bootstrap) {
-        $answer = Confirm-Ui -Question ("Положить это первым коммитом в {0} ({1})?" -f $Setup.Repo, $Setup.Branch) -Yes 'Положить' -No 'Отмена'
-        if (-not $answer) { Write-Line 'Отмена: ничего не выгружал.'; return }
-        $parent = $head.Sha
-        if (-not $parent) { $parent = Initialize-GhRepo -Gh $Setup.Gh -Branch $Setup.Branch -Readme (Get-GitReadme) -Message 'Репозиторий расширений: README' }
-        $attributes = Join-Path $Setup.Root '.gitattributes'
-        [System.IO.File]::WriteAllText($attributes, "* -text`n", (New-Object System.Text.UTF8Encoding($false)))
-        $changes += [pscustomobject]@{ Path = '.gitattributes'; Kind = 'add'; File = $attributes; Sha = (Get-GitBlobSha ([System.IO.File]::ReadAllBytes($attributes))) }
-        $what = @(@($tracked.Extensions) + @($(if ($tracked.HasProcessings) { 'внешние обработки' }))) -join ', '
-        $sha = New-GitVerifiedCommit -Setup $Setup -Parent $parent -Changes $changes -Message ("Выгрузка {0} в git: {1}" -f $script:TempBase, $what)
-        Set-GhBranch -Gh $Setup.Gh -Branch $Setup.Branch -Sha $sha
-        $State['commit'] = $sha
-        $State['how'] = 'export'
-        foreach ($name in @('pendingBranch', 'pendingUrl', 'pendingCommit')) { $State[$name] = '' }
-        $State['pendingNumber'] = 0
-        Save-GitState $Setup $State
-        Write-Line ("Положил в {0} ({1}): коммит {2}, https://github.com/{0}/commit/{3}" -f $Setup.Repo, $Setup.Branch, (Get-GitShort $sha), $sha) 'Green'
-        return
+        $repoFiles = [ordered]@{ 'README.md' = (Get-GitReadme); '.gitattributes' = "* -text`n" }
+        foreach ($path in $repoFiles.Keys) {
+            if ($baseFiles.ContainsKey($path)) { continue }
+            $file = Join-Path $Setup.Root $path
+            [System.IO.File]::WriteAllText($file, $repoFiles[$path], (New-Object System.Text.UTF8Encoding($false)))
+            $changes += [pscustomobject]@{ Path = $path; Kind = 'add'; File = $file; Sha = (Get-GitBlobSha ([System.IO.File]::ReadAllBytes($file))) }
+        }
     }
     $answer = Confirm-Ui -Question ("Выгрузить правки {0} веткой temp/<время> и открыть pull request в {1}?" -f $script:TempBase, $Setup.Branch) -Yes 'Выгрузить' -No 'Отмена'
     if (-not $answer) { Write-Line 'Отмена: ничего не выгружал.'; return }
@@ -2657,8 +2686,8 @@ function Save-GitImportResult {
 function Invoke-GitImport {
     # «Загрузить из git»: правили ли temp после прошлой загрузки (выгрузка и сравнение с известным коммитом), не висят
     # ли правки temp в неслитом pull request, потом - обычный прогон гейта отдельным процессом с тем, что изменилось
-    # в main. Правки temp можно слить с main (ветка temp/<время>, слияние на GitHub; конфликт - pull request, temp не
-    # трогается). Комплект оставлен и загрузилось всё - temp соответствует main. Unattended - без вопросов (ночью).
+    # в main. Правки temp можно сохранить веткой и PR. Загрузка после слияния - при следующем запуске.
+    # Комплект оставлен и загрузилось всё - temp соответствует main. Unattended - без вопросов (ночью).
     # Возвращает код прогона.
     param($Setup, $State, [switch]$Unattended)
     Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note 'загрузка не закончилась'
@@ -2689,37 +2718,25 @@ function Invoke-GitImport {
         foreach ($line in (Get-GitFileLines $drift)) { Write-Line ('    ' + $line) 'Yellow' }
         $driftBase = $known
         if (-not $driftBase) { $driftBase = $head.Sha }
-        if ($Unattended) {
-            # Без человека правки temp не сливаются и не затираются: ветка и pull request, temp как есть.
-            $made = New-GitTempBranch -Setup $Setup -State $State -Base $driftBase -Changes $drift -Note 'выгружено ночью'
+        $saveDrift = $true
+        if (-not $Unattended) {
+            $choice = Select-UiOne -Header ("В {0} правки после прошлой загрузки из git: что делать?" -f $script:TempBase) -Items @(
+                'Выгрузить правки temp в git (ветка и pull request), загрузку не делать',
+                ('Загрузить {0} всё равно: правки temp пропадут' -f $Setup.Branch),
+                'Отмена') -Danger @(1)
+            if ($choice -ne 0 -and $choice -ne 1) { Write-Line ("Отмена: {0} не трогаю." -f $script:TempBase); return 0 }
+            $saveDrift = $choice -eq 0
+        }
+        if ($saveDrift) {
+            $note = ''
+            if ($Unattended) { $note = 'выгружено ночью' }
+            $made = New-GitTempBranch -Setup $Setup -State $State -Base $driftBase -Changes $drift -Note $note
             Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note ("правки temp - веткой {0}, pull request #{1}; temp не трогал" -f $made.Branch, $made.Number)
             return 0
         }
-        $choice = Select-UiOne -Header ("В {0} правки после прошлой загрузки из git: что делать?" -f $script:TempBase) -Items @(
-            ('Слить правки temp с {0} и загрузить: правки - веткой temp/<время>, конфликт - pull request, temp не трогаю' -f $Setup.Branch),
-            'Выгрузить правки temp в git (ветка и pull request), загрузку не делать',
-            ('Загрузить {0} всё равно: правки temp пропадут' -f $Setup.Branch),
-            'Отмена') -Danger @(2)
-        if ($choice -eq 0) {
-            $made = New-GitTempBranch -Setup $Setup -State $State -Base $driftBase -Changes $drift -NoPull
-            $merge = Merge-GhBranch -Gh $Setup.Gh -Base $Setup.Branch -Head $made.Branch -Message ("Слияние правок {0} ({1}) с {2}" -f $script:TempBase, $made.Branch, $Setup.Branch)
-            if ($merge.Status -eq 'conflict') {
-                Add-GitTempPull -Setup $Setup -State $State -Made $made -Note ('конфликт со слиянием в ' + $Setup.Branch)
-                Write-Line ("Правки {0} и {1} задевают одно и то же: слить без человека нельзя. Разреши конфликт в pull request #{2}, потом «Загрузить из git». {0} не трогаю." -f $script:TempBase, $Setup.Branch, $made.Number) 'Yellow'
-                return 0
-            }
-            Write-Line ("Правки {0} слиты с {1}{2}." -f $script:TempBase, $Setup.Branch, $(if ($merge.Sha) { ': коммит ' + (Get-GitShort $merge.Sha) } else { '' })) 'Green'
-            $head = Get-GhHead -Gh $Setup.Gh -Branch $Setup.Branch
-            $headFiles = Get-GhFiles -Gh $Setup.Gh -Commit $head.Sha
-        }
-        elseif ($choice -eq 1) {
-            $null = New-GitTempBranch -Setup $Setup -State $State -Base $driftBase -Changes $drift
-            return 0
-        }
-        elseif ($choice -ne 2) { Write-Line ("Отмена: {0} не трогаю." -f $script:TempBase); return 0 }
-        else { Write-Line ("Загружаю {0} поверх правок {1}: так решили." -f $Setup.Branch, $script:TempBase) 'Yellow' }
+        Write-Line ("Загружаю {0} поверх правок {1}: так решили." -f $Setup.Branch, $script:TempBase) 'Yellow'
     }
-    elseif ([string]$State['pendingCommit'] -and -not (Test-GhContains -Gh $Setup.Gh -Branch $Setup.Branch -Commit ([string]$State['pendingCommit']))) {
+    elseif ([string]$State['pendingCommit'] -and -not (Test-GhContains -Gh $Setup.Gh -Branch '' -Head $head.Sha -Commit ([string]$State['pendingCommit']))) {
         if ($Unattended) {
             Write-Line ("Правки {0} из pull request #{1} ещё не в {2}: без человека {2} не гружу." -f $script:TempBase, $State['pendingNumber'], $Setup.Branch) 'Yellow'
             Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note ("pull request #{0} с правками temp не слит: main не грузил" -f $State['pendingNumber'])
@@ -2800,7 +2817,7 @@ function Invoke-GitImport {
     # пишет прямо в ту же консоль или в тот же канал ci.exe, вопросы задаёт сам. «& powershell.exe» внутри функции
     # забрал бы весь вывод в её результат - хода прогона не было бы видно.
     $quote = { param([string]$Text) '"' + $Text.Replace('"', '\"') + '"' }
-    $runArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (& $quote (Join-Path $Root 'run.ps1')), '-Kit', (& $quote $kitDir), '-KitSource', (& $quote ("git {0}@{1}" -f $Setup.Repo, (Get-GitShort $head.Sha))))
+    $runArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (& $quote (Join-Path $Root 'run.ps1')), '-Kit', (& $quote $kitDir), '-KitSource', (& $quote ("git {0}@{1}" -f $Setup.Repo, [string]$head.Sha)))
     if ($Config) { $runArgs += @('-Config', (& $quote $Config)) }
     if ($UiChannel) { $runArgs += @('-UiChannel', (& $quote $UiChannel)) }
     # Без человека - как ночной прогон: вопросов нет, комплект остаётся (temp идёт за main, красное видно в итоге).
@@ -2860,6 +2877,7 @@ function Invoke-GitProdSnapshot {
     # конфигуратором temp, manifest.json, PROD.md. Ветки prod нет - создаётся от main без расширений. Main не трогает.
     param($Setup)
     $prodBranch = [string](Get-Setting $cfg 'ExtensionsProdBranch' 'prod')
+    if ($prodBranch -eq 'main') { throw 'Для снимков рабочей укажи отдельную ветку в ExtensionsProdBranch (например, prod).' }
     if ($prodBranch -eq $Setup.Branch) { throw ("ExtensionsProdBranch и ExtensionsBranch - одна ветка ({0}): снимок рабочей затёр бы то, что должно стоять в temp" -f $prodBranch) }
     $main = Get-GhHead -Gh $Setup.Gh -Branch $Setup.Branch
     if (-not $main.Sha) { throw ("в {0} ({1}) пусто: сначала «Выгрузить temp в git»" -f $Setup.Repo, $Setup.Branch) }
@@ -2911,10 +2929,26 @@ function Get-ComConfigInfo {
                 while ($null -ne $connectError.InnerException) { $connectError = $connectError.InnerException }
                 throw ([string]$connectError.Message)
             }
-            $metadata = $connection.Metadata
+            # Свойства - поздним связыванием (IDispatch), мимо PowerShell: у объектов 1С нет описания типов, и PowerShell
+            # их свойства иногда не видит - отдаёт $null без ошибки (20.11.2026 так пришли пустые имя и версия типовой).
+            # Подставной COM тестов - обычные объекты PowerShell.
+            $get = {
+                param($Object, [string]$Name)
+                if ($null -eq $Object) { throw ("нет объекта, у которого брать «{0}»" -f $Name) }
+                if (-not [Runtime.InteropServices.Marshal]::IsComObject($Object)) { return , ($Object.$Name) }
+                $comType = [type]::GetType('System.__ComObject')
+                if ($null -eq $comType) { $comType = $Object.GetType() }
+                try { return , ($comType.InvokeMember($Name, [System.Reflection.BindingFlags]::GetProperty, $null, $Object, $null)) }
+                catch {
+                    $memberError = $_.Exception
+                    while ($null -ne $memberError.InnerException) { $memberError = $memberError.InnerException }
+                    throw ("{0}: {1}" -f $Name, [string]$memberError.Message)
+                }
+            }
+            $metadata = & $get $connection 'Metadata'
             # Массивом: Invoke-UiBackground берёт у результата .PSObject.BaseObject, а у одиночного pscustomobject
             # там голый объект без свойств.
-            return , @([pscustomobject]@{ Name = [string]$metadata.Name; Synonym = [string]$metadata.Synonym; Version = [string]$metadata.Version })
+            return , @([pscustomobject]@{ Name = [string](& $get $metadata 'Name'); Synonym = [string](& $get $metadata 'Synonym'); Version = [string](& $get $metadata 'Version') })
         }
         finally {
             foreach ($comObject in @($connection, $connector)) {
@@ -2933,7 +2967,14 @@ function Get-ComConfigInfo {
         return [pscustomobject]@{ Ok = $false; Error = $message; Name = ''; Synonym = ''; Version = '' }
     }
     $info = @($call.Result)[0]
-    return [pscustomobject]@{ Ok = $true; Error = ''; Name = [string]$info.Name; Synonym = [string]$info.Synonym; Version = [string]$info.Version }
+    $name = [string]$info.Name
+    $version = [string]$info.Version
+    # Пустые имя или версия - не прочитал, а не «версия пустая»: с пустой версией сравнение «та же, что в прошлый раз»
+    # совпало бы и после обновления типовой.
+    if (-not $name -or -not $version) {
+        return [pscustomobject]@{ Ok = $false; Error = ("внешнее соединение вернуло пустые имя или версию конфигурации (имя «{0}», версия «{1}»)" -f $name, $version); Name = ''; Synonym = ''; Version = '' }
+    }
+    return [pscustomobject]@{ Ok = $true; Error = ''; Name = $name; Synonym = [string]$info.Synonym; Version = $version }
 }
 
 function Update-TypicalDump {
@@ -2989,6 +3030,7 @@ function Invoke-GitTypical {
     # Репозиторий git - отдельно от выгрузки (repo.git): конфигуратор может стереть выгрузку и выгрузить заново.
     $repo = [string](Get-Setting $cfg 'TypicalRepo' '')
     if (-not $repo) { return }
+    if ($repo -eq [string](Get-Setting $cfg 'ExtensionsRepo' '')) { throw 'TypicalRepo совпадает с ExtensionsRepo. Для выгрузки типовой нужен отдельный репозиторий.' }
     $branch = [string](Get-Setting $cfg 'TypicalBranch' 'main')
     if ($repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw ("TypicalRepo «{0}» - не в виде владелец/имя" -f $repo) }
     $typicalRoot = Join-Path (Resolve-RootPath ([string](Get-Setting $cfg 'GitDir' 'git'))) ($repo.Split('/')[1])
@@ -3008,6 +3050,30 @@ function Invoke-GitTypical {
     $info = Get-ComConfigInfo -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
     if (-not $info.Ok) { Write-Line ("  версию конфигурации {0} не прочитал: {1}. Типовую не выгружаю." -f $script:TempBase, $info.Error) 'Yellow'; return }
     $title = '{0} ({1}) {2}' -f $info.Synonym, $info.Name, $info.Version
+    if (-not $state['version'] -and $state['commit']) {
+        # Коммит есть, а версии при нём нет: до 20.11.2026 версия могла прочитаться пустой (свойства COM 1С), выгрузка
+        # и коммит при этом прошли. Версию того коммита - из его Configuration.xml (repo.git цел, даже если выгрузку
+        # удалили): та же, что в temp, - дописываю её, выгрузку не повторяю. Другая или не прочиталась (temp могли
+        # обновить после того запуска) - обычный путь: вопрос и выгрузка.
+        $committed = ''
+        $gitDir = Join-Path $typicalRoot 'repo.git'
+        if (Test-Path -LiteralPath (Join-Path $gitDir 'HEAD')) {
+            $git = Get-PortableGit -ToolsDir (Resolve-RootPath 'tools') -Exe ([string](Get-Setting $cfg 'GitExe' ''))
+            $show = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $typicalRoot -Arguments @('show', ($state['commit'] + ':Configuration.xml')) -AllowFail
+            if ($show.ExitCode -eq 0 -and $show.Output -match '<Version>([^<]*)</Version>') { $committed = $Matches[1].Trim() }
+        }
+        if ($committed -and $committed -eq $info.Version) {
+            $state['name'] = $info.Name
+            $state['version'] = $info.Version
+            $state['time'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            [System.IO.File]::WriteAllText($statePath, (ConvertTo-Json -InputObject $state), $Utf8Bom)
+            Write-Line ("  типовая {0}: в {1} коммит {2} записан без версии, в нём та же версия - дописал её, выгружать нечего." -f $title, $repo, (Get-GitShort $state['commit'])) 'Green'
+            return
+        }
+        $seen = $committed
+        if (-not $seen) { $seen = 'не прочитал' }
+        Write-Line ("  в {0} коммит {1} записан без версии; версия в нём - {2}, в {3} - {4}: выгружаю как новую." -f $repo, (Get-GitShort $state['commit']), $seen, $script:TempBase, $info.Version) 'Yellow'
+    }
     if ($state['version'] -eq $info.Version -and $state['commit']) {
         Write-Line ("  типовая {0} уже в {1} (коммит {2}): выгружать нечего." -f $title, $repo, (Get-GitShort $state['commit'])) 'Green'
         return
@@ -3037,7 +3103,37 @@ function Invoke-GitTypical {
         return
     }
     Write-Line ("  выгружаю типовую {0} в файлы: {1} (первый раз - надолго; на диске {2} свободно {3} ГБ)" -f $script:TempBase, $dump, $drive.Name, $freeGb)
+    # Колонка шагов ci.exe: весь путь типовой виден заранее. Названия - заголовки операций ниже; шаг, которого не
+    # было (коммит уже сделан прошлым запуском), останется «не выполнялся».
+    Send-UiPlan -Operations -StepNames @(
+        ('Выгрузить типовую {0} в файлы' -f $script:TempBase), 'Типовая: git fetch (что сейчас в GitHub)', 'Типовая: git add (файлы - в pack)',
+        'Типовая: git commit', 'Типовая: git repack (сжать объекты перед отправкой)', 'Типовая: git push (отправка в GitHub)')
     Update-TypicalDump -Dir $dump
+    # Конфигуратор может оставить повреждённый XML даже при наличии Configuration.xml.
+    # Прочитать потоками до записи git-индекса. Пути с # и % передавать как файлы, а не URI.
+    $xmlSettings = New-Object System.Xml.XmlReaderSettings
+    $xmlSettings.XmlResolver = $null
+    try {
+        Get-ChildItem -LiteralPath $dump -Filter '*.xml' -Recurse -File -ErrorAction Stop | ForEach-Object {
+            $xmlFile = $_.FullName
+            $stream = [System.IO.File]::OpenRead($xmlFile)
+            $reader = $null
+            try {
+                $reader = [System.Xml.XmlReader]::Create($stream, $xmlSettings)
+                while ($reader.Read()) { }
+            }
+            catch { throw ("Не удалось прочитать XML выгрузки типовой {0}: {1}" -f $xmlFile, $_.Exception.Message) }
+            finally {
+                if ($null -ne $reader) { $reader.Dispose() }
+                $stream.Dispose()
+            }
+        }
+    }
+    catch {
+        $marker = Join-Path $dump 'ConfigDumpInfo.xml'
+        if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force -ErrorAction Stop }
+        throw
+    }
     # Больше 50 МБ GitHub не любит (больше 100 МБ - не примет): такие файлы - мимо git, их список - в README.
     $dumpFull = [System.IO.Path]::GetFullPath($dump).TrimEnd('\', '/')
     $big = @(Get-ChildItem -LiteralPath $dump -Recurse -File | Where-Object { $_.Length -gt 50MB } | ForEach-Object { $_.FullName.Substring($dumpFull.Length + 1).Replace('\', '/') } | Sort-Object)
@@ -3171,7 +3267,11 @@ $preparedWhen = ''
 function Read-PreparedState {
     # Подготовленное обновление рабочей или $null, если его нет.
     if (-not (Test-Path -LiteralPath $preparedPath)) { return $null }
-    try { return ([System.IO.File]::ReadAllText($preparedPath, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json) }
+    try {
+        $state = [System.IO.File]::ReadAllText($preparedPath, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+        if (-not $state -or -not $state.PSObject.Properties['base']) { throw 'отсутствует запись о базе' }
+        return $state
+    }
     catch { throw ("подготовленное обновление не читается ({0}): {1}" -f $preparedPath, $_.Exception.Message) }
 }
 
@@ -3222,13 +3322,17 @@ function Save-PreparedState {
         runId      = $runId
         timeText   = (Get-Date).ToString('dd.MM.yyyy HH:mm')
         base       = $script:ProdBase
+        target     = $deployTarget.Identity
         tempBase   = $script:TempBase
         user       = $env:USERNAME
         partial    = $Partial
         gate       = $GateRun
         extensions = $items
     }
-    [System.IO.File]::WriteAllText($preparedPath, (ConvertTo-Json -InputObject $state -Depth 5), $Utf8Bom)
+    $next = $preparedPath + '.tmp'
+    [System.IO.File]::WriteAllText($next, (ConvertTo-Json -InputObject $state -Depth 5), $Utf8Bom)
+    if ([System.IO.File]::Exists($preparedPath)) { [System.IO.File]::Replace($next, $preparedPath, [System.Management.Automation.Language.NullString]::Value) }
+    else { [System.IO.File]::Move($next, $preparedPath) }
     Write-RunLog ("Подготовка записана: {0}" -f $preparedPath)
 }
 
@@ -3274,7 +3378,44 @@ function Undo-PreparedExtensions {
     return $ok
 }
 
+function Assert-DeployRecordTarget {
+    param($Record, [string]$Identity, [string]$Path)
+    if ([string](Get-JsonValue $Record 'base' '') -ine $script:ProdBase) {
+        throw ("Другая база: запись {0} не соответствует ProdBase текущего профиля." -f $Path)
+    }
+    $saved = [string](Get-JsonValue $Record 'target' '')
+    if (-not $saved) {
+        # Запись сделал гейт прежней версии: идентификатора кластера и ИБ в ней нет, сверить можно только имя базы.
+        # Отказ сделал бы недоступным штатный откат всех прежних обновлений, поэтому решает человек; без человека -
+        # отказ, как и был.
+        $sure = $null
+        if (Test-UiCanAsk) {
+            $sure = Confirm-Ui -Question ("В записи {0} нет идентификатора кластера и базы: её сделал гейт прежней версии. Она относится к {1}\{2}?" -f $Path, $script:Server, $script:ProdBase) -Yes 'Да, к этой базе' -No 'Нет, выйти'
+        }
+        if ($sure -ne $true) {
+            throw ("В записи {0} нет идентификатора кластера и ИБ, и подтверждения, что она относится к {1}\{2}, нет. Ничего не менял." -f $Path, $script:Server, $script:ProdBase)
+        }
+        Write-RunLog ("Запись {0} без идентификатора цели: человек подтвердил, что она относится к {1}\{2}" -f $Path, $script:Server, $script:ProdBase)
+        return
+    }
+    if ($saved -cne $Identity) { throw ("Кластер или ИБ текущего профиля не совпадает с целью в {0}." -f $Path) }
+}
+
+$writeRun = (-not $StatusOnly -or $Prepare -or $ApplyPrepared -or $CancelPrepared -or $Rollback)
+$deployGuard = $null
+if ($writeRun) {
+    try { $deployGuard = [System.IO.File]::Open((Join-Path $deployRoot 'deploy.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
+    catch { throw ("Не получил исключительный доступ к каталогу обновлений {0}. Проверь права и другие запуски deploy." -f $deployRoot) }
+}
+try {
 $prepared = Read-PreparedState
+$deployTarget = $null
+if ($writeRun -and (-not $CancelPrepared -or $null -ne $prepared)) {
+    $deployLink = Connect-ClusterAgent
+    $deployTarget = Get-BaseInfo $deployLink $script:ProdBase $script:ProdUser $script:ProdPassword
+    if ($null -ne $prepared) { Assert-DeployRecordTarget $prepared $deployTarget.Identity $preparedPath }
+    if (-not $CancelPrepared) { $null = Get-BaseInfo $deployLink $script:TempBase $script:TempUser $script:TempPassword }
+}
 
 if ($CancelPrepared) {
     if (-not (Test-UiCanAsk)) { throw 'отмена подготовки только из консоли или ci.exe' }
@@ -3291,6 +3432,128 @@ if ($CancelPrepared) {
     }
     Write-Line ("ИТОГ: подготовка отменена не полностью (см. выше). {0} оставлен: повтори отмену." -f $preparedPath) 'Red'
     exit 1
+}
+
+# ** Хлебников С.Ю. 20261120 Журнал обновления (#29). deploy.json пишется с outcome = inProgress до первой записи
+# в рабочую и переписывается после каждого шага объекта (stage: pending, backup, loading, loaded, applying, applied;
+# у обработок writing, written) - заменой файла целиком, так что на диске всегда целый JSON. Процесс погиб
+# (окно закрыли, машина перезагрузилась) - при следующем запуске deploy журнал разбирается: что успело, сверка
+# рабочей по хеш-суммам (только чтение), запись становится «прервано» и попадает в список откатов.
+function Save-DeployJournalFile {
+    param([string]$Path, $Record)
+    $temp = $Path + '.tmp'
+    [System.IO.File]::WriteAllText($temp, (ConvertTo-Json -InputObject $Record -Depth 6), $Utf8Bom)
+    # [NullString]::Value - без резервной копии: $null PowerShell передал бы пустой строкой.
+    if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($temp, $Path, [NullString]::Value) }
+    else { [System.IO.File]::Move($temp, $Path) }
+}
+
+function Save-DeployJournal {
+    # Журнал этого запуска: что выбрано, стадия каждого объекта, резервные копии, хеш-суммы до и после.
+    param([string]$Step = '')
+    if (-not $script:JournalOn) { return }
+    $journal = [ordered]@{
+        runId = $runId; time = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss'); base = $script:ProdBase; tempBase = $script:TempBase
+        user = $env:USERNAME; mode = $mode; outcome = 'inProgress'; step = $Step; rollbackOf = $rollbackOf
+        pid = $PID; processStart = $script:JournalProcessStart
+        gate = $script:JournalGate; riskAccepted = $riskAccepted; risks = @($gateRisks); riskReason = $riskReason
+        extensions = @(foreach ($journalEntry in $selected) {
+                $journalBackup = ''
+                if ($journalEntry.Backup) { $journalBackup = 'before\' + (Split-Path -Leaf $journalEntry.Backup) }
+                [ordered]@{ name = $journalEntry.Name; status = $journalEntry.Status; backup = $journalBackup; oldVersion = $journalEntry.ProdVersion; newVersion = $journalEntry.TempVersion
+                    stage = [string]$journalEntry.Stage; oldHash = [string]$journalEntry.OldHash; newHash = [string]$journalEntry.NewHash }
+            })
+        processings = @(foreach ($journalProc in $selectedProcessings) {
+                $journalProcBackup = ''
+                if ((Get-JsonValue $journalProc 'Backup' '')) { $journalProcBackup = 'before\processings\' + (Split-Path -Leaf ([string]$journalProc.Backup)) }
+                [ordered]@{ name = $journalProc.ObjName; fileName = [string](Get-JsonValue $journalProc 'FileName' ''); action = [string](Get-JsonValue $journalProc 'Action' '')
+                    ref = [string](Get-JsonValue $journalProc 'Ref' ''); isNew = [string](Get-JsonValue $journalProc 'IsNew' ''); backup = $journalProcBackup
+                    oldVersion = [string](Get-JsonValue $journalProc 'ProdVersion' ''); newVersion = [string](Get-JsonValue $journalProc 'TempVersion' ''); stage = [string](Get-JsonValue $journalProc 'Stage' 'pending') }
+            })
+        light = @(); article = ''
+    }
+    try { Save-DeployJournalFile -Path (Join-Path $script:RunDir 'deploy.json') -Record $journal }
+    catch { Write-RunLog ('Журнал обновления не записался: ' + $_.Exception.Message) }
+}
+
+function Set-DeployStage {
+    param($Item, [string]$Stage)
+    $Item | Add-Member -NotePropertyName Stage -NotePropertyValue $Stage -Force
+    Save-DeployJournal -Step $Stage
+}
+
+function Resolve-InterruptedDeploys {
+    # Журналы inProgress, чей процесс уже не живёт: разбор, сверка рабочей (только чтение), outcome = interrupted.
+    # Возвращает, сколько нашлось.
+    if (-not (Test-Path -LiteralPath $deployRoot)) { return 0 }
+    $found = 0
+    foreach ($dir in @(Get-ChildItem -LiteralPath $deployRoot -Directory | Where-Object { $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name)) {
+        $jsonFile = Join-Path $dir.FullName 'deploy.json'
+        if (-not (Test-Path -LiteralPath $jsonFile)) { continue }
+        $record = $null
+        try { $record = (Get-Content -LiteralPath $jsonFile -Raw -Encoding UTF8) | ConvertFrom-Json } catch { continue }
+        if ([string](Get-JsonValue $record 'outcome' '') -ne 'inProgress') { continue }
+        if ([string](Get-JsonValue $record 'base' '') -ne $script:ProdBase) { continue }
+        $journalPid = [int](Get-JsonValue $record 'pid' 0)
+        $alive = $null
+        if ($journalPid -gt 0) { $alive = Get-Process -Id $journalPid -ErrorAction SilentlyContinue }
+        if ($null -ne $alive) {
+            $startText = ''
+            try { $startText = $alive.StartTime.ToString('yyyy-MM-ddTHH:mm:ss') } catch { $startText = '' }
+            if (-not $startText -or $startText -eq [string](Get-JsonValue $record 'processStart' '')) {
+                throw ("обновление {0} {1} ещё идёт (процесс {2}): дождись его конца" -f $script:ProdBase, $dir.Name, $journalPid)
+            }
+        }
+        $found++
+        $lines = New-Object System.Collections.Generic.List[string]
+        $prodNow = Get-ExtensionStates -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+        $stageNames = @{ pending = 'не начиналось'; backup = 'резервная копия снята, загрузки не было'; loading = 'шла загрузка'; loaded = 'загружено'; applying = 'шло обновление конфигурации БД'; applied = 'применено'; writing = 'шла запись'; written = 'записана' }
+        foreach ($item in @(Get-JsonValue $record 'extensions' @())) {
+            $stage = [string](Get-JsonValue $item 'stage' 'pending')
+            $stageText = $stage
+            if ($stageNames.ContainsKey($stage)) { $stageText = $stageNames[$stage] }
+            $nowText = 'сверить не удалось: хеш-сумма рабочей не прочитана'
+            if ($prodNow.Ok -and $prodNow.Items.ContainsKey([string]$item.name)) {
+                $nowHash = [string]$prodNow.Items[[string]$item.name].Hash
+                if ($nowHash -and $nowHash -eq [string](Get-JsonValue $item 'newHash' '')) { $nowText = 'в конфигурации рабочей новая версия (применена ли к БД - по журналу)' }
+                elseif ($nowHash -and $nowHash -eq [string](Get-JsonValue $item 'oldHash' '')) { $nowText = 'в рабочей прежняя версия' }
+                else { $nowText = 'исход неизвестен: хеш-сумма ни прежняя, ни новая' }
+            }
+            elseif ($prodNow.Ok) { $nowText = 'в рабочей его нет' }
+            $backupText = 'копии нет - откатом не вернуть'
+            if ([string](Get-JsonValue $item 'backup' '') -and (Test-Path -LiteralPath (Join-Path $dir.FullName ([string]$item.backup)))) { $backupText = 'копия есть' }
+            $lines.Add(("{0}: {1}; {2}; {3}" -f $item.name, $stageText, $nowText, $backupText))
+        }
+        foreach ($item in @(Get-JsonValue $record 'processings' @())) {
+            $stage = [string](Get-JsonValue $item 'stage' 'pending')
+            $stageText = $stage
+            if ($stageNames.ContainsKey($stage)) { $stageText = $stageNames[$stage] }
+            $backupText = 'копии нет - откатом не вернуть, проверить карточку руками'
+            if ([string](Get-JsonValue $item 'backup' '')) { $backupText = 'копия есть' }
+            if ($stage -eq 'writing') { $stageText = 'исход неизвестен (запись шла)' }
+            $lines.Add(("обработка {0}: {1}; {2}" -f $item.name, $stageText, $backupText))
+        }
+        $record.outcome = 'interrupted'
+        $record | Add-Member -NotePropertyName interruptCheck -NotePropertyValue @($lines.ToArray()) -Force
+        $record | Add-Member -NotePropertyName interruptFoundAt -NotePropertyValue ((Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')) -Force
+        Save-DeployJournalFile -Path $jsonFile -Record $record
+        Write-RunLog ("Прерванное обновление {0}: {1}" -f $dir.Name, ($lines -join ' | '))
+        $more = @($lines.ToArray()) + @(
+            'Блокировки рабочей обрыв мог оставить: посмотреть - «Состояние баз», снять - консоль кластера.',
+            'Откатить то, что успело, - «Откатить рабочую базу»: это обновление в списке с пометкой ПРЕРВАНО (вернутся только объекты с копией).',
+            'Проверить рабочую - «Проверить рабочую базу (только читает)».')
+        Show-UiTitle -Text ("Обновление {0} {1} прервано (процесс не закончил)" -f $script:ProdBase, $dir.Name) -Kind 'bad' -More $more
+    }
+    return $found
+}
+# ** Хлебников С.Ю. 20261120 конец
+
+if (-not $Prepare -and -not $CancelPrepared) {
+    $interrupted = Resolve-InterruptedDeploys
+    if ($interrupted -gt 0 -and -not $Rollback) {
+        Write-Line 'Сначала - разобраться с прерванным обновлением (см. выше). Выход, ничего не менял.' 'Yellow'
+        exit 0
+    }
 }
 
 #endregion
@@ -3312,6 +3575,9 @@ if ($Rollback) {
     $lastRun = $null
     $lastVerdict = $null
     $riskAccepted = $false
+    $gateRed = $false
+    $riskReason = ''
+    $checkedNote = ''
 
     $history = @(Get-DeployHistory)
     Write-Host ''
@@ -3345,6 +3611,8 @@ if ($Rollback) {
             -Items @('Откатить', 'Отмена') -Danger @(0)
         if ($action -eq 0) { $target = $record }
     }
+
+    Assert-DeployRecordTarget $target $deployTarget.Identity $target.Dir
 
     # Что вернётся: расширения обновления с резервной копией. Без копии (новые) откатом не удаляются.
     $selected = @()
@@ -3427,6 +3695,22 @@ else {
             }
         }
     }
+    # ** Хлебников С.Ю. 20261120 «Обновить подготовленным» - по прогону, с которым готовили (prepared.gate), а не по
+    # последнему: подготовили красный A, потом прошёл зелёный B - применяется A, и вердикт - его.
+    $preparedGateMissing = ''
+    if ($ApplyPrepared -and $null -ne $prepared) {
+        $preparedGateName = [string](Get-JsonValue $prepared 'gate' '')
+        if ($preparedGateName) {
+            $preparedGateDir = Join-Path $runsRoot $preparedGateName
+            $preparedVerdictFile = Join-Path $preparedGateDir 'verdict.json'
+            if (Test-Path -LiteralPath $preparedVerdictFile) {
+                $lastRun = Get-Item -LiteralPath $preparedGateDir
+                $lastVerdict = (Get-Content -LiteralPath $preparedVerdictFile -Raw -Encoding UTF8) | ConvertFrom-Json
+            }
+            else { $lastRun = $null; $lastVerdict = $null; $preparedGateMissing = $preparedGateName }
+        }
+    }
+    # ** Хлебников С.Ю. 20261120 конец
 
     $ciLines = New-Object System.Collections.Generic.List[string]     # для отчёта
     $advice = New-Object System.Collections.Generic.List[object]      # рекомендации: Kind = do / dont / note
@@ -3434,10 +3718,17 @@ else {
     # откатили - перед обновлением переспросить, а красное из гейта унести в отчёт с пометкой «проверить».
     $gateRisks = New-Object System.Collections.Generic.List[string]
     $gateRedItems = New-Object System.Collections.Generic.List[string]
+    $gateRed = $false
+    $riskReason = ''
 
     Write-Host ''
     Write-Host 'ПОСЛЕДНИЙ ПРОГОН ГЕЙТА' -ForegroundColor Cyan
-    if ($null -eq $lastRun) {
+    if ($null -eq $lastRun -and $preparedGateMissing) {
+        Write-Line ("  прогона подготовки {0} нет в папке прогонов" -f $preparedGateMissing) 'Yellow'
+        $ciLines.Add(("Прогона подготовки {0} нет." -f $preparedGateMissing))
+        $gateRisks.Add(("прогона {0}, с которым готовили обновление, нет" -f $preparedGateMissing))
+    }
+    elseif ($null -eq $lastRun) {
         Write-Line '  прогонов гейта нет' 'Yellow'
         $ciLines.Add('Прогонов гейта нет.')
         $gateRisks.Add('прогонов гейта нет')
@@ -3492,7 +3783,7 @@ else {
         }
 
         # Красное из гейта: упавшие шаги и красные строки разбора.
-        if ($verdict -eq 'RED') { $gateRisks.Add(("гейт {0} красный" -f $lastRun.Name)) }
+        if ($verdict -eq 'RED') { $gateRisks.Add(("гейт {0} красный" -f $lastRun.Name)); $gateRed = $true }
         if ($decision -eq 'rolledBack' -or $decision -eq 'rollbackFailed') { $gateRisks.Add('комплект последнего прогона гейта откатили: в temp не то, что он проверял') }
         foreach ($step in @($badSteps | Where-Object { $_.status -eq 'FAIL' })) {
             $detail = [string](Get-JsonValue $step 'detail' '')
@@ -3530,7 +3821,7 @@ else {
             $advice.Add([pscustomobject]@{ Kind = 'note'; Text = ("прогону {0} ч: если temp с тех пор меняли, сначала новый прогон гейта" -f $ageHours) })
         }
     }
-    $advice.Add([pscustomobject]@{ Kind = 'dont'; Text = ("не обновлять с {0}:00 до {1:00}:00 и в рабочее время: обновлению нужен монопольный доступ к {2}" -f $deniedFrom, $deniedTo, $script:ProdBase) })
+    $advice.Add([pscustomobject]@{ Kind = 'dont'; Text = ("обновлять {0} только {1} (DeployDeniedFrom/To): обновлению нужен монопольный доступ" -f $script:ProdBase, (Get-DeployWindowText)) })
 
     #endregion
 
@@ -3666,7 +3957,7 @@ else {
         # Обновить подготовленным: что загружено при подготовке, то и применяется. Сверка: temp и рабочая с тех пор
         # не менялись (по хеш-суммам через внешнее соединение, если они читаются).
         if ($null -eq $prepared) { throw 'подготовленного обновления нет: сначала «Подготовить обновление рабочей»' }
-        if ([bool](Get-JsonValue $prepared 'partial' $false)) { throw 'подготовка не закончена (часть расширений не загрузилась): «Отменить подготовку» или «Подготовить заново»' }
+        if ([bool](Get-JsonValue $prepared 'partial' $false)) { throw 'подготовка не закончена (часть расширений не загрузилась): «Отменить подготовку рабочей» или «Подготовить обновление рабочей» заново' }
         if ([string](Get-JsonValue $prepared 'base' '') -ne $script:ProdBase) { throw ("подготовлено для базы {0}, а рабочая сейчас {1}" -f (Get-JsonValue $prepared 'base' '?'), $script:ProdBase) }
         $preparedRunId = [string](Get-JsonValue $prepared 'runId' '')
         $preparedWhen = [string](Get-JsonValue $prepared 'timeText' '')
@@ -3698,8 +3989,9 @@ else {
         }
         if ($preparedChanged.Count -gt 0) {
             foreach ($line in $preparedChanged) { Write-Line ('  ' + $line) 'Yellow' }
-            $go = Confirm-Ui -Question ("После подготовки было изменено: {0}. Обновить {1} подготовленным всё равно? Надёжнее - «Подготовить заново»." -f ($preparedChanged -join '; '), $script:ProdBase) -Yes 'Да, обновлять подготовленным' -No 'Нет, выйти'
-            if ($go -ne $true) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
+            # ** Хлебников С.Ю. 20261120 Изменения после подготовки - риск, как красный гейт: вопрос один, ответ «да» -
+            # riskAccepted, и они уходят в отчёт и deploy.json. Надёжнее - «Подготовить обновление рабочей» заново.
+            foreach ($line in $preparedChanged) { $gateRisks.Add(('после подготовки изменено - ' + $line)) }
             Write-RunLog ('Обновление подготовленным несмотря на: ' + ($preparedChanged -join '; '))
         }
         elseif ($preparedCompared -gt 0) { Write-Line ("  с подготовки {0} и {1} не менялись" -f $script:TempBase, $script:ProdBase) 'Green' }
@@ -3708,7 +4000,7 @@ else {
     }
     if (-not $ApplyPrepared) {
     $modeMenu = New-Object System.Collections.Generic.List[object]
-    $modeMenu.Add([pscustomobject]@{ Key = '1'; Label = ("Обновить все расширения из {0} в {1} ({2}); ошибки гейта сбросятся" -f $script:TempBase, $script:ProdBase, (@($allTargets | ForEach-Object { $_.Name }) -join ', ')) })
+    $modeMenu.Add([pscustomobject]@{ Key = '1'; Label = ("Обновить все расширения из {0} в {1} ({2})" -f $script:TempBase, $script:ProdBase, (@($allTargets | ForEach-Object { $_.Name }) -join ', ')) })
     $modeMenu.Add([pscustomobject]@{ Key = '2'; Label = 'Обновить выбранные расширения' })
     if ($processingsPending.Count -gt 0) {
         $modeMenu.Add([pscustomobject]@{ Key = 'epf'; Label = ("Обновить только внешние обработки ({0}): без блокировок рабочей и обновления конфигурации БД" -f $processingsPending.Count) })
@@ -3836,6 +4128,49 @@ else {
     elseif ($selected.Count -gt 0) { Write-Line ("Обновляю в {0}: {1}" -f $script:ProdBase, (@($selected | ForEach-Object { $_.Name }) -join ', ')) 'Cyan' }
     if ($selectedProcessings.Count -gt 0) { Write-Line ("Внешние обработки в {0}: {1}" -f $script:ProdBase, (@($selectedProcessings | ForEach-Object { $_.ObjName }) -join ', ')) 'Cyan' }
 
+    # ** Хлебников С.Ю. 20261120 Что проверил прогон (#27): хеш-суммы temp на конец его проверок (checkedState в
+    # verdict.json) против того, что сейчас уходит в рабочую. Разошлось - это другой комплект: риск, вопрос заново.
+    # Снимка нет (старый прогон, «как есть», COM не прочитался) - честная отметка, не риск.
+    $checkedNote = ''
+    if ($null -ne $lastRun -and $mode -ne 'asis') {
+        $checked = Get-JsonValue $lastVerdict 'checkedState' $null
+        if ($null -eq $checked) { $checkedNote = ("проверка этого состава не подтверждена: в прогоне {0} нет снимка temp" -f $lastRun.Name) }
+        elseif (-not [bool](Get-JsonValue $checked 'ok' $false)) { $checkedNote = ("проверка этого состава не подтверждена: снимок temp прогона {0} не снялся ({1})" -f $lastRun.Name, [string](Get-JsonValue $checked 'error' '')) }
+        else {
+            $checkedExt = Get-JsonValue $checked 'extensions' $null
+            $checkedProc = Get-JsonValue $checked 'processings' $null
+            $mismatch = New-Object System.Collections.Generic.List[string]
+            $unconfirmed = New-Object System.Collections.Generic.List[string]
+            foreach ($checkEntry in $selected) {
+                $nowHash = ''
+                if ($mode -eq 'prepared') { $nowHash = [string](Get-JsonValue $preparedByName[$checkEntry.Name] 'tempHash' '') }
+                elseif ($tempStates.Ok -and $tempStates.Items.ContainsKey($checkEntry.Name)) { $nowHash = [string]$tempStates.Items[$checkEntry.Name].Hash }
+                $thenItem = $null
+                if ($null -ne $checkedExt) { $thenItem = Get-JsonValue $checkedExt $checkEntry.Name $null }
+                if ($null -eq $thenItem) { $mismatch.Add(("{0}: прогон его не проверял" -f $checkEntry.Name)); continue }
+                $thenHash = [string](Get-JsonValue $thenItem 'hash' '')
+                if (-not $nowHash -or -not $thenHash) { $unconfirmed.Add([string]$checkEntry.Name); continue }
+                if ($nowHash -ne $thenHash) { $mismatch.Add(("{0}: в temp не то, что проверял прогон" -f $checkEntry.Name)) }
+            }
+            foreach ($checkProc in $selectedProcessings) {
+                $nowItem = @($tempProcExport.Items | Where-Object { $_.ObjName -eq $checkProc.ObjName } | Select-Object -First 1)
+                $thenItem = $null
+                if ($null -ne $checkedProc) { $thenItem = Get-JsonValue $checkedProc $checkProc.ObjName $null }
+                if ($null -eq $thenItem) { $mismatch.Add(("{0}: прогон эту обработку не проверял" -f $checkProc.ObjName)); continue }
+                if ($nowItem.Count -eq 0 -or -not [string]$nowItem[0].Hash) { $unconfirmed.Add([string]$checkProc.ObjName); continue }
+                if ([string]$nowItem[0].Hash -ne [string](Get-JsonValue $thenItem 'hash' '')) { $mismatch.Add(("{0}: в temp не та обработка, что проверял прогон" -f $checkProc.ObjName)) }
+            }
+            if ($mismatch.Count -gt 0) {
+                $gateRisks.Add(("состав расходится с проверенным прогоном {0}: {1}" -f $lastRun.Name, ($mismatch -join '; ')))
+                foreach ($line in $mismatch) { Write-Line ('  ' + $line) 'Yellow' }
+            }
+            if ($unconfirmed.Count -gt 0) { $checkedNote = ("совпадение с проверенным не установлено (хеш не прочитан): {0}" -f ($unconfirmed -join ', ')) }
+            elseif ($mismatch.Count -eq 0 -and ($selected.Count + @($selectedProcessings).Count) -gt 0) { Write-Line ("  состав совпадает с проверенным прогоном {0}" -f $lastRun.Name) 'Green' }
+        }
+        if ($checkedNote) { Write-Line ('  ' + $checkedNote) 'Yellow'; $ciLines.Add(($checkedNote + '.')) }
+    }
+    # ** Хлебников С.Ю. 20261120 конец
+
     # Гейт красный, его нет или комплект откатили: переспросить. Да - едем, красное гейта уходит в отчёт.
     $riskAccepted = $false
     if ($gateRisks.Count -gt 0) {
@@ -3846,19 +4181,59 @@ else {
         $riskAccepted = $true
         Write-RunLog ('Обновление несмотря на: ' + ($gateRisks -join '; '))
         Write-Line ("  Обновляю, несмотря на: {0}" -f ($gateRisks -join '; ')) 'Yellow'
+        # ** Хлебников С.Ю. 20261120 Выпуск с красным гейтом - с причиной одной строкой: она уходит в deploy.json,
+        # отчёт, статью и отметку released.txt прогона. Прогон остаётся красным, в эталон он сам не принимается.
+        if ($gateRed) {
+            for ($attempt = 1; $attempt -le 3 -and -not $riskReason; $attempt++) {
+                $typedReason = Read-UiText -Prompt 'Причина выпуска с красным гейтом (одной строкой, попадёт в отчёт)' -CancelAsNull
+                if ($null -eq $typedReason) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
+                $riskReason = ([string]$typedReason).Trim()
+                if (-not $riskReason) { Write-Line '  Без причины красный комплект не выпускаю: напиши её одной строкой (Esc - выйти).' 'Yellow' }
+            }
+            if (-not $riskReason) { Write-Host 'Причина не указана - выход, ничего не обновлял.'; exit 0 }
+            Write-RunLog ('Причина выпуска с красным гейтом: ' + $riskReason)
+            Write-Line ("  Причина: {0}" -f $riskReason) 'Yellow'
+            $ciLines.Add(("Выпуск с красным гейтом, причина: {0}." -f $riskReason))
+        }
+        # ** Хлебников С.Ю. 20261120 конец
     }
 }
 
-$hour = (Get-Date).Hour
-$inDenied = $false
-if ($deniedFrom -gt $deniedTo) { $inDenied = ($hour -ge $deniedFrom -or $hour -lt $deniedTo) }
-else { $inDenied = ($hour -ge $deniedFrom -and $hour -lt $deniedTo) }
-if ($inDenied -and -not $Prepare) { throw ("сейчас {0}: с {1}:00 до {2}:00 рабочую базу не обновляем" -f (Get-Date -Format 'HH:mm'), $deniedFrom, $deniedTo) }
+if ((Test-DeployHourDenied (Get-Date)) -and -not $Prepare) { throw ("сейчас {0}: рабочую базу обновляем только {1}" -f (Get-Date -Format 'HH:mm'), (Get-DeployWindowText)) }
+
+# ** Хлебников С.Ю. 20261120 Сводка прямо перед вводом имени: цель, операция, что было и что станет, обработки
+# (и ноль), гейт и причина выпуска - всё, что выше могло уехать за край экрана.
+$confirmLines = New-Object System.Collections.Generic.List[string]
+$operationNames = @{ '1' = 'обновление одним проходом (все из temp)'; '2' = 'обновление одним проходом (выбранные из temp)'; 'epf' = 'только внешние обработки'; 'asis' = 'обновление конфигурации БД как есть'; 'rollback' = 'откат'; 'prepared' = 'применение подготовленного' }
+$operationText = 'обновление'
+if ($operationNames.ContainsKey([string]$mode)) { $operationText = $operationNames[[string]$mode] }
+if ($Prepare) { $operationText = 'подготовка: загрузка в конфигурацию без применения, пользователи работают' }
+$confirmLines.Add(("Операция: {0}" -f $operationText))
+foreach ($confirmEntry in $selected) {
+    $fromText = [string]$confirmEntry.ProdVersion
+    if (-not $confirmEntry.ProdPresent) { $fromText = 'нет' } elseif (-not $fromText) { $fromText = '?' }
+    $toText = [string]$confirmEntry.TempVersion
+    if ($mode -eq 'rollback') { $toText = 'резервная копия' } elseif ($mode -eq 'asis') { $toText = 'как загружено' } elseif (-not $toText) { $toText = '?' }
+    $confirmLines.Add(("  {0}: {1} -> {2}" -f $confirmEntry.Name, $fromText, $toText))
+}
+if ($selected.Count -eq 0) { $confirmLines.Add('  расширений: 0') }
+$confirmLines.Add(("Внешние обработки: {0}" -f @($selectedProcessings).Count))
+foreach ($confirmProc in $selectedProcessings) { $confirmLines.Add(("  {0}" -f $confirmProc.ObjName)) }
+if ($null -ne $lastRun) { $confirmLines.Add(("Гейт: прогон {0}, вердикт {1}" -f $lastRun.Name, [string](Get-JsonValue $lastVerdict 'verdict' ''))) }
+elseif ($mode -ne 'rollback') { $confirmLines.Add('Гейт: прогонов нет') }
+if ($riskReason) { $confirmLines.Add(("Выпуск с красным гейтом, причина: {0}" -f $riskReason)) }
+if ($mode -ne 'rollback' -and $checkedNote) { $confirmLines.Add(("Проверка: {0}" -f $checkedNote)) }
+if (-not $Prepare) { $confirmLines.Add(("Окно обновления: {0}" -f (Get-DeployWindowText))) }
+Show-UiTitle -Text ("Перед записью в {0}" -f $script:ProdBase) -Kind 'warn' -More $confirmLines.ToArray()
+Write-RunLog ('Сводка перед подтверждением: ' + ($confirmLines -join ' | '))
+# ** Хлебников С.Ю. 20261120 конец
 
 Write-Host ("  Это рабочая база. Чтобы продолжить, набери её имя ({0}) и Enter:" -f $script:ProdBase) -ForegroundColor Yellow
 $typedName = Read-UiText -Prompt ("Это рабочая база. Чтобы продолжить, набери её имя ({0})" -f $script:ProdBase)
 if ($typedName -cne $script:ProdBase) { throw 'имя базы набрано не так: обновление отменено' }
 Write-RunLog 'Подтверждено именем базы'
+# ** Хлебников С.Ю. 20261120 Пока ждали ввода имени, могло наступить запретное время: сверка ещё раз перед первой записью.
+if ((Test-DeployHourDenied (Get-Date)) -and -not $Prepare) { throw ("пока ждал подтверждения, наступило {0}: рабочую базу обновляем только {1}. В рабочую ничего не записано" -f (Get-Date -Format 'HH:mm'), (Get-DeployWindowText)) }
 
 #endregion
 
@@ -3890,30 +4265,37 @@ $planSteps.Add('Статья в базу знаний')
 }
 Send-UiPlan -StepNames $planSteps.ToArray()
 
-# Отсюда и до конца блокировки рабочей базы снимаются обязательно: в finally в конце скрипта (он выполняется
-# и при exit, и по Ctrl+C) и в trap.
-# Только внешние обработки - монопольный доступ не нужен: блокировки не ставятся и в конце не снимаются
-# (снятие снимает и чужие блокировки), пользователи работают дальше.
+# ** Хлебников С.Ю. 20261120 Прогноз длительности против конца окна: до первой записи, остановиться ещё можно.
+if (-not $Prepare) {
+    $forecastSeconds = 0.0
+    foreach ($planTitle in $planSteps) { $forecastSeconds += [double](Get-StatPlan -Title $planTitle) }
+    $windowEnd = Get-DeployWindowEnd (Get-Date)
+    if ($forecastSeconds -gt 0 -and $null -ne $windowEnd) {
+        $finishAt = (Get-Date).AddSeconds($forecastSeconds)
+        if ($finishAt -gt $windowEnd) {
+            $goOn = Confirm-Ui -Question ("По прогнозу обновление займёт ~{0} мин и закончится около {1:HH:mm}, а окно обновления - до {2:HH:mm}. Начинать?" -f [Math]::Ceiling($forecastSeconds / 60), $finishAt, $windowEnd) -Yes 'Да, начинать' -No 'Нет, выйти'
+            if ($goOn -ne $true) { Write-Host 'Выход, в рабочую ничего не записано.'; exit 0 }
+            Write-RunLog ("Начато, хотя прогноз выходит за окно: до {0:HH:mm}, окно до {1:HH:mm}" -f $finishAt, $windowEnd)
+        }
+    }
+}
+# ** Хлебников С.Ю. 20261120 конец
+
+# Только обновлению расширений нужен монопольный доступ. Свои изменения возвращаем через finally.
 $needExclusive = ($selected.Count -gt 0 -and -not $Prepare)
-if ($needExclusive) { $script:ProdLocksArmed = $true }
+if ($needExclusive) { $script:ProdLockState = New-GateLockState }
 try {
 
 if ($needExclusive) {
     Write-Host ''
     Write-Host 'Подготовка рабочей базы:'
     $prepLink = Connect-ClusterAgent
-    $prepTarget = $null
+    $prepTarget = Get-BaseInfo -Link $prepLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
     try {
-        $prepTarget = Get-BaseInfo -Link $prepLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
-        if ([bool]$prepTarget.InfoBase.ScheduledJobsDenied) {
-            Write-Line '  блокировка регламентных заданий уже стоит; в конце обновления сниму её'
-        }
-        else {
-            $prepTarget.InfoBase.ScheduledJobsDenied = $true
-            $prepTarget.Process.UpdateInfoBase($prepTarget.InfoBase)
-            if (-not [bool](Read-BaseInfoAgain $prepTarget $script:ProdBase).ScheduledJobsDenied) { throw 'флажок не записался' }
+        if (Set-GateJobsLock $script:ProdLockState $prepTarget { param($t) Read-BaseInfoAgain $t $script:ProdBase }) {
             Write-Line '  поставил блокировку регламентных заданий на время обновления; в конце сниму' 'Green'
         }
+        else { Write-Line '  блокировка регламентных заданий уже стоит, оставляю её' }
     }
     catch {
         $prepTarget = $null
@@ -3983,38 +4365,37 @@ if ($needExclusive) {
         # сразу (начало на 30 минут назад: часы сервера и этой машины могут расходиться).
         param($Target, $StartAt = $null)
         if ($null -eq $Target) { Write-Line '  блокировку начала сеансов поставить не смог (нет входа в свойства базы): сеансы могут вернуться' 'Yellow'; return }
-        $infoBase = $Target.InfoBase
+        $infoBase = Read-BaseInfoAgain $Target $script:ProdBase
         if ([bool]$infoBase.SessionsDenied) {
             $existing = [string]$infoBase.PermissionCode
-            if ($existing -and $existing -ne $script:UnlockCode) {
-                $script:KeepForeignSessionLock = $true
+            if ($existing -cne $script:UnlockCode) {
                 throw ("в {0} уже стоит чужая блокировка сеансов с другим кодом: впиши его в UnlockCode или сними блокировку" -f $script:ProdBase)
             }
-            Write-Line '  блокировка начала сеансов уже стоит (код тот же); в конце обновления сниму её'
+            $now = Get-Date
+            if (($null -ne $infoBase.DeniedFrom -and [datetime]$infoBase.DeniedFrom -gt $now) -or
+                ($null -ne $infoBase.DeniedTo -and ([datetime]$infoBase.DeniedTo).Year -ge 1900 -and [datetime]$infoBase.DeniedTo -lt $now)) {
+                throw 'в свойствах уже стоит блокировка начала сеансов с другим периодом, оставляю её расписание'
+            }
+            Write-Line '  блокировка начала сеансов уже стоит (код тот же), оставляю её'
             if ($null -ne $StartAt) {
                 Write-Line '  предупреждать не буду: блокировка уже стоит; оставшиеся сеансы завершу перед загрузкой'
                 $script:WarnLockAt = Get-Date
             }
             return
         }
-        if ([string]::IsNullOrEmpty($script:UnlockCode)) { $script:UnlockCode = '123'; Write-Line '  UnlockCode пустой: код разрешения входа на этот запуск - 123' }
+        if ([string]::IsNullOrEmpty($script:UnlockCode)) { $script:UnlockCode = '123'; Write-Line '  UnlockCode пустой: на этот запуск взят код разрешения входа по умолчанию. Задай свой: Настройки, Базы, UnlockCode.' }
         $start = Get-Date
         if ($null -ne $StartAt) { $start = [datetime]$StartAt }
         $until = $start.AddHours($sessionLockHours)
+        $from = $start
         if ($null -eq $StartAt) {
-            $infoBase.DeniedFrom = (Get-Date).AddMinutes(-30)
-            $infoBase.DeniedMessage = ("Идёт обновление расширений, база заблокирована до {0}" -f $until.ToString('HH:mm'))
+            $from = $start.AddMinutes(-30)
+            $message = "Идёт обновление расширений, база заблокирована до {0}" -f $until.ToString('HH:mm')
         }
         else {
-            $infoBase.DeniedFrom = $start
-            $infoBase.DeniedMessage = ("Обновление программы: в {0} база закрывается (не дольше чем до {1}). Сохраните работу и выйдите из программы до {0}." -f $start.ToString('HH:mm'), $until.ToString('HH:mm'))
+            $message = "Обновление программы: в {0} база закрывается (не дольше чем до {1}). Сохраните работу и выйдите из программы до {0}." -f $start.ToString('HH:mm'), $until.ToString('HH:mm')
         }
-        $infoBase.DeniedTo = $until
-        $infoBase.PermissionCode = $script:UnlockCode
-        $infoBase.SessionsDenied = $true
-        $Target.Process.UpdateInfoBase($infoBase)
-        if (-not [bool](Read-BaseInfoAgain $Target $script:ProdBase).SessionsDenied) { throw 'блокировка сеансов не записалась' }
-        $script:SessionLockCode = $script:UnlockCode
+        Set-GateSessionLock $script:ProdLockState $Target $from $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:ProdBase }
         if ($null -eq $StartAt) { Write-Line ("  поставил блокировку начала сеансов до {0}; сниму в конце" -f $until.ToString('HH:mm')) 'Green'; return }
         $script:WarnLockAt = $start
         $script:WarnLockUntil = $until
@@ -4231,12 +4612,40 @@ if ($Prepare -and -not $failed) {
 }
 # Дальше рабочая меняется: при предупреждении пользователей - дождаться закрытия базы.
 if (-not $failed -and $null -ne $script:WarnLockAt) { Wait-ProdWarnLock }
+# ** Хлебников С.Ю. 20261120 Журнал обновления - до первой записи в рабочую (не при подготовке: у неё prepared.json).
+$script:JournalOn = $false
+if (-not $failed -and -not $Prepare -and ($selected.Count + @($selectedProcessings).Count) -gt 0) {
+    $script:JournalOn = $true
+    try { $script:JournalProcessStart = (Get-Process -Id $PID).StartTime.ToString('yyyy-MM-ddTHH:mm:ss') } catch { $script:JournalProcessStart = '' }
+    $script:JournalGate = $null
+    if ($null -ne $lastRun) { $script:JournalGate = [ordered]@{ run = $lastRun.Name; verdict = [string](Get-JsonValue $lastVerdict 'verdict' '') } }
+    foreach ($journalEntry in $selected) {
+        $oldHashNow = ''
+        $newHashNow = ''
+        if ($mode -ne 'rollback' -and $mode -ne 'asis') {
+            if ((Get-Variable -Name prodStates -ErrorAction SilentlyContinue) -and $null -ne $prodStates -and $prodStates.Ok -and $prodStates.Items.ContainsKey($journalEntry.Name)) { $oldHashNow = [string]$prodStates.Items[$journalEntry.Name].Hash }
+            if ($mode -eq 'prepared') { $newHashNow = [string](Get-JsonValue $preparedByName[$journalEntry.Name] 'tempHash' '') }
+            elseif ((Get-Variable -Name tempStates -ErrorAction SilentlyContinue) -and $null -ne $tempStates -and $tempStates.Ok -and $tempStates.Items.ContainsKey($journalEntry.Name)) { $newHashNow = [string]$tempStates.Items[$journalEntry.Name].Hash }
+        }
+        $journalEntry | Add-Member -NotePropertyName OldHash -NotePropertyValue $oldHashNow -Force
+        $journalEntry | Add-Member -NotePropertyName NewHash -NotePropertyValue $newHashNow -Force
+        $startStage = 'pending'
+        if ($journalEntry.Backup) { $startStage = 'backup' }
+        if ($mode -eq 'prepared') { $startStage = 'loaded' }
+        $journalEntry | Add-Member -NotePropertyName Stage -NotePropertyValue $startStage -Force
+    }
+    foreach ($journalProc in $selectedProcessings) { $journalProc | Add-Member -NotePropertyName Stage -NotePropertyValue 'pending' -Force }
+    Save-DeployJournal -Step 'start'
+}
+# ** Хлебников С.Ю. 20261120 конец
 
 if (-not $failed -and $mode -ne 'asis' -and $mode -ne 'prepared') {
     foreach ($entry in $selected) {
+        Set-DeployStage $entry 'loading'
         $result = Invoke-Designer -BaseName $script:ProdBase -Command @('/LoadCfg', ('"{0}"' -f $entry.NewFile), '-Extension', $entry.Name) `
             -LogName ("load_{0}.log" -f $entry.Name) -TimeoutSec $timeoutLoadSec -Title ("Загрузить {0} в {1}" -f $entry.Name, $script:ProdBase)
         if ($result.ExitCode -eq 0 -or $result.TimedOut) { $entry.Loaded = $true; $touched.Add($entry) }
+        if ($result.ExitCode -eq 0) { Set-DeployStage $entry 'loaded' }
         if ($result.ExitCode -ne 0) {
             Write-Line ("[FAIL] Загрузить {0} в {1}: {2}" -f $entry.Name, $script:ProdBase, $result.Text) 'Red'
             $failed = $true; break
@@ -4262,7 +4671,7 @@ if ($Prepare) {
                 Remove-Item -LiteralPath $preparedPath -Force
                 Write-Line ("ИТОГ: подготовка не прошла, расширения {0} возвращены к применённым версиям." -f $script:ProdBase) 'Red'
             }
-            else { Write-Line ("ИТОГ: подготовка не закончена. В конфигурации {0} остались загруженные, не применённые версии: «Отменить подготовку» или «Подготовить заново»." -f $script:ProdBase) 'Red' }
+            else { Write-Line ("ИТОГ: подготовка не закончена. В конфигурации {0} остались загруженные, не применённые версии: «Отменить подготовку рабочей» или «Подготовить обновление рабочей» заново." -f $script:ProdBase) 'Red' }
         }
         else { Write-Line ("ИТОГ: подготовка не прошла, в конфигурации {0} ничего не изменено." -f $script:ProdBase) 'Red' }
         exit 1
@@ -4278,6 +4687,7 @@ if ($Prepare) {
 if (-not $failed) {
     foreach ($entry in $selected) {
         $attempt = 0
+        if ($script:JournalOn) { Set-DeployStage $entry 'applying' }
         while ($true) {
             $attempt++
             $result = Invoke-Designer -BaseName $script:ProdBase -Command @('/UpdateDBCfg', '-Extension', $entry.Name) `
@@ -4298,6 +4708,7 @@ if (-not $failed) {
             $failed = $true; break
         }
         Write-Line ("[OK]   Обновить конфигурацию БД {0}: {1} с" -f $entry.Name, $result.Seconds) 'Green'
+        if ($script:JournalOn) { Set-DeployStage $entry 'applied' }
     }
 }
 
@@ -4326,16 +4737,19 @@ if (-not $failed -and $selectedProcessings.Count -gt 0) {
                 $proc.RemovedFile = Join-Path $removedDir $proc.FileName
                 Copy-Item -LiteralPath $proc.TempFile -Destination $proc.RemovedFile -Force
             }
+            Set-DeployStage $proc 'writing'
             $session = Invoke-ProdProcessing -Mode 'unregepf' -OutDir $procDir -Name $proc.ObjName -Ref $proc.Ref -Title $title
             if (-not $session.Done -or $session.Status -ne 'done') {
                 Write-Line ("[FAIL] {0}: {1}" -f $title, $session.Message) 'Red'
                 $failed = $true; break
             }
             $touchedProcessings.Add($proc)
+            Set-DeployStage $proc 'written'
             Write-Line ("[OK]   {0}: публикация «Отключена», пометка удаления" -f $title) 'Green'
             continue
         }
 
+        Set-DeployStage $proc 'writing'
         $session = Invoke-ProdProcessing -Mode 'regepf' -OutDir $procDir -File $proc.Source -TextFile $proc.SourceB64 -Name $proc.FileName -Title $title
         $values = $session.Values
         $proc.Ref = [string](Get-Setting $values 'ref' '')
@@ -4344,6 +4758,7 @@ if (-not $failed -and $selectedProcessings.Count -gt 0) {
         $isNewText = [string](Get-Setting $values 'isnew' '')
         if ($isNewText -eq '1') { $proc.IsNew = 'yes' } elseif ($isNewText -eq '0') { $proc.IsNew = 'no' }
         if ($session.OldB64) { $proc.Backup = Write-ProcessingBackup -Proc $proc -OldB64 $session.OldB64 }
+        if ($session.Done -and ($session.Status -eq 'done' -or $proc.Ref)) { Set-DeployStage $proc 'written' } else { Save-DeployJournal -Step 'writing' }
         if (-not $session.Done) {
             # Итога нет: записалась ли обработка, неизвестно. Прежняя версия успела сохраниться - откат возможен.
             $touchedProcessings.Add($proc)
@@ -4613,6 +5028,7 @@ if ($mode -eq 'asis') { [void]$html.Append('<p>Расширения загруж
 if ($riskAccepted) {
     [void]$html.Append('<div style="border:2px solid #c0392b;padding:8px 12px;margin:10px 0;background:#fdecea">')
     [void]$html.Append(('<h2 style="color:#c0392b;margin-top:0">Обновлено несмотря на гейт: проверить работоспособность</h2><p>{0}.</p>' -f (ConvertTo-Html ($gateRisks -join '; '))))
+    if ($riskReason) { [void]$html.Append(('<p>Причина выпуска: {0}</p>' -f (ConvertTo-Html $riskReason))) }
     if ($gateRedItems.Count -gt 0) {
         [void]$html.Append('<p>Что гейт нашёл красного - проверить в рабочей базе в первую очередь:</p><ul>')
         foreach ($item in $gateRedItems) { [void]$html.Append(('<li>{0}</li>' -f (ConvertTo-Html $item))) }
@@ -4754,12 +5170,37 @@ if ($outcome -eq 'updated') {
     if ($mode -ne 'asis') { foreach ($entry in $selected) { $null = Update-Mirror -BaseName $script:ProdBase -Extension $entry.Name } }
     # Хеш-суммы рабочей после обновления: следующий запуск по ним увидит ручную загрузку («как есть»).
     if ($selected.Count -gt 0) { Save-MirrorHashes -Names @($selected | ForEach-Object { $_.Name }) }
-    # «Обновить все»: ошибки последнего прогона гейта сбрасываются - принимаются в эталон как известные
-    # (они либо исправлены, либо неважны). Следующий прогон гейта покажет только новое.
+    # ** Хлебников С.Ю. 20261120 «Обновить все» больше не принимает прогон в эталон молча. Выпуск несмотря на гейт -
+    # эталон не трогается: падения останутся новыми, пока их не исправят или не примут вручную. Жёлтый, ещё не
+    # принятый - вопрос, по умолчанию «не принимать». Зелёный - как раньше (нового в нём нет).
     if ($mode -eq '1' -and $null -ne $lastRun) {
-        Write-Line ("Сбрасываю ошибки прогона гейта {0}: принимаю в эталон как известные." -f $lastRun.Name)
-        & (Join-Path $Root 'run.ps1') -AcceptBaseline $lastRun.FullName
+        $lastVerdictText = [string](Get-JsonValue $lastVerdict 'verdict' '')
+        $lastAccepted = Test-Path -LiteralPath (Join-Path $lastRun.FullName 'accepted.txt')
+        if ($riskAccepted) {
+            Write-Line ("Эталон не тронут: обновлено несмотря на гейт, новое прогона {0} останется новым, пока его не исправят или не примут вручную (меню гейта)." -f $lastRun.Name) 'Yellow'
+        }
+        elseif ($lastVerdictText -eq 'YELLOW' -and -not $lastAccepted) {
+            $acceptNow = Confirm-Ui -Question ("Принять новое прогона {0} (жёлтый) в эталон? Тогда следующий прогон будет считать его известным. Что внутри - report.txt прогона." -f $lastRun.Name) -Yes 'Принять в эталон' -No 'Не принимать'
+            if ($acceptNow -eq $true) {
+                Write-Line ("Принимаю новое прогона {0} в эталон." -f $lastRun.Name)
+                & (Join-Path $Root 'run.ps1') -AcceptBaseline $lastRun.FullName
+            }
+            else { Write-Line ("Эталон не тронут: новое прогона {0} останется новым." -f $lastRun.Name) }
+        }
+        elseif ($lastVerdictText -eq 'GREEN' -and -not $lastAccepted) {
+            & (Join-Path $Root 'run.ps1') -AcceptBaseline $lastRun.FullName
+        }
     }
+    # Отметка в папке прогона: его комплект выпущен в рабочую этим обновлением (вердикт прогона не меняется).
+    if ($null -ne $lastRun -and $mode -ne 'rollback') {
+        $releasedLine = ("time={0}`tdeploy={1}`tbase={2}`tmode={3}`tuser={4}`triskAccepted={5}`treason={6}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $runId, $script:ProdBase, $mode, $env:USERNAME, [int][bool]$riskAccepted, ($riskReason -replace '[\t\r\n]+', ' '))
+        try { [System.IO.File]::AppendAllText((Join-Path $lastRun.FullName 'released.txt'), $releasedLine + "`r`n", $Utf8Bom) }
+        catch { Write-Line ("Отметка выпуска в прогоне {0} не записалась: {1}" -f $lastRun.Name, $_.Exception.Message) 'Yellow' }
+        # Разбор прогона - заново: в шапке report.txt появится строка выпуска.
+        try { & (Join-Path $Root 'report.ps1') -RunDir $lastRun.FullName -Quiet | Out-Null }
+        catch { Write-RunLog ('report.txt прогона не пересобран: ' + $_.Exception.Message) }
+    }
+    # ** Хлебников С.Ю. 20261120 конец
 }
 
 # Обновили подготовленным или откатили его - подготовки больше нет. Не прошло и не откатывали - остаётся:
@@ -4771,6 +5212,8 @@ Clear-ProdLocks
 $summary = New-Object System.Collections.Generic.List[string]
 $summary.Add($reportTitle)
 $summary.Add(('Итог: ' + $outcomeNames[$outcome]))
+if ($riskAccepted) { $summary.Add(('Несмотря на гейт: ' + ($gateRisks -join '; '))) }
+if ($riskReason) { $summary.Add(('Причина выпуска: ' + $riskReason)) }
 $summary.Add(('Расширения: ' + (@($selected | ForEach-Object { $_.Name }) -join ', ')))
 if ($selectedProcessings.Count -gt 0) { $summary.Add(('Внешние обработки: ' + (@($touchedProcessings | ForEach-Object { $_.ObjName }) -join ', '))) }
 foreach ($item in $light) { $summary.Add(('[{0}] {1}: {2}' -f $item.Status, $item.Name, $item.Text)) }
@@ -4801,11 +5244,16 @@ $recordProcessings = @(foreach ($proc in $touchedProcessings) {
             oldVersion = $proc.OldVersion; newVersion = $proc.NewVersion; backup = $backupRelative; file = $fileRelative; status = $procStatus; problems = @($proc.Problems) }
     })
 $recordGate = $null
-if ($null -ne $lastRun) { $recordGate = [ordered]@{ run = $lastRun.Name; verdict = [string](Get-JsonValue $lastVerdict 'verdict' '') } }
+if ($null -ne $lastRun) {
+    # ** Хлебников С.Ю. 20261120 Связь «вход - прогон - установка»: откуда комплект (полный коммит), что проверено, что выпущено.
+    $recordGate = [ordered]@{ run = $lastRun.Name; verdict = [string](Get-JsonValue $lastVerdict 'verdict' ''); kitSource = [string](Get-JsonValue $lastVerdict 'kitSource' ''); checkedNote = $checkedNote
+        installed = @(foreach ($entry in $selected) { $installedHash = ''; if ($mode -eq 'prepared') { $installedHash = [string](Get-JsonValue $preparedByName[$entry.Name] 'tempHash' '') } elseif ($null -ne $tempStates -and $tempStates.Ok -and $tempStates.Items.ContainsKey($entry.Name)) { $installedHash = [string]$tempStates.Items[$entry.Name].Hash }; [ordered]@{ name = $entry.Name; hash = $installedHash } }) }
+}
 $record = [ordered]@{
     runId        = $runId
     time         = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
     base         = $script:ProdBase
+    target       = $deployTarget.Identity
     tempBase     = $script:TempBase
     user         = $env:USERNAME
     mode         = $mode
@@ -4815,6 +5263,7 @@ $record = [ordered]@{
     gate         = $recordGate
     riskAccepted = $riskAccepted
     risks        = @($gateRisks)
+    riskReason   = $riskReason
     extensions   = $recordExtensions
     processings  = $recordProcessings
     light        = @(foreach ($item in $light) { [ordered]@{ status = $item.Status; name = $item.Name; text = $item.Text } })
@@ -4835,6 +5284,7 @@ if ($statLines.Count -gt 0) {
 Write-Line ("ИТОГ: {0}. Резервные копии: {1}" -f $outcomeNames[$outcome], $beforeDir) $finalColor
 if ($riskAccepted -and $outcome -eq 'updated') {
     Write-Line ("ПРОВЕРИТЬ РАБОТОСПОСОБНОСТЬ: обновлено, хотя {0}." -f ($gateRisks -join '; ')) 'Red'
+    if ($riskReason) { Write-Line ("  причина выпуска: {0}" -f $riskReason) 'Red' }
     foreach ($item in @($gateRedItems | Select-Object -First 15)) { Write-Line ("  [КРАСН] {0}" -f $item) 'Red' }
 }
 
@@ -4890,3 +5340,5 @@ finally {
 }
 
 #endregion
+}
+finally { if ($null -ne $deployGuard) { $deployGuard.Dispose() } }

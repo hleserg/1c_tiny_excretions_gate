@@ -18,6 +18,9 @@ import (
 // readClipboard - текст из буфера обмена Windows (в тестах подменяется).
 var readClipboard = clipboard.ReadAll
 
+// writeClipboard - текст в буфер обмена Windows (в тестах подменяется).
+var writeClipboard = clipboard.WriteAll
+
 type dialog struct {
 	ev       uiEvent
 	local    string // не пусто - вопрос самого ci.exe (остановка), не движка
@@ -78,6 +81,106 @@ func hotkeyIndex(s string) int {
 		c = lat
 	}
 	return strings.IndexRune(hotkeys, c)
+}
+
+// customKeys - у пунктов свои клавиши (вопрос one с keys, по одной на пункт): клавиша пункта не зависит от того,
+// какие пункты сейчас показаны выше него (меню гейта).
+func (d *dialog) customKeys() bool {
+	return d.ev.Kind == "one" && len(d.ev.Keys) > 0 && len(d.ev.Keys) == len(d.ev.Items)
+}
+
+// itemKey - клавиша пункта i: своя или порядковая; "" - клавиши нет.
+func (d *dialog) itemKey(i int) string {
+	if d.customKeys() {
+		return strings.ToLower(d.ev.Keys[i])
+	}
+	return hotkeyLabel(i)
+}
+
+// keyItem - номер пункта по нажатой клавише в любой раскладке; -1 - не клавиша пункта.
+func (d *dialog) keyItem(s string) int {
+	k := hotkeyIndex(s)
+	if k < 0 {
+		return -1
+	}
+	if !d.customKeys() {
+		if k < len(d.ev.Items) {
+			return k
+		}
+		return -1
+	}
+	pressed := string(hotkeys[k])
+	for i, key := range d.ev.Keys {
+		if strings.ToLower(key) == pressed {
+			return i
+		}
+	}
+	return -1
+}
+
+// innerWidth - ширина текста внутри окна вопроса.
+func (d *dialog) innerWidth() int {
+	return max(30, min(d.width-6, 110))
+}
+
+// itemHint - пояснение пункта i (вопрос one с hints): переменное и подробности серым рядом с подписью, сама
+// подпись при этом не меняется; "" - нет.
+func (d *dialog) itemHint(i int) string {
+	if d.ev.Kind != "one" || d.docked() || len(d.ev.Hints) != len(d.ev.Items) || i < 0 || i >= len(d.ev.Items) {
+		return ""
+	}
+	return d.ev.Hints[i]
+}
+
+// itemRows - сколько строк занимает пункт i в списке выбора одного: длинная подпись и пояснение, не влезшее в
+// строку, переносятся. Опасный пункт (рамка) и отметки считаются одной строкой, как раньше.
+func (d *dialog) itemRows(i int) int {
+	if d.ev.Kind != "one" || d.docked() || d.isDanger(i) || i < 0 || i >= len(d.ev.Items) {
+		return 1
+	}
+	prefix := "  "
+	if k := d.itemKey(i); k != "" {
+		prefix += k + " "
+	}
+	return lipgloss.Height(hangHint(prefix, d.ev.Items[i], d.itemHint(i), d.innerWidth(), lipgloss.NewStyle()))
+}
+
+// sectionTitle - заголовок группы, которая начинается с пункта i (вопрос one с sections); "" - нет.
+func (d *dialog) sectionTitle(i int) string {
+	if d.ev.Kind != "one" || d.docked() || len(d.ev.Sections) != len(d.ev.Items) || i < 0 || i >= len(d.ev.Items) {
+		return ""
+	}
+	return d.ev.Sections[i]
+}
+
+// sectionOf - заголовок группы, в которую входит пункт i: его собственный или ближайший выше.
+func (d *dialog) sectionOf(i int) string {
+	for ; i >= 0; i-- {
+		if title := d.sectionTitle(i); title != "" {
+			return title
+		}
+	}
+	return ""
+}
+
+// windowEnd - до какого пункта (не включая) список влезает в окно, если первый видимый - offset. Пункт - строка
+// (с переносами - больше, itemRows), заголовок группы - ещё одна; над первым видимым пунктом заголовок его
+// группы стоит всегда.
+func (d *dialog) windowEnd(offset int) int {
+	rows := d.visibleRows()
+	used := 0
+	i := offset
+	for ; i < len(d.ev.Items); i++ {
+		cost := d.itemRows(i)
+		if (i == offset && d.sectionOf(i) != "") || (i != offset && d.sectionTitle(i) != "") {
+			cost++
+		}
+		if used+cost > rows && i > offset {
+			break
+		}
+		used += cost
+	}
+	return i
 }
 
 func newDialog(ev uiEvent, width, height int) *dialog {
@@ -174,7 +277,7 @@ func (d *dialog) Update(msg tea.Msg) tea.Cmd {
 		}
 		if d.ev.Kind == "one" {
 			// Цифрой или буквой (1-9, a-z, в русской раскладке - те же клавиши) - сразу выбрать пункт.
-			if k := hotkeyIndex(s); k >= 0 && k < n {
+			if k := d.keyItem(s); k >= 0 {
 				d.cursor = k
 				d.finish(answer{Index: k})
 				return nil
@@ -253,8 +356,9 @@ func (d *dialog) Update(msg tea.Msg) tea.Cmd {
 		if d.cursor < d.offset {
 			d.offset = d.cursor
 		}
-		if d.cursor >= d.offset+d.visibleRows() {
-			d.offset = d.cursor - d.visibleRows() + 1
+		// Заголовки групп занимают строки: окно считает windowEnd, а не число пунктов.
+		for d.offset < d.cursor && d.cursor >= d.windowEnd(d.offset) {
+			d.offset++
 		}
 	case "confirm":
 		switch s {
@@ -460,7 +564,7 @@ func (d *dialog) selected() []int {
 }
 
 func (d *dialog) View() string {
-	inner := max(30, min(d.width-6, 110))
+	inner := d.innerWidth()
 	var b strings.Builder
 	header := d.ev.Header
 	if header == "" && d.ev.Kind == "view" {
@@ -481,12 +585,20 @@ func (d *dialog) View() string {
 	switch d.ev.Kind {
 	case "one", "many":
 		d.hits = d.hits[:0]
-		rows := d.visibleRows()
-		end := min(len(d.ev.Items), d.offset+rows)
+		end := d.windowEnd(d.offset)
 		if d.offset > 0 {
 			b.WriteString(styleDim.Render(fmt.Sprintf("  ↑ ещё %d", d.offset)) + "\n")
 		}
 		for i := d.offset; i < end; i++ {
+			// Заголовок группы - перед её первым пунктом; у первого видимого - заголовок его группы, даже если
+			// начало группы прокручено вверх.
+			title := d.sectionTitle(i)
+			if i == d.offset {
+				title = d.sectionOf(i)
+			}
+			if title != "" {
+				b.WriteString("  " + styleDialogGroup.Render(strings.ToUpper(title)) + "\n")
+			}
 			mark := ""
 			if d.ev.Kind == "many" {
 				if d.marks[i] {
@@ -494,7 +606,7 @@ func (d *dialog) View() string {
 				} else {
 					mark = "[ ] "
 				}
-			} else if k := hotkeyLabel(i); k != "" {
+			} else if k := d.itemKey(i); k != "" {
 				mark = styleDim.Render(k + " ")
 			}
 			top := strings.Count(b.String(), "\n")
@@ -527,7 +639,7 @@ func (d *dialog) View() string {
 				prefix = styleCursor.Render("› ") + mark
 				st = styleSelected
 			}
-			row := hang(prefix, text, inner, st)
+			row := hangHint(prefix, text, d.itemHint(i), inner, st)
 			b.WriteString(row + "\n")
 			d.hits = append(d.hits, hitArea{y0: top, y1: top + lipgloss.Height(row), index: i})
 		}
@@ -678,7 +790,7 @@ func (d *dialog) ViewDocked(width int) string {
 				buttons = append(buttons, styleButton.Render(label))
 			}
 		}
-		help = "←→ выбор · enter ок · цифра, щелчок мышью - сразу · ↑↓ PgUp PgDn журнал · esc отмена"
+		help = "←→ выбор · enter ок · цифра, щелчок мышью - сразу · ↑↓ PgUp PgDn журнал · F2 журнал в буфер обмена · esc отмена"
 	} else {
 		yes := nonEmpty(d.ev.Yes, "Да")
 		no := nonEmpty(d.ev.No, "Нет")
@@ -687,7 +799,7 @@ func (d *dialog) ViewDocked(width int) string {
 			yb, nb = styleButtonActive.Render(yes), styleButton.Render(no)
 		}
 		buttons = []string{yb, nb}
-		help = "←→ выбор · enter ок · y/n, щелчок мышью · ↑↓ PgUp PgDn журнал · esc отмена"
+		help = "←→ выбор · enter ок · y/n, щелчок мышью · ↑↓ PgUp PgDn журнал · F2 журнал в буфер обмена · esc отмена"
 	}
 	// Кнопки в ряд; не влезают в ширину - столбиком. Места кнопок - для щелчка мышью.
 	top := strings.Count(b.String(), "\n")

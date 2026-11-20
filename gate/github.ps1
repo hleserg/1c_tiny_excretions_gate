@@ -4,14 +4,13 @@
 точкой (deploy.ps1). Функции принимают контекст New-GhContext: репозиторий, токен, подставной GitHub.
 
 Что умеет: голова ветки (и пустой ли репозиторий), файлы коммита (путь -> git-хеш блоба), git-хеш файла локально,
-первый коммит в пустой репозиторий, коммит изменений поверх родителя (только изменённые файлы: текст - прямо
+коммит изменений поверх родителя (только изменённые файлы: текст - прямо
 в дереве, двоичные - блобами), ветка, pull request, «содержит ли ветка коммит», скачивание файлов коммита
 (архив zipball, токен - только в API: на адрес скачивания не уходит).
 
 Подставной GitHub для тестов: переменная CI_FAKE_GITHUB - папка, репозиторий в ней файлами: refs.json (ветка ->
 коммит), commits\<хеш>.txt (родитель, сообщение, строки «путь<TAB>хеш блоба»), blobs\<хеш>, pulls.txt
-(номер, ветка, куда, заголовок), pulls\<номер>.md; каждое действие - строкой в requests.log. Слияние
-(Merge-GhBranch) - трёхстороннее по файлам от общего предка, как у git.
+(номер, ветка, куда, заголовок), pulls\<номер>.md; каждое действие - строкой в requests.log.
 
 Большие репозитории (выгрузка типовой конфигурации, десятки тысяч файлов) через REST не пролезают: для них -
 портативный git (MinGit из релизов git-for-windows, скачивается в tools\git без установки и прав администратора)
@@ -271,27 +270,6 @@ function Get-GhFiles {
     return $files
 }
 
-function Initialize-GhRepo {
-    # Первый коммит пустого репозитория: README.md (Git Data API на пустом репозитории не работает). Возвращает хеш.
-    param($Gh, [string]$Branch, [string]$Readme, [string]$Message)
-    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($Readme)
-    if ($Gh.FakeDir) {
-        New-Item -ItemType Directory -Path $Gh.FakeDir -Force | Out-Null
-        $blob = Save-GhFakeBlob $Gh $bytes
-        $sha = New-GhFakeCommit -Gh $Gh -Parent '' -Message $Message -Files @{ 'README.md' = $blob }
-        $refs = Read-GhFakeRefs $Gh
-        $refs[$Branch] = $sha
-        Save-GhFakeRefs $Gh $refs
-        Write-GhFakeLog $Gh ("init {0} {1}" -f $Branch, $sha)
-        return $sha
-    }
-    $body = '{"message":' + (ConvertTo-GhJsonString $Message) + ',"branch":' + (ConvertTo-GhJsonString $Branch) + ',"content":"' + [Convert]::ToBase64String($bytes) + '"}'
-    $answer = Invoke-GhApi -Gh $Gh -Method 'PUT' -Path ('/repos/{0}/contents/README.md' -f $Gh.Repo) -Body $body
-    $found = [regex]::Match($answer.Text, '"commit"\s*:\s*\{\s*"sha"\s*:\s*"([0-9a-f]{40})"')
-    if (-not $found.Success) { throw 'GitHub: не понял ответ на первый коммит' }
-    return $found.Groups[1].Value
-}
-
 function Add-GhTreePortion {
     # Порция дерева поверх BaseTree (пусто - с нуля). Возвращает хеш нового дерева.
     param($Gh, [string]$BaseTree, $Entries)
@@ -400,7 +378,8 @@ function New-GhPull {
     }
     $body = '{"title":' + (ConvertTo-GhJsonString $Title) + ',"head":' + (ConvertTo-GhJsonString $Head) + ',"base":' + (ConvertTo-GhJsonString $Base) + ',"body":' + (ConvertTo-GhJsonString $Body) + '}'
     $answer = Invoke-GhApi -Gh $Gh -Method 'POST' -Path ('/repos/{0}/pulls' -f $Gh.Repo) -Body $body
-    $number = [regex]::Match($answer.Text, '"number"\s*:\s*(\d+)').Groups[1].Value
+    $number = [int](($answer.Text | ConvertFrom-Json).number)
+    if ($number -lt 1) { throw 'GitHub не вернул номер созданного PR' }
     $url = ('https://github.com/{0}/pull/{1}' -f $Gh.Repo, $number)
     return [pscustomobject]@{ Number = [int]$number; Url = $url }
 }
@@ -444,52 +423,6 @@ function Get-GhBlobBytes {
         return , $memory.ToArray()
     }
     finally { $response.Close() }
-}
-
-function Merge-GhBranch {
-    # Слить ветку Head в Base на стороне GitHub (POST merges). Status: merged (Sha - коммит слияния, Base уже на нём),
-    # same (Head уже в Base), conflict (не слилось без человека - Base не тронут).
-    param($Gh, [string]$Base, [string]$Head, [string]$Message)
-    if ($Gh.FakeDir) {
-        $refs = Read-GhFakeRefs $Gh
-        $ours = $refs[$Base]
-        $theirs = $refs[$Head]
-        Write-GhFakeLog $Gh ("merge {0} <- {1}" -f $Base, $Head)
-        $oursAncestors = Get-GhFakeAncestors $Gh $ours
-        if ($oursAncestors.ContainsKey($theirs)) { return [pscustomobject]@{ Status = 'same'; Sha = $ours } }
-        $theirsAncestors = Get-GhFakeAncestors $Gh $theirs
-        if ($theirsAncestors.ContainsKey($ours)) {
-            $refs[$Base] = $theirs
-            Save-GhFakeRefs $Gh $refs
-            return [pscustomobject]@{ Status = 'merged'; Sha = $theirs }
-        }
-        # Трёхстороннее слияние по файлам от ближайшего общего предка.
-        $common = @($oursAncestors.Keys | Where-Object { $theirsAncestors.ContainsKey($_) } | Sort-Object { $oursAncestors[$_] + $theirsAncestors[$_] } | Select-Object -First 1)
-        $baseFiles = @{}
-        if ($common.Count -gt 0) { $baseFiles = (Read-GhFakeCommit $Gh $common[0]).Files }
-        $oursFiles = (Read-GhFakeCommit $Gh $ours).Files
-        $theirsFiles = (Read-GhFakeCommit $Gh $theirs).Files
-        $result = @{}
-        foreach ($path in @(@($baseFiles.Keys) + @($oursFiles.Keys) + @($theirsFiles.Keys) | Sort-Object -Unique)) {
-            $b = $baseFiles[$path]; $o = $oursFiles[$path]; $t = $theirsFiles[$path]
-            if ($o -eq $t) { $pick = $o }
-            elseif ($o -eq $b) { $pick = $t }
-            elseif ($t -eq $b) { $pick = $o }
-            else { Write-GhFakeLog $Gh ("conflict {0}" -f $path); return [pscustomobject]@{ Status = 'conflict'; Sha = '' } }
-            if ($pick) { $result[$path] = $pick }
-        }
-        $sha = New-GhFakeCommit -Gh $Gh -Parent ($ours + ' ' + $theirs) -Message $Message -Files $result
-        $refs[$Base] = $sha
-        Save-GhFakeRefs $Gh $refs
-        return [pscustomobject]@{ Status = 'merged'; Sha = $sha }
-    }
-    $body = '{"base":' + (ConvertTo-GhJsonString $Base) + ',"head":' + (ConvertTo-GhJsonString $Head) + ',"commit_message":' + (ConvertTo-GhJsonString $Message) + '}'
-    $answer = Invoke-GhApi -Gh $Gh -Method 'POST' -Path ('/repos/{0}/merges' -f $Gh.Repo) -Body $body -AllowStatus @(204, 409)
-    if ($answer.Status -eq 204) { return [pscustomobject]@{ Status = 'same'; Sha = '' } }
-    if ($answer.Status -eq 409) { return [pscustomobject]@{ Status = 'conflict'; Sha = '' } }
-    $sha = Get-GhJsonValue $answer.Text 'sha'
-    if ($sha -notmatch '^[0-9a-f]{40}$') { throw 'GitHub: не понял ответ на слияние' }
-    return [pscustomobject]@{ Status = 'merged'; Sha = $sha }
 }
 
 function Save-GhFiles {
@@ -722,11 +655,14 @@ function Invoke-GitCli {
     $errTask = $process.StandardError.ReadToEndAsync()
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $showProgress = ($Title -and $null -ne (Get-Command Write-UiProgress -ErrorAction SilentlyContinue))
+    # Итог долгой команды - строкой под «начато»: готово или нет, за сколько, и что ответил git.
+    $showResult = ($Title -and $null -ne (Get-Command Write-UiOperationResult -ErrorAction SilentlyContinue))
     if ($Title) { Write-Host ("  ...  {0}: начато в {1}, жду не дольше {2} мин" -f $Title, (Get-Date -Format 'HH:mm:ss'), [int]($TimeoutSec / 60)) -ForegroundColor DarkGray }
     while (-not $process.WaitForExit(250)) {
         if ($watch.Elapsed.TotalSeconds -ge $TimeoutSec) {
             & $stopGit
             if ($showProgress) { Complete-UiProgress }
+            if ($showResult) { Write-UiOperationResult -Title $Title -Status 'FAIL' -Seconds $watch.Elapsed.TotalSeconds -Problem ('не закончил за {0} мин, git снят' -f [int]($TimeoutSec / 60)) }
             throw ('git {0}: не закончил за {1} мин' -f $Arguments[0], [int]($TimeoutSec / 60))
         }
         if ($showProgress) {
@@ -744,6 +680,17 @@ function Invoke-GitCli {
     $output = ($outTask.Result + $errTask.Result).Trim()
     if ($Token) { $output = $output.Replace($Token, '***') }
     $code = $process.ExitCode
+    if ($showResult) {
+        $resultStatus = 'OK'
+        $problem = ''
+        if ($code -ne 0) {
+            # Не ноль, но вызывающему это можно (AllowFail: ветки ещё нет и т. п.) - не ошибка, а пометка.
+            $resultStatus = 'FAIL'
+            if ($AllowFail) { $resultStatus = 'WARN' }
+            $problem = 'код {0}: {1}' -f $code, (@($output -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 2) -join ' | ')
+        }
+        Write-UiOperationResult -Title $Title -Status $resultStatus -Seconds $watch.Elapsed.TotalSeconds -Problem $problem
+    }
     if ($code -ne 0 -and -not $AllowFail) {
         $tail = @($output -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 3) -join ' | '
         throw ('git {0} - код {1}: {2}' -f $Arguments[0], $code, $tail)

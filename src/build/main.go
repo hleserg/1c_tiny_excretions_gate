@@ -233,20 +233,23 @@ func loadPackages() []pack {
 	return packs
 }
 
+const methodPrefix = `(?im)^[ \t]*(?:Асинх\s+)?(?:Процедура|Функция)\s+`
+
 func defines(text, name string) bool {
-	re := regexp.MustCompile(`(?m)^(?:Асинх\s+)?(?:Процедура|Функция)\s+` + regexp.QuoteMeta(name) + `\s*\(`)
+	re := regexp.MustCompile(methodPrefix + regexp.QuoteMeta(name) + `\s*\(`)
 	return re.MatchString(text)
 }
 
 // Определённые в модуле процедуры и функции.
 func definedNames(text string) map[string]bool {
-	re := regexp.MustCompile(`(?m)^(?:Асинх\s+)?(?:Процедура|Функция)\s+([^\s(]+)\s*\(`)
+	re := regexp.MustCompile(methodPrefix + `([^\s(]+)\s*\(`)
 	out := map[string]bool{}
 	for _, m := range re.FindAllStringSubmatch(text, -1) {
-		if out[m[1]] {
+		name := strings.ToLower(m[1])
+		if out[name] {
 			fail("метод %s определён дважды (пакеты пересекаются по именам?)", m[1])
 		}
-		out[m[1]] = true
+		out[name] = true
 	}
 	return out
 }
@@ -459,19 +462,21 @@ func buildProcessing(packs []pack) []entry {
 	actions := regexp.MustCompile(`<Action>([^<]+)</Action>`).FindAllStringSubmatch(formXML, -1)
 	var stubs []string
 	for _, a := range actions {
-		if defined[a[1]] {
+		name := strings.ToLower(a[1])
+		if defined[name] {
 			continue
 		}
 		stubs = append(stubs, fmt.Sprintf("// Команда пакета сценариев, которого нет в этой сборке.\n&НаКлиенте\nПроцедура %[1]s(Команда)\n\n"+
 			"\tПоказатьПредупреждение(, \"Команда «%[1]s» относится к пакету сценариев, которого нет в этой сборке обработки.\");\n\nКонецПроцедуры", a[1]))
-		defined[a[1]] = true
+		defined[name] = true
 	}
 	if len(stubs) > 0 {
 		commands = append(commands, genMark+"\n\n"+strings.Join(stubs, "\n\n"))
 	}
 	form = insert(form, "КОМАНДЫ", strings.Join(commands, "\n\n"), "модуль формы")
+	defined = definedNames(form)
 	for _, m := range regexp.MustCompile(`<Event name="[^"]+">([^<]+)</Event>`).FindAllStringSubmatch(formXML, -1) {
-		if !definedNames(form)[m[1]] {
+		if !defined[strings.ToLower(m[1])] {
 			fail("обработчик события формы %s не определён", m[1])
 		}
 	}
@@ -554,7 +559,7 @@ func goBuild(dir, out, ldflags string) []byte {
 func buildGate() []entry {
 	gate := filepath.Join(root, "gate")
 	version := "Версия " + placeholder + "."
-	scripts := []string{"run.ps1", "deploy.ps1", "nightly.ps1", "report.ps1", "settings.ps1", "stats.ps1", "ui.ps1", "unittests.ps1", "unittests-cli.ps1", "update.ps1", "publish.ps1", "github.ps1", "check.ps1", "test/tests.ps1", "test/fakecom.ps1"}
+	scripts := []string{"run.ps1", "deploy.ps1", "nightly.ps1", "report.ps1", "settings.ps1", "stats.ps1", "ui.ps1", "unittests.ps1", "unittests-cli.ps1", "update.ps1", "publish.ps1", "github.ps1", "cluster-target.ps1", "locks.ps1", "check.ps1", "test/tests.ps1", "test/fakecom.ps1", "test/deploy-contract.tests.ps1"}
 	stamped := map[string]bool{"run.ps1": true, "deploy.ps1": true, "nightly.ps1": true, "report.ps1": true, "settings.ps1": true, "stats.ps1": true, "unittests-cli.ps1": true, "update.ps1": true, "publish.ps1": true, "github.ps1": true, "test/tests.ps1": true, "test/fakecom.ps1": true}
 	var files []entry
 	texts := map[string]string{}

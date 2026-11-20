@@ -36,6 +36,12 @@ type uiEvent struct {
 	Blocks      []subBlock `json:"blocks"`
 	Preselected []int      `json:"preselected"`
 	AllowEmpty  bool       `json:"allowEmpty"` // вопрос many: Enter без отметок - ответ «ни одного», а не отказ
+	Restart     bool       `json:"restart"`    // событие close: после выхода открыть ci заново (новый ci.exe)
+	Sections    []string   `json:"sections"`   // вопрос one: заголовок группы перед пунктом, "" - нет; по одному на пункт
+	Keys        []string   `json:"keys"`       // вопрос one: своя клавиша пункта (1-9, a-z) вместо порядковой; по одной на пункт
+	Hints       []string   `json:"hints"`      // вопрос one: пояснение пункта серым рядом с подписью, "" - нет; по одному на пункт
+	Status      string     `json:"status"`     // событие step: итог долгой операции - OK, WARN или FAIL
+	Ops         bool       `json:"ops"`        // событие plan: план долгих операций без вердикта, шаги закрывает событие step
 	Yes         string     `json:"yes"`
 	No          string     `json:"no"`
 	Lines       []string   `json:"lines"`
@@ -74,6 +80,8 @@ type exitMsg struct {
 
 type engine struct {
 	cmd     *exec.Cmd
+	stdout  io.Reader
+	stderr  io.Reader
 	channel string
 	started time.Time
 	script  string
@@ -94,8 +102,7 @@ func engineCommand(baseDir, script string, extra []string, channel string) *exec
 	return exec.Command("powershell.exe", args...)
 }
 
-// startEngine запускает движок и отдаёт его вывод в программу через p.Send.
-func startEngine(p *tea.Program, baseDir, script string, extra []string) (*engine, error) {
+func startEngine(baseDir, script string, extra []string) (*engine, error) {
 	// Папка канала - в папке гейта (ui\), а не в %TEMP%: сессионную временную папку RDP Windows чистит при
 	// отключении, и вопрос, оставшийся без ответа на ночь, уже не получал ответа. Не вышло - %TEMP%, как раньше.
 	uiDir := filepath.Join(baseDir, "ui")
@@ -122,22 +129,22 @@ func startEngine(p *tea.Program, baseDir, script string, extra []string) (*engin
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("не запустился %s: %w", script, err)
 	}
-	e := &engine{cmd: cmd, channel: channel, started: time.Now(), script: script}
+	return &engine{cmd: cmd, stdout: stdout, stderr: stderr, channel: channel, started: time.Now(), script: script}, nil
+}
 
+// Модель уже приняла engineStartedMsg: даже короткий процесс не пришлёт выход раньше запуска.
+func (e *engine) wait(p *tea.Program) tea.Msg {
 	done := make(chan struct{}, 2)
-	go readLines(p, stdout, done)
-	go readLines(p, stderr, done)
-	go func() {
-		<-done
-		<-done
-		err := cmd.Wait()
-		code := 0
-		if cmd.ProcessState != nil {
-			code = cmd.ProcessState.ExitCode()
-		}
-		p.Send(exitMsg{code: code, err: err})
-	}()
-	return e, nil
+	go readLines(p, e.stdout, done)
+	go readLines(p, e.stderr, done)
+	<-done
+	<-done
+	err := e.cmd.Wait()
+	code := 0
+	if e.cmd.ProcessState != nil {
+		code = e.cmd.ProcessState.ExitCode()
+	}
+	return exitMsg{code: code, err: err}
 }
 
 func readLines(p *tea.Program, r io.Reader, done chan<- struct{}) {

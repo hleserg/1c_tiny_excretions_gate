@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 const maxLogLines = 6000
@@ -50,6 +51,7 @@ type model struct {
 	script    string
 	extra     []string
 	eng       *engine
+	starting  bool
 	running   bool
 	exitCode  int
 	exitErr   error
@@ -76,6 +78,19 @@ type model struct {
 	height    int
 	stopAsked time.Time
 	notice    string
+
+	// ** Хлебников С.Ю. 20261120 Для шапки (#32): с какой базой работает скрипт (событие context) и когда от него
+	// было последнее сообщение - строка или событие. Видно и в узком окне, где нет колонки шагов.
+	context    string
+	lastOutput time.Time
+
+	// Скрипт попросил закрыть ci, когда кончится (событие close: гейт обновлён, а работает ещё прежний);
+	// restartAfter - и сразу открыть ci заново: в папке гейта уже новый ci.exe.
+	closeAfter   bool
+	restartAfter bool
+	// planOps - план колонки шагов прислан как план долгих операций (событие plan с ops): шаги закрывает
+	// событие step, узла «Вердикт» нет.
+	planOps bool
 }
 
 func newModel(baseDir, script string, extra []string) model {
@@ -85,14 +100,15 @@ func newModel(baseDir, script string, extra []string) model {
 	sp.Style = styleAccent
 	bar := progress.New(progress.WithGradient("#5A56E0", "#3EC7A0"), progress.WithoutPercentage())
 	return model{
-		baseDir: baseDir,
-		script:  script,
-		extra:   extra,
-		follow:  true,
-		logView: viewport.New(80, 20),
-		bar:     bar,
-		overall: newOverallBar(),
-		spin:    sp,
+		baseDir:  baseDir,
+		script:   script,
+		extra:    extra,
+		starting: true,
+		follow:   true,
+		logView:  viewport.New(80, 20),
+		bar:      bar,
+		overall:  newOverallBar(),
+		spin:     sp,
 	}
 }
 
@@ -107,7 +123,7 @@ func tick() tea.Cmd {
 func (m model) startCmd() tea.Cmd {
 	base, script, extra := m.baseDir, m.script, m.extra
 	return func() tea.Msg {
-		eng, err := startEngine(program, base, script, extra)
+		eng, err := startEngine(base, script, extra)
 		return engineStartedMsg{eng: eng, err: err}
 	}
 }
@@ -212,6 +228,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case engineStartedMsg:
+		m.starting = false
 		if msg.err != nil {
 			m.appendLine("Остановлено: " + msg.err.Error())
 			m.running = false
@@ -221,27 +238,41 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.eng = msg.eng
 		m.running = true
-		m.started = time.Now()
+		m.started = msg.eng.started
 		m.exitCode = 0
 		m.exitErr = nil
 		m.stopAsked = time.Time{}
+		m.closeAfter = false
+		m.restartAfter = false
 		m.touchActive()
-		return m, nil
+		return m, func() tea.Msg { return msg.eng.wait(program) }
 
 	case lineMsg:
+		m.lastOutput = time.Now()
 		m.appendLine(msg.text)
 		m.refreshLog()
 		return m, m.syncOverall()
 
 	case eventMsg:
 		ev := msg.ev
+		m.lastOutput = time.Now()
 		switch ev.Kind {
+		case "context":
+			m.context = ev.Text
 		case "plan":
-			m.setPlan(ev.Steps, ev.Parallel)
+			m.setPlan(ev.Steps, ev.Parallel, ev.Ops)
 			return m, m.syncOverall()
 		case "reset":
 			m.resetRun()
 			m.layout()
+		case "close":
+			m.closeAfter = true
+			m.restartAfter = ev.Restart
+		case "step":
+			// Долгая операция кончилась. У действия без своего плана шагов (выгрузка в git, типовая, сравнения)
+			// она встаёт в колонку шагов с итогом и временем; с планом колонку ведут план и строки [OK]/[FAIL].
+			m.addOperation(ev.Title, ev.Status, ev.Elapsed)
+			return m, m.syncOverall()
 		case "subplan":
 			m.setSubPlan(ev)
 			m.layout()
@@ -296,8 +327,14 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.queue = nil
 		if m.eng != nil {
 			m.eng.cleanup()
+			m.eng = nil
 		}
 		m.closeAll()
+		if m.closeAfter && msg.code == 0 {
+			// Скрипт просил закрыть ci (после обновления гейта) и кончился без ошибки. С ошибкой экран остаётся:
+			// её нужно прочитать.
+			return m, tea.Quit
+		}
 		m.layout()
 		m.refreshLog()
 		return m, m.syncOverall()
@@ -340,6 +377,12 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.dialogMouse(m.overlayMouse(msg))
 
 	case tea.KeyMsg:
+		if msg.String() == "f2" {
+			// Весь журнал - в буфер обмена. Мышь у ci.exe занята прокруткой и щелчками по пунктам, поэтому выделить
+			// текст в окне, как в обычной консоли, нельзя. Работает и при открытом вопросе.
+			m.copyLog()
+			return m, nil
+		}
 		if m.dialog != nil && m.dialog.docked() {
 			switch msg.String() {
 			case "up", "down", "pgup", "pgdown", "home", "end":
@@ -470,6 +513,9 @@ func describeAnswer(d *dialog) string {
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c", "q":
+		if m.starting {
+			return m, nil
+		}
 		if !m.running {
 			return m, tea.Quit
 		}
@@ -490,7 +536,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "enter", "r", "esc":
 		// Прогон кончился: снова главное меню гейта. Esc - так же, как Enter: привычнее.
-		if !m.running {
+		if !m.starting && !m.running {
+			m.starting = true
 			m.lines = nil
 			m.resetRun()
 			m.notice = ""
@@ -539,13 +586,24 @@ func (m model) View() string {
 }
 
 func (m model) viewHeader() string {
-	left := styleHeader.Render(" CI · гейт и обновление расширений ")
+	title := " CI · гейт и обновление расширений "
+	if m.width < minWidthForSteps {
+		title = " CI "
+	}
+	left := styleHeader.Render(title)
+	if m.context != "" {
+		left += styleAccent.Render(" " + m.context + " ")
+	}
 	state := ""
 	switch {
 	case m.running && !m.stopAsked.IsZero():
 		state = styleWarn.Render(" останавливается ")
+	case m.running && m.dialog != nil:
+		state = styleWarn.Render(" ждёт ответа ")
 	case m.running:
 		state = styleOk.Render(" " + m.spin.View() + " работает ")
+	case m.starting:
+		state = styleAccent.Render(" запускается ")
 	case m.exitCode == 0:
 		state = styleOk.Render(" готово ")
 	default:
@@ -560,12 +618,30 @@ func (m model) viewHeader() string {
 		state += " " + verdictStyle(m.verdict).Render(" "+short+" ")
 	}
 	clock := styleDim.Render(time.Now().Format("15:04:05") + " ")
+	// Скрипт давно молчит - когда было последнее сообщение; вывода «завис» нет: тихий шаг бывает и долгим.
+	if quiet := m.quietText(time.Now()); quiet != "" {
+		clock = styleDim.Render(quiet+" · ") + clock
+	}
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(state) - lipgloss.Width(clock)
 	if gap < 1 {
 		gap = 1
 	}
 	return left + state + strings.Repeat(" ", gap) + clock
 }
+
+// quietText - «посл. сообщение 03:12 (5 мин)», если скрипт работает и молчит дольше минуты; иначе пусто.
+func (m model) quietText(now time.Time) string {
+	if !m.running || m.lastOutput.IsZero() {
+		return ""
+	}
+	silent := now.Sub(m.lastOutput)
+	if silent < time.Minute {
+		return ""
+	}
+	return fmt.Sprintf("посл. сообщение %s (%d мин)", m.lastOutput.Format("15:04"), int(silent.Minutes()))
+}
+
+// ** Хлебников С.Ю. 20261120 конец
 
 func (m model) viewBody() string {
 	logBox := styleLog.Render(m.logView.View())
@@ -633,18 +709,31 @@ func (m model) viewProgress() string {
 	return styleProgressBox.Width(m.width - 2).Render(line1 + "\n" + line2 + "\n" + line3)
 }
 
+// copyLog - весь журнал (то, что в окне справа, без раскраски) в буфер обмена; итог - строкой подсказки.
+func (m *model) copyLog() {
+	lines := make([]string, len(m.lines))
+	for i, l := range m.lines {
+		lines[i] = ansi.Strip(l)
+	}
+	if err := writeClipboard(strings.Join(lines, "\r\n")); err != nil {
+		m.notice = "журнал в буфер обмена не скопировался: " + err.Error()
+		return
+	}
+	m.notice = fmt.Sprintf("журнал в буфере обмена: строк %d", len(lines))
+}
+
 func (m model) viewFooter() string {
 	var help string
 	switch {
-	case m.dialog != nil:
+	case m.dialog != nil || m.starting:
 		help = ""
 	case m.running:
-		help = "↑↓ PgUp PgDn журнал · f к концу · q остановить скрипт"
+		help = "↑↓ PgUp PgDn журнал · f к концу · F2 журнал в буфер обмена · q остановить скрипт"
 		if !m.stopAsked.IsZero() && time.Since(m.stopAsked) > 20*time.Second {
 			help += " · k снять процесс"
 		}
 	default:
-		help = "enter или esc снова в меню · q выход · ↑↓ журнал"
+		help = "enter или esc снова в меню · q выход · ↑↓ журнал · F2 журнал в буфер обмена"
 	}
 	// Строки подсказки не обрезаются: не влезает - переносится. Версия сборки - в правом нижнем углу.
 	width := max(20, m.width)

@@ -126,6 +126,10 @@ param(
     [Parameter(ParameterSetName = 'Accept', Mandatory = $true)]
     [string]$AcceptBaseline,
 
+    # С -AcceptBaseline: падения модульных тестов не принимать - в эталон тестов идут только прошедшие.
+    [Parameter(ParameterSetName = 'Accept')]
+    [switch]$KeepFailures,
+
     [Parameter(ParameterSetName = 'Password', Mandatory = $true)]
     [string]$SavePassword
 )
@@ -141,11 +145,9 @@ if ($UiChannel) {
 
 # Блокировку начала сеансов на время прогона ставит гейт (ответ «завершить и продолжить» перед началом).
 # Снимает её в конце прогона и при остановке; если скрипт оборвали, она кончится сама через SessionLockHours.
-$script:SessionLockSet = $false
-$script:SessionLockCode = ''
+$script:TestLockState = $null
 # Блокировку регламентных заданий гейт ставит в начале и обычно оставляет. С ключом -ReleaseJobsLock
 # (или настройкой ReleaseJobsLock) снимает в конце, но только если поставил её сам.
-$script:JobsLockSet = $false
 $script:JobsLockRelease = $false
 # Проверка конфигурации, которая идёт параллельно с остальными шагами, и ожидаемые длительности шагов плана
 # (для оценки, сколько осталось всего прогона).
@@ -169,15 +171,13 @@ trap {
     if ([string]$_.FullyQualifiedErrorId -ne [string]$_.Exception.Message -and $null -ne $_.InvocationInfo) {
         Write-Host ("  {0}" -f ($_.InvocationInfo.PositionMessage -split "`r?`n")[0]) -ForegroundColor DarkGray
     }
-    if ($script:SessionLockSet -or ($script:JobsLockSet -and $script:JobsLockRelease)) {
-        try { Clear-TestBaseLocks } catch { Write-Host ("Блокировки снять не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Yellow }
-    }
     # Итог остановленного прогона - в GitHub: причина, шаги, что успели, конец run.log.
     if ($script:PublishRunDir) { Invoke-RunPublish -Stage 'crash' -Message $_.Exception.Message }
     exit 1
 }
 
 $Root = $PSScriptRoot
+. (Join-Path $Root 'cluster-target.ps1')
 # Версия гейта - из заголовка этого файла (её ставит сборщик); показывается в меню у «Обновить гейт».
 $script:GateVersion = 'неизвестна'
 $gateVersionFound = [regex]::Match((@(Get-Content -LiteralPath $PSCommandPath -Encoding UTF8 -TotalCount 80) -join "`n"), 'Версия (\d{8}\.\d{6})\.')
@@ -204,10 +204,26 @@ function Get-Setting {
     return $Default
 }
 
+# Значения, которые в выводе и журнале заменяются звёздочками целиком (Get-MaskedLine): код разрешения входа.
+$script:MaskValues = @()
+
+function Get-MaskedLine {
+    # Чувствительное - звёздочками, одной обработкой на консоль, run.log и всё, что из них собирается (отчёты, итог
+    # в GitHub): пароль и код разрешения входа в ключах запуска 1С (/P, /UC) и в строке соединения (Pwd=, UC=) и
+    # само значение UnlockCode, где бы оно ни встретилось, - если в нём шесть знаков и больше (короткий код вроде
+    # «0» совпал бы с обычными цифрами текста; он закрыт в ключах и строке соединения).
+    param([string]$Line)
+    if (-not $Line) { return $Line }
+    $masked = [regex]::Replace([regex]::Replace($Line, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"')
+    $masked = [regex]::Replace($masked, '(?i)\b(Pwd|UC)="(?:[^"]|"")*"', '$1="***"')
+    foreach ($secret in @($script:MaskValues)) { if ($secret) { $masked = $masked.Replace([string]$secret, '***') } }
+    return $masked
+}
+
 function Write-RunLog {
     param([string]$Text)
     $stamp = Get-Date -Format 'HH:mm:ss'
-    [System.IO.File]::AppendAllText($script:RunLogPath, ("{0} {1}`r`n" -f $stamp, $Text), $Utf8Bom)
+    [System.IO.File]::AppendAllText($script:RunLogPath, ("{0} {1}`r`n" -f $stamp, (Get-MaskedLine $Text)), $Utf8Bom)
 }
 
 function Invoke-RunPublish {
@@ -2111,7 +2127,9 @@ if ($PSCmdlet.ParameterSetName -eq 'Password') {
 function Invoke-AcceptBaseline {
     # Принять замечания прогона как известные: записать их в эталон базы. Зовут ключ -AcceptBaseline
     # и пункт меню «Принять новое последнего прогона в эталон». Ошибка - исключением.
-    param([string]$RunPath)
+    # ** Хлебников С.Ю. 20261120 KeepFailures - частичное принятие: в эталон тестов из прогона идут только OK,
+    # у падений, пропусков и пропавших тестов остаётся прежняя запись (новое падение остаётся новым).
+    param([string]$RunPath, [switch]$KeepFailures)
     $acceptDir = $RunPath
     $verdictFile = Join-Path $acceptDir 'verdict.json'
     if (-not (Test-Path -LiteralPath $verdictFile)) { throw "Не нашёл verdict.json в $acceptDir" }
@@ -2131,11 +2149,39 @@ function Invoke-AcceptBaseline {
     if ($logFiles.Count -eq 0 -and -not (Test-Path -LiteralPath $acceptSelfCheck) -and -not (Test-Path -LiteralPath $acceptUnit)) {
         throw "В $acceptDir нет ни логов проверок (check*.log), ни записей самопроверки (selfcheck-after.norm.txt), ни результатов модульных тестов (unittests.txt): принимать нечего."
     }
+    $acceptScope = 'full'
     if (Test-Path -LiteralPath $acceptUnit) {
-        # Результаты модульных тестов того прогона: его падения становятся известными.
-        Copy-Item -LiteralPath $acceptUnit -Destination (Join-Path $baselineTarget 'unittests.txt') -Force
-        Write-Host 'Принято как известное: результаты модульных тестов'
+        $unitTarget = Join-Path $baselineTarget 'unittests.txt'
+        if ($KeepFailures) {
+            # Только прошедшие: строки эталона по ключу, OK прогона их заменяют или добавляются.
+            $acceptScope = 'partial'
+            $kept = [ordered]@{}
+            if (Test-Path -LiteralPath $unitTarget) {
+                foreach ($line in [System.IO.File]::ReadAllLines($unitTarget, [System.Text.Encoding]::UTF8)) {
+                    $clean = ([string]$line).TrimStart([char]0xFEFF)
+                    $parts = $clean.Split("`t")
+                    if ($parts.Length -ge 2) { $kept[$parts[1]] = $clean }
+                }
+            }
+            $takenOk = 0
+            $leftFailed = 0
+            foreach ($line in [System.IO.File]::ReadAllLines($acceptUnit, [System.Text.Encoding]::UTF8)) {
+                $clean = ([string]$line).TrimStart([char]0xFEFF)
+                $parts = $clean.Split("`t")
+                if ($parts.Length -lt 2) { continue }
+                if ($parts[0] -eq 'OK') { $kept[$parts[1]] = $clean; $takenOk++ }
+                elseif ($parts[0] -eq 'FAIL' -or $parts[0] -eq 'ERROR') { $leftFailed++ }
+            }
+            [System.IO.File]::WriteAllLines($unitTarget, [string[]]@($kept.Values), $Utf8Bom)
+            Write-Host ("Принято как известное: прошедшие модульные тесты ({0}); падения ({1}) не приняты - останутся новыми" -f $takenOk, $leftFailed)
+        }
+        else {
+            # Результаты модульных тестов того прогона: его падения становятся известными.
+            Copy-Item -LiteralPath $acceptUnit -Destination $unitTarget -Force
+            Write-Host 'Принято как известное: результаты модульных тестов'
+        }
     }
+    # ** Хлебников С.Ю. 20261120 конец
     foreach ($file in $logFiles) {
         $acceptLines = @(Read-V8Log $file.FullName)
         if (Test-DesignerBusy $acceptLines) {
@@ -2143,6 +2189,10 @@ function Invoke-AcceptBaseline {
             continue
         }
         $acceptRecords = @(ConvertTo-CheckRecords $acceptLines)
+        if ($acceptRecords.Count -eq 0 -and -not (Test-Path -LiteralPath (Join-Path $acceptDir ($file.BaseName + '.norm.txt')))) {
+            Write-Host ("Пропущено: {0} - в прогоне нет подтверждённого результата проверки" -f $file.Name) -ForegroundColor Yellow
+            continue
+        }
         [System.IO.File]::WriteAllLines((Join-Path $baselineTarget ($file.BaseName + '.norm.txt')), [string[]]$acceptRecords, $Utf8Bom)
         Write-Host ("Принято как известное: {0}, записей {1}" -f $file.BaseName, $acceptRecords.Count)
     }
@@ -2186,12 +2236,12 @@ function Invoke-AcceptBaseline {
         }
     }
     # Отметка в папке прогона: в списке прогонов он виден как принятый, второй раз его не предлагают.
-    [System.IO.File]::WriteAllLines((Join-Path $acceptDir 'accepted.txt'), [string[]]@(('time={0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))), $Utf8Bom)
+    [System.IO.File]::WriteAllLines((Join-Path $acceptDir 'accepted.txt'), [string[]]@(('time={0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')), ('scope={0}' -f $acceptScope)), $Utf8Bom)
     Write-Host "Эталон базы «$($acceptMeta.baseKey)» обновлён: $baselineTarget"
 }
 
 if ($PSCmdlet.ParameterSetName -eq 'Accept') {
-    Invoke-AcceptBaseline -RunPath (Resolve-RootPath $AcceptBaseline)
+    Invoke-AcceptBaseline -RunPath (Resolve-RootPath $AcceptBaseline) -KeepFailures:$KeepFailures
     exit 0
 }
 
@@ -2227,6 +2277,7 @@ $script:FileBase = [string](Get-Setting $cfg 'File' '')
 # Код разрешения входа: один и тот же для блокировки, которую ставит гейт, и для всех входов в базу. Пусто - 0.
 $script:UnlockCode = [string](Get-Setting $cfg 'UnlockCode' '0')
 if ([string]::IsNullOrWhiteSpace($script:UnlockCode)) { $script:UnlockCode = '0' }
+if ($script:UnlockCode.Length -ge 6) { $script:MaskValues = @($script:MaskValues) + @($script:UnlockCode) }
 
 if ([string]::IsNullOrEmpty($script:FileBase)) {
     if ([string]::IsNullOrEmpty($script:Server) -or [string]::IsNullOrEmpty($script:Base)) {
@@ -2277,6 +2328,7 @@ foreach ($unitName in $unitTestExtensions) {
 # (файл .epf или .erf, каталог выгрузки обработки). Обработки гейт пока только показывает.
 $inboxDir = Resolve-RootPath ([string](Get-Setting $cfg 'InboxDir' 'inbox'))
 # Меню и вопросы (ui.ps1): из ci.exe их рисует ci.exe, без него - консоль.
+. (Join-Path $Root 'locks.ps1')
 . (Join-Path $Root 'ui.ps1')
 Initialize-Ui -Channel $UiChannel
 
@@ -2511,8 +2563,20 @@ function Invoke-AcceptFromMenu {
     if ($red) { $yesText = 'Принять, хотя прогон красный' }
     $sure = Confirm-Ui -Question ('Принять новое прогона {0} в эталон? Что внутри - report.txt и *.new.txt в папке прогона.' -f $runName) -Yes $yesText -No 'Не принимать'
     if ($sure -ne $true) { Write-Host '  Не принято.'; return $false }
+    # ** Хлебников С.Ю. 20261120 Падения модульных тестов - отдельным решением: принять остальное (снимки, самопроверку),
+    # а падения оставить новыми.
+    $keepFailures = $false
+    $unitFile = Join-Path $Run.Dir.FullName 'unittests.txt'
+    if (Test-Path -LiteralPath $unitFile) {
+        $unitFailed = @([System.IO.File]::ReadAllLines($unitFile, [System.Text.Encoding]::UTF8) | Where-Object { ([string]$_).TrimStart([char]0xFEFF) -match '^(FAIL|ERROR)\t' }).Count
+        if ($unitFailed -gt 0) {
+            $withFailures = Confirm-Ui -Question ('В прогоне {0} падают модульные тесты ({1}). Их тоже принять как известные?' -f $runName, $unitFailed) -Yes 'Да, и падения' -No 'Нет, падения оставить новыми'
+            $keepFailures = ($withFailures -ne $true)
+        }
+    }
+    # ** Хлебников С.Ю. 20261120 конец
     try {
-        Invoke-AcceptBaseline -RunPath $Run.Dir.FullName
+        Invoke-AcceptBaseline -RunPath $Run.Dir.FullName -KeepFailures:$keepFailures
         Write-Host ('  Принято: новое прогона {0} теперь известное.' -f $runName) -ForegroundColor Green
         return $true
     }
@@ -2543,6 +2607,14 @@ function Show-RecentRuns {
             $rows += [pscustomobject]@{ Dir = $run; Verdict = $verdict }
             $acceptedMark = ''
             if (Test-Path -LiteralPath (Join-Path $run.FullName 'accepted.txt')) { $acceptedMark = ' · принят в эталон' }
+            # ** Хлебников С.Ю. 20261120 Выпущен в рабочую (released.txt пишет deploy): с отклонением - если несмотря на гейт.
+            $releasedFile = Join-Path $run.FullName 'released.txt'
+            if (Test-Path -LiteralPath $releasedFile) {
+                $releasedLast = @([System.IO.File]::ReadAllLines($releasedFile, [System.Text.Encoding]::UTF8) | Where-Object { $_ } | Select-Object -Last 1)
+                if ($releasedLast.Count -gt 0 -and ([string]$releasedLast[0]).Contains("riskAccepted=1")) { $acceptedMark += ' · выпущен с отклонением' }
+                else { $acceptedMark += ' · выпущен' }
+            }
+            # ** Хлебников С.Ю. 20261120 конец
             $resumeMark = ''
             if ($null -ne $verdict) {
                 $resumeInfo = Get-UiField $verdict 'resume' $null
@@ -2587,7 +2659,7 @@ function Show-RecentRuns {
             $canAccept = ($null -ne $acceptable -and $acceptable.Dir.FullName -eq $runPath)
             if ($canAccept) { $actions.Add([pscustomobject]@{ Key = 'accept'; Label = 'Принять новое этого прогона в эталон (станет известным)' }) }
             $resumeTarget = Get-ResumeTargetDir
-            if ($resumeTarget -and [System.IO.Path]::GetFullPath($resumeTarget).TrimEnd('\') -eq [System.IO.Path]::GetFullPath($runPath).TrimEnd('\') -and (Get-ResumeMenuLabel $resumeTarget)) {
+            if ($resumeTarget -and [System.IO.Path]::GetFullPath($resumeTarget).TrimEnd('\') -eq [System.IO.Path]::GetFullPath($runPath).TrimEnd('\') -and (Get-ResumeMenuHint $resumeTarget)) {
                 $actions.Add([pscustomobject]@{ Key = 'resume'; Label = 'Продолжить прогон с упавшего шага…' })
             }
             $actions.Add([pscustomobject]@{ Key = 'back'; Label = 'Назад к списку' })
@@ -2861,9 +2933,17 @@ function Get-ResumeTargetDir {
     return $dir
 }
 
-function Get-ResumeMenuLabel {
-    # Пункт меню «Продолжить прогон»: последний прогон этой базы не зелёный и записан гейтом с продолжением.
-    # Пусто - пункта нет. Можно ли на самом деле и с какого шага, считает Get-ResumePlan, когда пункт выбран.
+function New-MenuItem {
+    # Пункт меню гейта: Key - что делать (строка таблицы $menuSlots), Label - подпись, она не меняется; Hint -
+    # переменное и подробности, их показывают серым рядом с подписью.
+    param([string]$Key, [string]$Label, [string]$Hint = '')
+    return [pscustomobject]@{ Key = $Key; Label = $Label; Hint = $Hint }
+}
+
+function Get-ResumeMenuHint {
+    # Пояснение пункта меню «Продолжить прогон с упавшего шага»: какой прогон и чем кончился. Пункт есть, если
+    # последний прогон этой базы не зелёный и записан гейтом с продолжением; пусто - пункта нет. Можно ли на самом
+    # деле и с какого шага, считает Get-ResumePlan, когда пункт выбран.
     param([string]$Dir)
     if (-not $Dir) { return '' }
     $record = Read-RunRecord $Dir
@@ -2872,7 +2952,7 @@ function Get-ResumeMenuLabel {
         if ([string](Get-UiField $record.Verdict 'verdict' '') -eq 'GREEN') { return '' }
         if ([string](Get-UiField $record.Verdict 'kitDecision' '') -eq 'rollbackFailed') { return '' }
     }
-    return ('Продолжить прогон {0} с упавшего шага ({1})' -f $record.Name, (Get-RunListText $record.Verdict))
+    return ('{0} ({1})' -f $record.Name, (Get-RunListText $record.Verdict))
 }
 
 function Get-InboxList {
@@ -3813,18 +3893,50 @@ function Invoke-UtStep {
         Add-StepResult -Name $StepName -Status 'FAIL' -Detail ("отчёт jUnit не разобрался: {0}" -f $_.Exception.Message) -Log $session.Junit -Seconds $session.Seconds
         return
     }
+    $expectedTests = @($known | Where-Object { $_.Registered -and -not $_.Disabled } | ForEach-Object { $_.Key })
+    if ($Filter) { $expectedTests = @($Filter) }
+    $reported = @{}
+    foreach ($result in $results) {
+        if ($result.Method) { $reported[($result.Key -replace '\s*\[.*$', '')] = $true }
+    }
+    $missing = @($expectedTests | Where-Object { -not $reported.ContainsKey($_) })
+    $failed = @($results | Where-Object { Test-UtFailed $_.Status })
+    $issue = ''
+    if ($results.Count -eq 0) { $issue = 'в отчёте jUnit нет результатов тестов' }
+    elseif ($missing.Count -gt 0) {
+        $issue = 'в отчёте jUnit нет результатов запланированных тестов ({0}): {1}' -f $missing.Count, (($missing | Select-Object -First 5) -join ', ')
+        if ($failed.Count -gt 0) { $issue += ('. Ошибка: {0}' -f $failed[0].Message) }
+    }
+    elseif ($session.State -eq 'done' -and (($session.Code -notin @('0', '1')) -or (($session.Code -eq '1') -ne ($failed.Count -gt 0)))) {
+        $issue = 'код возврата YAxUnit «{0}», падений в jUnit: {1}' -f $session.Code, $failed.Count
+    }
+    if ($issue) {
+        # Отчёт остаётся в папке прогона. unittests.txt доступен для принятия вручную только после этой проверки.
+        Add-StepResult -Name $StepName -Status 'FAIL' -Detail $issue -Log $session.Junit -Seconds $session.Seconds
+        return
+    }
     $resultFile = Join-Path $RunDir 'unittests.txt'
     [System.IO.File]::WriteAllLines($resultFile, [string[]]@($results | ForEach-Object { Format-UtResultLine $_ }), $Utf8Bom)
     $comparison = Compare-UtResults -Current $results -BaselineFile $unitBaselineFile
-    $failed = @($results | Where-Object { Test-UtFailed $_.Status })
     $passed = @($results | Where-Object { $_.Status -eq 'OK' }).Count
     $skippedCount = @($results | Where-Object { $_.Status -eq 'SKIP' }).Count
+    # ** Хлебников С.Ю. 20261120 Пустой и неполный отчёт - красный выше (сверка с запланированными). Здесь - тесты,
+    # что были в эталоне, а в каталоге их больше нет (Gone): жёлтый, эталон их не теряет.
+    $goneCount = 0
+    if (-not $Filter) { $goneCount = @($comparison.Gone).Count }
+    $changedCount = @($comparison.ReasonChanged).Count
+    # ** Хлебников С.Ю. 20261120 конец
     $detail = 'тестов {0}: прошло {1}, упало {2}' -f $results.Count, $passed, $failed.Count
-    if ($failed.Count -gt 0) { $detail += (' (новых {0}, известных {1})' -f @($comparison.NewFailed).Count, @($comparison.KnownFailed).Count) }
+    if ($failed.Count -gt 0) {
+        $newErrors = @($comparison.NewFailed | Where-Object { $_.Status -eq 'ERROR' }).Count
+        $newFails = @($comparison.NewFailed).Count - $newErrors
+        $detail += (' (новых {0}: ERROR - ошибка выполнения {1}, FAIL - не прошло утверждение {2}; известных {3})' -f @($comparison.NewFailed).Count, $newErrors, $newFails, @($comparison.KnownFailed).Count)
+    }
+    if ($changedCount -gt 0) { $detail += (', известных падает по-другому {0} (unittests.changed.txt)' -f $changedCount) }
     if ($skippedCount -gt 0) { $detail += (', пропущено {0}' -f $skippedCount) }
     if ($disabled.Count -gt 0 -and -not $Filter) { $detail += (', выключено {0}' -f $disabled.Count) }
     if (@($comparison.Fixed).Count -gt 0) { $detail += (', починились {0}' -f @($comparison.Fixed).Count) }
-    if (@($comparison.Gone).Count -gt 0 -and -not $Filter) { $detail += (', пропало из эталона {0}' -f @($comparison.Gone).Count) }
+    if ($goneCount -gt 0) { $detail += (', пропало из эталона {0}: эталон не сдвинут, принять - вручную' -f $goneCount) }
     if (-not $comparison.HasBaseline) { $detail += '; эталона тестов не было' }
     if ($problems -gt 0) { $detail += ('; замечаний к описаниям тестов {0} (unittests-*.catalog.txt)' -f $problems) }
     if ($session.State -eq 'junit') { $detail += '; кода возврата YAxUnit нет (движок упал после отчёта, см. unittests\yaxunit.log) - итог по junit.xml' }
@@ -3837,16 +3949,24 @@ function Invoke-UtStep {
         $sample = (@($comparison.NewFailed | Select-Object -First 3 | ForEach-Object {
                     $message = [string]$_.Message
                     if ($message.Length -gt 160) { $message = $message.Substring(0, 160) + '...' }
-                    '{0}: {1}' -f $_.Key, $message
+                    '{0} ({1}): {2}' -f $_.Key, (Get-UtStatusTitle $_.Status), $message
                 }) -join ' | ')
         $detail += ('. Новые падения в unittests.new.txt: {0}' -f $sample)
     }
-    elseif ($problems -gt 0) { $status = 'WARN' }
-    # Эталон двигается сам, когда новых падений нет (как у самопроверки); прогон одного теста эталон не трогает.
+    elseif ($problems -gt 0 -or $goneCount -gt 0 -or $changedCount -gt 0) { $status = 'WARN' }
+    if ($changedCount -gt 0) {
+        $changedLines = @($comparison.ReasonChanged | ForEach-Object { ("{0}`t{1}`tбыло: {2} {3}`tстало: {4} {5}" -f $_.Result.Status, $_.Result.Key, $_.BeforeStatus, $_.BeforeMessage, $_.Result.Status, (([string]$_.Result.Message) -replace '\s+', ' ')) })
+        [System.IO.File]::WriteAllLines((Join-Path $RunDir 'unittests.changed.txt'), [string[]]$changedLines, $Utf8Bom)
+    }
+    # ** Хлебников С.Ю. 20261120 Эталон двигается сам, когда новых падений нет, - но только по подтверждённым OK
+    # (Merge-UtBaseline): у падений, пропусков и пропавших тестов остаётся прежняя запись, и следующий прогон снова
+    # их покажет. Прогон одного теста эталон не трогает. Целиком - только принятием.
     if ($status -ne 'FAIL' -and -not $Filter) {
         New-Item -ItemType Directory -Path $baselineDir -Force | Out-Null
-        Copy-Item -LiteralPath $resultFile -Destination $unitBaselineFile -Force
+        $mergedLines = Merge-UtBaseline -Current $results -BaselineFile $unitBaselineFile
+        [System.IO.File]::WriteAllLines($unitBaselineFile, [string[]]$mergedLines, $Utf8Bom)
     }
+    # ** Хлебников С.Ю. 20261120 конец
     Add-StepResult -Name $StepName -Status $status -Detail $detail -Log $session.Junit -Seconds $session.Seconds
 }
 
@@ -4120,37 +4240,52 @@ if (-not $Tests) { Invoke-RunPublish -Pending }
 $menuKeys = @($PSBoundParameters.Keys | Where-Object { $_ -ne 'UiChannel' })
 if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-UiCanAsk)) {
     $choice = ''
+    # Слоты меню: порядок строк - порядок пунктов на экране, у пункта - группа и своя клавиша. Клавиша не зависит от
+    # того, какие условные пункты сейчас показаны (inbox пуст, прогон зелёный, подготовки нет): «d» - всегда
+    # «Обновить рабочую базу». Новый пункт меню - новая строка здесь (клавиши - из 1-9, a-z, без повторов).
+    $menuSlots = @(
+        @('kit', 'Тестовая база', '1'), @('asis', 'Тестовая база', '2'), @('resume', 'Тестовая база', '3'),
+        @('gitimport', 'Тестовая база', '4'), @('gitexport', 'Тестовая база', '5'), @('accept', 'Тестовая база', '6'),
+        @('runs', 'Тестовая база', '7'), @('tests', 'Тестовая база', '8'),
+        @('precheck', 'Рабочая база', '9'), @('applyprep', 'Рабочая база', 'a'), @('prepare', 'Рабочая база', 'b'),
+        @('cancelprep', 'Рабочая база', 'c'), @('deploy', 'Рабочая база', 'd'), @('rollback', 'Рабочая база', 'e'),
+        @('basestate', 'Рабочая база', 'f'),
+        @('cmpext', 'Сравнить и забрать', 'g'), @('cmpepf', 'Сравнить и забрать', 'h'), @('pullext', 'Сравнить и забрать', 'i'),
+        @('pullepf', 'Сравнить и забрать', 'j'), @('gitprod', 'Сравнить и забрать', 'k'),
+        @('settings', 'Гейт', 'l'), @('update', 'Гейт', 'm'), @('stats', 'Гейт', 'n'), @('comcheck', 'Гейт', 'o'), @('exit', 'Гейт', 'p'))
     while ($true) {
         # inbox - заново на каждом круге меню: «Подтянуть из рабочей» кладёт туда новое.
         $inboxList = New-Object System.Collections.Generic.List[object]
         if (Test-Path -LiteralPath $inboxDir) { Add-InboxItems -Dir $inboxDir -Depth 0 -Items $inboxList }
         $usable = @($inboxList | Where-Object { $_.Usable })
         $unusable = @($inboxList | Where-Object { -not $_.Usable })
+        # Подпись пункта не меняется; переменное (сколько в inbox, какой прогон, какая версия, что подготовлено) и
+        # подробности - в пояснении: его показывают серым рядом с подписью.
         $menu = New-Object System.Collections.Generic.List[object]
-        if ($usable.Count -gt 0) { $menu.Add([pscustomobject]@{ Key = 'kit'; Label = ("Прогон с обновлением из inbox ({0})" -f $usable.Count) }) }
-        $menu.Add([pscustomobject]@{ Key = 'asis'; Label = 'Прогон на том, что есть в базе' })
+        if ($usable.Count -gt 0) { $menu.Add((New-MenuItem 'kit' 'Прогон с обновлением из inbox' ('обновлений в inbox: {0}' -f $usable.Count))) }
+        $menu.Add((New-MenuItem 'asis' 'Прогон на том, что есть в базе'))
         # Последний прогон не зелёный - его можно продолжить с упавшего шага, не гоняя всё заново.
         $resumeDir = Get-ResumeTargetDir
-        $resumeLabel = Get-ResumeMenuLabel $resumeDir
-        if ($resumeLabel) { $menu.Add([pscustomobject]@{ Key = 'resume'; Label = $resumeLabel }) }
+        $resumeHint = Get-ResumeMenuHint $resumeDir
+        if ($resumeHint) { $menu.Add((New-MenuItem 'resume' 'Продолжить прогон с упавшего шага' $resumeHint)) }
         # Расширения и обработки через git (deploy.ps1 -GitImport/-GitExport, раздел 5.23).
         $gitRepo = [string](Get-Setting $cfg 'ExtensionsRepo' '')
         if ($gitRepo -and (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1'))) {
-            $menu.Add([pscustomobject]@{ Key = 'gitimport'; Label = ('Загрузить из git в {0} ({1})' -f $script:Base, $gitRepo) })
-            $menu.Add([pscustomobject]@{ Key = 'gitexport'; Label = ('Выгрузить {0} в git: правки temp - веткой и pull request' -f $script:Base) })
-            $menu.Add([pscustomobject]@{ Key = 'gitprod'; Label = ('Снимок внешних обработок рабочей в git (ветка {0}, рабочую только читает)' -f [string](Get-Setting $cfg 'ExtensionsProdBranch' 'prod')) })
+            $menu.Add((New-MenuItem 'gitimport' 'Загрузить из git' ('в {0} из {1}' -f $script:Base, $gitRepo)))
+            $menu.Add((New-MenuItem 'gitexport' 'Выгрузить temp в git' ('правки {0} - веткой и pull request' -f $script:Base)))
+            $menu.Add((New-MenuItem 'gitprod' 'Снимок внешних обработок рабочей в git' ('ветка {0}, рабочую только читает' -f [string](Get-Setting $cfg 'ExtensionsProdBranch' 'prod'))))
         }
         $acceptable = Get-AcceptableRun
         if ($null -ne $acceptable) {
-            $menu.Add([pscustomobject]@{ Key = 'accept'; Label = ('Принять новое последнего прогона в эталон ({0}, {1})' -f $acceptable.Dir.Name, (Get-RunListText $acceptable.Verdict)) })
+            $menu.Add((New-MenuItem 'accept' 'Принять новое последнего прогона в эталон' ('{0}, {1}' -f $acceptable.Dir.Name, (Get-RunListText $acceptable.Verdict))))
         }
-        $menu.Add([pscustomobject]@{ Key = 'runs'; Label = 'Результаты последних прогонов' })
-        if ($unitTestExtensions.Count -gt 0) { $menu.Add([pscustomobject]@{ Key = 'tests'; Label = ('Модульные тесты: список, прогон, новый тест, забрать из {0}' -f $script:Base) }) }
-        $menu.Add([pscustomobject]@{ Key = 'stats'; Label = 'Статистика длительностей: план и факт' })
-        $menu.Add([pscustomobject]@{ Key = 'settings'; Label = 'Настройки (config.psd1)' })
-        if ([string](Get-Setting $cfg 'UpdateRepo' '')) { $menu.Add([pscustomobject]@{ Key = 'update'; Label = ('Обновить гейт из GitHub (стоит {0})' -f $script:GateVersion) }) }
+        $menu.Add((New-MenuItem 'runs' 'Результаты последних прогонов'))
+        if ($unitTestExtensions.Count -gt 0) { $menu.Add((New-MenuItem 'tests' 'Модульные тесты' ('список, прогон, новый тест, забрать из {0}' -f $script:Base))) }
+        $menu.Add((New-MenuItem 'stats' 'Статистика длительностей' 'план и факт'))
+        $menu.Add((New-MenuItem 'settings' 'Настройки гейта'))
+        if ([string](Get-Setting $cfg 'UpdateRepo' '')) { $menu.Add((New-MenuItem 'update' 'Обновить гейт из GitHub' ('стоит {0}' -f $script:GateVersion))) }
         if (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1')) {
-            $menu.Add([pscustomobject]@{ Key = 'deploy'; Label = 'Обновить рабочую базу (deploy)' })
+            $menu.Add((New-MenuItem 'deploy' 'Обновить рабочую базу' 'за один заход, без подготовки'))
             # Обновление в два приёма (deploy.ps1 -Prepare/-ApplyPrepared/-CancelPrepared): подготовка - без блокировок,
             # пользователи работают; что подготовлено - в deploy\prepared.json.
             $preparedFile = Join-Path (Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))) 'prepared.json'
@@ -4161,27 +4296,27 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
                 catch { $preparedBroken = $true }
             }
             if ($null -eq $preparedState -and -not $preparedBroken) {
-                $menu.Add([pscustomobject]@{ Key = 'prepare'; Label = 'Подготовить обновление рабочей: копии и загрузка без применения, пользователи работают' })
+                $menu.Add((New-MenuItem 'prepare' 'Подготовить обновление рабочей' 'копии и загрузка без применения, пользователи работают'))
             }
             else {
                 $preparedNames = @(foreach ($preparedItem in @(Get-UiField $preparedState 'extensions' @())) { [string](Get-UiField $preparedItem 'name' '') }) -join ', '
                 $preparedTime = [string](Get-UiField $preparedState 'timeText' '?')
                 if ($null -ne $preparedState -and -not [bool](Get-UiField $preparedState 'partial' $false)) {
-                    $menu.Add([pscustomobject]@{ Key = 'applyprep'; Label = ('Обновить рабочую подготовленным ({0}; подготовлено {1})' -f $preparedNames, $preparedTime) })
+                    $menu.Add((New-MenuItem 'applyprep' 'Обновить рабочую подготовленным' ('{0}; подготовлено {1}' -f $preparedNames, $preparedTime)))
                 }
-                $menu.Add([pscustomobject]@{ Key = 'prepare'; Label = 'Подготовить заново (прошлая подготовка отменяется)' })
-                $menu.Add([pscustomobject]@{ Key = 'cancelprep'; Label = 'Отменить подготовку рабочей: вернуть расширения к применённым версиям' })
+                $menu.Add((New-MenuItem 'prepare' 'Подготовить обновление рабочей' 'заново: прошлая подготовка отменяется'))
+                $menu.Add((New-MenuItem 'cancelprep' 'Отменить подготовку рабочей' 'вернуть расширения к применённым версиям'))
             }
-            $menu.Add([pscustomobject]@{ Key = 'basestate'; Label = 'Показать состояние баз: блокировки и сеансы' })
-            $menu.Add([pscustomobject]@{ Key = 'comcheck'; Label = ('Проверка внешнего соединения (COM) с {0}: как читаются расширения, только читает' -f $script:Base) })
-            $menu.Add([pscustomobject]@{ Key = 'cmpext'; Label = 'Сравнить расширения: рабочая и temp' })
-            $menu.Add([pscustomobject]@{ Key = 'cmpepf'; Label = 'Сравнить внешние обработки: рабочая и temp' })
-            $menu.Add([pscustomobject]@{ Key = 'precheck'; Label = 'Проверка рабочей перед обновлением (только читает): что изменит загрузка, каких настроек нет' })
-            $menu.Add([pscustomobject]@{ Key = 'rollback'; Label = 'Откатить рабочую базу' })
-            $menu.Add([pscustomobject]@{ Key = 'pullext'; Label = 'Подтянуть расширения из рабочей (в inbox)' })
-            $menu.Add([pscustomobject]@{ Key = 'pullepf'; Label = 'Подтянуть обработки из рабочей (в inbox)' })
+            $menu.Add((New-MenuItem 'basestate' 'Показать состояние баз' 'блокировки и сеансы'))
+            $menu.Add((New-MenuItem 'comcheck' 'Проверка внешнего соединения (COM)' ('с {0}: как читаются расширения, только читает' -f $script:Base)))
+            $menu.Add((New-MenuItem 'cmpext' 'Сравнить расширения' 'рабочая и temp'))
+            $menu.Add((New-MenuItem 'cmpepf' 'Сравнить внешние обработки' 'рабочая и temp'))
+            $menu.Add((New-MenuItem 'precheck' 'Проверка рабочей перед обновлением' 'что изменит загрузка, каких настроек нет; только читает'))
+            $menu.Add((New-MenuItem 'rollback' 'Откатить рабочую базу'))
+            $menu.Add((New-MenuItem 'pullext' 'Подтянуть расширения из рабочей' 'в inbox'))
+            $menu.Add((New-MenuItem 'pullepf' 'Подтянуть обработки из рабочей' 'в inbox'))
         }
-        $menu.Add([pscustomobject]@{ Key = 'exit'; Label = 'Выход' })
+        $menu.Add((New-MenuItem 'exit' 'Выход'))
         $notes = @()
         # Итог ночного прогона (nightly.ps1) - первой строкой: его смотрят утром.
         $nightlyLast = Join-Path $Root 'nightly\last.json'
@@ -4201,8 +4336,25 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             catch { $notes += 'ночной прогон: nightly\last.json не читается' }
         }
         if ($usable.Count -eq 0) { $notes += 'в inbox нет обновлений расширений и обработок: прогон с обновлением недоступен' }
-        $picked = Select-UiOne -Header ("Гейт расширений: {0} на {1}" -f $script:Base, $script:Server) -Items @($menu | ForEach-Object { $_.Label }) -Notes $notes
-        if ($picked -lt 0) { $choice = 'exit' } else { $choice = $menu[$picked].Key }
+        # На экран - в порядке слотов: группа за группой, заголовок группы - у её первого показанного пункта.
+        $menuShown = New-Object System.Collections.Generic.List[object]
+        $menuSections = New-Object System.Collections.Generic.List[string]
+        $menuKeys = New-Object System.Collections.Generic.List[string]
+        $menuGroup = ''
+        foreach ($slot in $menuSlots) {
+            foreach ($entry in @($menu | Where-Object { $_.Key -eq $slot[0] })) {
+                $menuShown.Add($entry)
+                if ($slot[1] -ne $menuGroup) { $menuSections.Add([string]$slot[1]) } else { $menuSections.Add('') }
+                $menuGroup = [string]$slot[1]
+                $menuKeys.Add([string]$slot[2])
+            }
+        }
+        if ($menuShown.Count -ne $menu.Count) {
+            $slotNames = @($menuSlots | ForEach-Object { $_[0] })
+            throw ('у пункта меню нет слота в $menuSlots: {0}' -f (@($menu | Where-Object { $slotNames -notcontains $_.Key } | ForEach-Object { $_.Key }) -join ', '))
+        }
+        $picked = Select-UiOne -Header ("Гейт расширений: {0} на {1}" -f $script:Base, $script:Server) -Items @($menuShown | ForEach-Object { $_.Label }) -Notes $notes -Sections $menuSections.ToArray() -Keys $menuKeys.ToArray() -Hints @($menuShown | ForEach-Object { [string]$_.Hint })
+        if ($picked -lt 0) { $choice = 'exit' } else { $choice = $menuShown[$picked].Key }
         if ($choice -eq 'exit') { Write-Host 'Выход.'; exit 0 }
         # Экран ci.exe - с чистого листа: шаги и вердикт прошлого действия не должны висеть над следующим.
         Send-UiReset
@@ -4285,16 +4437,29 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             continue
         }
         if ($choice -eq 'update') {
-            # update.ps1: релизы GitHub, выбрать, поставить. Код 10 - поставлен: скрипты на диске уже новые, меню - заново.
+            # update.ps1: релизы GitHub, выбрать, поставить. Код 10 - поставлен: скрипты и ci.exe на диске уже новые,
+            # а работают прежние. Меню здесь больше не открывается: в ci.exe - перезапустить его или закрыть (событие
+            # close, новый ci.exe - в этом же окне), в консоли - выйти.
             $updateArgs = @{}
             if ($UiChannel) { $updateArgs['UiChannel'] = $UiChannel }
             & (Join-Path $Root 'update.ps1') @updateArgs
             $updateCode = $LASTEXITCODE
-            Wait-UiAcknowledge
             if ($updateCode -eq 10) {
-                Write-Host 'Гейт обновлён: перезапусти ci (закрой окно и открой снова).' -ForegroundColor Green
+                if ($UiChannel) {
+                    $afterUpdate = Read-UiChoice -Header 'Гейт обновлён, а работает ещё прежний. Что дальше?' -Keys @('1', '2') -Labels @('Перезапустить ci: новый откроется в этом же окне', 'Закрыть ci') -CancelKey '2' -DefaultKey '1' -Dock
+                    Send-UiClose -Restart:($afterUpdate -eq '1')
+                    if ($afterUpdate -eq '1') { Write-Host 'Гейт обновлён: перезапускаю ci.' -ForegroundColor Green }
+                    else { Write-Host 'Гейт обновлён: закрываю ci, новый - при следующем запуске.' -ForegroundColor Green }
+                    # Эту строку видно, только если ci.exe события close не знает (он старше этой кнопки).
+                    Write-Host 'Если окно ci осталось на этом экране - закрой его и открой снова.' -ForegroundColor DarkGray
+                }
+                else {
+                    Wait-UiAcknowledge -Label 'Закрыть'
+                    Write-Host 'Гейт обновлён: запусти гейт заново.' -ForegroundColor Green
+                }
                 exit 0
             }
+            Wait-UiAcknowledge
             continue
         }
         if ($choice -eq 'settings') {
@@ -4508,6 +4673,8 @@ $referenceSnapshotDir = Join-Path $RunDir 'before-selfcheck'
 
 Write-Host ''
 Write-Host ("Прогон {0}, база {1}" -f $runId, $baseKey) -ForegroundColor Cyan
+# ** Хлебников С.Ю. 20261120 База - в шапку ci.exe (событие context): видно и в узком окне.
+if ($UiChannel) { Send-UiEvent @{ kind = 'context'; text = ('база ' + $baseKey) } }
 Write-Host ("Папка прогона: {0}" -f $RunDir)
 Write-RunLog ("Прогон {0}, база {1}, комплект: {2}" -f $runId, $baseKey, $Kit)
 
@@ -4798,6 +4965,11 @@ function Add-CheckStep {
     if ($Blocking) { $badStatus = 'FAIL' }
 
     $records = @(ConvertTo-CheckRecords $Result.Lines)
+    if ($Result.ExitCode -eq 101 -and $records.Count -eq 0 -and -not $Result.TimedOut) {
+        # До исключения известных сообщений: у выполненной проверки с кодом 101 должна быть хотя бы одна запись.
+        Add-StepResult -Name $Name -Status $badStatus -Detail 'код 101, но в журнале конфигуратора нет замечаний или файл /Out отсутствует' -Log $Result.Log -Seconds $Result.Seconds
+        return
+    }
     # Замечания по модулям тестовых расширений (Get-UtCheckIgnorePattern) - не в счёт: их видно в шаге «Модульные тесты».
     $utIgnored = 0
     if ($script:UtCheckIgnore) {
@@ -5257,6 +5429,12 @@ function Get-SelfCheckFailure {
     return ("обработка открылась, но тестирование не началось: {0}" -f $reason)
 }
 
+function Test-KitBackupFile {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    return ((Get-Item -LiteralPath $Path -ErrorAction Stop).Length -gt 0)
+}
+
 function Get-ExtensionNamesBefore {
     # Имена расширений, которые стояли в базе до загрузки: строки «ext=Имя|...» из сведений самопроверки «до».
     # $null - узнать не удалось: самопроверка до загрузки не выполнялась или обработка не открылась.
@@ -5388,6 +5566,7 @@ function Connect-TestBaseAgent {
     $link = [pscustomobject]@{
         Connector       = $null
         Agent           = $null
+        Server          = $script:Server
         Clusters        = @()
         Errors          = @()
         ClusterUser     = [string](Get-Setting $cfg 'ClusterAdmin' '')
@@ -5436,46 +5615,24 @@ function Get-TestBaseSessions {
     # Возвращает объекты: Text - для человека, IsDesigner - конфигуратор, IsError - не получилось прочитать.
     param($Link)
     $list = New-Object System.Collections.Generic.List[object]
-    foreach ($message in @($Link.Errors)) { $list.Add([pscustomobject]@{ Text = $message; IsDesigner = $false; IsError = $true }) }
-    foreach ($cluster in @($Link.Clusters)) {
-        foreach ($session in @($Link.Agent.GetSessions($cluster))) {
-            $sessionBase = ''
-            try { $sessionBase = [string]$session.infoBase.Name } catch { continue }
-            if ($sessionBase -ine $script:Base) { continue }
+    try {
+        $target = Resolve-ClusterBase $Link $script:Base $adminUser $adminPassword
+        foreach ($session in @($Link.Agent.GetInfoBaseSessions($target.Cluster, $target.ShortBase))) {
             $list.Add([pscustomobject]@{ Text = (Format-ClusterSession $session); IsDesigner = ([string]$session.AppID -eq 'Designer'); IsError = $false })
         }
     }
+    catch { $list.Add([pscustomobject]@{ Text = $_.Exception.Message; IsDesigner = $false; IsError = $true }) }
     return $list.ToArray()
 }
 
 function Get-TestBaseInfoBase {
-    # Свойства тестовой базы в кластере через рабочий процесс. Менять их платформа даёт только со входом в саму
-    # базу: пользователь и пароль - как у конфигуратора (AdminUser), пустое имя - вход текущим пользователем Windows.
-    # Возвращает соединение с рабочим процессом (Process) и описание базы (InfoBase).
     param($Link)
-    if ($null -eq $Link.Agent) { throw (@($Link.Errors) -join '; ') }
-    foreach ($cluster in @($Link.Clusters)) {
-        $processes = @($Link.Agent.GetWorkingProcesses($cluster) | Where-Object { [int]$_.Running -eq 1 })
-        if ($processes.Count -eq 0) { continue }
-        $process = $Link.Connector.ConnectWorkingProcess(("tcp://{0}:{1}" -f $processes[0].HostName, $processes[0].MainPort))
-        $process.AuthenticateAdmin($Link.ClusterUser, $Link.ClusterPassword)
-        $process.AddAuthentication($adminUser, $adminPassword)
-        foreach ($infoBase in @($process.GetInfoBases())) {
-            if ([string]$infoBase.Name -ieq $script:Base) {
-                return [pscustomobject]@{ Process = $process; InfoBase = $infoBase }
-            }
-        }
-    }
-    throw ("в кластере не нашёл базу {0} или нет рабочего процесса" -f $script:Base)
+    return (Get-CurrentClusterBase $Link $script:Base $adminUser $adminPassword)
 }
 
 function Read-TestBaseInfoBase {
-    # Описание базы, прочитанное заново: после UpdateInfoBase проверяем, что изменение записалось.
     param($Target)
-    foreach ($infoBase in @($Target.Process.GetInfoBases())) {
-        if ([string]$infoBase.Name -ieq $script:Base) { return $infoBase }
-    }
-    throw ("база {0} пропала из списка баз кластера" -f $script:Base)
+    return (Read-ClusterBaseAgain $Target $script:Base)
 }
 
 function Set-TestBaseSessionLock {
@@ -5483,69 +5640,36 @@ function Set-TestBaseSessionLock {
     # Срок - SessionLockHours: если скрипт оборвут, блокировка кончится сама.
     # Чужую блокировку (стояла до гейта) не трогаем.
     param($Target, [string]$Code, [int]$Hours)
-    $infoBase = $Target.InfoBase
+    $infoBase = Read-TestBaseInfoBase $Target
     if ([bool]$infoBase.SessionsDenied) {
         $existing = [string]$infoBase.PermissionCode
-        if ($existing -and $existing -ne $Code) {
+        if ($existing -cne $Code) {
             return ("блокировка сеансов уже стоит, не моя, код разрешения у неё другой: впиши его в UnlockCode, иначе гейт в базу не войдёт")
         }
         return 'блокировка сеансов уже стоит, не моя: не трогаю и в конце не снимаю'
     }
     $until = (Get-Date).AddHours($Hours)
     # С запасом назад: часы сервера 1С и этой машины могут расходиться на минуты.
-    $infoBase.DeniedFrom = (Get-Date).AddMinutes(-30)
-    $infoBase.DeniedTo = $until
-    $infoBase.DeniedMessage = ("Идёт проверка расширений, база заблокирована до {0}" -f $until.ToString('HH:mm'))
-    $infoBase.PermissionCode = $Code
-    $infoBase.SessionsDenied = $true
-    $Target.Process.UpdateInfoBase($infoBase)
-    $check = Read-TestBaseInfoBase $Target
-    if (-not [bool]$check.SessionsDenied) { throw 'блокировка сеансов не записалась' }
-    $script:SessionLockSet = $true
-    $script:SessionLockCode = $Code
+    $message = "Идёт проверка расширений, база заблокирована до {0}" -f $until.ToString('HH:mm')
+    Set-GateSessionLock $script:TestLockState $Target ((Get-Date).AddMinutes(-30)) $until $Code $message { param($t) Read-TestBaseInfoBase $t }
     Write-RunLog ("Блокировка начала сеансов {0} поставлена до {1}" -f $script:Base, $until.ToString('yyyy-MM-dd HH:mm'))
     return ("поставил блокировку начала сеансов до {0} (код разрешения из UnlockCode); сниму в конце прогона" -f $until.ToString('HH:mm'))
 }
 
 function Clear-TestBaseLocks {
-    # В конце прогона и при остановке. Снимает блокировку начала сеансов, которую поставил гейт: только если она
-    # всё ещё наша (стоит, и код разрешения тот же). Блокировку регламентных заданий снимает, только если её
-    # поставил гейт и задан ключ -ReleaseJobsLock или настройка ReleaseJobsLock.
-    # Подключение новое: за время прогона старое могло отвалиться.
-    $releaseSessions = $script:SessionLockSet
-    $releaseJobs = ($script:JobsLockSet -and $script:JobsLockRelease)
-    if (-not $releaseSessions -and -not $releaseJobs) { return }
-    $script:SessionLockSet = $false
-    $script:JobsLockSet = $false
+    $state = $script:TestLockState
+    if ($null -eq $state -or (-not $state.Expected.Count -and -not ($state.JobsSet -and $script:JobsLockRelease))) { return }
     try {
         $target = Get-TestBaseInfoBase (Connect-TestBaseAgent)
-        $infoBase = $target.InfoBase
-        $changes = New-Object System.Collections.Generic.List[string]
-        if ($releaseSessions) {
-            if ([bool]$infoBase.SessionsDenied -and [string]$infoBase.PermissionCode -eq $script:SessionLockCode) {
-                $infoBase.SessionsDenied = $false
-                $infoBase.DeniedMessage = ''
-                $infoBase.PermissionCode = ''
-                $changes.Add('блокировку начала сеансов')
-            }
-            else {
-                Write-Host ("Блокировка начала сеансов {0} уже снята или заменена чужой: не трогаю." -f $script:Base) -ForegroundColor DarkGray
-                Write-RunLog 'Блокировка начала сеансов к концу прогона уже не наша, не трогаю'
-            }
-        }
-        if ($releaseJobs -and [bool]$infoBase.ScheduledJobsDenied) {
-            $infoBase.ScheduledJobsDenied = $false
-            $changes.Add('блокировку регламентных заданий')
-        }
-        if ($changes.Count -gt 0) {
-            $target.Process.UpdateInfoBase($infoBase)
-            $text = "Снял у {0}: {1}." -f $script:Base, ($changes -join ' и ')
+        $released = Restore-GateLocks $state $target $script:JobsLockRelease { param($t) Read-TestBaseInfoBase $t }
+        if ($released) {
+            $text = "Снял у {0}: {1}." -f $script:Base, $released
             Write-Host $text
             Write-RunLog $text
         }
     }
     catch {
-        $text = "Блокировки {0} снять не получилось: {1}. Блокировка сеансов кончится сама в срок; снять руками - в консоли кластера, erp_temp - Свойства." -f $script:Base, $_.Exception.Message
+        $text = "Снятие блокировок {0} не подтверждено: {1}. Проверь свойства базы в консоли кластера." -f $script:Base, $_.Exception.Message
         Write-Host $text -ForegroundColor Yellow
         Write-RunLog $text
     }
@@ -5564,30 +5688,23 @@ function Stop-TestBaseSessions {
         return $lines.ToArray()
     }
     if ($null -eq $Link) { $Link = Connect-TestBaseAgent }
-    foreach ($message in @($Link.Errors)) { $lines.Add($message) }
-    if ($null -eq $Link.Agent) { return $lines.ToArray() }
-
+    $target = Resolve-ClusterBase $Link $script:Base $adminUser $adminPassword
     $killed = 0
-    foreach ($cluster in @($Link.Clusters)) {
-        foreach ($session in @($Link.Agent.GetSessions($cluster))) {
-            $sessionBase = ''
-            try { $sessionBase = [string]$session.infoBase.Name } catch { continue }
-            if ($sessionBase -ine $script:Base) { continue }
-            $description = Format-ClusterSession $session
-            $isDesigner = ([string]$session.AppID -eq 'Designer')
-            if ($Designers -and -not $isDesigner) { continue }
-            if ($isDesigner -and -not $Designers) {
-                $lines.Add(("{0} - конфигуратор, не трогаю: закрой его сам" -f $description))
-                continue
-            }
-            try {
-                $Link.Agent.TerminateSession($cluster, $session)
-                $killed++
-                $lines.Add(("{0} - завершён" -f $description))
-            }
-            catch {
-                $lines.Add(("{0} - не завершился: {1}" -f $description, $_.Exception.Message))
-            }
+    foreach ($session in @($Link.Agent.GetInfoBaseSessions($target.Cluster, $target.ShortBase))) {
+        $description = Format-ClusterSession $session
+        $isDesigner = ([string]$session.AppID -eq 'Designer')
+        if ($Designers -and -not $isDesigner) { continue }
+        if ($isDesigner -and -not $Designers) {
+            $lines.Add(("{0} - конфигуратор, не трогаю: закрой его сам" -f $description))
+            continue
+        }
+        try {
+            $Link.Agent.TerminateSession($target.Cluster, $session)
+            $killed++
+            $lines.Add(("{0} - завершён" -f $description))
+        }
+        catch {
+            $lines.Add(("{0} - не завершился: {1}" -f $description, $_.Exception.Message))
         }
     }
     if ($killed -eq 0 -and $lines.Count -eq 0) {
@@ -6051,6 +6168,12 @@ Save-RunState
 
 # Меню «Тесты» (ключ -Tests): только тестовые расширения, без комплекта, подготовки базы, проверок и вердикта гейта.
 if ($Tests) {
+    if (-not $script:FileBase -and $Tests -ne 'Take') {
+        # Цель в кластере запоминается с начала запуска. Не определилась - как и в прогоне: стоп только на двух
+        # регистрациях одного имени, в остальном гейт в кластере ничего не трогает и идёт дальше.
+        try { $null = Get-TestBaseInfoBase (Connect-TestBaseAgent) }
+        catch { if ($_.Exception.Message -match '^Неоднозначная цель') { throw } }
+    }
     if ($unitTestExtensions.Count -eq 0) { throw 'модульных тестов нет: в config.psd1 пустой UnitTestExtensions' }
     $serviceFailed = 0
     if ($Tests -eq 'Take') {
@@ -6178,11 +6301,15 @@ Send-UiPlan -StepNames $planSteps.ToArray() -Parallel $planParallel
 $script:PrepLines = New-Object System.Collections.Generic.List[string]
 function Add-PrepLine {
     param([string]$Text, [string]$Color = 'Gray')
+    # Строки подготовки уходят в итог прогона и в GitHub: чувствительное закрывается здесь же.
+    $Text = Get-MaskedLine $Text
     $script:PrepLines.Add($Text)
     Write-Host ('  ' + $Text) -ForegroundColor $Color
     Write-RunLog ('Подготовка базы: ' + $Text)
 }
 
+$script:TestLockState = New-GateLockState
+try {
 Write-Host 'Подготовка базы:'
 if (-not [string]::IsNullOrEmpty($script:FileBase)) {
     Add-PrepLine 'база файловая: блокировки ставятся через кластер, здесь их нет; сеансы не проверяю'
@@ -6192,19 +6319,17 @@ else {
     $prepTarget = $null
     try {
         $prepTarget = Get-TestBaseInfoBase $prepLink
-        if ([bool]$prepTarget.InfoBase.ScheduledJobsDenied) {
-            Add-PrepLine 'блокировка регламентных заданий уже стоит'
-        }
-        else {
-            $prepTarget.InfoBase.ScheduledJobsDenied = $true
-            $prepTarget.Process.UpdateInfoBase($prepTarget.InfoBase)
-            if (-not [bool](Read-TestBaseInfoBase $prepTarget).ScheduledJobsDenied) { throw 'флажок не записался' }
-            $script:JobsLockSet = $true
+        if (Set-GateJobsLock $script:TestLockState $prepTarget { param($t) Read-TestBaseInfoBase $t }) {
             if ($script:JobsLockRelease) { Add-PrepLine 'поставил блокировку регламентных заданий; в конце прогона сниму (-ReleaseJobsLock)' 'Green' }
             else { Add-PrepLine 'поставил блокировку регламентных заданий; она остаётся и после прогона' 'Green' }
         }
+        else { Add-PrepLine 'блокировка регламентных заданий уже стоит' }
     }
     catch {
+        # Одно имя базы на две регистрации - настройка противоречива, на этом прогон встаёт (#5).
+        # Остальное (агент сервера не ответил, кластер или база не пустили, адрес кластера не сошёлся с Server) -
+        # цели в кластере нет: гейт там ничего не трогает, прогон идёт без блокировок и списка сеансов.
+        if ($_.Exception.Message -match '^Неоднозначная цель') { throw }
         $prepTarget = $null
         Add-PrepLine ("блокировку регламентных заданий поставить не смог: {0}. Поставь её в консоли кластера (erp_temp - Свойства) или задай AdminUser с паролем" -f $_.Exception.Message) 'Yellow'
     }
@@ -6321,7 +6446,7 @@ else {
                 $script:UnlockCode = $lockCode
                 $designerBase = @('DESIGNER') + @(Get-ConnectionArgs -User $adminUser -Password $adminPassword) +
                     @('/DisableStartupDialogs', '/DisableStartupMessages')
-                Add-PrepLine 'UnlockCode пустой: код разрешения входа на этот прогон - 123'
+                Add-PrepLine 'UnlockCode пустой: на этот прогон взят код разрешения входа по умолчанию; задай свой в Настройки, Базы, UnlockCode'
             }
             if ($null -eq $prepTarget) {
                 Add-PrepLine 'блокировку начала сеансов поставить не смог (нет входа в свойства базы, см. выше): сеансы могут вернуться' 'Yellow'
@@ -6424,6 +6549,12 @@ if (Restore-Phase 'backup') {
     # Прежние версии и копия эталона перед загрузкой - из первого прогона цепочки.
     if ($script:RunState.referenceSnapshotDir) { $referenceSnapshotDir = [string]$script:RunState.referenceSnapshotDir }
     Restore-ChainReferences
+    foreach ($item in $kitItems) {
+        if ($item.WasInBase -eq 'no' -or (Test-KitBackupFile $item.Backup)) { continue }
+        Add-StepResult -Name ("Проверить копию {0}" -f $item.Name) -Status 'FAIL' -Detail 'в предыдущем прогоне нет пригодной копии для отката'
+        $proceed = $false
+    }
+    if (-not $proceed) { Set-PhaseState 'backup' 'failed' }
 }
 elseif ($kitItems.Count -gt 0) {
     # Какие расширения были в базе до загрузки. Без самопроверки «до» это неизвестно; тогда про расширение
@@ -6431,7 +6562,7 @@ elseif ($kitItems.Count -gt 0) {
     $extensionsBefore = Get-ExtensionNamesBefore (Join-Path $RunDir 'selfcheck-before\try1\info.txt')
 
     New-Item -ItemType Directory -Path $referenceSnapshotDir -Force | Out-Null
-    foreach ($file in @($selfCheckReferenceFile, $selfCheckReferenceInfoFile, $selfCheckLastFile, $selfCheckSnapshotsFile, $selfCheckExchangeFile, $coverageReferenceFile, $exchangeRulesStateFile, $exchangeRulesFindingsFile)) {
+    foreach ($file in @($selfCheckReferenceFile, $selfCheckReferenceInfoFile, $selfCheckLastFile, $selfCheckSnapshotsFile, $selfCheckExchangeFile, $coverageReferenceFile, $exchangeRulesStateFile, $exchangeRulesFindingsFile, $unitBaselineFile)) {
         if (Test-Path -LiteralPath $file) { Copy-Item -LiteralPath $file -Destination $referenceSnapshotDir -Force }
     }
 
@@ -6446,26 +6577,31 @@ elseif ($kitItems.Count -gt 0) {
         $backupFile = Join-Path $beforeDir ("{0}_{1}_{2}.cfe" -f $baseKey, $item.Name, (Get-Date -Format 'yyyyMMdd'))
         $result = Invoke-Designer -Command @('/DumpCfg', ('"{0}"' -f $backupFile), '-Extension', $item.Name) `
             -LogName ("backup_{0}.log" -f $item.Name) -TimeoutSec $timeoutLoadSec -Title $stepName
-        $dumped = ($result.ExitCode -eq 0 -and -not $result.TimedOut -and (Test-Path -LiteralPath $backupFile))
+        $dumped = ($result.ExitCode -eq 0 -and -not $result.TimedOut -and (Test-KitBackupFile $backupFile))
 
         # Новым расширение считается, только когда сошлись оба признака: его нет в списке расширений
-        # из самопроверки и конфигуратор его не выгрузил. От этого зависит, удалять ли его при откате.
-        if ($listed -eq 'no' -and -not $dumped -and -not $result.TimedOut -and -not (Test-DesignerBusy $result.Lines)) {
+        # из самопроверки и конфигуратор сообщил, что расширение не найдено.
+        $missingExtension = ($result.Lines -match 'расширени[ея].*не найден|не найден[оа]? расширение')
+        if ($listed -eq 'no' -and $result.ExitCode -ne 0 -and -not $result.TimedOut -and $missingExtension -and -not (Test-DesignerBusy $result.Lines)) {
             $item.WasInBase = 'no'
             Add-StepResult -Name $stepName -Status 'OK' -Detail 'расширения в базе ещё нет, оно новое: сохранять нечего' -Log $result.Log -Seconds $result.Seconds
             continue
         }
-        $saved = Add-SimpleStep -Name $stepName -Result $result -Blocking $false
-        if ($saved -and $dumped) {
-            $item.Backup = $backupFile
-            $item.WasInBase = 'yes'
+        if ($listed -eq 'yes') { $item.WasInBase = 'yes' }
+        if (-not $result.TimedOut -and $result.ExitCode -eq 0 -and -not $dumped) {
+            Add-StepResult -Name $stepName -Status 'FAIL' -Detail 'конфигуратор вернул 0, но файл резервной копии отсутствует или пуст' -Log $result.Log -Seconds $result.Seconds
+            $proceed = $false
+            continue
         }
-        elseif ($listed -eq 'yes') {
-            $item.WasInBase = 'yes'
+        if (-not (Add-SimpleStep -Name $stepName -Result $result -Blocking $true)) {
+            $proceed = $false
+            continue
         }
+        $item.Backup = $backupFile
+        $item.WasInBase = 'yes'
     }
     $script:RunState.referenceSnapshotDir = $referenceSnapshotDir
-    Set-PhaseState 'backup' 'done'
+    if ($proceed) { Set-PhaseState 'backup' 'done' } else { Set-PhaseState 'backup' 'failed' }
 }
 else { Set-PhaseState 'backup' 'na' }
 
@@ -7072,6 +7208,7 @@ function Write-RunSummary {
         preparation = @($script:PrepLines)
         gateVersion = $script:GateVersion
         resume      = $resumeInfo
+        checkedState = $script:CheckedState
     }
     [System.IO.File]::WriteAllText((Join-Path $RunDir 'verdict.json'), ($summary | ConvertTo-Json -Depth 6), $Utf8Bom)
 
@@ -7101,6 +7238,30 @@ function Write-RunSummary {
     [System.IO.File]::WriteAllLines((Join-Path $RunDir 'summary.txt'), $text.ToArray(), $Utf8Bom)
     Save-RunState
 }
+
+# ** Хлебников С.Ю. 20261120 Снимок «что проверено» (#27): хеш-суммы расширений и обработок temp сразу после проверок,
+# до вопроса про комплект - по нему обновление рабочей сверяет, что выпускает то, что проверено. Только если
+# рабочая настроена (ProdBase); отдельным процессом deploy.ps1 -SnapshotTemp (внешнее соединение, только чтение).
+# Не снялся - в verdict.json так и записано, на вердикт не влияет.
+$script:CheckedState = $null
+if ([string](Get-Setting $cfg 'ProdBase' '') -and (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1'))) {
+    $checkedFile = Join-Path $RunDir 'checked-state.json'
+    $snapshotLog = Join-Path $RunDir 'checked-state.log'
+    $snapshotArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f (Join-Path $Root 'deploy.ps1')), '-SnapshotTemp', ('"{0}"' -f $checkedFile))
+    if ($Config) { $snapshotArgs += @('-Config', ('"{0}"' -f $Config)) }
+    Write-Host 'Снимок temp для обновления рабочей (хеш-суммы расширений и обработок, только чтение)...' -ForegroundColor DarkGray
+    try {
+        $snapshotProcess = Start-Process -FilePath 'powershell.exe' -ArgumentList ($snapshotArgs -join ' ') -NoNewWindow -PassThru -RedirectStandardOutput $snapshotLog -RedirectStandardError ($snapshotLog + '.err')
+        $snapshotLimit = ([int](Get-Setting $cfg 'ComTimeoutSec' 300) * 4 + 60) * 1000
+        if (-not $snapshotProcess.WaitForExit($snapshotLimit)) { try { $snapshotProcess.Kill() } catch { }; throw 'не уложился в срок' }
+        if (-not (Test-Path -LiteralPath $checkedFile)) { throw ('файла снимка нет (код {0}), см. checked-state.log' -f $snapshotProcess.ExitCode) }
+        $script:CheckedState = [System.IO.File]::ReadAllText($checkedFile, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+    }
+    catch { $script:CheckedState = [pscustomobject]@{ ok = $false; error = [string]$_.Exception.Message } }
+    if ([bool](Get-UiField $script:CheckedState 'ok' $false)) { Write-RunLog 'Снимок temp для обновления рабочей снят' }
+    else { Write-RunLog ('Снимок temp для обновления рабочей не снят: ' + [string](Get-UiField $script:CheckedState 'error' '')) }
+}
+# ** Хлебников С.Ю. 20261120 конец
 
 # Итог пишется сразу: вопрос про комплект может ждать ответа сколько угодно.
 Write-RunSummary -KitDecision '' -Aftermath @()
@@ -7272,8 +7433,8 @@ elseif ($anyTouched -gt 0) {
             if ($outcome.Done) {
                 $decision = 'rolledBack'
                 $aftermath.Add('Откат выполнен: комплект возвращён к состоянию до загрузки.')
-                # Эталон самопроверки и отпечаток возвращаются к тем, что были перед загрузкой.
-                foreach ($name in @('selfcheck.norm.txt', 'selfcheck.info.txt', 'selfcheck.last.txt', 'selfcheck.snapshots.txt', 'coverage.txt')) {
+                # Эталон самопроверки, отпечаток и эталон модульных тестов возвращаются к тем, что были перед загрузкой.
+                foreach ($name in @('selfcheck.norm.txt', 'selfcheck.info.txt', 'selfcheck.last.txt', 'selfcheck.snapshots.txt', 'coverage.txt', 'unittests.txt')) {
                     $savedFile = Join-Path $referenceSnapshotDir $name
                     $currentFile = Join-Path $baselineDir $name
                     if (Test-Path -LiteralPath $savedFile) { Copy-Item -LiteralPath $savedFile -Destination $currentFile -Force }
@@ -7351,7 +7512,8 @@ if ($decision -ne 'rolledBack' -and $decision -ne 'rollbackFailed') {
     }
 }
 
-Clear-TestBaseLocks
+}
+finally { Clear-TestBaseLocks }
 Invoke-RunPublish -Stage 'final'
 
 exit $exitCode
