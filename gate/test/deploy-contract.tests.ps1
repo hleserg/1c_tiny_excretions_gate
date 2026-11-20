@@ -198,7 +198,9 @@ function New-ContractCatalogLink {
             Check (@($r.ComLog | Where-Object { $_ -match '\tTerminateSession ' }).Count -eq 0) 'блокировки руками завершали сеансы'
             Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase erp_base ' }).Count -eq 2) 'свойства рабочей записаны не два раза'
             $log = Join-Path $sb 'deploy\locks\run.log'
-            Check ((Test-Path -LiteralPath $log) -and ([System.IO.File]::ReadAllText($log, $utf8) -match 'поставил блокировку начала сеансов до .*поставил блокировку регламентных заданий')) 'в deploy\locks\run.log нет сделанного'
+            $logText = ''
+            if (Test-Path -LiteralPath $log) { $logText = [System.IO.File]::ReadAllText($log, $utf8) }
+            Check ($logText.Contains('erp_base: поставил блокировку начала сеансов до ') -and $logText.Contains('erp_base: поставил блокировку регламентных заданий')) ("в deploy\locks\run.log нет сделанного: {0}" -f $logText.Trim())
             $runDirs = @(Get-ChildItem -LiteralPath (Join-Path $sb 'deploy') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8}-\d{6}$' })
             Check ($runDirs.Count -eq 0) 'блокировки руками создали папку запуска обновления'
         }
