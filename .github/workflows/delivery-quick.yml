@@ -38,6 +38,21 @@ jobs:
         run: |
           & ./gate/test/tests.ps1 -Only delivery -TimeoutSec 600 -Keep
           exit $LASTEXITCODE
+      - name: Собрать песочницы
+        if: always()
+        shell: pwsh
+        run: |
+          $dst = 'gate/test/out'
+          New-Item -ItemType Directory -Path $dst -Force | Out-Null
+          $src = Join-Path $env:TEMP 'ci-tests'
+          if (Test-Path $src) {
+            Get-ChildItem $src -Recurse -File | Where-Object { $_.Extension -in '.txt','.json','.jsonl','.md','.log' -and $_.Length -lt 2MB } | ForEach-Object {
+              $rel = $_.FullName.Substring($src.Length).TrimStart('\')
+              $to = Join-Path $dst $rel
+              New-Item -ItemType Directory -Path (Split-Path -Parent $to) -Force | Out-Null
+              Copy-Item $_.FullName $to
+            }
+          }
       - name: Отчёт
         if: always()
         uses: actions/upload-artifact@v4
@@ -45,8 +60,5 @@ jobs:
           name: delivery-quick
           path: |
             gate/test/last-run.txt
-            ${{ runner.temp }}/ci-tests/**/output.txt
-            ${{ runner.temp }}/ci-tests/**/deliveries/**/state.json
-            ${{ runner.temp }}/ci-tests/**/deliveries/**/report.md
-            ${{ runner.temp }}/ci-tests/**/deploy/delivery/run.log
+            gate/test/out/**
           if-no-files-found: ignore

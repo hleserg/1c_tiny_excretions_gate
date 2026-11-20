@@ -27,6 +27,9 @@
 
 #region Настройки, реестр, журнал
 
+# Блокировка начала сеансов temp на время применения (Lock-DeliveryTemp); снимается в конце прохода в любом случае.
+$script:DeliveryTempLock = $null
+
 function Get-DeliverySetup {
     $root = Resolve-RootPath ([string](Get-Setting $cfg 'DeliveryDir' 'deliveries'))
     $inbox = Resolve-RootPath ([string](Get-Setting $cfg 'DeliveryInboxDir' 'Входящие'))
@@ -676,7 +679,7 @@ function Sync-DeliveryTemp {
     }
     $drift = Get-DeliveryTempDrift -Setup $Setup -GitState $GitState -HeadFiles $headFiles -Head $head
     if (@($drift.Changes).Count -gt 0) {
-        $lines = @(Get-GitChangeLines $drift.Changes)
+        $lines = Get-GitChangeLines $drift.Changes
         Write-DeliveryEvent $D $State 'temp-drift' ("в {0} правки после синхронизации с git: {1} - сохраняю веткой и PR" -f $script:TempBase, ($lines -join '; ')) 'Yellow'
         $made = New-GitTempBranch -Setup $Setup -State $GitState -Base $drift.Known -Changes $drift.Changes -Note ('перед поставкой ' + [string]$State['id'])
         $State['drift'] = [ordered]@{ number = $made.Number; url = $made.Url; branch = $made.Branch; commit = $made.Sha; continued = [bool]$made.Continued }
@@ -1204,7 +1207,7 @@ function Invoke-DeliveryApply {
         }
         if (@($drift.Changes).Count -gt 0) {
             Unlock-DeliveryTemp $lock
-            Write-DeliveryEvent $D $State 'temp-changed' ("temp изменился после сборки кандидата ({0}): применение отложено, правки - в git, кандидат будет пересобран" -f ((@(Get-GitChangeLines $drift.Changes)) -join '; ')) 'Yellow'
+            Write-DeliveryEvent $D $State 'temp-changed' ("temp изменился после сборки кандидата ({0}): применение отложено, правки - в git, кандидат будет пересобран" -f ((Get-GitChangeLines $drift.Changes) -join '; ')) 'Yellow'
             $made = New-GitTempBranch -Setup $Setup -State $GitState -Base $drift.Known -Changes $drift.Changes -Note ('во время поставки ' + [string]$State['id'])
             $State['drift'] = [ordered]@{ number = $made.Number; url = $made.Url; branch = $made.Branch; commit = $made.Sha; continued = [bool]$made.Continued }
             Set-DeliveryStatus $D $State 'waiting-temp' ('правки temp в PR #{0}' -f $made.Number)
@@ -1606,11 +1609,22 @@ function Invoke-Delivery {
         }
         if ($OnlyId) { $ids = New-Object System.Collections.Generic.List[string]; $ids.Add($OnlyId) }
         $worked = 0
+        $failed = 0
         foreach ($id in $ids) {
             $state = Read-DeliveryState $D $id
             if ($null -eq $state -or [string]$state['status'] -eq 'done') { continue }
             $worked++
-            Invoke-DeliveryStep -D $D -Setup $setup -GitState $gitState -Id $id -Unattended:$Unattended
+            try { Invoke-DeliveryStep -D $D -Setup $setup -GitState $gitState -Id $id -Unattended:$Unattended }
+            catch {
+                # Сбой этапа: причина и место - в журнал поставки; состояние остаётся как было, следующий проход
+                # начинает с проверки фактического состояния.
+                $failed++
+                $where = ([string]$_.ScriptStackTrace -split "`r?`n" | Select-Object -First 3) -join ' <- '
+                $state = Read-DeliveryState $D $id
+                if ($null -ne $state) { Write-DeliveryEvent $D $state 'error' ("сбой: {0} ({1})" -f $_.Exception.Message, $where) 'Red' }
+                else { Write-Line ("Поставка {0}: сбой: {1} ({2})" -f $id, $_.Exception.Message, $where) 'Red' }
+                if ($null -ne $script:DeliveryTempLock) { Unlock-DeliveryTemp $script:DeliveryTempLock }
+            }
             $gitState = Read-GitState $setup
             $state = Read-DeliveryState $D $id
             $report = Get-DeliveryReport -D $D -State $state
@@ -1619,6 +1633,7 @@ function Invoke-Delivery {
         }
         if ($worked -eq 0) { Write-Line 'Поставок в работе нет, во «Входящих» пусто.' 'Green' }
         Update-DeliveryOpenList $D
+        if ($failed -gt 0) { return 1 }
         return 0
     }
     finally {
