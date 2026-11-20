@@ -221,7 +221,8 @@ function Invoke-Script {
     if (Test-Path -LiteralPath $callsFile) {
         $calls = @([System.IO.File]::ReadAllLines($callsFile, $utf8) | ForEach-Object {
                 $parts = $_.Split("`t")
-                [pscustomobject]@{ Mode = $parts[1]; Code = [int]$parts[2]; Line = $parts[3] }
+                # Time - когда вызов закончился (подставная 1С пишет строку перед выходом), ЧЧ:мм:сс.мс.
+                [pscustomobject]@{ Time = $parts[0]; Mode = $parts[1]; Code = [int]$parts[2]; Line = $parts[3] }
             })
     }
     $runDir = ''
@@ -2160,7 +2161,7 @@ $tests = @(
             Check ($text -match 'сообщение: Идёт обновление') 'нет сообщения блокировки'
             Check ($text -match 'Блокировка регламентных заданий: ВКЛЮЧЕНА') 'нет блокировки регламентных'
             Check ($text -match 'из них конфигураторов: 1') 'нет конфигуратора в сеансах'
-            Check (@($r.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'состояние баз что-то поменяло'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase |\tTerminateSession ' }).Count -eq 0) 'состояние баз что-то поменяло'
             Check (-not (Test-Path -LiteralPath (Join-Path $sb 'deploy\state\deploy.json'))) 'появился deploy.json'
             $runDirs = @(Get-ChildItem -LiteralPath (Join-Path $sb 'deploy') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8}-\d{6}$' })
             Check ($runDirs.Count -eq 0) 'показ состояния создал папку запуска обновления'
@@ -2181,7 +2182,7 @@ $tests = @(
             Check (@($r.Output | Where-Object { $_ -match 'Адаптация: версия 1\.0\.0\.h2, хеш-сумма есть' }).Count -eq 1) 'обычное чтение не показало расширение с версией'
             Check (@($r.Output | Where-Object { $_ -match 'ИТОГ: расширения erp_temp_test через внешнее соединение читаются: 2' }).Count -eq 1) 'нет итога проверки'
             Check (@($r.Calls).Count -eq 0) ("проверка запускала 1С: {0}" -f (@($r.Calls | ForEach-Object { $_.Line } | Select-Object -First 2) -join ' | '))
-            Check (@($r.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'проверка меняла блокировки или сеансы'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase |\tTerminateSession ' }).Count -eq 0) 'проверка меняла блокировки или сеансы'
             Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\comcheck\run.log')) 'нет журнала deploy\comcheck\run.log'
         }
     },
@@ -2220,7 +2221,7 @@ $tests = @(
             Check ((Get-Calls $r @('ENTERPRISE', 'precheck', 'fake\erp_base')).Count -eq 1) 'клиент рабочей в режиме precheck не запускался'
             Check ((Get-Calls $r @('ENTERPRISE', 'selfcheck')).Count -eq 0) 'запускалась полная самопроверка'
             Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0 -and (Get-Calls $r @('/UpdateDBCfg')).Count -eq 0) 'проверка что-то загружала'
-            Check (@($r.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'проверка меняла блокировки или сеансы'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase |\tTerminateSession ' }).Count -eq 0) 'проверка меняла блокировки или сеансы'
             Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\precheck\precheck.txt')) 'нет журнала deploy\precheck\precheck.txt'
             $runDirs = @(Get-ChildItem -LiteralPath (Join-Path $sb 'deploy') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8}-\d{6}$' })
             Check ($runDirs.Count -eq 0) 'проверка создала папку запуска обновления'
@@ -2254,7 +2255,7 @@ $tests = @(
             Check ($text -match 'не начала проверку за 5 с') 'нет причины «не начала проверку»'
             Check ($text -match 'пересоберёт её из поставки') 'нет подсказки про сборку обработки'
             Check ($r.Seconds -lt 90) ("ждал зависший клиент: {0} с" -f $r.Seconds)
-            Check (@($r.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'проверка меняла блокировки или сеансы'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase |\tTerminateSession ' }).Count -eq 0) 'проверка меняла блокировки или сеансы'
             Check (-not (Test-Path -LiteralPath (Join-Path $sb 'deploy\precheck\precheck.txt'))) 'журнал проверки появился, хотя проверки не было'
         }
     },
@@ -2293,7 +2294,7 @@ $tests = @(
             Check ((Get-Calls $first @('/DumpCfg', 'fake\erp_base', '\before\erp_base_Адаптация_')).Count -eq 1) 'подготовка не сняла резервную копию Адаптация'
             Check ((Get-Calls $first @('/LoadCfg', '-Extension Адаптация', 'fake\erp_base')).Count -eq 1) 'подготовка не загрузила Адаптация в рабочую ровно один раз'
             Check ((Get-Calls $first @('/UpdateDBCfg')).Count -eq 0) 'подготовка обновила конфигурацию БД'
-            Check (@($first.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'подготовка меняла блокировки или завершала сеансы'
+            Check (@($first.ComLog | Where-Object { $_ -match '\tUpdateInfoBase |\tTerminateSession ' }).Count -eq 0) 'подготовка меняла блокировки или завершала сеансы'
             Check ($null -eq (Get-DeployRecord $sb)) 'подготовка записала deploy.json: в истории обновлений её быть не должно'
             if (-not (Test-Path -LiteralPath $preparedFile)) { return }
             $state = [System.IO.File]::ReadAllText($preparedFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
@@ -2406,7 +2407,7 @@ $tests = @(
             if ($loads.Count -eq 1) { Check ($loads[0].Line.Contains('\before\erp_base_Адаптация_')) 'отмена грузила не резервную копию' }
             Check ((Get-Calls $r @('/UpdateDBCfg')).Count -eq 0) 'отмена подготовки обновила конфигурацию БД'
             Check ((Get-Calls $r @('/DeleteCfg')).Count -eq 0) 'отмена подготовки удаляла расширение'
-            Check (@($r.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'подготовка или её отмена меняли блокировки или завершали сеансы'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase |\tTerminateSession ' }).Count -eq 0) 'подготовка или её отмена меняли блокировки или завершали сеансы'
             Check (-not (Test-Path -LiteralPath $preparedFile)) 'после отмены prepared.json остался'
         }
     },

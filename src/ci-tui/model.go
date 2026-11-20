@@ -834,7 +834,9 @@ func bounceBar(width, frame int) string {
 	return b.String()
 }
 
-var idleCaptions = []string{"конфигуратор работает", "SQL шуршит", "сервер 1С занят делом", "платформа думает", "ещё немного"}
+// Подписи под полосой хода, когда у операции нет своих подробностей: любая долгая операция (конфигуратор,
+// клиент 1С, git), поэтому без имён - «сервер 1С занят делом» при отправке в GitHub сбивало с толку.
+var idleCaptions = []string{"работа идёт", "жду, пока закончит", "процесс жив", "ещё немного"}
 
 func idleCaption(frame int) string {
 	return idleCaptions[(frame/40)%len(idleCaptions)]
