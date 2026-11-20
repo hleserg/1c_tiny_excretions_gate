@@ -141,7 +141,7 @@ function Get-ClientTitle {
     if ($mode -eq 'selfcheck') {
         $om = [regex]::Match($Arguments, 'out=([^;"]*)')
         $label = ''
-        if ($om.Success) { $label = [regex]::Match($om.Groups[1].Value, 'selfcheck-([^\\/]+)').Groups[1].Value }
+        if ($om.Success) { $label = [regex]::Match($om.Groups[1].Value, 'selfcheck-([^\\/]+)[\\/](?:w\d+-)?try\d+[\\/]?$').Groups[1].Value }
         $worker = ''
         $wm = [regex]::Match($Arguments, 'worker=(\d+)')
         if ($wm.Success) { $worker = ', исполнитель ' + $wm.Groups[1].Value }
