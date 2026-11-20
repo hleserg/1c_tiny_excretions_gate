@@ -407,6 +407,56 @@ function Check-DeliveryCommon {
         }
     },
     @{
+        Name = 'delivery-mixed-report'
+        Text = 'Приёмка: смешанная поставка одной папкой - CFE (спорная процедура и новая функция), EPF для двух одноимённых карточек, новый ERF и защищённая EPF: три вопроса, один PR, один прогон со всеми объектами, GREEN; отчёт показывает каждый файл, решения, сборку, регистрацию в справочнике и цепочку до вердикта.'
+        Run = {
+            param($Name)
+            $refMain = '33333333-3333-3333-3333-333333333333'
+            $refOff = '44444444-4444-4444-4444-444444444444'
+            $cards = @(
+                @{ objName = 'Печать'; title = 'Печать актов'; version = '1'; kind = 'Печатная форма'; content = $printOld; ref = $refMain; use = 'Используется'; targets = @('Документ.Заказ') },
+                @{ objName = 'Печать'; title = 'Печать актов (старая)'; version = '0'; kind = 'Печатная форма'; content = $printOld; ref = $refOff; use = 'Отключена'; targets = @('Документ.Счёт') })
+            $com = New-ComState -TempProcessings $cards
+            $sb = New-DeliverySandbox $Name -Com $com -Dumps (New-DDumps)
+            $gh = Get-FakeGh $sb
+            $files = Get-GhFiles -Gh $gh -Commit (Get-GhHead -Gh $gh -Branch 'main').Sha
+            $root = $utf8.GetString((Get-GhBlob -Gh $gh -Sha $files['processings/Печать/Печать.xml'])).TrimStart([char]0xFEFF).Replace("`r`n", "`n")
+            $pullsBefore = (Get-DPulls $sb).Count
+            $set = Join-Path $sb 'Входящие\поставка_склад_и_печать'
+            $null = New-DZip -Path (Join-Path $set 'Доработки_v9.cfe') -Files (New-DExtFiles -Version '1.0.0.9' -Module (New-DModule -Digits '0' -Extra 'Сумма * 0.1'))
+            $null = New-DZip -Path (Join-Path $set 'Печать.epf') -Files @{ 'Печать.xml' = $root; 'Печать/Ext/ObjectModule.bsl' = $printNew }
+            $null = New-DZip -Path (Join-Path $set 'ОтчётПродаж.erf') -Files (New-DReportFiles)
+            $closed = New-DZip -Path (Join-Path $set 'Закрытая.epf') -Files @{ 'Закрытая.xml' = 'x' } -Protected
+            $closedSha = (Get-FileHash -LiteralPath $closed -Algorithm SHA256).Hash.ToLowerInvariant()
+            (Get-Item -LiteralPath $set).LastWriteTime = (Get-Date).AddMinutes(-5)
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{ dumps = (New-DDumps) } -Com $null -Answers @(
+                @{ Kind = 'one'; Header = 'в какую карточку'; Item = 'Используется' },
+                @{ Kind = 'one'; Header = 'процедура Пересчитать'; Item = '^Оставить наше' },
+                @{ Kind = 'one'; Header = 'файл целиком'; Item = '^Взять поставку' })
+            Check-DeliveryCommon $r
+            $states = @(Get-DeliveryStates $sb)
+            Check ($states.Count -eq 1) ("поставок {0}, ждали 1 (папка - один комплект)" -f $states.Count)
+            if ($states.Count -ne 1) { return }
+            $state = $states[0]
+            Check ([string]$state.status -eq 'done' -and [string]$state.verdict -eq 'GREEN') ("поставка: {0} {1} ({2})" -f $state.status, $state.verdict, $state.note)
+            $kinds = @($state.files | ForEach-Object { [string]$_.actualKind } | Sort-Object) -join ','
+            Check ($kinds -eq 'extension,processing,processing,report') ("типы файлов: " + $kinds)
+            Check ((Get-DPulls $sb).Count -eq $pullsBefore + 1) 'поставке нужен ровно один PR'
+            $stubs = Get-DStubs $sb
+            Check ($stubs.Count -eq 1 -and $stubs[0] -match 'dir=Доработки' -and $stubs[0] -match 'dir=Печать\r?\n' -and $stubs[0] -match 'dir=ОтчётПродаж' -and $stubs[0].Contains('binary=Закрытая.epf')) ("прогон - не весь комплект: " + ($stubs -join ' / '))
+            $module = Get-DMainText $gh 'extensions/Доработки/Documents/Заказ/Ext/ObjectModule.bsl'
+            Check ($null -ne $module -and $module.Contains('Окр(Цена * Количество, 2)') -and $module.Contains('Функция Наценка')) 'в main не наше решение по процедуре или нет новой функции'
+            $print = Get-DMainText $gh 'processings/Печать/Печать/Ext/ObjectModule.bsl'
+            Check ($null -ne $print -and $print.Contains('НоваяПроцедура')) 'обработка не в выбранной карточке'
+            $report = [System.IO.File]::ReadAllText((Join-Path $sb ('deliveries\{0}eport.md' -f $state.id)), $utf8)
+            foreach ($word in @('Доработки_v9.cfe', 'Печать.epf', 'ОтчётПродаж.erf', 'Закрытая.epf', $closedSha, 'Решено человеком', 'Регистрация в справочнике', 'Сборка в технической базе', 'Цепочка', $refMain)) {
+                Check ($report.Contains($word)) ("в отчёте нет «{0}»" -f $word)
+            }
+            Check (-not $report.Contains('Ждёт решения')) 'в отчёте GREEN-поставки есть неразобранные решения'
+            [System.IO.File]::WriteAllText((Join-Path $sb 'mixed-report.md'), $report, $utf8)
+        }
+    },
+    @{
         Name = 'delivery-drift-during-ci'
         Text = 'Приёмка: пока шёл CI, в temp сохранили новую правку. Перед записью temp проверен под блокировкой: правка ушла штатно в PR и слита, кандидат пересобран поверх нового main (то же решение, тот же PR, новый CI), в итоге в main и правка temp, и поставка.'
         Run = {

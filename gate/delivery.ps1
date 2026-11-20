@@ -1305,6 +1305,8 @@ function Complete-DeliveryRun {
         $folder = [string]$object['folder']
         $loaded = $false
         $detail = ''
+        $registration = ''
+        $cardRef = ''
         if ($null -ne $verdict) {
             if ([string]$object['kind'] -eq 'extension') {
                 $entry = @(@($verdict.kitItems) | Where-Object { [string]$_.name -eq $name -or [string]$_.name -eq $folder }) | Select-Object -First 1
@@ -1317,7 +1319,11 @@ function Complete-DeliveryRun {
                     $ref = [string](Get-UiField $entry 'ref' '')
                     $wanted = [string]$object['ref']
                     if ($wanted -and $ref -and $ref -ne $wanted) { $loaded = $false; $detail = ('записано не в ту карточку: {0}, ждали {1}' -f $ref, $wanted) }
-                    else { $detail = ('карточка {0}; {1}' -f $ref, (Get-UiField $entry 'registration' '')) }
+                    else {
+                        $registration = [string](Get-UiField $entry 'registration' '')
+                        $cardRef = $ref
+                        $detail = ('карточка {0}' -f $ref)
+                    }
                 }
             }
         }
@@ -1327,7 +1333,7 @@ function Complete-DeliveryRun {
         }
         if ($kind -eq 'verified') { $loaded = $true; $detail = 'в temp как в main' }
         if (-not $loaded) { $allLoaded = $false; if (-not $detail) { $detail = 'не загружен' } }
-        $objects += [ordered]@{ object = [string]$object['repoPath']; title = [string]$object['title']; loaded = $loaded; detail = $detail }
+        $objects += [ordered]@{ object = [string]$object['repoPath']; title = [string]$object['title']; kind = [string]$object['kind']; loaded = $loaded; detail = $detail; ref = $cardRef; registration = $registration }
         $item['status'] = $(if ($loaded) { 'loaded' } else { 'accepted' })
     }
     $gateVerdict = ''
@@ -1432,6 +1438,21 @@ function Get-DeliveryReport {
         $lines.Add('## Сборка в технической базе')
         $lines.Add('')
         foreach ($note in @($State['build']['notes'])) { $lines.Add(('- ' + $note)) }
+        $lines.Add('')
+    }
+    # Регистрация в справочнике (команды, назначение, публикация) - отдельно от изменений кода.
+    $registered = @()
+    if ($null -ne $State['result']) { $registered = @(@($State['result']['objects']) | Where-Object { $null -ne $_ -and [string]$_['kind'] -eq 'processing' }) }
+    if ($registered.Count -gt 0) {
+        $lines.Add('## Регистрация в справочнике «Дополнительные отчёты и обработки»')
+        $lines.Add('')
+        foreach ($item in $registered) {
+            $text = [string]$item['registration']
+            if (-not $text) { $text = 'команды, назначение и публикация не менялись' }
+            $refText = [string]$item['ref']
+            if (-not $refText) { $refText = 'не записана' }
+            $lines.Add(('- {0}: карточка `{1}`; {2}' -f $item['title'], $refText, $text))
+        }
         $lines.Add('')
     }
     if (-not $ForPull) {
