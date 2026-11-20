@@ -54,7 +54,7 @@ function New-Sandbox {
     param([string]$Name, [hashtable]$Config = @{})
     $dir = Join-Path $workRoot $Name
     foreach ($sub in @('bin', 'tools', 'inbox', 'fake')) { New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null }
-    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'cluster-target.ps1', 'locks.ps1')) {
+    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'cluster-target.ps1', 'locks.ps1', 'timeline.ps1')) {
         Copy-Item -LiteralPath (Join-Path $ciRoot $script) -Destination $dir
     }
     # Подставной COM для deploy.ps1: скрипт берёт его из test\ рядом с собой, когда задан CI_FAKE_COM.
@@ -1258,6 +1258,29 @@ $tests = @(
             $step = Get-Step $r 'Самопроверка до загрузки'
             Check ($null -ne $step -and [string]$step.detail -match 'снималось заново, потому что изменился код обработки самопроверки \(сборка 20261120\.130631 -> 20261120\.165501\)') ("нет причины полного прохода в итоге шага: {0}" -f $(if ($null -ne $step) { $step.detail } else { 'нет шага' }))
             if ($r.RunDir) { Check ([System.IO.File]::ReadAllText((Join-Path $r.RunDir 'run.log'), $utf8).Contains('Самопроверка до загрузки выполнялась полностью: изменился код обработки самопроверки')) 'нет причины полного прохода в run.log' }
+        }
+    },
+    @{
+        # ** Хлебников С.Ю. 20261120
+        Name = 'gate-timeline'
+        Text = 'разбор времени прогона (timeline.ps1): по папке прогона - путь до вердикта без оценок, шаги, группы самопроверки'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ }, @{ tasks = $errorTasks; fingerprint = 'после' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'RED' 1
+            if (-not $r.RunDir) { Check $false 'нет папки прогона'; return }
+            $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sb 'timeline.ps1') $r.RunDir -Quiet 2>&1
+            Check ($LASTEXITCODE -eq 0) ("timeline.ps1 упал: {0}" -f (@($output) -join ' | '))
+            $timeline = Join-Path $r.RunDir 'timeline.txt'
+            if (-not (Test-Path -LiteralPath $timeline)) { Check $false 'нет timeline.txt'; return }
+            $text = [System.IO.File]::ReadAllText($timeline, $utf8)
+            Check ($text.Contains('Путь от старта до вердикта')) 'в timeline.txt нет пути до вердикта'
+            Check ($text -match 'вердикт \d\d\.\d\d \d\d:\d\d:\d\d RED') ("вердикт не найден по run.log или оценён: {0}" -f ($text -split "`n" | Select-Object -First 2))
+            Check ($text.Contains('самопроверка')) 'в пути до вердикта нет самопроверки'
+            Check (Test-Path -LiteralPath (Join-Path $r.RunDir 'selfcheck-groups.txt')) 'нет selfcheck-groups.txt'
         }
     },
     @{
