@@ -80,6 +80,9 @@ param(
     [switch]$ProdPreCheck,
     # Диагностика внешнего соединения (COM) с temp: каким способом читаются расширения. Только чтение, только temp.
     [switch]$ComCheck,
+    # Снимок temp для прогона гейта (run.ps1 в конце проверок): хеш-суммы расширений и внешних обработок - в файл
+    # JSON. По нему обновление рабочей сверяет, что в temp то, что проверял прогон. Только чтение, только temp.
+    [string]$SnapshotTemp = '',
     # Репозиторий расширений (ExtensionsRepo): выгрузить temp в git или загрузить из git в temp. Рабочую не трогает.
     [switch]$GitExport,
     [switch]$GitImport,
@@ -1815,6 +1818,30 @@ function Update-SelfCheckEpf {
     Write-Line ("  обработка самопроверки собрана из поставки: {0} (прежняя - {0}.old)" -f $selfCheckEpf) 'Green'
 }
 
+# ** Хлебников С.Ю. 20261120 Снимок «что проверено» (#27): расширения - хеш-сумма конфигурации из базы, обработки -
+# хеш файла справочника. Ошибка - в файле (ok = false), а не исключением: прогон гейта от снимка не зависит.
+if ($SnapshotTemp) {
+    $snapshot = [ordered]@{ time = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss'); base = $script:TempBase; ok = $false; error = ''; extensions = [ordered]@{}; processings = [ordered]@{} }
+    try {
+        $snapStates = Get-ExtensionStates -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
+        if (-not $snapStates.Ok) { throw ('расширения не прочитаны: ' + $snapStates.Error) }
+        foreach ($snapName in @($snapStates.Items.Keys | Sort-Object)) {
+            $snapItem = $snapStates.Items[$snapName]
+            $snapshot.extensions[[string]$snapName] = [ordered]@{ version = [string]$snapItem.Version; hash = [string]$snapItem.Hash }
+        }
+        $snapExport = Export-Processings -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword -Dir (Join-Path $script:RunDir 'snapshot')
+        if (-not $snapExport.Ok) { throw ('обработки не выгружены: ' + $snapExport.Error) }
+        foreach ($snapProc in @($snapExport.Items | Sort-Object ObjName)) {
+            $snapshot.processings[[string]$snapProc.ObjName] = [ordered]@{ version = [string]$snapProc.Version; hash = [string]$snapProc.Hash }
+        }
+        $snapshot.ok = $true
+    }
+    catch { $snapshot.error = [string]$_.Exception.Message }
+    [System.IO.File]::WriteAllText($SnapshotTemp, (ConvertTo-Json -InputObject $snapshot -Depth 5), $Utf8Bom)
+    exit 0
+}
+# ** Хлебников С.Ю. 20261120 конец
+
 if ($ComCheck) {
     # Диагностика внешнего соединения с temp. Чтение расширений через COM на машине гейта не работало: соединение
     # есть, а РасширенияКонфигурации у него в PowerShell пусто (тесты этого не видят: в них COM подставной).
@@ -2822,7 +2849,7 @@ function Invoke-GitImport {
     # пишет прямо в ту же консоль или в тот же канал ci.exe, вопросы задаёт сам. «& powershell.exe» внутри функции
     # забрал бы весь вывод в её результат - хода прогона не было бы видно.
     $quote = { param([string]$Text) '"' + $Text.Replace('"', '\"') + '"' }
-    $runArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (& $quote (Join-Path $Root 'run.ps1')), '-Kit', (& $quote $kitDir), '-KitSource', (& $quote ("git {0}@{1}" -f $Setup.Repo, (Get-GitShort $head.Sha))))
+    $runArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (& $quote (Join-Path $Root 'run.ps1')), '-Kit', (& $quote $kitDir), '-KitSource', (& $quote ("git {0}@{1}" -f $Setup.Repo, [string]$head.Sha)))
     if ($Config) { $runArgs += @('-Config', (& $quote $Config)) }
     if ($UiChannel) { $runArgs += @('-UiChannel', (& $quote $UiChannel)) }
     # Без человека - как ночной прогон: вопросов нет, комплект остаётся (temp идёт за main, красное видно в итоге).
@@ -3415,6 +3442,7 @@ if ($Rollback) {
     $riskAccepted = $false
     $gateRed = $false
     $riskReason = ''
+    $checkedNote = ''
 
     $history = @(Get-DeployHistory)
     Write-Host ''
@@ -3530,6 +3558,22 @@ else {
             }
         }
     }
+    # ** Хлебников С.Ю. 20261120 «Обновить подготовленным» - по прогону, с которым готовили (prepared.gate), а не по
+    # последнему: подготовили красный A, потом прошёл зелёный B - применяется A, и вердикт - его.
+    $preparedGateMissing = ''
+    if ($ApplyPrepared -and $null -ne $prepared) {
+        $preparedGateName = [string](Get-JsonValue $prepared 'gate' '')
+        if ($preparedGateName) {
+            $preparedGateDir = Join-Path $runsRoot $preparedGateName
+            $preparedVerdictFile = Join-Path $preparedGateDir 'verdict.json'
+            if (Test-Path -LiteralPath $preparedVerdictFile) {
+                $lastRun = Get-Item -LiteralPath $preparedGateDir
+                $lastVerdict = (Get-Content -LiteralPath $preparedVerdictFile -Raw -Encoding UTF8) | ConvertFrom-Json
+            }
+            else { $lastRun = $null; $lastVerdict = $null; $preparedGateMissing = $preparedGateName }
+        }
+    }
+    # ** Хлебников С.Ю. 20261120 конец
 
     $ciLines = New-Object System.Collections.Generic.List[string]     # для отчёта
     $advice = New-Object System.Collections.Generic.List[object]      # рекомендации: Kind = do / dont / note
@@ -3542,7 +3586,12 @@ else {
 
     Write-Host ''
     Write-Host 'ПОСЛЕДНИЙ ПРОГОН ГЕЙТА' -ForegroundColor Cyan
-    if ($null -eq $lastRun) {
+    if ($null -eq $lastRun -and $preparedGateMissing) {
+        Write-Line ("  прогона подготовки {0} нет в папке прогонов" -f $preparedGateMissing) 'Yellow'
+        $ciLines.Add(("Прогона подготовки {0} нет." -f $preparedGateMissing))
+        $gateRisks.Add(("прогона {0}, с которым готовили обновление, нет" -f $preparedGateMissing))
+    }
+    elseif ($null -eq $lastRun) {
         Write-Line '  прогонов гейта нет' 'Yellow'
         $ciLines.Add('Прогонов гейта нет.')
         $gateRisks.Add('прогонов гейта нет')
@@ -3803,8 +3852,9 @@ else {
         }
         if ($preparedChanged.Count -gt 0) {
             foreach ($line in $preparedChanged) { Write-Line ('  ' + $line) 'Yellow' }
-            $go = Confirm-Ui -Question ("После подготовки было изменено: {0}. Обновить {1} подготовленным всё равно? Надёжнее - «Подготовить обновление рабочей» заново." -f ($preparedChanged -join '; '), $script:ProdBase) -Yes 'Да, обновлять подготовленным' -No 'Нет, выйти'
-            if ($go -ne $true) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
+            # ** Хлебников С.Ю. 20261120 Изменения после подготовки - риск, как красный гейт: вопрос один, ответ «да» -
+            # riskAccepted, и они уходят в отчёт и deploy.json. Надёжнее - «Подготовить обновление рабочей» заново.
+            foreach ($line in $preparedChanged) { $gateRisks.Add(('после подготовки изменено - ' + $line)) }
             Write-RunLog ('Обновление подготовленным несмотря на: ' + ($preparedChanged -join '; '))
         }
         elseif ($preparedCompared -gt 0) { Write-Line ("  с подготовки {0} и {1} не менялись" -f $script:TempBase, $script:ProdBase) 'Green' }
@@ -3813,7 +3863,7 @@ else {
     }
     if (-not $ApplyPrepared) {
     $modeMenu = New-Object System.Collections.Generic.List[object]
-    $modeMenu.Add([pscustomobject]@{ Key = '1'; Label = ("Обновить все расширения из {0} в {1} ({2}); ошибки гейта сбросятся" -f $script:TempBase, $script:ProdBase, (@($allTargets | ForEach-Object { $_.Name }) -join ', ')) })
+    $modeMenu.Add([pscustomobject]@{ Key = '1'; Label = ("Обновить все расширения из {0} в {1} ({2})" -f $script:TempBase, $script:ProdBase, (@($allTargets | ForEach-Object { $_.Name }) -join ', ')) })
     $modeMenu.Add([pscustomobject]@{ Key = '2'; Label = 'Обновить выбранные расширения' })
     if ($processingsPending.Count -gt 0) {
         $modeMenu.Add([pscustomobject]@{ Key = 'epf'; Label = ("Обновить только внешние обработки ({0}): без блокировок рабочей и обновления конфигурации БД" -f $processingsPending.Count) })
@@ -3941,6 +3991,49 @@ else {
     elseif ($selected.Count -gt 0) { Write-Line ("Обновляю в {0}: {1}" -f $script:ProdBase, (@($selected | ForEach-Object { $_.Name }) -join ', ')) 'Cyan' }
     if ($selectedProcessings.Count -gt 0) { Write-Line ("Внешние обработки в {0}: {1}" -f $script:ProdBase, (@($selectedProcessings | ForEach-Object { $_.ObjName }) -join ', ')) 'Cyan' }
 
+    # ** Хлебников С.Ю. 20261120 Что проверил прогон (#27): хеш-суммы temp на конец его проверок (checkedState в
+    # verdict.json) против того, что сейчас уходит в рабочую. Разошлось - это другой комплект: риск, вопрос заново.
+    # Снимка нет (старый прогон, «как есть», COM не прочитался) - честная отметка, не риск.
+    $checkedNote = ''
+    if ($null -ne $lastRun -and $mode -ne 'asis') {
+        $checked = Get-JsonValue $lastVerdict 'checkedState' $null
+        if ($null -eq $checked) { $checkedNote = ("проверка этого состава не подтверждена: в прогоне {0} нет снимка temp" -f $lastRun.Name) }
+        elseif (-not [bool](Get-JsonValue $checked 'ok' $false)) { $checkedNote = ("проверка этого состава не подтверждена: снимок temp прогона {0} не снялся ({1})" -f $lastRun.Name, [string](Get-JsonValue $checked 'error' '')) }
+        else {
+            $checkedExt = Get-JsonValue $checked 'extensions' $null
+            $checkedProc = Get-JsonValue $checked 'processings' $null
+            $mismatch = New-Object System.Collections.Generic.List[string]
+            $unconfirmed = New-Object System.Collections.Generic.List[string]
+            foreach ($checkEntry in $selected) {
+                $nowHash = ''
+                if ($mode -eq 'prepared') { $nowHash = [string](Get-JsonValue $preparedByName[$checkEntry.Name] 'tempHash' '') }
+                elseif ($tempStates.Ok -and $tempStates.Items.ContainsKey($checkEntry.Name)) { $nowHash = [string]$tempStates.Items[$checkEntry.Name].Hash }
+                $thenItem = $null
+                if ($null -ne $checkedExt) { $thenItem = Get-JsonValue $checkedExt $checkEntry.Name $null }
+                if ($null -eq $thenItem) { $mismatch.Add(("{0}: прогон его не проверял" -f $checkEntry.Name)); continue }
+                $thenHash = [string](Get-JsonValue $thenItem 'hash' '')
+                if (-not $nowHash -or -not $thenHash) { $unconfirmed.Add([string]$checkEntry.Name); continue }
+                if ($nowHash -ne $thenHash) { $mismatch.Add(("{0}: в temp не то, что проверял прогон" -f $checkEntry.Name)) }
+            }
+            foreach ($checkProc in $selectedProcessings) {
+                $nowItem = @($tempProcExport.Items | Where-Object { $_.ObjName -eq $checkProc.ObjName } | Select-Object -First 1)
+                $thenItem = $null
+                if ($null -ne $checkedProc) { $thenItem = Get-JsonValue $checkedProc $checkProc.ObjName $null }
+                if ($null -eq $thenItem) { $mismatch.Add(("{0}: прогон эту обработку не проверял" -f $checkProc.ObjName)); continue }
+                if ($nowItem.Count -eq 0 -or -not [string]$nowItem[0].Hash) { $unconfirmed.Add([string]$checkProc.ObjName); continue }
+                if ([string]$nowItem[0].Hash -ne [string](Get-JsonValue $thenItem 'hash' '')) { $mismatch.Add(("{0}: в temp не та обработка, что проверял прогон" -f $checkProc.ObjName)) }
+            }
+            if ($mismatch.Count -gt 0) {
+                $gateRisks.Add(("состав расходится с проверенным прогоном {0}: {1}" -f $lastRun.Name, ($mismatch -join '; ')))
+                foreach ($line in $mismatch) { Write-Line ('  ' + $line) 'Yellow' }
+            }
+            if ($unconfirmed.Count -gt 0) { $checkedNote = ("совпадение с проверенным не установлено (хеш не прочитан): {0}" -f ($unconfirmed -join ', ')) }
+            elseif ($mismatch.Count -eq 0 -and ($selected.Count + @($selectedProcessings).Count) -gt 0) { Write-Line ("  состав совпадает с проверенным прогоном {0}" -f $lastRun.Name) 'Green' }
+        }
+        if ($checkedNote) { Write-Line ('  ' + $checkedNote) 'Yellow'; $ciLines.Add(($checkedNote + '.')) }
+    }
+    # ** Хлебников С.Ю. 20261120 конец
+
     # Гейт красный, его нет или комплект откатили: переспросить. Да - едем, красное гейта уходит в отчёт.
     $riskAccepted = $false
     if ($gateRisks.Count -gt 0) {
@@ -3992,6 +4085,7 @@ foreach ($confirmProc in $selectedProcessings) { $confirmLines.Add(("  {0}" -f $
 if ($null -ne $lastRun) { $confirmLines.Add(("Гейт: прогон {0}, вердикт {1}" -f $lastRun.Name, [string](Get-JsonValue $lastVerdict 'verdict' ''))) }
 elseif ($mode -ne 'rollback') { $confirmLines.Add('Гейт: прогонов нет') }
 if ($riskReason) { $confirmLines.Add(("Выпуск с красным гейтом, причина: {0}" -f $riskReason)) }
+if ($mode -ne 'rollback' -and $checkedNote) { $confirmLines.Add(("Проверка: {0}" -f $checkedNote)) }
 if (-not $Prepare) { $confirmLines.Add(("Окно обновления: {0}" -f (Get-DeployWindowText))) }
 Show-UiTitle -Text ("Перед записью в {0}" -f $script:ProdBase) -Kind 'warn' -More $confirmLines.ToArray()
 Write-RunLog ('Сводка перед подтверждением: ' + ($confirmLines -join ' | '))
@@ -4989,7 +5083,11 @@ $recordProcessings = @(foreach ($proc in $touchedProcessings) {
             oldVersion = $proc.OldVersion; newVersion = $proc.NewVersion; backup = $backupRelative; file = $fileRelative; status = $procStatus; problems = @($proc.Problems) }
     })
 $recordGate = $null
-if ($null -ne $lastRun) { $recordGate = [ordered]@{ run = $lastRun.Name; verdict = [string](Get-JsonValue $lastVerdict 'verdict' '') } }
+if ($null -ne $lastRun) {
+    # ** Хлебников С.Ю. 20261120 Связь «вход - прогон - установка»: откуда комплект (полный коммит), что проверено, что выпущено.
+    $recordGate = [ordered]@{ run = $lastRun.Name; verdict = [string](Get-JsonValue $lastVerdict 'verdict' ''); kitSource = [string](Get-JsonValue $lastVerdict 'kitSource' ''); checkedNote = $checkedNote
+        installed = @(foreach ($entry in $selected) { $installedHash = ''; if ($mode -eq 'prepared') { $installedHash = [string](Get-JsonValue $preparedByName[$entry.Name] 'tempHash' '') } elseif ($null -ne $tempStates -and $tempStates.Ok -and $tempStates.Items.ContainsKey($entry.Name)) { $installedHash = [string]$tempStates.Items[$entry.Name].Hash }; [ordered]@{ name = $entry.Name; hash = $installedHash } }) }
+}
 $record = [ordered]@{
     runId        = $runId
     time         = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
