@@ -648,6 +648,8 @@ Initialize-Ui -Channel $UiChannel
 $script:Server = [string](Get-Setting $cfg 'Server' '')
 $script:TempBase = [string](Get-Setting $cfg 'Base' '')
 $script:ProdBase = [string](Get-Setting $cfg 'ProdBase' '')
+# ** Хлебников С.Ю. 20261120 Базы - в шапку ci.exe (событие context): видно и в узком окне.
+if ($UiChannel -and $script:ProdBase) { Send-UiEvent @{ kind = 'context'; text = ('рабочая {0} · temp {1}' -f $script:ProdBase, $script:TempBase) } }
 # Код разрешения входа: один и тот же для блокировки рабочей и для всех входов (конфигуратор, внешнее соединение). Пусто - 0.
 $script:UnlockCode = [string](Get-Setting $cfg 'UnlockCode' '0')
 if ([string]::IsNullOrWhiteSpace($script:UnlockCode)) { $script:UnlockCode = '0' }

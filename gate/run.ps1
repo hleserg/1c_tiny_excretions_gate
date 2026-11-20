@@ -4676,6 +4676,8 @@ $referenceSnapshotDir = Join-Path $RunDir 'before-selfcheck'
 
 Write-Host ''
 Write-Host ("Прогон {0}, база {1}" -f $runId, $baseKey) -ForegroundColor Cyan
+# ** Хлебников С.Ю. 20261120 База - в шапку ci.exe (событие context): видно и в узком окне.
+if ($UiChannel) { Send-UiEvent @{ kind = 'context'; text = ('база ' + $baseKey) } }
 Write-Host ("Папка прогона: {0}" -f $RunDir)
 Write-RunLog ("Прогон {0}, база {1}, комплект: {2}" -f $runId, $baseKey, $Kit)
 
