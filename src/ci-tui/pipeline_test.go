@@ -4,13 +4,14 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 func planModel(parallel ...string) *model {
 	m := &model{running: true}
-	m.setPlan([]string{"Подготовка базы", "Правила обмена", "Самопроверка после загрузки", "Модульные тесты", "Проверка конфигурации (all)"}, parallel)
+	m.setPlan([]string{"Подготовка базы", "Правила обмена", "Самопроверка после загрузки", "Модульные тесты", "Проверка конфигурации (all)"}, parallel, false)
 	return m
 }
 
@@ -41,7 +42,7 @@ func TestResetClearsPreviousRun(t *testing.T) {
 		t.Fatalf("reset тронул журнал: строк %d", len(m.lines))
 	}
 	// Новый план после reset - с чистого листа.
-	m.setPlan([]string{"Сохранить текущее"}, nil)
+	m.setPlan([]string{"Сохранить текущее"}, nil, false)
 	if got := nodeStatus(m, "Сохранить текущее"); got != nodePending {
 		t.Fatalf("шаг нового плана: %q", got)
 	}
@@ -197,5 +198,94 @@ func TestRestartTarget(t *testing.T) {
 	}
 	if got := restartTarget(filepath.Join(dir, "нет"), ""); got != "" {
 		t.Fatalf("ни одного файла: ждали пусто, получили %q", got)
+	}
+}
+
+// Событие step: у действия без плана шагов долгие операции копятся в колонке шагов с итогом и временем; при плане
+// колонку ведёт план, событие её не трогает.
+func TestStepEventWithoutPlan(t *testing.T) {
+	m := newModel("", "", nil)
+	m.running = true
+	for _, ev := range []uiEvent{
+		{Kind: "step", Title: "Типовая: git add (файлы - в pack)", Status: "OK", Elapsed: 367},
+		{Kind: "step", Title: "Типовая: git fetch (что сейчас в GitHub)", Status: "WARN", Elapsed: 1},
+		{Kind: "step", Title: "Типовая: git push (отправка в GitHub)", Status: "FAIL", Elapsed: 725},
+		{Kind: "step", Title: "", Status: "OK"},
+		{Kind: "step", Title: "Мусор", Status: "чужое"},
+	} {
+		next, _ := m.update(eventMsg{ev: ev})
+		m = next.(model)
+	}
+	if len(m.pipe) != 3 {
+		t.Fatalf("в колонке шагов %d операций, ждали 3", len(m.pipe))
+	}
+	if m.pipe[0].status != "OK" || m.pipe[1].status != "WARN" || m.pipe[2].status != "FAIL" {
+		t.Fatalf("итоги операций: %q %q %q", m.pipe[0].status, m.pipe[1].status, m.pipe[2].status)
+	}
+	if got := m.pipe[0].finished.Sub(m.pipe[0].started).Round(time.Second); got != 367*time.Second {
+		t.Fatalf("длительность первой операции %v, ждали 6m7s", got)
+	}
+	// С планом шагов событие step колонку не меняет.
+	planned := planModel()
+	before := len(planned.pipe)
+	planned.addOperation("Выгрузить расширение в файлы", "OK", 30)
+	if len(planned.pipe) != before {
+		t.Fatalf("при плане шагов событие step добавило шаг: было %d, стало %d", before, len(planned.pipe))
+	}
+}
+
+// План долгих операций (событие plan с ops): будущие шаги серые, событие step закрывает свой шаг итогом и временем,
+// узла «Вердикт» нет; второй такой план оставляет сделанное и заменяет серое.
+func TestOperationsPlan(t *testing.T) {
+	m := newModel("", "", nil)
+	m.running = true
+	send := func(ev uiEvent) {
+		next, _ := m.update(eventMsg{ev: ev})
+		m = next.(model)
+	}
+	send(uiEvent{Kind: "plan", Ops: true, Steps: []string{"Выгрузить Адаптация из temp", "Выгрузить Доработки из temp"}})
+	if len(m.pipe) != 2 || !m.planned || !m.planOps {
+		t.Fatalf("план операций: шагов %d, план %v, операции %v", len(m.pipe), m.planned, m.planOps)
+	}
+	for _, n := range m.pipe {
+		if n.name == verdictNode || n.status != nodePending {
+			t.Fatalf("в плане операций узел %q со статусом %q", n.name, n.status)
+		}
+	}
+	send(uiEvent{Kind: "step", Title: "Выгрузить Адаптация из temp", Status: "OK", Elapsed: 37})
+	send(uiEvent{Kind: "step", Title: "Сравнить с git", Status: "OK", Elapsed: 2})
+	if got := nodeStatus(&m, "Выгрузить Адаптация из temp"); got != "OK" {
+		t.Fatalf("шаг плана после своего step: %q", got)
+	}
+	if len(m.pipe) != 3 || m.pipe[1].name != "Сравнить с git" || m.pipe[2].status != nodePending {
+		t.Fatalf("операция не из плана должна встать перед первым серым: %d узлов, второй %q", len(m.pipe), m.pipe[1].name)
+	}
+	if got := m.pipe[0].finished.Sub(m.pipe[0].started).Round(time.Second); got != 37*time.Second {
+		t.Fatalf("длительность шага плана %v, ждали 37s", got)
+	}
+	// Второй план: сделанное остаётся (со своим временем), недошедшее серое заменяется новыми шагами.
+	send(uiEvent{Kind: "plan", Ops: true, Steps: []string{"Типовая: git add (файлы - в pack)", "Типовая: git push (отправка в GitHub)"}})
+	if len(m.pipe) != 4 || m.pipe[0].name != "Выгрузить Адаптация из temp" || m.pipe[1].name != "Сравнить с git" {
+		t.Fatalf("после второго плана: %d узлов, первые %q и %q", len(m.pipe), m.pipe[0].name, m.pipe[1].name)
+	}
+	if got := m.pipe[0].finished.Sub(m.pipe[0].started).Round(time.Second); got != 37*time.Second {
+		t.Fatalf("время сделанного после второго плана %v, ждали 37s", got)
+	}
+	if nodeStatus(&m, "Выгрузить Доработки из temp") != "нет шага" {
+		t.Fatal("серый шаг прошлого плана остался после нового")
+	}
+	send(uiEvent{Kind: "step", Title: "Типовая: git push (отправка в GitHub)", Status: "FAIL", Elapsed: 725})
+	if got := nodeStatus(&m, "Типовая: git push (отправка в GitHub)"); got != "FAIL" {
+		t.Fatalf("последний шаг: %q", got)
+	}
+	// Шаг, которого не было (операцию пропустили), закрыт как невыполненный, а не висит серым.
+	if got := nodeStatus(&m, "Типовая: git add (файлы - в pack)"); got == nodePending {
+		t.Fatal("пропущенный шаг остался серым после более позднего")
+	}
+	// Обычный план после этого - с вердиктом и без учёта step.
+	send(uiEvent{Kind: "reset"})
+	send(uiEvent{Kind: "plan", Steps: []string{"Подготовка базы"}})
+	if m.planOps || nodeStatus(&m, verdictNode) == "нет шага" {
+		t.Fatalf("обычный план: операции %v, вердикт %q", m.planOps, nodeStatus(&m, verdictNode))
 	}
 }

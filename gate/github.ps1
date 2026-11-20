@@ -655,11 +655,14 @@ function Invoke-GitCli {
     $errTask = $process.StandardError.ReadToEndAsync()
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $showProgress = ($Title -and $null -ne (Get-Command Write-UiProgress -ErrorAction SilentlyContinue))
+    # Итог долгой команды - строкой под «начато»: готово или нет, за сколько, и что ответил git.
+    $showResult = ($Title -and $null -ne (Get-Command Write-UiOperationResult -ErrorAction SilentlyContinue))
     if ($Title) { Write-Host ("  ...  {0}: начато в {1}, жду не дольше {2} мин" -f $Title, (Get-Date -Format 'HH:mm:ss'), [int]($TimeoutSec / 60)) -ForegroundColor DarkGray }
     while (-not $process.WaitForExit(250)) {
         if ($watch.Elapsed.TotalSeconds -ge $TimeoutSec) {
             & $stopGit
             if ($showProgress) { Complete-UiProgress }
+            if ($showResult) { Write-UiOperationResult -Title $Title -Status 'FAIL' -Seconds $watch.Elapsed.TotalSeconds -Problem ('не закончил за {0} мин, git снят' -f [int]($TimeoutSec / 60)) }
             throw ('git {0}: не закончил за {1} мин' -f $Arguments[0], [int]($TimeoutSec / 60))
         }
         if ($showProgress) {
@@ -677,6 +680,17 @@ function Invoke-GitCli {
     $output = ($outTask.Result + $errTask.Result).Trim()
     if ($Token) { $output = $output.Replace($Token, '***') }
     $code = $process.ExitCode
+    if ($showResult) {
+        $resultStatus = 'OK'
+        $problem = ''
+        if ($code -ne 0) {
+            # Не ноль, но вызывающему это можно (AllowFail: ветки ещё нет и т. п.) - не ошибка, а пометка.
+            $resultStatus = 'FAIL'
+            if ($AllowFail) { $resultStatus = 'WARN' }
+            $problem = 'код {0}: {1}' -f $code, (@($output -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 2) -join ' | ')
+        }
+        Write-UiOperationResult -Title $Title -Status $resultStatus -Seconds $watch.Elapsed.TotalSeconds -Problem $problem
+    }
     if ($code -ne 0 -and -not $AllowFail) {
         $tail = @($output -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 3) -join ' | '
         throw ('git {0} - код {1}: {2}' -f $Arguments[0], $code, $tail)

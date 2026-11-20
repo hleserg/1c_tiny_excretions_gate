@@ -146,15 +146,19 @@ function Get-Setting {
     return $Default
 }
 
+# Значения, которые в выводе и журнале заменяются звёздочками целиком (Get-MaskedLine): код разрешения входа.
+$script:MaskValues = @()
+
 function Write-RunLog {
     param([string]$Text)
     $stamp = Get-Date -Format 'HH:mm:ss'
-    [System.IO.File]::AppendAllText($script:RunLogPath, ("{0} {1}`r`n" -f $stamp, $Text), $Utf8Bom)
+    [System.IO.File]::AppendAllText($script:RunLogPath, ("{0} {1}`r`n" -f $stamp, (Get-MaskedLine $Text)), $Utf8Bom)
 }
 
 function Write-Line {
     # Строка в консоль и в run.log.
     param([string]$Text, [string]$Color = 'Gray')
+    $Text = Get-MaskedLine $Text
     Write-Host $Text -ForegroundColor $Color
     Write-RunLog $Text
 }
@@ -186,13 +190,22 @@ function Get-ConnectionArgs {
 }
 
 function Get-MaskedLine {
+    # Чувствительное - звёздочками, одной обработкой на консоль, run.log и всё, что из них собирается (отчёты, итог
+    # в GitHub): пароль и код разрешения входа в ключах запуска 1С (/P, /UC) и в строке соединения (Pwd=, UC=) и
+    # само значение UnlockCode, где бы оно ни встретилось, - если в нём шесть знаков и больше (короткий код вроде
+    # «0» совпал бы с обычными цифрами текста; он закрыт в ключах и строке соединения).
     param([string]$Line)
-    return [regex]::Replace([regex]::Replace($Line, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"')
+    if (-not $Line) { return $Line }
+    $masked = [regex]::Replace([regex]::Replace($Line, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"')
+    $masked = [regex]::Replace($masked, '(?i)\b(Pwd|UC)="(?:[^"]|"")*"', '$1="***"')
+    foreach ($secret in @($script:MaskValues)) { if ($secret) { $masked = $masked.Replace([string]$secret, '***') } }
+    return $masked
 }
 
 function Invoke-V8 {
     # Запускает 1С и ждёт завершения не дольше таймаута. По таймауту процесс снимается.
-    param([string]$Exe, [string[]]$Arguments, [int]$TimeoutSec, [string]$Title = '')
+    # NoResultLine - строку итога операции («готово за ...») напишет вызывающий: у него есть текст ошибки из лога 1С.
+    param([string]$Exe, [string[]]$Arguments, [int]$TimeoutSec, [string]$Title = '', [switch]$NoResultLine)
     $argLine = $Arguments -join ' '
     Write-RunLog ("> {0} {1}" -f (Split-Path -Leaf $Exe), (Get-MaskedLine $argLine))
     if ($Title) {
@@ -213,6 +226,14 @@ function Invoke-V8 {
         $statStatus = 'FAIL'
         if (-not $finished) { $statStatus = 'TIMEOUT' } elseif ($exitCode -eq 0) { $statStatus = 'OK' }
         Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status $statStatus
+        if (-not $NoResultLine) {
+            $problem = ''
+            if (-not $finished) { $problem = 'не уложилось в {0} мин, процесс снят' -f [int]($TimeoutSec / 60) }
+            elseif ($exitCode -ne 0) { $problem = 'код {0}' -f $exitCode }
+            $resultStatus = 'FAIL'
+            if ($statStatus -eq 'OK') { $resultStatus = 'OK' }
+            Write-UiOperationResult -Title $Title -Status $resultStatus -Seconds $seconds -Problem $problem
+        }
     }
     return [pscustomobject]@{ ExitCode = $exitCode; TimedOut = (-not $finished); Seconds = $seconds }
 }
@@ -287,8 +308,17 @@ function Invoke-Designer {
     $argList = @('DESIGNER') + @(Get-ConnectionArgs -BaseName $BaseName -User $user -Password $password) +
         @('/DisableStartupDialogs', '/DisableStartupMessages') + $Command + @('/Out', ('"{0}"' -f $logPath))
     while ($true) {
-        $result = Invoke-V8 -Exe $script:V8 -Arguments $argList -TimeoutSec $TimeoutSec -Title $Title
+        $result = Invoke-V8 -Exe $script:V8 -Arguments $argList -TimeoutSec $TimeoutSec -Title $Title -NoResultLine
         $lines = @(Read-V8Log $logPath)
+        if ($Title) {
+            # Итог операции - сразу под её строкой «начато»: готово или нет, за сколько и что написал конфигуратор.
+            $problem = ''
+            if ($result.TimedOut) { $problem = 'не уложилось в {0} мин, процесс снят' -f [int]($TimeoutSec / 60) }
+            elseif ($result.ExitCode -ne 0) { $problem = 'код {0}: {1}' -f $result.ExitCode, ((@($lines | Where-Object { $_ }) | Select-Object -First 3) -join ' ') }
+            $resultStatus = 'OK'
+            if ($problem) { $resultStatus = 'FAIL' }
+            Write-UiOperationResult -Title $Title -Status $resultStatus -Seconds $result.Seconds -Problem $problem
+        }
         if ($result.ExitCode -eq 0 -or $result.TimedOut -or -not (Test-DesignerBusy $lines)) { break }
         if (-not (Resolve-DesignerBusy -BaseName $BaseName -Title (Get-NonEmptyTitle $Title $LogName))) { break }
     }
@@ -618,6 +648,7 @@ $script:ProdBase = [string](Get-Setting $cfg 'ProdBase' '')
 # Код разрешения входа: один и тот же для блокировки рабочей и для всех входов (конфигуратор, внешнее соединение). Пусто - 0.
 $script:UnlockCode = [string](Get-Setting $cfg 'UnlockCode' '0')
 if ([string]::IsNullOrWhiteSpace($script:UnlockCode)) { $script:UnlockCode = '0' }
+if ($script:UnlockCode.Length -ge 6) { $script:MaskValues = @($script:MaskValues) + @($script:UnlockCode) }
 if (-not [string]::IsNullOrEmpty([string](Get-Setting $cfg 'File' ''))) { throw 'Скрипт обновления работает только с базами кластера: в config.psd1 заполнено File.' }
 if (-not $script:Server -or -not $script:TempBase) { throw 'В config.psd1 не заполнены Server и Base.' }
 if (-not $script:ProdBase) {
@@ -1012,7 +1043,7 @@ function Assert-ProdOpen {
     if ($States.Ok) { return }
     $text = ([string]$States.Error -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 2) -join ' '
     if (Test-SessionLockError $States.Error) {
-        Write-Line ("  {0}: стоит блокировка начала сеансов, и код разрешения у неё не тот, что в UnlockCode" -f $script:ProdBase) 'Red'
+        Write-Line ("  {0}: стоит блокировка начала сеансов, и код разрешения у неё не тот, что в UnlockCode: {1}" -f $script:ProdBase, $text) 'Red'
         Write-Line '  Если блокировку ставил ты - впиши её код в Настройки, Базы, UnlockCode и запусти снова. Или сними её в консоли кластера.' 'Red'
     }
     elseif (Test-AuthError $States.Error) {
@@ -2593,6 +2624,8 @@ function Invoke-GitExport {
     $processingsText = 'нет'
     if ($tracked.HasProcessings) { $processingsText = 'все из справочника' }
     Write-Line ("Выгружаю из {0} в файлы: расширения {1}; обработки {2}" -f $script:TempBase, (Get-NonEmpty (@($tracked.Extensions) -join ', ') 'нет'), $processingsText) 'Cyan'
+    # Колонка шагов ci.exe: выгрузки расширений видны заранее, серыми (названия - заголовки самих операций).
+    Send-UiPlan -StepNames @(@($tracked.Extensions) | ForEach-Object { 'Выгрузить {0} из {1}' -f $_, $script:TempBase }) -Operations
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$tracked.HasProcessings
     foreach ($item in $snapshot.Missing) { Write-Line ("  в {0} нет: {1} - в git остаётся как есть" -f $script:TempBase, $item) 'Yellow' }
     # Без @(): функция возвращает массив запятой, @() завернул бы его ещё раз.
@@ -2876,10 +2909,26 @@ function Get-ComConfigInfo {
                 while ($null -ne $connectError.InnerException) { $connectError = $connectError.InnerException }
                 throw ([string]$connectError.Message)
             }
-            $metadata = $connection.Metadata
+            # Свойства - поздним связыванием (IDispatch), мимо PowerShell: у объектов 1С нет описания типов, и PowerShell
+            # их свойства иногда не видит - отдаёт $null без ошибки (20.11.2026 так пришли пустые имя и версия типовой).
+            # Подставной COM тестов - обычные объекты PowerShell.
+            $get = {
+                param($Object, [string]$Name)
+                if ($null -eq $Object) { throw ("нет объекта, у которого брать «{0}»" -f $Name) }
+                if (-not [Runtime.InteropServices.Marshal]::IsComObject($Object)) { return , ($Object.$Name) }
+                $comType = [type]::GetType('System.__ComObject')
+                if ($null -eq $comType) { $comType = $Object.GetType() }
+                try { return , ($comType.InvokeMember($Name, [System.Reflection.BindingFlags]::GetProperty, $null, $Object, $null)) }
+                catch {
+                    $memberError = $_.Exception
+                    while ($null -ne $memberError.InnerException) { $memberError = $memberError.InnerException }
+                    throw ("{0}: {1}" -f $Name, [string]$memberError.Message)
+                }
+            }
+            $metadata = & $get $connection 'Metadata'
             # Массивом: Invoke-UiBackground берёт у результата .PSObject.BaseObject, а у одиночного pscustomobject
             # там голый объект без свойств.
-            return , @([pscustomobject]@{ Name = [string]$metadata.Name; Synonym = [string]$metadata.Synonym; Version = [string]$metadata.Version })
+            return , @([pscustomobject]@{ Name = [string](& $get $metadata 'Name'); Synonym = [string](& $get $metadata 'Synonym'); Version = [string](& $get $metadata 'Version') })
         }
         finally {
             foreach ($comObject in @($connection, $connector)) {
@@ -2898,7 +2947,14 @@ function Get-ComConfigInfo {
         return [pscustomobject]@{ Ok = $false; Error = $message; Name = ''; Synonym = ''; Version = '' }
     }
     $info = @($call.Result)[0]
-    return [pscustomobject]@{ Ok = $true; Error = ''; Name = [string]$info.Name; Synonym = [string]$info.Synonym; Version = [string]$info.Version }
+    $name = [string]$info.Name
+    $version = [string]$info.Version
+    # Пустые имя или версия - не прочитал, а не «версия пустая»: с пустой версией сравнение «та же, что в прошлый раз»
+    # совпало бы и после обновления типовой.
+    if (-not $name -or -not $version) {
+        return [pscustomobject]@{ Ok = $false; Error = ("внешнее соединение вернуло пустые имя или версию конфигурации (имя «{0}», версия «{1}»)" -f $name, $version); Name = ''; Synonym = ''; Version = '' }
+    }
+    return [pscustomobject]@{ Ok = $true; Error = ''; Name = $name; Synonym = [string]$info.Synonym; Version = $version }
 }
 
 function Update-TypicalDump {
@@ -2974,6 +3030,30 @@ function Invoke-GitTypical {
     $info = Get-ComConfigInfo -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
     if (-not $info.Ok) { Write-Line ("  версию конфигурации {0} не прочитал: {1}. Типовую не выгружаю." -f $script:TempBase, $info.Error) 'Yellow'; return }
     $title = '{0} ({1}) {2}' -f $info.Synonym, $info.Name, $info.Version
+    if (-not $state['version'] -and $state['commit']) {
+        # Коммит есть, а версии при нём нет: до 20.11.2026 версия могла прочитаться пустой (свойства COM 1С), выгрузка
+        # и коммит при этом прошли. Версию того коммита - из его Configuration.xml (repo.git цел, даже если выгрузку
+        # удалили): та же, что в temp, - дописываю её, выгрузку не повторяю. Другая или не прочиталась (temp могли
+        # обновить после того запуска) - обычный путь: вопрос и выгрузка.
+        $committed = ''
+        $gitDir = Join-Path $typicalRoot 'repo.git'
+        if (Test-Path -LiteralPath (Join-Path $gitDir 'HEAD')) {
+            $git = Get-PortableGit -ToolsDir (Resolve-RootPath 'tools') -Exe ([string](Get-Setting $cfg 'GitExe' ''))
+            $show = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $typicalRoot -Arguments @('show', ($state['commit'] + ':Configuration.xml')) -AllowFail
+            if ($show.ExitCode -eq 0 -and $show.Output -match '<Version>([^<]*)</Version>') { $committed = $Matches[1].Trim() }
+        }
+        if ($committed -and $committed -eq $info.Version) {
+            $state['name'] = $info.Name
+            $state['version'] = $info.Version
+            $state['time'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            [System.IO.File]::WriteAllText($statePath, (ConvertTo-Json -InputObject $state), $Utf8Bom)
+            Write-Line ("  типовая {0}: в {1} коммит {2} записан без версии, в нём та же версия - дописал её, выгружать нечего." -f $title, $repo, (Get-GitShort $state['commit'])) 'Green'
+            return
+        }
+        $seen = $committed
+        if (-not $seen) { $seen = 'не прочитал' }
+        Write-Line ("  в {0} коммит {1} записан без версии; версия в нём - {2}, в {3} - {4}: выгружаю как новую." -f $repo, (Get-GitShort $state['commit']), $seen, $script:TempBase, $info.Version) 'Yellow'
+    }
     if ($state['version'] -eq $info.Version -and $state['commit']) {
         Write-Line ("  типовая {0} уже в {1} (коммит {2}): выгружать нечего." -f $title, $repo, (Get-GitShort $state['commit'])) 'Green'
         return
@@ -3003,6 +3083,11 @@ function Invoke-GitTypical {
         return
     }
     Write-Line ("  выгружаю типовую {0} в файлы: {1} (первый раз - надолго; на диске {2} свободно {3} ГБ)" -f $script:TempBase, $dump, $drive.Name, $freeGb)
+    # Колонка шагов ci.exe: весь путь типовой виден заранее. Названия - заголовки операций ниже; шаг, которого не
+    # было (коммит уже сделан прошлым запуском), останется «не выполнялся».
+    Send-UiPlan -Operations -StepNames @(
+        ('Выгрузить типовую {0} в файлы' -f $script:TempBase), 'Типовая: git fetch (что сейчас в GitHub)', 'Типовая: git add (файлы - в pack)',
+        'Типовая: git commit', 'Типовая: git repack (сжать объекты перед отправкой)', 'Типовая: git push (отправка в GitHub)')
     Update-TypicalDump -Dir $dump
     # Конфигуратор может оставить повреждённый XML даже при наличии Configuration.xml.
     # Прочитать потоками до записи git-индекса. Пути с # и % передавать как файлы, а не URI.
@@ -3657,7 +3742,7 @@ else {
         # Обновить подготовленным: что загружено при подготовке, то и применяется. Сверка: temp и рабочая с тех пор
         # не менялись (по хеш-суммам через внешнее соединение, если они читаются).
         if ($null -eq $prepared) { throw 'подготовленного обновления нет: сначала «Подготовить обновление рабочей»' }
-        if ([bool](Get-JsonValue $prepared 'partial' $false)) { throw 'подготовка не закончена (часть расширений не загрузилась): «Отменить подготовку» или «Подготовить заново»' }
+        if ([bool](Get-JsonValue $prepared 'partial' $false)) { throw 'подготовка не закончена (часть расширений не загрузилась): «Отменить подготовку рабочей» или «Подготовить обновление рабочей» заново' }
         if ([string](Get-JsonValue $prepared 'base' '') -ne $script:ProdBase) { throw ("подготовлено для базы {0}, а рабочая сейчас {1}" -f (Get-JsonValue $prepared 'base' '?'), $script:ProdBase) }
         $preparedRunId = [string](Get-JsonValue $prepared 'runId' '')
         $preparedWhen = [string](Get-JsonValue $prepared 'timeText' '')
@@ -3689,7 +3774,7 @@ else {
         }
         if ($preparedChanged.Count -gt 0) {
             foreach ($line in $preparedChanged) { Write-Line ('  ' + $line) 'Yellow' }
-            $go = Confirm-Ui -Question ("После подготовки было изменено: {0}. Обновить {1} подготовленным всё равно? Надёжнее - «Подготовить заново»." -f ($preparedChanged -join '; '), $script:ProdBase) -Yes 'Да, обновлять подготовленным' -No 'Нет, выйти'
+            $go = Confirm-Ui -Question ("После подготовки было изменено: {0}. Обновить {1} подготовленным всё равно? Надёжнее - «Подготовить обновление рабочей» заново." -f ($preparedChanged -join '; '), $script:ProdBase) -Yes 'Да, обновлять подготовленным' -No 'Нет, выйти'
             if ($go -ne $true) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
             Write-RunLog ('Обновление подготовленным несмотря на: ' + ($preparedChanged -join '; '))
         }
@@ -3988,7 +4073,7 @@ if ($needExclusive) {
             }
             return
         }
-        if ([string]::IsNullOrEmpty($script:UnlockCode)) { $script:UnlockCode = '123'; Write-Line '  UnlockCode пустой: на этот запуск использован резервный код разрешения входа' }
+        if ([string]::IsNullOrEmpty($script:UnlockCode)) { $script:UnlockCode = '123'; Write-Line '  UnlockCode пустой: на этот запуск взят код разрешения входа по умолчанию. Задай свой: Настройки, Базы, UnlockCode.' }
         $start = Get-Date
         if ($null -ne $StartAt) { $start = [datetime]$StartAt }
         $until = $start.AddHours($sessionLockHours)
@@ -4253,7 +4338,7 @@ if ($Prepare) {
                 Remove-Item -LiteralPath $preparedPath -Force
                 Write-Line ("ИТОГ: подготовка не прошла, расширения {0} возвращены к применённым версиям." -f $script:ProdBase) 'Red'
             }
-            else { Write-Line ("ИТОГ: подготовка не закончена. В конфигурации {0} остались загруженные, не применённые версии: «Отменить подготовку» или «Подготовить заново»." -f $script:ProdBase) 'Red' }
+            else { Write-Line ("ИТОГ: подготовка не закончена. В конфигурации {0} остались загруженные, не применённые версии: «Отменить подготовку рабочей» или «Подготовить обновление рабочей» заново." -f $script:ProdBase) 'Red' }
         }
         else { Write-Line ("ИТОГ: подготовка не прошла, в конфигурации {0} ничего не изменено." -f $script:ProdBase) 'Red' }
         exit 1

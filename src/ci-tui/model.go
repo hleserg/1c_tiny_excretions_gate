@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 const maxLogLines = 6000
@@ -82,6 +83,9 @@ type model struct {
 	// restartAfter - и сразу открыть ci заново: в папке гейта уже новый ci.exe.
 	closeAfter   bool
 	restartAfter bool
+	// planOps - план колонки шагов прислан как план долгих операций (событие plan с ops): шаги закрывает
+	// событие step, узла «Вердикт» нет.
+	planOps bool
 }
 
 func newModel(baseDir, script string, extra []string) model {
@@ -247,7 +251,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		ev := msg.ev
 		switch ev.Kind {
 		case "plan":
-			m.setPlan(ev.Steps, ev.Parallel)
+			m.setPlan(ev.Steps, ev.Parallel, ev.Ops)
 			return m, m.syncOverall()
 		case "reset":
 			m.resetRun()
@@ -255,6 +259,11 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "close":
 			m.closeAfter = true
 			m.restartAfter = ev.Restart
+		case "step":
+			// Долгая операция кончилась. У действия без своего плана шагов (выгрузка в git, типовая, сравнения)
+			// она встаёт в колонку шагов с итогом и временем; с планом колонку ведут план и строки [OK]/[FAIL].
+			m.addOperation(ev.Title, ev.Status, ev.Elapsed)
+			return m, m.syncOverall()
 		case "subplan":
 			m.setSubPlan(ev)
 			m.layout()
@@ -359,6 +368,12 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.dialogMouse(m.overlayMouse(msg))
 
 	case tea.KeyMsg:
+		if msg.String() == "f2" {
+			// Весь журнал - в буфер обмена. Мышь у ci.exe занята прокруткой и щелчками по пунктам, поэтому выделить
+			// текст в окне, как в обычной консоли, нельзя. Работает и при открытом вопросе.
+			m.copyLog()
+			return m, nil
+		}
 		if m.dialog != nil && m.dialog.docked() {
 			switch msg.String() {
 			case "up", "down", "pgup", "pgdown", "home", "end":
@@ -658,18 +673,31 @@ func (m model) viewProgress() string {
 	return styleProgressBox.Width(m.width - 2).Render(line1 + "\n" + line2 + "\n" + line3)
 }
 
+// copyLog - весь журнал (то, что в окне справа, без раскраски) в буфер обмена; итог - строкой подсказки.
+func (m *model) copyLog() {
+	lines := make([]string, len(m.lines))
+	for i, l := range m.lines {
+		lines[i] = ansi.Strip(l)
+	}
+	if err := writeClipboard(strings.Join(lines, "\r\n")); err != nil {
+		m.notice = "журнал в буфер обмена не скопировался: " + err.Error()
+		return
+	}
+	m.notice = fmt.Sprintf("журнал в буфере обмена: строк %d", len(lines))
+}
+
 func (m model) viewFooter() string {
 	var help string
 	switch {
 	case m.dialog != nil || m.starting:
 		help = ""
 	case m.running:
-		help = "↑↓ PgUp PgDn журнал · f к концу · q остановить скрипт"
+		help = "↑↓ PgUp PgDn журнал · f к концу · F2 журнал в буфер обмена · q остановить скрипт"
 		if !m.stopAsked.IsZero() && time.Since(m.stopAsked) > 20*time.Second {
 			help += " · k снять процесс"
 		}
 	default:
-		help = "enter или esc снова в меню · q выход · ↑↓ журнал"
+		help = "enter или esc снова в меню · q выход · ↑↓ журнал · F2 журнал в буфер обмена"
 	}
 	// Строки подсказки не обрезаются: не влезает - переносится. Версия сборки - в правом нижнем углу.
 	width := max(20, m.width)

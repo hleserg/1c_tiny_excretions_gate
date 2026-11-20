@@ -4,11 +4,13 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"syscall"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func withClipboard(t *testing.T, text string, err error) {
@@ -137,5 +139,141 @@ func TestPasteFromTerminal(t *testing.T) {
 	d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("C:\\ci\\inbox\n"), Paste: true})
 	if got := d.input.Value(); got != "C:\\ci\\inbox" {
 		t.Fatalf("значение: %q", got)
+	}
+}
+
+// Меню с группами: заголовок группы - строка перед её первым пунктом, выбрать её нельзя; клавиши пунктов свои и
+// не зависят от того, какие пункты показаны.
+func TestOneSectionsAndKeys(t *testing.T) {
+	ev := uiEvent{Kind: "one", Header: "Меню",
+		Items:    []string{"Прогон", "Результаты", "Обновить рабочую", "Откатить", "Настройки"},
+		Sections: []string{"Тестовая база", "", "Рабочая база", "", "Гейт"},
+		Keys:     []string{"2", "7", "d", "e", "l"}}
+	d := newDialog(ev, 100, 40)
+	view := ansi.Strip(d.View())
+	for _, title := range []string{"ТЕСТОВАЯ БАЗА", "РАБОЧАЯ БАЗА", "ГЕЙТ"} {
+		if strings.Count(view, title) != 1 {
+			t.Fatalf("заголовок группы %q показан %d раз, ждали 1", title, strings.Count(view, title))
+		}
+	}
+	if len(d.hits) != len(ev.Items) {
+		t.Fatalf("мест для щелчка %d, пунктов %d: заголовок группы не должен выбираться", len(d.hits), len(ev.Items))
+	}
+	// Щелчок по строке заголовка «Рабочая база» ничего не выбирает, по пункту под ним - выбирает его
+	// (по настоящей отрисовке экрана, как в mouse_test.go).
+	m := ask(testModel(120, 50), ev)
+	hx, hy := onScreen(t, m, "РАБОЧАЯ БАЗА")
+	m = mouse(m, hx+2, hy, tea.MouseButtonLeft)
+	if m.dialog == nil {
+		t.Fatalf("щелчок по заголовку группы выбрал пункт (журнал: %q)", lastLine(m))
+	}
+	ix, iy := onScreen(t, m, "Обновить рабочую")
+	if iy != hy+1 {
+		t.Fatalf("первый пункт группы на строке %d, заголовок на %d: ждали пункт сразу под заголовком", iy, hy)
+	}
+	m = mouse(m, ix+2, iy, tea.MouseButtonLeft)
+	if m.dialog != nil || !strings.Contains(lastLine(m), "Обновить рабочую") {
+		t.Fatalf("щелчок по пункту под заголовком не выбрал его (журнал: %q)", lastLine(m))
+	}
+
+	// Своя клавиша: «d» - третий пункт (порядковая «d» была бы тринадцатым), в русской раскладке - «в».
+	for _, key := range []string{"d", "в", "D"} {
+		k := newDialog(ev, 100, 40)
+		k.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		if !k.finished || k.result.Index != 2 {
+			t.Fatalf("клавиша %q: finished=%v index=%d, ждали пункт 2", key, k.finished, k.result.Index)
+		}
+	}
+	// Клавиша, которой нет ни у одного пункта (порядковая «1»), ничего не выбирает.
+	gap := newDialog(ev, 100, 40)
+	gap.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("1")})
+	if gap.finished {
+		t.Fatalf("клавиша без пункта выбрала пункт %d", gap.result.Index)
+	}
+	for _, want := range []string{"2 Прогон", "7 Результаты", "d Обновить рабочую", "e Откатить", "l Настройки"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("в меню нет %q:\n%s", want, view)
+		}
+	}
+
+	// Без keys - клавиши порядковые, как раньше.
+	plain := newDialog(uiEvent{Kind: "one", Header: "Меню", Items: []string{"А", "Б", "В"}}, 100, 40)
+	plain.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("2")})
+	if !plain.finished || plain.result.Index != 1 {
+		t.Fatalf("порядковая клавиша: finished=%v index=%d", plain.finished, plain.result.Index)
+	}
+}
+
+// Окно ниже списка: заголовки групп занимают строки, курсор остаётся на экране, а над первым видимым пунктом
+// стоит заголовок его группы.
+func TestOneSectionsScroll(t *testing.T) {
+	items := make([]string, 12)
+	sections := make([]string, 12)
+	for i := range items {
+		items[i] = fmt.Sprintf("Пункт %02d", i)
+	}
+	sections[0], sections[4], sections[8] = "Первая", "Вторая", "Третья"
+	// Высота 16: visibleRows = 16 - 10 = 6 строк на пункты и заголовки.
+	d := newDialog(uiEvent{Kind: "one", Header: "Меню", Items: items, Sections: sections}, 100, 16)
+	if got := d.windowEnd(0); got != 4 {
+		t.Fatalf("с начала влезает до пункта %d, ждали 4: заголовки «Первая» и «Вторая» занимают строки", got)
+	}
+	for i := 0; i < 9; i++ {
+		d.Update(tea.KeyMsg{Type: tea.KeyDown})
+		if d.cursor < d.offset || d.cursor >= d.windowEnd(d.offset) {
+			t.Fatalf("после %d нажатий вниз курсор %d вне окна [%d, %d)", i+1, d.cursor, d.offset, d.windowEnd(d.offset))
+		}
+	}
+	view := ansi.Strip(d.View())
+	if !strings.Contains(view, "Пункт 09") {
+		t.Fatal("пункт под курсором не на экране")
+	}
+	if rows := strings.Count(view, "Пункт "); rows > 6 {
+		t.Fatalf("на экране %d пунктов при шести строках", rows)
+	}
+	first := items[d.offset]
+	if strings.Index(view, strings.ToUpper(d.sectionOf(d.offset))) > strings.Index(view, first) {
+		t.Fatal("заголовок группы первого видимого пункта стоит не над ним")
+	}
+}
+
+// Пояснения пунктов: подпись не меняется, переменное - серым рядом; не влезло в строку - под подписью, и щелчок
+// по строке пояснения выбирает тот же пункт.
+func TestOneHints(t *testing.T) {
+	ev := uiEvent{Kind: "one", ID: 1, Header: "Гейт расширений",
+		Items: []string{"Прогон на том, что есть в базе", "Продолжить прогон с упавшего шага", "Обновить гейт из GitHub", "Выход"},
+		Hints: []string{"", "20261119-211941 (красный / Адаптация 20261119.203826, оставлен)", "стоит 20261120.002435", ""}}
+	wide := ansi.Strip(newDialog(ev, 120, 40).View())
+	for _, want := range []string{"2 Продолжить прогон с упавшего шага  20261119-211941 (красный", "3 Обновить гейт из GitHub  стоит 20261120.002435", "1 Прогон на том, что есть в базе", "4 Выход"} {
+		if !strings.Contains(wide, want) {
+			t.Fatalf("широкое окно: нет %q:\n%s", want, wide)
+		}
+	}
+	// Узкое окно: пояснение второго пункта не влезает рядом - уходит под подпись, подпись остаётся как есть.
+	m := ask(testModel(64, 40), ev)
+	screen := ansi.Strip(m.View())
+	if !strings.Contains(screen, "2 Продолжить прогон с упавшего шага") || strings.Contains(screen, "шага  20261119") {
+		t.Fatalf("узкое окно: подпись второго пункта не отдельной строкой:\n%s", screen)
+	}
+	hx, hy := onScreen(t, m, "20261119-211941")
+	_, ly := onScreen(t, m, "Продолжить прогон с упавшего шага")
+	if hy != ly+1 {
+		t.Fatalf("пояснение на строке %d, подпись на %d: ждали пояснение сразу под подписью", hy, ly)
+	}
+	m = mouse(m, hx+2, hy, tea.MouseButtonLeft)
+	if m.dialog != nil || !strings.Contains(lastLine(m), "Продолжить прогон с упавшего шага") {
+		t.Fatalf("щелчок по строке пояснения не выбрал пункт (журнал: %q)", lastLine(m))
+	}
+	// Перенесённое пояснение занимает строки окна: пунктов влезает меньше.
+	narrow := newDialog(uiEvent{Kind: "one", Header: "Меню", Items: ev.Items, Hints: ev.Hints}, 64, 13)
+	if rows := narrow.itemRows(1); rows < 2 {
+		t.Fatalf("пункт с перенесённым пояснением: строк %d, ждали больше одной", rows)
+	}
+	if end := narrow.windowEnd(0); end >= len(ev.Items) {
+		t.Fatalf("в окно из трёх строк влезло пунктов %d: перенос пояснения не посчитан", end)
+	}
+	// Без пояснений - как раньше.
+	if strings.Contains(ansi.Strip(newDialog(uiEvent{Kind: "one", Header: "Меню", Items: ev.Items}, 120, 40).View()), "стоит") {
+		t.Fatal("пояснение показано, хотя hints нет")
 	}
 }
