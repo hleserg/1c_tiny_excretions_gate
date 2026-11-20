@@ -171,6 +171,14 @@ $script:UtCheckIgnore = ''
 # Итоги модульных тестов этого прогона (Read-UtJUnit) и карта покрытия, которая ждёт их (#16).
 $script:UtRunResults = $null
 $script:CoveragePending = $null
+# Действия после обновления (раздел 5.24): папка, действия, собранная обработка, что не так, нужен ли шаг; папка
+# действий прежнего прогона - для сверки при выборе продолжения.
+$script:GateActionsDir = ''
+$script:GateActions = @()
+$script:GateActionsEpf = ''
+$script:GateActionsProblem = ''
+$script:GateActionsNeeded = $false
+$script:PlanActionsDir = ''
 # Итог прогона в GitHub (publish.ps1, настройка RunReportRepo): папка прогона, когда она есть и отправка включена.
 $script:PublishRunDir = ''
 
@@ -2832,7 +2840,11 @@ function Get-PhaseInputs {
         'unittests' { $keys = @('UnitTestExtensions', 'UnitTestEngine', 'RunUnitTests') }
         'actions' {
             $keys = @('ActionsRegister', 'HistoryRegister')
-            $flags['действия'] = Get-GateActionsStamp $script:GateActionsDir
+            # Папка ещё не выбрана (меню продолжения) - та, что будет: -ActionsDir или папка прежнего прогона.
+            $actionsDirNow = $script:GateActionsDir
+            if (-not $actionsDirNow -and $ActionsDir) { $actionsDirNow = Resolve-RootPath $ActionsDir }
+            if (-not $actionsDirNow) { $actionsDirNow = $script:PlanActionsDir }
+            $flags['действия'] = Get-GateActionsStamp $actionsDirNow
         }
     }
     $inputs = [ordered]@{}
@@ -3111,6 +3123,7 @@ function Get-ResumePlan {
 
     # Можно ли взять этап готовым и почему нельзя.
     $prevGate = [string](Get-UiField $state 'gateVersion' '')
+    $script:PlanActionsDir = [string](Get-UiField $state 'actionsDir' '')
     $phasesState = Get-UiField $state 'phases' $null
     $reusable = @{}
     $why = @{}
@@ -4883,11 +4896,6 @@ function Update-GateTools {
 # (исходники - tools\src), собирает её конфигуратором в начале прогона и запускает после канареечного входа.
 # Выполненные (запись в регистре ActionsRegister) обработка не повторяет; загрузку пишет в HistoryRegister.
 
-$script:GateActionsDir = ''
-$script:GateActions = @()
-$script:GateActionsEpf = ''
-$script:GateActionsProblem = ''
-$script:GateActionsNeeded = $false
 # Папка actions внутри комплекта (так её кладёт «Загрузить из git»).
 $script:KitActionsDir = ''
 
