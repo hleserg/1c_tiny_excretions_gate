@@ -112,7 +112,10 @@ function New-DeliverySandbox {
     $sb = New-GitSandbox $Name -Extra $config
     $gh = Get-FakeGh $sb
     [System.IO.File]::WriteAllText((Join-Path $sb 'fake-github\ci-default.txt'), "completed`tsuccess", $utf8)
-    $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = $Dumps } -Com $Com -Answers $gitBootstrapAnswers
+    # Вопрос «Вести в git и внешние обработки» - только если в temp есть карточки справочника.
+    $answers = $gitBootstrapAnswers
+    if (@($Com['bases']['erp_temp_test']['processings']).Count -eq 0) { $answers = @($gitBootstrapAnswers | Where-Object { $_.Header -ne 'Вести в git и внешние обработки' }) }
+    $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = $Dumps } -Com $Com -Answers $answers
     Check-DeployCommon $boot -LocksExpected $false
     $state = Read-GitStateFile $sb
     if ($state.pendingCommit) { Set-GhBranch -Gh $gh -Branch 'main' -Sha $state.pendingCommit }
