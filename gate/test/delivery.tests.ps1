@@ -504,6 +504,13 @@ function Check-DeliveryCommon {
             param($Name)
             $com = New-ComState
             $sb = New-DeliverySandbox $Name -Com $com -Dumps (New-DDumps) -Extra @{ DeliveryAutoMerge = $false }
+            # Этот сценарий только печатает команду. Выполнение настоящего python.exe проверяет тест установленного ZIP.
+            $runtime = Join-Path $sb 'runtime'
+            $pyDir = Join-Path $runtime 'python-3.14.10'
+            $null = New-Item -ItemType Directory -Path $pyDir -Force
+            [IO.File]::WriteAllText((Join-Path $runtime 'python-version.txt'), '3.14.10')
+            $expectedExe = Join-Path $pyDir 'python.exe'
+            [IO.File]::WriteAllText($expectedExe, 'fixture')
             $gh = Get-FakeGh $sb
             $null = New-DZip -Path (Join-Path $sb 'Входящие\Доработки.cfe') -Files (New-DExtFiles -Module (New-DModule -Extra 'Сумма * 0.3'))
             $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{ dumps = (New-DDumps) } -Com $null
@@ -511,7 +518,9 @@ function Check-DeliveryCommon {
             $state = @(Get-DeliveryStates $sb)[0]
             Check ([string]$state.status -eq 'waiting-merge') ("без автослияния статус {0} ({1})" -f $state.status, $state.note)
             Check ((Get-DStubs $sb).Count -eq 0) 'до слияния гейт запускался'
-            Check (@($first.Output | Where-Object { $_ -match 'merge_checked.py .* --merge ' }).Count -gt 0) 'не сказано, как слить'
+            $pull = Get-GhPull -Gh $gh -Number ([int]$state.pr.number)
+            $command = "& '{0}' -I -X utf8 'ci/merge_checked.py' {1} --merge '{2}'" -f $expectedExe.Replace("'", "''"), $state.pr.number, $pull.Merge
+            Check (@($first.Output | Where-Object { $_.Contains($command) }).Count -gt 0) 'нет команды с комплектным Python, номером PR и проверенным SHA'
             # Человек слил PR (здесь - main на коммит кандидата).
             Set-GhBranch -Gh $gh -Branch 'main' -Sha ([string]$state.pr.head)
             $pulls = (Get-DPulls $sb).Count
