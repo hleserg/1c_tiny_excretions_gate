@@ -3574,6 +3574,91 @@ $tests = @(
         }
     },
     @{
+        Name = 'gate-publish-run-files'
+        Text = 'файлы прогона в git (RunFilesRepo): текстовые файлы папки прогона - в ветку-сироту gate-runs, папка runs/<прогон>, README.md и latest.txt, ссылка в итоге, main не тронут; файлы не ушли - досылаются следующим запуском; двоичные и файл с токеном не выкладываются, README.md говорит почему'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ RunReportRepo = 'owner/repo'; RunFilesRepo = 'owner/ext'; GitHubTokenPassFile = 'secrets\github.txt' }
+            New-Item -ItemType Directory -Path (Join-Path $sb 'secrets') -Force | Out-Null
+            $secret = 'tok-файлы-прогона-321'
+            [System.IO.File]::WriteAllText((Join-Path $sb 'secrets\github.txt'), (ConvertFrom-SecureString -SecureString (ConvertTo-SecureString $secret -AsPlainText -Force)))
+            $http = Join-Path $sb 'fake-http'
+            New-Item -ItemType Directory -Path $http -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $sb 'fake-github') -Force | Out-Null
+            $gh = Get-FakeGh $sb
+            $seedFile = [pscustomobject]@{ Path = 'README.md'; Bytes = $utf8.GetBytes('Репозиторий расширений') }
+            $seed = New-GhCommit -Gh $gh -Parent '' -Changes @($seedFile) -Message 'Начальный коммит'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $seed -Create
+
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep'
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            $id = ''
+            if ($r.RunDir) { $id = Split-Path -Leaf $r.RunDir }
+            Check ((Get-GhHead -Gh $gh -Branch 'main').Sha -eq $seed) 'файлы прогона тронули main'
+            $head = (Get-GhHead -Gh $gh -Branch 'gate-runs').Sha
+            Check ([bool]$head) 'нет ветки gate-runs'
+            if ($head -and $id) {
+                Check (-not (Get-GhFakeAncestors $gh $head).ContainsKey($seed)) 'ветка gate-runs ответвлена от main, а должна быть сиротой'
+                $files = (Read-GhFakeCommit $gh $head).Files
+                foreach ($path in @('report.txt', 'summary.txt', 'run.log', 'verdict.json', 'README.md')) {
+                    Check ($files.ContainsKey(('runs/{0}/{1}' -f $id, $path))) ('в ветке нет runs/{0}/{1}' -f $id, $path)
+                }
+                $latest = ''
+                if ($files.ContainsKey('runs/latest.txt')) { $latest = ([System.Text.Encoding]::UTF8.GetString((Get-GhBlob $gh $files['runs/latest.txt']))).Trim() }
+                Check ($latest -eq $id) ("runs/latest.txt: «{0}», ждали {1}" -f $latest, $id)
+                Check (-not $files.ContainsKey('README.md')) 'в ветку gate-runs попали файлы main'
+                foreach ($blob in @($files.Values)) {
+                    Check (-not ([System.Text.Encoding]::UTF8.GetString((Get-GhBlob $gh $blob))).Contains($secret)) 'токен в выложенном файле'
+                }
+            }
+            $sent = @(Get-ChildItem -LiteralPath $http -Filter 'dispatch-*.json' | Sort-Object Name)
+            Check ($sent.Count -ge 1) 'итог прогона не ушёл'
+            if ($sent.Count -ge 1 -and $id) {
+                $body = [string](([System.IO.File]::ReadAllText($sent[$sent.Count - 1].FullName, $utf8) | ConvertFrom-Json).client_payload.body)
+                Check ($body.Contains(('https://github.com/owner/ext/tree/gate-runs/runs/{0}' -f $id))) 'в итоге нет ссылки на файлы прогона'
+            }
+            if ($r.RunDir) {
+                $statePath = Join-Path $r.RunDir 'publish.json'
+                $state = [System.IO.File]::ReadAllText($statePath, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check ($state.filesSent -eq 'final') 'publish.json: не отмечено, что файлы ушли'
+                # Итог ушёл, а файлы - нет (как без связи с git); в папке - новый текстовый файл, файл с токеном и двоичные.
+                [System.IO.File]::WriteAllText($statePath, '{"wanted":"final","sent":"final","message":"","filesWanted":"final","filesSent":"","filesError":"нет связи"}', $utf8Bom)
+                [System.IO.File]::WriteAllText((Join-Path $r.RunDir 'extra.txt'), 'дослано следующим запуском', $utf8Bom)
+                [System.IO.File]::WriteAllText((Join-Path $r.RunDir 'leak.txt'), ('токен ' + $secret), $utf8Bom)
+                New-Item -ItemType Directory -Path (Join-Path $r.RunDir 'epf') -Force | Out-Null
+                [System.IO.File]::WriteAllBytes((Join-Path $r.RunDir 'epf\old.txt'), [byte[]]@(65, 66))
+                [System.IO.File]::WriteAllBytes((Join-Path $r.RunDir 'saved.cfe'), [byte[]]@(0, 1, 2, 3))
+            }
+            Reset-FakeState $sb
+            $next = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep'
+            Check-Common $next
+            Check (@($next.Output | Where-Object { $_ -match [regex]::Escape($secret) }).Count -eq 0) 'токен в выводе'
+            Check (@($next.Output | Where-Object { $_ -match 'нашёлся секрет' }).Count -gt 0) 'не сказано, что в файле прогона нашёлся секрет'
+            $head = (Get-GhHead -Gh $gh -Branch 'gate-runs').Sha
+            if ($head -and $id) {
+                $files = (Read-GhFakeCommit $gh $head).Files
+                Check ($files.ContainsKey(('runs/{0}/extra.txt' -f $id))) 'файлы прогона, не ушедшие в прошлый раз, не досланы'
+                Check (-not $files.ContainsKey(('runs/{0}/leak.txt' -f $id))) 'выложен файл с токеном'
+                Check (-not $files.ContainsKey(('runs/{0}/saved.cfe' -f $id)) -and -not $files.ContainsKey(('runs/{0}/epf/old.txt' -f $id))) 'выложены двоичные файлы или папка epf'
+                $readmeKey = 'runs/{0}/README.md' -f $id
+                $readme = ''
+                if ($files.ContainsKey($readmeKey)) { $readme = [System.Text.Encoding]::UTF8.GetString((Get-GhBlob $gh $files[$readmeKey])) }
+                Check ($readme.Contains('leak.txt') -and $readme.Contains('секрет')) 'в README.md нет, что leak.txt не выложен из-за секрета'
+                Check (-not $readme.Contains($secret)) 'токен в README.md'
+                $state = [System.IO.File]::ReadAllText((Join-Path $r.RunDir 'publish.json'), $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check ($state.filesSent -eq 'final') 'publish.json: дослав файлы, не отмечено, что они ушли'
+                if ($next.RunDir) {
+                    $nextId = Split-Path -Leaf $next.RunDir
+                    Check ($files.ContainsKey(('runs/{0}/summary.txt' -f $nextId))) 'файлы следующего прогона не ушли'
+                    $latest = ''
+                    if ($files.ContainsKey('runs/latest.txt')) { $latest = ([System.Text.Encoding]::UTF8.GetString((Get-GhBlob $gh $files['runs/latest.txt']))).Trim() }
+                    Check ($latest -eq $nextId) ("runs/latest.txt после второго прогона: «{0}», ждали {1}" -f $latest, $nextId)
+                }
+            }
+            Check ((Get-GhHead -Gh $gh -Branch 'main').Sha -eq $seed) 'второй прогон тронул main'
+        }
+    },
+    @{
         Name = 'git-export'
         Text = '«Выгрузить temp в git»: первый снимок и следующая правка в отдельных PR, основная ветка сохраняет исходный коммит. Состав снимка, state.json и повтор без изменений.'
         Run = {
