@@ -51,17 +51,27 @@ type task struct {
 	Lines []string `json:"lines"`
 	// Снимки задания (ключ -> текст): уходят в следующую часть журнала после строк задания, как у обработки.
 	Snapshots map[string]string `json:"snapshots"`
+	// Два исполнителя: задание группы, которую делят (@@group=1), и ожидание второго (@@wait=1).
+	group bool
+	wait  bool
 }
 
 type selfcheck struct {
 	Ext         []string `json:"ext"`
 	Pack        string   `json:"pack"`
 	Fingerprint string   `json:"fingerprint"`
-	Tasks       []task   `json:"tasks"`
-	Status      string   `json:"status"`
-	NoStart     bool     `json:"nostart"`
-	ExitAfter   int      `json:"exitAfter"`
-	Sleep       float64  `json:"sleep"`
+	// Хеш исходников обработки (строка selfchecksrc в info.txt): как у обработки, входит в состав отпечатка.
+	Src       string `json:"src"`
+	Build     string `json:"build"`
+	Tasks     []task `json:"tasks"`
+	Status    string `json:"status"`
+	NoStart   bool   `json:"nostart"`
+	ExitAfter int    `json:"exitAfter"`
+	// Второй исполнитель обрывается после стольких заданий (ExitAfter - у обоих); NoPlan - обработка прежней версии:
+	// only=, split= и worker= не знает, список plan.txt не пишет.
+	ExitAfterW2 int     `json:"exitAfterW2"`
+	NoPlan      bool    `json:"noPlan"`
+	Sleep       float64 `json:"sleep"`
 }
 
 type canary struct {
@@ -430,9 +440,14 @@ func client(sc scenario, args []string, state map[string]int) int {
 		if !ok {
 			s = selfcheck{}
 		}
+		// Второй исполнитель запускается, пока первый ещё идёт (его счётчик ещё не записан): он взял тот же сценарий,
+		// а счётчик не двигает - оба одна самопроверка.
+		if p["worker"] == "2" {
+			state["selfcheck"]--
+		}
 		start := 0
 		fmt.Sscanf(p["start"], "%d", &start)
-		selfcheckRun(s, dirOf(p["out"]), p["known"], start)
+		selfcheckRun(s, dirOf(p["out"]), p["known"], start, p)
 	case "rununittests":
 		u, ok := pick(sc.Unittests, state, "unittests")
 		if !ok {
@@ -466,7 +481,80 @@ func client(sc scenario, args []string, state map[string]int) int {
 
 // start - как у обработки: продолжить с задания start (с нуля). Дальше конца очереди - заданий нет, только сведения
 // о базе и итог (так гейт проверяет базу перед продолжением прогона).
-func selfcheckRun(s selfcheck, dir, known string, start int) {
+// Сигналы гейта второму исполнителю и первому, который его ждёт: строки par.txt (go=1, done2=1, stop=1).
+func laneSignals(dir string) map[string]bool {
+	out := map[string]bool{}
+	data, err := os.ReadFile(dir + "par.txt")
+	if err != nil {
+		return out
+	}
+	for _, l := range strings.Split(string(trimBOM(data)), "\n") {
+		out[strings.TrimSpace(l)] = true
+	}
+	return out
+}
+
+// Ждёт одного из сигналов не дольше двух минут; ответ - какой пришёл (пусто - не дождался).
+func waitSignal(dir string, names ...string) string {
+	for i := 0; i < 600; i++ {
+		got := laneSignals(dir)
+		for _, n := range names {
+			if got[n] {
+				return n
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return ""
+}
+
+// Очередь исполнителя - как ОчередьИсполнителя обработки: only= - одна группа, split= и worker= - группу делят
+// два исполнителя по очереди, первый после последнего задания группы ждёт второго. Весь список - в plan.txt.
+func laneTasks(tasks []task, dir string, p map[string]string) []task {
+	only, split := p["only"], p["split"]
+	worker := 1
+	fmt.Sscanf(p["worker"], "%d", &worker)
+	if only == "" && split == "" {
+		return tasks
+	}
+	picked := []task{}
+	for _, t := range tasks {
+		if only == "" || t.Step == only {
+			picked = append(picked, t)
+		}
+	}
+	inGroup := func(t task) bool { return split != "" && t.Step == split && !strings.HasPrefix(t.Key, "Запись/") }
+	last, count := -1, 0
+	for i, t := range picked {
+		if inGroup(t) {
+			last, count = i, count+1
+		}
+	}
+	canSplit := count > 1
+	kept := []task{}
+	plan := []string{}
+	k := 0
+	for i, t := range picked {
+		lane := 1
+		if canSplit && inGroup(t) {
+			lane = k%2 + 1
+			k++
+			t.group = true
+		}
+		plan = append(plan, fmt.Sprintf("%d\t%d\t%s", i, lane, t.Key))
+		if lane == worker {
+			kept = append(kept, t)
+		}
+		if canSplit && worker == 1 && i == last {
+			kept = append(kept, task{Key: "Ожидание/Ожидание второго исполнителя: " + split, Title: "Ожидание второго исполнителя", Step: split,
+				Lines: []string{"[ИНФО] Второй исполнитель закончил свою часть группы"}, wait: true})
+		}
+	}
+	writeUTF8(dir+"plan.txt", strings.Join(plan, "\n"))
+	return kept
+}
+
+func selfcheckRun(s selfcheck, dir, known string, start int, p map[string]string) {
 	if s.NoStart {
 		return
 	}
@@ -485,7 +573,11 @@ func selfcheckRun(s selfcheck, dir, known string, start int) {
 	}
 	sum := sha256.Sum256([]byte(seed))
 	fingerprint := fmt.Sprintf("%x", sum)
-	info := []string{"selfcheck=20261117.999999", "base=erp_temp_test", "config=УправлениеПредприятием 2.5", "testbase=1",
+	build := s.Build
+	if build == "" {
+		build = "20261117.999999"
+	}
+	info := []string{"selfcheck=" + build, "selfchecksrc=" + s.Src, "base=erp_temp_test", "config=УправлениеПредприятием 2.5", "testbase=1",
 		"pack=" + pack, "packname=" + pack, "packreason=тест"}
 	for _, e := range ext {
 		info = append(info, "ext="+e)
@@ -502,6 +594,19 @@ func selfcheckRun(s selfcheck, dir, known string, start int) {
 			{Key: "Окружение", Title: "Окружение и расширения", Step: "Окружение", Lines: []string{"[ОК] Обработка запущена под полными правами"}},
 			// Ключ - как у ядра: «КомпиляцияМодулей/<вид>|<имя>».
 			{Key: "КомпиляцияМодулей/ОбщийМодуль|Адаптация_ОбщийСервер", Title: "ОбщийМодуль.Адаптация_ОбщийСервер", Step: "КомпиляцияМодулей", Lines: []string{"[ОК] ОбщийМодуль.Адаптация_ОбщийСервер: компилируется"}},
+		}
+	}
+	if !s.NoPlan {
+		tasks = laneTasks(tasks, dir, p)
+	}
+	exitAfter := s.ExitAfter
+	if p["worker"] == "2" && s.ExitAfterW2 > 0 {
+		exitAfter = s.ExitAfterW2
+	}
+	if p["worker"] == "2" && len(tasks) > 0 && !s.NoPlan {
+		if waitSignal(dir, "go=1", "stop=1") != "go=1" {
+			writeUTF8(dir+"result.txt", "status=stopped\nversion=20261117.999999\nfingerprint=\npieces=0\nwriteerrors=0")
+			return
 		}
 	}
 	if start > 0 {
@@ -585,12 +690,22 @@ func selfcheckRun(s selfcheck, dir, known string, start int) {
 	previous := []string{"[ИНФО] Самопроверка (подставная 1С)"}
 	var previousSnaps map[string]string
 	for n, t := range tasks {
-		if s.ExitAfter > 0 && n >= s.ExitAfter {
+		if exitAfter > 0 && n >= exitAfter {
 			return
 		}
 		pieces++
-		head := fmt.Sprintf("@@n=%d\n@@total=%d\n@@key=%s\n@@title=%s\n@@step=%s\n", n, len(tasks), t.Key, t.Title, t.Step) + blockLines() + "@@journal\n"
+		head := fmt.Sprintf("@@n=%d\n@@total=%d\n@@key=%s\n@@title=%s\n@@step=%s\n", n, len(tasks), t.Key, t.Title, t.Step) + blockLines()
+		if t.group {
+			head += "@@group=1\n"
+		}
+		if t.wait {
+			head += "@@wait=1\n"
+		}
+		head += "@@journal\n"
 		writeUTF8(fmt.Sprintf("%sp%06d.txt", dir, pieces), head+journal(previous)+snaps(previousSnaps))
+		if t.wait {
+			waitSignal(dir, "done2=1", "stop=1")
+		}
 		count(t.Lines)
 		b := blockOf[t.Step]
 		b.done++

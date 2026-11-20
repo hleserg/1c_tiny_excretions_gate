@@ -54,7 +54,7 @@ function New-Sandbox {
     param([string]$Name, [hashtable]$Config = @{})
     $dir = Join-Path $workRoot $Name
     foreach ($sub in @('bin', 'tools', 'inbox', 'fake')) { New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null }
-    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'cluster-target.ps1', 'locks.ps1')) {
+    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'cluster-target.ps1', 'locks.ps1', 'timeline.ps1', 'selfcheck-compare.ps1')) {
         Copy-Item -LiteralPath (Join-Path $ciRoot $script) -Destination $dir
     }
     # Подставной COM для deploy.ps1: скрипт берёт его из test\ рядом с собой, когда задан CI_FAKE_COM.
@@ -355,6 +355,18 @@ $errorTasks = @(
     @{ key = 'Окружение'; title = 'Окружение и расширения'; step = 'Окружение'; lines = @('[ОК] Обработка запущена под полными правами') },
     @{ key = 'КомпиляцияМодулей/ОбщийМодуль|Адаптация_ОбщийСервер'; title = 'ОбщийМодуль.Адаптация_ОбщийСервер'; step = 'КомпиляцияМодулей'; lines = @('[ОШИБКА] ОбщийМодуль.Адаптация_ОбщийСервер: не компилируется: тест') }
 )
+# ** Хлебников С.Ю. 20261120 Два исполнителя: группа «Формы расширений» из четырёх форм между двумя другими шагами.
+$laneGroup = 'Формы расширений'
+$laneTasks = @(
+    @{ key = 'Окружение'; title = 'Окружение и расширения'; step = 'Окружение'; lines = @('[ОК] Обработка запущена под полными правами') },
+    @{ key = 'Форма/Документ.А.Форма.ФормаДокумента'; title = 'Документ.А.Форма.ФормаДокумента'; step = $laneGroup; lines = @('[ОК] Документ.А.Форма.ФормаДокумента: создаётся (15 мс)') },
+    @{ key = 'Форма/Документ.Б.Форма.ФормаДокумента'; title = 'Документ.Б.Форма.ФормаДокумента'; step = $laneGroup; lines = @('[ОК] Документ.Б.Форма.ФормаДокумента: создаётся (20 мс)') },
+    @{ key = 'Форма/Документ.В.Форма.ФормаСписка'; title = 'Документ.В.Форма.ФормаСписка'; step = $laneGroup; lines = @('[ВНИМАНИЕ] Документ.В.Форма.ФормаСписка: вспомогательная форма без параметров не создалась (7 мс)') },
+    @{ key = 'Форма/Справочник.Г.Форма.ФормаЭлемента'; title = 'Справочник.Г.Форма.ФормаЭлемента'; step = $laneGroup; lines = @('[ОК] Справочник.Г.Форма.ФормаЭлемента: создаётся (11 мс)') },
+    @{ key = 'ПерепроведениеДокументов/Документ.А'; title = 'Документ.А'; step = 'Перепроведение документов'; lines = @('[ОК] Документ.А: перепроводится') }
+)
+$laneConfig = @{ SelfCheckWorkers = 2; SelfCheckSplitGroup = $laneGroup }
+# ** Хлебников С.Ю. 20261120 конец
 $epfDump = '<?xml version="1.0" encoding="UTF-8"?><MetaDataObject><ExternalDataProcessor uuid="1"><Properties><Name>Печать</Name></Properties></ExternalDataProcessor></MetaDataObject>'
 
 # Сообщение обмена для снимка: заголовок с полями, которые меняются при каждой выгрузке, и тело.
@@ -1222,6 +1234,159 @@ $tests = @(
             $step = Get-Step $r 'Самопроверка после загрузки'
             if ($null -ne $step) { Check ([string]$step.detail -match 'снимков 1, изменились 0') ("в итоге шага нет сведений о снимках: {0}" -f $step.detail) }
             if ($r.RunDir) { Check (-not (Test-Path -LiteralPath (Join-Path $r.RunDir 'selfcheck-after.snapshots.diff.txt'))) 'файл разницы есть, хотя менялся только заголовок' }
+        }
+    },
+    @{
+        # ** Хлебников С.Ю. 20261120
+        Name = 'gate-before-reason'
+        Text = 'самопроверка «до загрузки»: код обработки тот же - берётся из эталона; код обработки изменился - снимается заново, в итоге шага и в run.log сказано, что изменилось'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $srcA = 'a' * 64
+            $srcB = 'b' * 64
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ src = $srcA; build = '20261120.065748' }, @{ fingerprint = 'после'; src = $srcA; build = '20261120.065748' }) }
+            $first = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $first; Check-Verdict $first 'GREEN' 0
+            $last = Join-Path $sb 'baseline\erp_temp_test\selfcheck.last.txt'
+            Check ((Test-Path -LiteralPath $last) -and ([System.IO.File]::ReadAllText($last, $utf8).Contains('part:selfchecksrc=' + $srcA))) 'в selfcheck.last.txt нет состава отпечатка'
+            # Сборка другая, код тот же: обработка отвечает «то же» (отпечаток из кода), «до» не снимается.
+            Start-Sleep -Seconds 2
+            Remove-Item -LiteralPath (Join-Path $sb 'fake\fake1c-state.json') -Force -ErrorAction SilentlyContinue
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ fingerprint = 'после'; src = $srcA; build = '20261120.130631' }, @{ fingerprint = 'после'; src = $srcA; build = '20261120.130631' }) }
+            $same = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $same; Check-Verdict $same 'GREEN' 0
+            $step = Get-Step $same 'Самопроверка до загрузки'
+            Check ($null -ne $step -and [string]$step.detail -like 'не запускалась*') ("«до» снималась, хотя код обработки тот же: {0}" -f $(if ($null -ne $step) { $step.detail } else { 'нет шага' }))
+            # Код обработки изменился: повтор обязателен, причина - в итоге шага.
+            Start-Sleep -Seconds 2
+            Remove-Item -LiteralPath (Join-Path $sb 'fake\fake1c-state.json') -Force -ErrorAction SilentlyContinue
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ fingerprint = 'новый код'; src = $srcB; build = '20261120.165501' }, @{ fingerprint = 'после3'; src = $srcB; build = '20261120.165501' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $r
+            $step = Get-Step $r 'Самопроверка до загрузки'
+            Check ($null -ne $step -and [string]$step.detail -match 'снималось заново, потому что изменился код обработки самопроверки \(сборка 20261120\.130631 -> 20261120\.165501\)') ("нет причины полного прохода в итоге шага: {0}" -f $(if ($null -ne $step) { $step.detail } else { 'нет шага' }))
+            if ($r.RunDir) { Check ([System.IO.File]::ReadAllText((Join-Path $r.RunDir 'run.log'), $utf8).Contains('Самопроверка до загрузки выполнялась полностью: изменился код обработки самопроверки')) 'нет причины полного прохода в run.log' }
+        }
+    },
+    @{
+        # ** Хлебников С.Ю. 20261120
+        Name = 'gate-timeline'
+        Text = 'разбор времени прогона (timeline.ps1): по папке прогона - путь до вердикта без оценок, шаги, группы самопроверки'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ }, @{ tasks = $errorTasks; fingerprint = 'после' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'RED' 1
+            if (-not $r.RunDir) { Check $false 'нет папки прогона'; return }
+            $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sb 'timeline.ps1') $r.RunDir -Quiet 2>&1
+            Check ($LASTEXITCODE -eq 0) ("timeline.ps1 упал: {0}" -f (@($output) -join ' | '))
+            $timeline = Join-Path $r.RunDir 'timeline.txt'
+            if (-not (Test-Path -LiteralPath $timeline)) { Check $false 'нет timeline.txt'; return }
+            $text = [System.IO.File]::ReadAllText($timeline, $utf8)
+            Check ($text.Contains('Путь от старта до вердикта')) 'в timeline.txt нет пути до вердикта'
+            Check ($text -match 'вердикт \d\d\.\d\d \d\d:\d\d:\d\d RED') ("вердикт не найден по run.log или оценён: {0}" -f ($text -split "`n" | Select-Object -First 2))
+            Check ($text.Contains('самопроверка')) 'в пути до вердикта нет самопроверки'
+            Check (Test-Path -LiteralPath (Join-Path $r.RunDir 'selfcheck-groups.txt')) 'нет selfcheck-groups.txt'
+        }
+    },
+    @{
+        # ** Хлебников С.Ю. 20261120
+        Name = 'gate-selfcheck-group-lanes'
+        Text = 'замер одной группы самопроверки: одним исполнителем и двумя - только задания группы, второй исполнитель взял половину, сверка заданий без пропусков, selfcheck-compare: результаты совпали; эталон не тронут'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $fake = @{ selfcheck = @(@{ tasks = $laneTasks; sleep = 0.2 }) }
+            $one = Invoke-Script -Sandbox $sb -Arguments ('-SelfCheckGroup "{0}" -SelfCheckWorkers 1' -f $laneGroup) -Fake $fake
+            Check-Common $one
+            Check ((Get-Calls $one @('selfcheck', ('only=' + $laneGroup))).Count -eq 1) 'обработке не передана группа (only=)'
+            Check ((Get-Calls $one @('selfcheck', 'worker=2')).Count -eq 0) 'один исполнитель, а запускался второй'
+            Start-Sleep -Seconds 2
+            Remove-Item -LiteralPath (Join-Path $sb 'fake\fake1c-state.json') -Force -ErrorAction SilentlyContinue
+            $two = Invoke-Script -Sandbox $sb -Arguments ('-SelfCheckGroup "{0}" -SelfCheckWorkers 2' -f $laneGroup) -Fake $fake
+            Check-Common $two
+            Check ((Get-Calls $two @('selfcheck', 'worker=2', ('split=' + $laneGroup))).Count -eq 1) 'второй исполнитель не запускался'
+            $runs = @(Get-ChildItem -LiteralPath (Join-Path $sb 'selfcheck-runs') -Directory | Sort-Object Name)
+            if ($runs.Count -ne 2) { Check $false ("замеров {0}, ждали 2" -f $runs.Count); return }
+            $info = [System.IO.File]::ReadAllText((Join-Path $runs[1].FullName 'group-run.txt'), $utf8)
+            Check ($info.Contains('workers=2') -and $info.Contains('state=done') -and -not $info.Contains('problem=')) ("итог замера двумя: {0}" -f $info)
+            $norm = [System.IO.File]::ReadAllText((Join-Path $runs[1].FullName 'selfcheck-group.norm.txt'), $utf8)
+            Check (-not $norm.Contains('Окружение') -and -not $norm.Contains('Перепроведение')) 'в замер попали задания не из группы'
+            $lanes = @([System.IO.File]::ReadAllLines((Join-Path $runs[1].FullName 'selfcheck-group.lanes.txt'), $utf8) | Where-Object { $_ })
+            Check ($lanes.Count -eq 4 -and @($lanes | Where-Object { $_ -match "^2`t" }).Count -eq 2) ("сверка заданий: {0}" -f ($lanes -join ' | '))
+            Check (@($lanes | Where-Object { $_ -notmatch "`t1`t1$" }).Count -eq 0) ("задание выполнено не ровно один раз: {0}" -f ($lanes -join ' | '))
+            $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sb 'selfcheck-compare.ps1') $runs[0].FullName $runs[1].FullName 2>&1
+            Check ($LASTEXITCODE -eq 0) ("selfcheck-compare: результаты не совпали или сбой ({0}): {1}" -f $LASTEXITCODE, ((@($output) | Select-Object -Last 6) -join ' | '))
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'baseline\erp_temp_test\selfcheck.norm.txt'))) 'замер группы записал эталон самопроверки'
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'baseline\erp_temp_test\selfcheck.last.txt'))) 'замер группы записал отпечаток самопроверки'
+        }
+    },
+    @{
+        # ** Хлебников С.Ю. 20261120
+        Name = 'gate-selfcheck-lanes-run'
+        Text = 'прогон с комплектом, SelfCheckWorkers = 2: «до» и «после» двумя исполнителями, второй начинает по сигналу и берёт половину группы, сверка без пропусков, зелёный'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $laneConfig
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ tasks = $laneTasks }, @{ tasks = $laneTasks; fingerprint = 'после' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            Check ((Get-Calls $r @('selfcheck', 'worker=2')).Count -eq 2) ("второй исполнитель запускался {0} раз, ждали 2 (до и после)" -f (Get-Calls $r @('selfcheck', 'worker=2')).Count)
+            Check-Step $r 'Самопроверка после загрузки' 'OK'
+            if ($r.RunDir) {
+                foreach ($label in @('before', 'after')) {
+                    $lanesFile = Join-Path $r.RunDir ("selfcheck-{0}.lanes.txt" -f $label)
+                    if (-not (Test-Path -LiteralPath $lanesFile)) { Check $false ("нет сверки заданий {0}" -f $label); continue }
+                    $lanes = @([System.IO.File]::ReadAllLines($lanesFile, $utf8) | Where-Object { $_ })
+                    Check ($lanes.Count -eq 6 -and @($lanes | Where-Object { $_ -notmatch "`t1`t1$" }).Count -eq 0) ("сверка {0}: {1}" -f $label, ($lanes -join ' | '))
+                }
+                $journal = [System.IO.File]::ReadAllText((Join-Path $r.RunDir 'selfcheck-after.journal.txt'), $utf8)
+                Check ($journal.Contains('##### исполнитель 2')) 'в журнале нет части второго исполнителя'
+            }
+        }
+    },
+    @{
+        # ** Хлебников С.Ю. 20261120
+        Name = 'gate-selfcheck-lanes-crash'
+        Text = 'два исполнителя, второй оборвался после первого задания: задание, на котором он оборвался, - ошибка, его невыполненное задание названо в итоге шага, первый дождался и закончил, вердикт не зелёный'
+        Run = {
+            param($Name)
+            $config = @{ SelfCheckWorkers = 2; SelfCheckSplitGroup = $laneGroup; SelfCheckRestarts = 0 }
+            $sb = New-Sandbox $Name -Config $config
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ tasks = $laneTasks }, @{ tasks = $laneTasks; fingerprint = 'после'; exitAfterW2 = 1 }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake $fake
+            Check-Common $r
+            Check ($null -ne $r.Verdict -and $r.Verdict.verdict -ne 'GREEN') 'второй исполнитель оборвался, а вердикт зелёный'
+            $step = Get-Step $r 'Самопроверка после загрузки'
+            Check ($null -ne $step -and [string]$step.detail -match 'не выполнены задания из списка \(1\): Форма/Справочник\.Г\.Форма\.ФормаЭлемента \(исполнитель 2\)') ("невыполненное задание не названо: {0}" -f $(if ($null -ne $step) { $step.detail } else { 'нет шага' }))
+            Check ($null -ne $step -and [string]$step.detail -match 'исполнитель 2, сеанс 1: клиент 1С закрылся без итога') ("обрыв второго исполнителя не назван: {0}" -f $(if ($null -ne $step) { $step.detail } else { 'нет шага' }))
+            if ($r.RunDir) {
+                $norm = [System.IO.File]::ReadAllText((Join-Path $r.RunDir 'selfcheck-after.norm.txt'), $utf8)
+                Check ($norm.Contains('[ОК] Перепроведение') -or $norm.Contains('ПерепроведениеДокументов/Документ.А')) 'первый исполнитель не дошёл до шагов после группы'
+            }
+        }
+    },
+    @{
+        # ** Хлебников С.Ю. 20261120
+        Name = 'gate-selfcheck-lanes-old-processing'
+        Text = 'SelfCheckWorkers = 2, а обработка деления не знает (нет plan.txt): второй исполнитель не запускается, самопроверка идёт одним, зелёный'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $laneConfig
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ tasks = $laneTasks; noPlan = $true }, @{ tasks = $laneTasks; fingerprint = 'после'; noPlan = $true }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            Check ((Get-Calls $r @('selfcheck', 'worker=2')).Count -eq 0) 'обработка без деления, а второй исполнитель запускался: две самопроверки разом'
+            if ($r.RunDir) { Check ([System.IO.File]::ReadAllText((Join-Path $r.RunDir 'run.log'), $utf8).Contains('шла одним исполнителем')) 'в run.log не сказано, что самопроверка шла одним исполнителем' }
         }
     },
     @{
