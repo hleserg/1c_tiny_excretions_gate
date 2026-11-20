@@ -134,12 +134,15 @@ function New-ContractCatalogLink {
             [System.IO.File]::WriteAllText($manifest, (ConvertTo-Json -InputObject $state -Depth 5), $utf8Bom)
             $before = (Get-FileHash -LiteralPath $manifest).Hash
             $writes = @('/LoadCfg', '/DeleteCfg', '/UpdateDBCfg')
+            # Журнал вызовов подставной 1С копится по песочнице: перед каждым запуском - с нуля.
+            Reset-FakeState $sb
             $no = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CancelPrepared' -Com (New-ComState) -Answers @(
                 @{ Kind = 'confirm'; Header = 'нет идентификатора кластера и базы'; Yes = $false })
             Check ($no.ExitCode -ne 0 -and -not $no.TimedOut -and $no.Unexpected.Count -eq 0 -and $no.UnusedAnswers -eq 0) 'ответ «нет» по записи без идентификатора не остановил отмену'
             foreach ($command in $writes) { Check ((Get-Calls $no @($command)).Count -eq 0) ('после «нет» отправлена команда записи ' + $command) }
             Check (@($no.ComLog | Where-Object { $_ -match 'UpdateInfoBase|TerminateSession' }).Count -eq 0) 'после «нет» изменились свойства или сеансы'
             Check ((Test-Path -LiteralPath $manifest) -and (Get-FileHash -LiteralPath $manifest).Hash -eq $before) 'после «нет» манифест изменён или удалён'
+            Reset-FakeState $sb
             $yes = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CancelPrepared' -Com (New-ComState) -Answers @(
                 @{ Kind = 'confirm'; Header = 'нет идентификатора кластера и базы'; Yes = $true },
                 @{ Kind = 'confirm'; Header = 'Вернуть расширения'; Yes = $true })
