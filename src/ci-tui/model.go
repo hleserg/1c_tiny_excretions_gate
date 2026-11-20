@@ -79,6 +79,11 @@ type model struct {
 	stopAsked time.Time
 	notice    string
 
+	// ** Хлебников С.Ю. 20261120 Для шапки (#32): с какой базой работает скрипт (событие context) и когда от него
+	// было последнее сообщение - строка или событие. Видно и в узком окне, где нет колонки шагов.
+	context    string
+	lastOutput time.Time
+
 	// Скрипт попросил закрыть ci, когда кончится (событие close: гейт обновлён, а работает ещё прежний);
 	// restartAfter - и сразу открыть ci заново: в папке гейта уже новый ci.exe.
 	closeAfter   bool
@@ -243,13 +248,17 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, func() tea.Msg { return msg.eng.wait(program) }
 
 	case lineMsg:
+		m.lastOutput = time.Now()
 		m.appendLine(msg.text)
 		m.refreshLog()
 		return m, m.syncOverall()
 
 	case eventMsg:
 		ev := msg.ev
+		m.lastOutput = time.Now()
 		switch ev.Kind {
+		case "context":
+			m.context = ev.Text
 		case "plan":
 			m.setPlan(ev.Steps, ev.Parallel, ev.Ops)
 			return m, m.syncOverall()
@@ -577,11 +586,20 @@ func (m model) View() string {
 }
 
 func (m model) viewHeader() string {
-	left := styleHeader.Render(" CI · гейт и обновление расширений ")
+	title := " CI · гейт и обновление расширений "
+	if m.width < minWidthForSteps {
+		title = " CI "
+	}
+	left := styleHeader.Render(title)
+	if m.context != "" {
+		left += styleAccent.Render(" " + m.context + " ")
+	}
 	state := ""
 	switch {
 	case m.running && !m.stopAsked.IsZero():
 		state = styleWarn.Render(" останавливается ")
+	case m.running && m.dialog != nil:
+		state = styleWarn.Render(" ждёт ответа ")
 	case m.running:
 		state = styleOk.Render(" " + m.spin.View() + " работает ")
 	case m.starting:
@@ -600,12 +618,30 @@ func (m model) viewHeader() string {
 		state += " " + verdictStyle(m.verdict).Render(" "+short+" ")
 	}
 	clock := styleDim.Render(time.Now().Format("15:04:05") + " ")
+	// Скрипт давно молчит - когда было последнее сообщение; вывода «завис» нет: тихий шаг бывает и долгим.
+	if quiet := m.quietText(time.Now()); quiet != "" {
+		clock = styleDim.Render(quiet+" · ") + clock
+	}
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(state) - lipgloss.Width(clock)
 	if gap < 1 {
 		gap = 1
 	}
 	return left + state + strings.Repeat(" ", gap) + clock
 }
+
+// quietText - «посл. сообщение 03:12 (5 мин)», если скрипт работает и молчит дольше минуты; иначе пусто.
+func (m model) quietText(now time.Time) string {
+	if !m.running || m.lastOutput.IsZero() {
+		return ""
+	}
+	silent := now.Sub(m.lastOutput)
+	if silent < time.Minute {
+		return ""
+	}
+	return fmt.Sprintf("посл. сообщение %s (%d мин)", m.lastOutput.Format("15:04"), int(silent.Minutes()))
+}
+
+// ** Хлебников С.Ю. 20261120 конец
 
 func (m model) viewBody() string {
 	logBox := styleLog.Render(m.logView.View())
