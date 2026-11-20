@@ -876,6 +876,25 @@ if ($kitDecision) {
     $report.Add(('Комплект после вердикта: ' + $text))
 }
 if ($referenceNote -and $comparedSomething) { $report.Add($referenceNote) }
+# ** Хлебников С.Ю. 20261120 Выпуск в рабочую (released.txt пишет deploy): отдельно от вердикта - вердикт не меняется.
+$releasedPath = Join-Path $RunDir 'released.txt'
+if (Test-Path -LiteralPath $releasedPath) {
+    foreach ($releasedRow in @([System.IO.File]::ReadAllLines($releasedPath, [System.Text.Encoding]::UTF8) | Where-Object { $_ })) {
+        $releasedFields = @{}
+        foreach ($releasedPart in ([string]$releasedRow).TrimStart([char]0xFEFF).Split("`t")) {
+            $eq = $releasedPart.IndexOf('=')
+            if ($eq -gt 0) { $releasedFields[$releasedPart.Substring(0, $eq)] = $releasedPart.Substring($eq + 1) }
+        }
+        $releasedText = 'Выпуск в рабочую: {0}, обновление {1}' -f [string]$releasedFields['time'], [string]$releasedFields['deploy']
+        if ([string]$releasedFields['riskAccepted'] -eq '1') {
+            $releasedReason = [string]$releasedFields['reason']
+            if (-not $releasedReason) { $releasedReason = 'не записана' }
+            $releasedText += (', с отклонением, причина: {0}' -f $releasedReason)
+        }
+        $report.Add($releasedText)
+    }
+}
+# ** Хлебников С.Ю. 20261120 конец
 $report.Add('')
 # Сломанный обмен - первой строкой, до «КОРОТКО».
 foreach ($line in $exchangeTop) { $report.Add($line) }

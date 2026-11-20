@@ -7,7 +7,7 @@
 
     .\nightly.ps1 -Install [-At 03:30]
         Задание планировщика Windows ci-gate-nightly: каждый день в At (или NightlyAt из config.psd1,
-        по умолчанию 03:30) запускать этот скрипт. Время с 22:00 до 02:00 не принимается: в это окно
+        по умолчанию 03:30) запускать этот скрипт. Время в часы NightlyDeniedFrom..To (по умолчанию 22:00-02:00) не принимается: в это окно
         ставят обновления. Задание - от текущего пользователя (его файлы паролей DPAPI), только пока
         он вошёл в систему; «выполнять для всех пользователей» - в планировщике руками, с паролем.
 
@@ -64,15 +64,22 @@ function Get-NightlySetting {
 }
 
 function ConvertTo-NightlyTime {
-    # «ЧЧ:ММ» -> DateTime сегодня в это время. Не время или окно 22:00-02:00 - исключение.
+    # «ЧЧ:ММ» -> DateTime сегодня в это время. Не время или запретные часы (NightlyDeniedFrom..To) - исключение.
     param([string]$Text)
     $parsed = [datetime]::MinValue
     if (-not [datetime]::TryParseExact($Text.Trim(), 'H:mm', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
         throw ("время «{0}» не в виде ЧЧ:ММ" -f $Text)
     }
-    if ($parsed.Hour -ge 22 -or $parsed.Hour -lt 2) {
-        throw ("время {0} попадает в окно 22:00-02:00: в него ставят обновления, ночной прогон там мешает. Возьми, например, 03:30" -f $parsed.ToString('HH:mm'))
+    # ** Хлебников С.Ю. 20261120 Запретные часы ночного прогона - из настроек (по умолчанию 22-02, как было).
+    $nightFrom = [int](Get-NightlySetting 'NightlyDeniedFrom' 22)
+    $nightTo = [int](Get-NightlySetting 'NightlyDeniedTo' 2)
+    $denied = $false
+    if ($nightFrom -gt $nightTo) { $denied = ($parsed.Hour -ge $nightFrom -or $parsed.Hour -lt $nightTo) }
+    elseif ($nightFrom -lt $nightTo) { $denied = ($parsed.Hour -ge $nightFrom -and $parsed.Hour -lt $nightTo) }
+    if ($denied) {
+        throw ("время {0} попадает в часы {1:00}:00-{2:00}:00 (NightlyDeniedFrom/To): в них бэкап и обновление рабочей, ночной прогон там мешает" -f $parsed.ToString('HH:mm'), $nightFrom, $nightTo)
     }
+    # ** Хлебников С.Ю. 20261120 конец
     return $parsed
 }
 

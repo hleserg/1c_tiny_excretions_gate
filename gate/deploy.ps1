@@ -687,6 +687,28 @@ foreach ($name in $deployExtensions) {
 }
 $deniedFrom = [int](Get-Setting $cfg 'DeployDeniedFrom' 22)
 $deniedTo = [int](Get-Setting $cfg 'DeployDeniedTo' 2)
+# ** Хлебников С.Ю. 20261120 Часы обновления рабочей - из настроек (DeployDeniedFrom/To): подсказка, проверка перед
+# подтверждением и повторно после него (пока ждали ответа, могло наступить запретное время), конец окна для прогноза.
+function Test-DeployHourDenied {
+    param([datetime]$At)
+    if ($deniedFrom -eq $deniedTo) { return $false }
+    if ($deniedFrom -gt $deniedTo) { return ($At.Hour -ge $deniedFrom -or $At.Hour -lt $deniedTo) }
+    return ($At.Hour -ge $deniedFrom -and $At.Hour -lt $deniedTo)
+}
+function Get-DeployWindowText {
+    # Когда рабочую обновлять можно: с конца запрета до его начала.
+    if ($deniedFrom -eq $deniedTo) { return 'в любое время (DeployDeniedFrom = DeployDeniedTo)' }
+    return ('с {0:00}:00 до {1:00}:00' -f $deniedTo, $deniedFrom)
+}
+function Get-DeployWindowEnd {
+    # Когда кончится разрешённое окно, если сейчас оно идёт: ближайшее начало запрета. $null - запрета нет.
+    param([datetime]$At)
+    if ($deniedFrom -eq $deniedTo) { return $null }
+    $end = $At.Date.AddHours($deniedFrom)
+    if ($end -le $At) { $end = $end.AddDays(1) }
+    return $end
+}
+# ** Хлебников С.Ю. 20261120 конец
 $sessionLockHours = [int](Get-Setting $cfg 'SessionLockHours' 2)
 if ($sessionLockHours -lt 1) { $sessionLockHours = 1 }
 # Предупреждение пользователей рабочей перед обновлением: за сколько минут до начала блокировки сеансов.
@@ -1166,6 +1188,9 @@ function Get-DeployDetailLines {
     if ($null -ne $gate) { $lines.Add(("Гейт перед обновлением: прогон {0}, вердикт {1}" -f (Get-JsonValue $gate 'run' ''), (Get-JsonValue $gate 'verdict' ''))) }
     if ([bool](Get-JsonValue $Record 'riskAccepted' $false)) {
         $lines.Add(("ОБНОВЛЯЛИ НЕСМОТРЯ НА ГЕЙТ: {0}" -f (@(Get-JsonValue $Record 'risks' @()) -join '; ')))
+        $reasonText = [string](Get-JsonValue $Record 'riskReason' '')
+        if (-not $reasonText) { $reasonText = 'не записана' }
+        $lines.Add(("Причина выпуска: {0}" -f $reasonText))
     }
     $light = @(Get-JsonValue $Record 'light' @())
     $lines.Add('Лёгкий прогон после обновления:')
@@ -3397,6 +3422,8 @@ if ($Rollback) {
     $lastRun = $null
     $lastVerdict = $null
     $riskAccepted = $false
+    $gateRed = $false
+    $riskReason = ''
 
     $history = @(Get-DeployHistory)
     Write-Host ''
@@ -3521,6 +3548,8 @@ else {
     # откатили - перед обновлением переспросить, а красное из гейта унести в отчёт с пометкой «проверить».
     $gateRisks = New-Object System.Collections.Generic.List[string]
     $gateRedItems = New-Object System.Collections.Generic.List[string]
+    $gateRed = $false
+    $riskReason = ''
 
     Write-Host ''
     Write-Host 'ПОСЛЕДНИЙ ПРОГОН ГЕЙТА' -ForegroundColor Cyan
@@ -3579,7 +3608,7 @@ else {
         }
 
         # Красное из гейта: упавшие шаги и красные строки разбора.
-        if ($verdict -eq 'RED') { $gateRisks.Add(("гейт {0} красный" -f $lastRun.Name)) }
+        if ($verdict -eq 'RED') { $gateRisks.Add(("гейт {0} красный" -f $lastRun.Name)); $gateRed = $true }
         if ($decision -eq 'rolledBack' -or $decision -eq 'rollbackFailed') { $gateRisks.Add('комплект последнего прогона гейта откатили: в temp не то, что он проверял') }
         foreach ($step in @($badSteps | Where-Object { $_.status -eq 'FAIL' })) {
             $detail = [string](Get-JsonValue $step 'detail' '')
@@ -3617,7 +3646,7 @@ else {
             $advice.Add([pscustomobject]@{ Kind = 'note'; Text = ("прогону {0} ч: если temp с тех пор меняли, сначала новый прогон гейта" -f $ageHours) })
         }
     }
-    $advice.Add([pscustomobject]@{ Kind = 'dont'; Text = ("не обновлять с {0}:00 до {1:00}:00 и в рабочее время: обновлению нужен монопольный доступ к {2}" -f $deniedFrom, $deniedTo, $script:ProdBase) })
+    $advice.Add([pscustomobject]@{ Kind = 'dont'; Text = ("обновлять {0} только {1} (DeployDeniedFrom/To): обновлению нужен монопольный доступ" -f $script:ProdBase, (Get-DeployWindowText)) })
 
     #endregion
 
@@ -3933,19 +3962,58 @@ else {
         $riskAccepted = $true
         Write-RunLog ('Обновление несмотря на: ' + ($gateRisks -join '; '))
         Write-Line ("  Обновляю, несмотря на: {0}" -f ($gateRisks -join '; ')) 'Yellow'
+        # ** Хлебников С.Ю. 20261120 Выпуск с красным гейтом - с причиной одной строкой: она уходит в deploy.json,
+        # отчёт, статью и отметку released.txt прогона. Прогон остаётся красным, в эталон он сам не принимается.
+        if ($gateRed) {
+            for ($attempt = 1; $attempt -le 3 -and -not $riskReason; $attempt++) {
+                $typedReason = Read-UiText -Prompt 'Причина выпуска с красным гейтом (одной строкой, попадёт в отчёт)' -CancelAsNull
+                if ($null -eq $typedReason) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
+                $riskReason = ([string]$typedReason).Trim()
+                if (-not $riskReason) { Write-Line '  Без причины красный комплект не выпускаю: напиши её одной строкой (Esc - выйти).' 'Yellow' }
+            }
+            if (-not $riskReason) { Write-Host 'Причина не указана - выход, ничего не обновлял.'; exit 0 }
+            Write-RunLog ('Причина выпуска с красным гейтом: ' + $riskReason)
+            Write-Line ("  Причина: {0}" -f $riskReason) 'Yellow'
+            $ciLines.Add(("Выпуск с красным гейтом, причина: {0}." -f $riskReason))
+        }
+        # ** Хлебников С.Ю. 20261120 конец
     }
 }
 
-$hour = (Get-Date).Hour
-$inDenied = $false
-if ($deniedFrom -gt $deniedTo) { $inDenied = ($hour -ge $deniedFrom -or $hour -lt $deniedTo) }
-else { $inDenied = ($hour -ge $deniedFrom -and $hour -lt $deniedTo) }
-if ($inDenied -and -not $Prepare) { throw ("сейчас {0}: с {1}:00 до {2}:00 рабочую базу не обновляем" -f (Get-Date -Format 'HH:mm'), $deniedFrom, $deniedTo) }
+if ((Test-DeployHourDenied (Get-Date)) -and -not $Prepare) { throw ("сейчас {0}: рабочую базу обновляем только {1}" -f (Get-Date -Format 'HH:mm'), (Get-DeployWindowText)) }
+
+# ** Хлебников С.Ю. 20261120 Сводка прямо перед вводом имени: цель, операция, что было и что станет, обработки
+# (и ноль), гейт и причина выпуска - всё, что выше могло уехать за край экрана.
+$confirmLines = New-Object System.Collections.Generic.List[string]
+$operationNames = @{ '1' = 'обновление одним проходом (все из temp)'; '2' = 'обновление одним проходом (выбранные из temp)'; 'epf' = 'только внешние обработки'; 'asis' = 'обновление конфигурации БД как есть'; 'rollback' = 'откат'; 'prepared' = 'применение подготовленного' }
+$operationText = 'обновление'
+if ($operationNames.ContainsKey([string]$mode)) { $operationText = $operationNames[[string]$mode] }
+if ($Prepare) { $operationText = 'подготовка: загрузка в конфигурацию без применения, пользователи работают' }
+$confirmLines.Add(("Операция: {0}" -f $operationText))
+foreach ($confirmEntry in $selected) {
+    $fromText = [string]$confirmEntry.ProdVersion
+    if (-not $confirmEntry.ProdPresent) { $fromText = 'нет' } elseif (-not $fromText) { $fromText = '?' }
+    $toText = [string]$confirmEntry.TempVersion
+    if ($mode -eq 'rollback') { $toText = 'резервная копия' } elseif ($mode -eq 'asis') { $toText = 'как загружено' } elseif (-not $toText) { $toText = '?' }
+    $confirmLines.Add(("  {0}: {1} -> {2}" -f $confirmEntry.Name, $fromText, $toText))
+}
+if ($selected.Count -eq 0) { $confirmLines.Add('  расширений: 0') }
+$confirmLines.Add(("Внешние обработки: {0}" -f @($selectedProcessings).Count))
+foreach ($confirmProc in $selectedProcessings) { $confirmLines.Add(("  {0}" -f $confirmProc.ObjName)) }
+if ($null -ne $lastRun) { $confirmLines.Add(("Гейт: прогон {0}, вердикт {1}" -f $lastRun.Name, [string](Get-JsonValue $lastVerdict 'verdict' ''))) }
+elseif ($mode -ne 'rollback') { $confirmLines.Add('Гейт: прогонов нет') }
+if ($riskReason) { $confirmLines.Add(("Выпуск с красным гейтом, причина: {0}" -f $riskReason)) }
+if (-not $Prepare) { $confirmLines.Add(("Окно обновления: {0}" -f (Get-DeployWindowText))) }
+Show-UiTitle -Text ("Перед записью в {0}" -f $script:ProdBase) -Kind 'warn' -More $confirmLines.ToArray()
+Write-RunLog ('Сводка перед подтверждением: ' + ($confirmLines -join ' | '))
+# ** Хлебников С.Ю. 20261120 конец
 
 Write-Host ("  Это рабочая база. Чтобы продолжить, набери её имя ({0}) и Enter:" -f $script:ProdBase) -ForegroundColor Yellow
 $typedName = Read-UiText -Prompt ("Это рабочая база. Чтобы продолжить, набери её имя ({0})" -f $script:ProdBase)
 if ($typedName -cne $script:ProdBase) { throw 'имя базы набрано не так: обновление отменено' }
 Write-RunLog 'Подтверждено именем базы'
+# ** Хлебников С.Ю. 20261120 Пока ждали ввода имени, могло наступить запретное время: сверка ещё раз перед первой записью.
+if ((Test-DeployHourDenied (Get-Date)) -and -not $Prepare) { throw ("пока ждал подтверждения, наступило {0}: рабочую базу обновляем только {1}. В рабочую ничего не записано" -f (Get-Date -Format 'HH:mm'), (Get-DeployWindowText)) }
 
 #endregion
 
@@ -3976,6 +4044,22 @@ if ($selected.Count -gt 0) {
 $planSteps.Add('Статья в базу знаний')
 }
 Send-UiPlan -StepNames $planSteps.ToArray()
+
+# ** Хлебников С.Ю. 20261120 Прогноз длительности против конца окна: до первой записи, остановиться ещё можно.
+if (-not $Prepare) {
+    $forecastSeconds = 0.0
+    foreach ($planTitle in $planSteps) { $forecastSeconds += [double](Get-StatPlan -Title $planTitle) }
+    $windowEnd = Get-DeployWindowEnd (Get-Date)
+    if ($forecastSeconds -gt 0 -and $null -ne $windowEnd) {
+        $finishAt = (Get-Date).AddSeconds($forecastSeconds)
+        if ($finishAt -gt $windowEnd) {
+            $goOn = Confirm-Ui -Question ("По прогнозу обновление займёт ~{0} мин и закончится около {1:HH:mm}, а окно обновления - до {2:HH:mm}. Начинать?" -f [Math]::Ceiling($forecastSeconds / 60), $finishAt, $windowEnd) -Yes 'Да, начинать' -No 'Нет, выйти'
+            if ($goOn -ne $true) { Write-Host 'Выход, в рабочую ничего не записано.'; exit 0 }
+            Write-RunLog ("Начато, хотя прогноз выходит за окно: до {0:HH:mm}, окно до {1:HH:mm}" -f $finishAt, $windowEnd)
+        }
+    }
+}
+# ** Хлебников С.Ю. 20261120 конец
 
 # Только обновлению расширений нужен монопольный доступ. Свои изменения возвращаем через finally.
 $needExclusive = ($selected.Count -gt 0 -and -not $Prepare)
@@ -4690,6 +4774,7 @@ if ($mode -eq 'asis') { [void]$html.Append('<p>Расширения загруж
 if ($riskAccepted) {
     [void]$html.Append('<div style="border:2px solid #c0392b;padding:8px 12px;margin:10px 0;background:#fdecea">')
     [void]$html.Append(('<h2 style="color:#c0392b;margin-top:0">Обновлено несмотря на гейт: проверить работоспособность</h2><p>{0}.</p>' -f (ConvertTo-Html ($gateRisks -join '; '))))
+    if ($riskReason) { [void]$html.Append(('<p>Причина выпуска: {0}</p>' -f (ConvertTo-Html $riskReason))) }
     if ($gateRedItems.Count -gt 0) {
         [void]$html.Append('<p>Что гейт нашёл красного - проверить в рабочей базе в первую очередь:</p><ul>')
         foreach ($item in $gateRedItems) { [void]$html.Append(('<li>{0}</li>' -f (ConvertTo-Html $item))) }
@@ -4831,12 +4916,37 @@ if ($outcome -eq 'updated') {
     if ($mode -ne 'asis') { foreach ($entry in $selected) { $null = Update-Mirror -BaseName $script:ProdBase -Extension $entry.Name } }
     # Хеш-суммы рабочей после обновления: следующий запуск по ним увидит ручную загрузку («как есть»).
     if ($selected.Count -gt 0) { Save-MirrorHashes -Names @($selected | ForEach-Object { $_.Name }) }
-    # «Обновить все»: ошибки последнего прогона гейта сбрасываются - принимаются в эталон как известные
-    # (они либо исправлены, либо неважны). Следующий прогон гейта покажет только новое.
+    # ** Хлебников С.Ю. 20261120 «Обновить все» больше не принимает прогон в эталон молча. Выпуск несмотря на гейт -
+    # эталон не трогается: падения останутся новыми, пока их не исправят или не примут вручную. Жёлтый, ещё не
+    # принятый - вопрос, по умолчанию «не принимать». Зелёный - как раньше (нового в нём нет).
     if ($mode -eq '1' -and $null -ne $lastRun) {
-        Write-Line ("Сбрасываю ошибки прогона гейта {0}: принимаю в эталон как известные." -f $lastRun.Name)
-        & (Join-Path $Root 'run.ps1') -AcceptBaseline $lastRun.FullName
+        $lastVerdictText = [string](Get-JsonValue $lastVerdict 'verdict' '')
+        $lastAccepted = Test-Path -LiteralPath (Join-Path $lastRun.FullName 'accepted.txt')
+        if ($riskAccepted) {
+            Write-Line ("Эталон не тронут: обновлено несмотря на гейт, новое прогона {0} останется новым, пока его не исправят или не примут вручную (меню гейта)." -f $lastRun.Name) 'Yellow'
+        }
+        elseif ($lastVerdictText -eq 'YELLOW' -and -not $lastAccepted) {
+            $acceptNow = Confirm-Ui -Question ("Принять новое прогона {0} (жёлтый) в эталон? Тогда следующий прогон будет считать его известным. Что внутри - report.txt прогона." -f $lastRun.Name) -Yes 'Принять в эталон' -No 'Не принимать'
+            if ($acceptNow -eq $true) {
+                Write-Line ("Принимаю новое прогона {0} в эталон." -f $lastRun.Name)
+                & (Join-Path $Root 'run.ps1') -AcceptBaseline $lastRun.FullName
+            }
+            else { Write-Line ("Эталон не тронут: новое прогона {0} останется новым." -f $lastRun.Name) }
+        }
+        elseif ($lastVerdictText -eq 'GREEN' -and -not $lastAccepted) {
+            & (Join-Path $Root 'run.ps1') -AcceptBaseline $lastRun.FullName
+        }
     }
+    # Отметка в папке прогона: его комплект выпущен в рабочую этим обновлением (вердикт прогона не меняется).
+    if ($null -ne $lastRun -and $mode -ne 'rollback') {
+        $releasedLine = ("time={0}`tdeploy={1}`tbase={2}`tmode={3}`tuser={4}`triskAccepted={5}`treason={6}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $runId, $script:ProdBase, $mode, $env:USERNAME, [int][bool]$riskAccepted, ($riskReason -replace '[\t\r\n]+', ' '))
+        try { [System.IO.File]::AppendAllText((Join-Path $lastRun.FullName 'released.txt'), $releasedLine + "`r`n", $Utf8Bom) }
+        catch { Write-Line ("Отметка выпуска в прогоне {0} не записалась: {1}" -f $lastRun.Name, $_.Exception.Message) 'Yellow' }
+        # Разбор прогона - заново: в шапке report.txt появится строка выпуска.
+        try { & (Join-Path $Root 'report.ps1') -RunDir $lastRun.FullName -Quiet | Out-Null }
+        catch { Write-RunLog ('report.txt прогона не пересобран: ' + $_.Exception.Message) }
+    }
+    # ** Хлебников С.Ю. 20261120 конец
 }
 
 # Обновили подготовленным или откатили его - подготовки больше нет. Не прошло и не откатывали - остаётся:
@@ -4848,6 +4958,8 @@ Clear-ProdLocks
 $summary = New-Object System.Collections.Generic.List[string]
 $summary.Add($reportTitle)
 $summary.Add(('Итог: ' + $outcomeNames[$outcome]))
+if ($riskAccepted) { $summary.Add(('Несмотря на гейт: ' + ($gateRisks -join '; '))) }
+if ($riskReason) { $summary.Add(('Причина выпуска: ' + $riskReason)) }
 $summary.Add(('Расширения: ' + (@($selected | ForEach-Object { $_.Name }) -join ', ')))
 if ($selectedProcessings.Count -gt 0) { $summary.Add(('Внешние обработки: ' + (@($touchedProcessings | ForEach-Object { $_.ObjName }) -join ', '))) }
 foreach ($item in $light) { $summary.Add(('[{0}] {1}: {2}' -f $item.Status, $item.Name, $item.Text)) }
@@ -4893,6 +5005,7 @@ $record = [ordered]@{
     gate         = $recordGate
     riskAccepted = $riskAccepted
     risks        = @($gateRisks)
+    riskReason   = $riskReason
     extensions   = $recordExtensions
     processings  = $recordProcessings
     light        = @(foreach ($item in $light) { [ordered]@{ status = $item.Status; name = $item.Name; text = $item.Text } })
@@ -4913,6 +5026,7 @@ if ($statLines.Count -gt 0) {
 Write-Line ("ИТОГ: {0}. Резервные копии: {1}" -f $outcomeNames[$outcome], $beforeDir) $finalColor
 if ($riskAccepted -and $outcome -eq 'updated') {
     Write-Line ("ПРОВЕРИТЬ РАБОТОСПОСОБНОСТЬ: обновлено, хотя {0}." -f ($gateRisks -join '; ')) 'Red'
+    if ($riskReason) { Write-Line ("  причина выпуска: {0}" -f $riskReason) 'Red' }
     foreach ($item in @($gateRedItems | Select-Object -First 15)) { Write-Line ("  [КРАСН] {0}" -f $item) 'Red' }
 }
 

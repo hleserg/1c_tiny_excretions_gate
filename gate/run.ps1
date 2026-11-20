@@ -2561,6 +2561,14 @@ function Show-RecentRuns {
             $rows += [pscustomobject]@{ Dir = $run; Verdict = $verdict }
             $acceptedMark = ''
             if (Test-Path -LiteralPath (Join-Path $run.FullName 'accepted.txt')) { $acceptedMark = ' · принят в эталон' }
+            # ** Хлебников С.Ю. 20261120 Выпущен в рабочую (released.txt пишет deploy): с отклонением - если несмотря на гейт.
+            $releasedFile = Join-Path $run.FullName 'released.txt'
+            if (Test-Path -LiteralPath $releasedFile) {
+                $releasedLast = @([System.IO.File]::ReadAllLines($releasedFile, [System.Text.Encoding]::UTF8) | Where-Object { $_ } | Select-Object -Last 1)
+                if ($releasedLast.Count -gt 0 -and ([string]$releasedLast[0]).Contains("riskAccepted=1")) { $acceptedMark += ' · выпущен с отклонением' }
+                else { $acceptedMark += ' · выпущен' }
+            }
+            # ** Хлебников С.Ю. 20261120 конец
             $resumeMark = ''
             if ($null -ne $verdict) {
                 $resumeInfo = Get-UiField $verdict 'resume' $null

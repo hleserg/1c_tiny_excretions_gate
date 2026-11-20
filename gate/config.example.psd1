@@ -36,7 +36,7 @@
     ProdAdminUser     = ''           # пусто - как AdminUser
     ProdAdminPassFile = ''           # пусто - как AdminPassFile
     DeployExtensions  = @()          # пусто - как Extensions; порядок = порядок загрузки
-    DeployDeniedFrom  = 22           # с этого часа обновлять нельзя
+    DeployDeniedFrom  = 22           # с этого часа обновлять нельзя (окно обновления - остальное время; равны - запрета нет)
     DeployDeniedTo    = 2            # до этого часа обновлять нельзя
     ProdSelfCheckForms = $false      # самопроверка на рабочей: проверять формы (создание формы может писать настройки)
     ProdSelfCheckTimeoutMin = 60
@@ -113,7 +113,9 @@
     # ContractorExtensions = @()
     # Что в снимках самопроверки меняется само (регулярные выражения, совпадение -> «*»). Пусто - по умолчанию.
     # SnapshotMasks = @('(?<=<(?:\w+:)?(?:CreationDate|MessageNo|ReceivedNo|LastUpdate)>)[^<]*')
-    NightlyAt = '03:30'              # ночной прогон «как есть» (nightly.cmd -Install, раздел 5.16); не с 22:00 до 02:00
+    NightlyAt = '03:30'              # ночной прогон «как есть» (nightly.cmd -Install, раздел 5.16); не в часы NightlyDeniedFrom..To
+    NightlyDeniedFrom = 22           # ночной прогон не ставить с этого часа (бэкап, обновление рабочей)
+    NightlyDeniedTo = 2              # и до этого часа
     MetricSlowFactor = 1.5           # время операций (раздел 5.15): медленно - дольше медианы истории в столько раз
     MetricMinDeltaMs = 500           # ... и на столько миллисекунд
     MetricMinHistory = 3             # меньше замеров в истории - не сравнивается
