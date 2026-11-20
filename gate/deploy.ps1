@@ -4509,8 +4509,9 @@ if ($needExclusive) {
     $prepLink = Connect-ClusterAgent
     $prepTarget = Get-BaseInfo -Link $prepLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
     try {
-        $jobsLocked = Set-GateJobsLock $script:ProdLockState $prepTarget { param($t) Read-BaseInfoAgain $t $script:ProdBase }
-        Save-ProdLockFile
+        # Запись прошла, а чтение-подтверждение упало: JobsSet уже true - в locks.json это должно попасть и так.
+        try { $jobsLocked = Set-GateJobsLock $script:ProdLockState $prepTarget { param($t) Read-BaseInfoAgain $t $script:ProdBase } }
+        finally { Save-ProdLockFile }
         if ($jobsLocked) {
             Write-Line '  поставил блокировку регламентных заданий на время обновления; в конце сниму' 'Green'
         }
