@@ -54,7 +54,7 @@ function New-Sandbox {
     param([string]$Name, [hashtable]$Config = @{})
     $dir = Join-Path $workRoot $Name
     foreach ($sub in @('bin', 'tools', 'inbox', 'fake')) { New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null }
-    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'delivery.ps1', 'cluster-target.ps1', 'locks.ps1', 'timeline.ps1', 'selfcheck-compare.ps1')) {
+    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'delivery.ps1', 'cluster-target.ps1', 'locks.ps1', 'post-update.ps1', 'timeline.ps1', 'selfcheck-compare.ps1')) {
         Copy-Item -LiteralPath (Join-Path $ciRoot $script) -Destination $dir
     }
     # Объединение поставок (раздел 5.26): merge1c.exe рядом с fake1c.exe (собирает CI).
@@ -1172,6 +1172,73 @@ $tests = @(
         }
     },
     @{
+        Name = 'gate-processing-pipeline'
+        Text = 'следующая сборка завершается во время первой регистрации; сбой сборки не запускает запись второй карточки'
+        Run = {
+            param($Name)
+            foreach ($broken in @($false, $true)) {
+                $sb = New-Sandbox ("{0}-{1}" -f $Name, $broken)
+                $kit = Join-Path $sb 'inbox'
+                $null = Add-InboxFile $sb 'Альфа\Альфа.xml' ($epfDump.Replace('Печать', 'Альфа'))
+                $null = Add-InboxFile $sb 'Бета\Бета.xml' ($epfDump.Replace('Печать', 'Бета'))
+                $fake = @{
+                    regepf = @(@{ status = 'done'; waitBuild = 'Бета' }, @{ status = 'done' })
+                    designer = @(@{ match = @('Бета.xml'); waitRegistration = 'Альфа' })
+                }
+                if ($broken) {
+                    $fake.regepf = @(@{ status = 'done' })
+                    $fake.designer = @(@{ match = @('/LoadExternalDataProcessorOrReportFromFiles', 'Бета.xml'); exit = 1; log = 'Ошибка сборки' })
+                }
+                $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $kit) -Fake $fake
+                Check-Common $r
+                Check-Step $r 'Записать в справочник Альфа' 'OK'
+                Check ((Get-Calls $r @('/LoadExternalDataProcessorOrReportFromFiles', 'Бета.xml')).Count -eq 1) 'второй файл должен собраться один раз'
+                if ($broken) {
+                    Check-Verdict $r 'RED' 1
+                    Check-Step $r 'Собрать Бета из файлов' 'FAIL'
+                    Check ((Get-Calls $r @('/Cregepf', 'name=Бета')).Count -eq 0) 'запущена запись после ошибки сборки'
+                }
+                else {
+                    Check-Verdict $r 'GREEN' 0
+                    Check-Step $r 'Записать в справочник Бета' 'OK'
+                    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sb 'timeline.ps1') $r.RunDir -Quiet | Out-Null
+                    $text = [System.IO.File]::ReadAllText((Join-Path $r.RunDir 'timeline.txt'), $utf8)
+                    Check ($text.Contains('Фоновая сборка обработок: файлов 1')) 'в разборе нет отдельного времени фоновой сборки'
+                }
+            }
+        }
+    },
+    @{
+        Name = 'gate-processing-target-rollback'
+        Text = 'откат обновления карточки по ref возвращает файл именно в выбранную карточку'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb 'Печать.epf'
+            $ref = '11111111-2222-3333-4444-555555555555'
+            [IO.File]::WriteAllText(($file + '.gate.json'), ('{"ref":"' + $ref + '"}'), $utf8)
+            $fake = @{ regepf = @(@{ status = 'done'; old = 'прежний файл'; formerror = @('отказ формы') }, @{ status = 'done' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Rollback' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'RED' 1
+            Check ((Get-Calls $r @('/Cregepf', ('ref=' + $ref))).Count -eq 2) 'при откате пропала ссылка на исходную карточку'
+        }
+    },
+    @{
+        Name = 'gate-processing-form-scope'
+        Text = 'ошибку отдельной именованной формы проверяет диагностический режим'
+        Run = {
+            param($Name)
+            foreach ($strict in @($false, $true)) {
+                $sb = New-Sandbox ("{0}-{1}" -f $Name, $strict) -Config @{ ProcessingAllForms = $strict }
+                $file = Add-InboxFile $sb 'Печать.epf'
+                $fake = @{ regepf = @(@{ status = 'done'; namedFormErrors = @('Форма.Служебная: не передано основание') }) }
+                $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake $fake
+                Check-Common $r
+                if ($strict) { Check-Verdict $r 'RED' 1 } else { Check-Verdict $r 'GREEN' 0 }
+            }
+        }
+    },
+    @{
         Name = 'gate-mixed-kit'
         Text = 'расширение и обработка вместе: расширение грузится, обработка записывается после него, проверки идут'
         Run = {
@@ -2139,6 +2206,52 @@ $tests = @(
             Check ([string]$snap.extensions.'Адаптация'.hash -eq 'h2') ("хеш Адаптация в снимке: {0}" -f $snap.extensions.'Адаптация'.hash)
             Check ($null -ne $snap.processings.'Печать' -and [string]$snap.processings.'Печать'.hash) 'в снимке нет обработки Печать'
             Check (@($r.ComLog | Where-Object { $_ -match 'erp_base' }).Count -eq 0) 'снимок temp обращался к рабочей'
+        }
+    },
+    @{
+        Name = 'deploy-actions'
+        Text = 'Проверенный на temp исполнитель работает под блокировкой без переустановки расширений; сбой второй транзакции сохраняет частичный итог, повтор пропускает завершённое.'
+        Run = {
+            param($Name)
+            $config = $deployConfig.Clone()
+            $config['ActionsRegister'] = 'ВыполненныеДействия'
+            $config['HistoryRegister'] = 'ЖурналОбновлений'
+            $sb = New-Sandbox $Name -Config $config
+            $runDir = Join-Path $sb 'runs\20261117-090000'
+            $actionDir = Join-Path $runDir 'actions'
+            New-Item -ItemType Directory -Path $actionDir -Force | Out-Null
+            $epf = Join-Path $actionDir 'ДействияПослеОбновления.epf'
+            [IO.File]::WriteAllBytes($epf, [byte[]]@(65,66))
+            $ids = @('20261117-01-Первое','20261117-02-Второе')
+            $proof = @{ ids = $ids; sha256 = (Get-FileHash -LiteralPath $epf).Hash; commit = ''; branch = ''
+                done = $config.ActionsRegister; history = $config.HistoryRegister }
+            $checked = @{ ok = $true; extensions = @{ 'Адаптация' = @{ hash = 'h2' }; 'Доработки' = @{ hash = 'hd' } }; processings = @{} }
+            $verdict = @{ baseKey = 'erp_temp_test'; verdict = 'GREEN'; kit = ''; steps = @(); kitDecision = ''; gateVersion = 'test'
+                checkedState = $checked; requestedActionIds = $ids; verifiedActions = $proof; kitProcessings = @() }
+            [IO.File]::WriteAllText((Join-Path $runDir 'verdict.json'), ($verdict | ConvertTo-Json -Depth 6), $utf8)
+            $answers = @(@{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Выполнить только проверенные действия' }, $deployNameAnswer)
+            $com = New-ComState -ProdHash 'h2'
+            $failedRun = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers $answers -Fake @{ actions = @(@{ fail = $ids[1] }) }
+            Check-DeployCommon $failedRun
+            Check ($failedRun.ExitCode -ne 0) 'частичное выполнение вернуло успех'
+            $record = Get-DeployRecord $sb
+            Check ($null -ne $record -and $record.outcome -eq 'actionsFailed') 'не сохранён исход действий'
+            Check (-not (Test-Path -LiteralPath (Join-Path $runDir 'released.txt'))) 'частичное выполнение принято как выпуск'
+            Reset-FakeState $sb
+            $retry = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers $answers -Fake @{ actions = @(@{ already = @($ids[0]) }) }
+            Check-DeployCommon $retry
+            Check ($retry.ExitCode -eq 0) 'повтор действий вернул ошибку'
+            $record = Get-DeployRecord $sb
+            if ($null -ne $record) {
+                $result = [IO.File]::ReadAllText((Join-Path $record.Dir 'actions\result.txt'))
+                Check ($result.Contains(($ids[0] + '|already')) -and $result.Contains(($ids[1] + '|done'))) 'итог повтора не совпал'
+            }
+            [IO.File]::WriteAllBytes($epf, [byte[]]@(67))
+            Reset-FakeState $sb
+            $changed = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @($answers[0])
+            Check ($changed.ExitCode -ne 0 -and ($changed.Output -join ' ') -match 'отличается от проверенной') 'подмена EPF прошла до подтверждения рабочей'
+            Check (@($changed.Calls | Where-Object { $_.Line -match 'actions;in=' }).Count -eq 0) 'запущен другой исполнитель'
+
         }
     },
     @{
@@ -3571,6 +3684,96 @@ $tests = @(
                 Check ($body -match 'run\.log') 'в событии нет конца run.log'
                 if ($r.RunDir) { Check ([string]$crashEvents[0].run -eq (Split-Path -Leaf $r.RunDir)) 'crash не того прогона' }
             }
+        }
+    },
+    @{
+        Name = 'gate-publish-run-files'
+        Text = 'файлы прогона в git (RunFilesRepo): текстовые файлы папки прогона - в ветку-сироту gate-runs, папка runs/<прогон>, README.md и latest.txt, ссылка в итоге, main не тронут; файлы не ушли - досылаются следующим запуском; двоичные и файл с токеном не выкладываются, README.md говорит почему'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ RunReportRepo = 'owner/repo'; RunFilesRepo = 'owner/ext'; GitHubTokenPassFile = 'secrets\github.txt' }
+            New-Item -ItemType Directory -Path (Join-Path $sb 'secrets') -Force | Out-Null
+            $secret = 'tok-файлы-прогона-321'
+            [System.IO.File]::WriteAllText((Join-Path $sb 'secrets\github.txt'), (ConvertFrom-SecureString -SecureString (ConvertTo-SecureString $secret -AsPlainText -Force)))
+            $http = Join-Path $sb 'fake-http'
+            New-Item -ItemType Directory -Path $http -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $sb 'fake-github') -Force | Out-Null
+            $gh = Get-FakeGh $sb
+            $seedFile = [pscustomobject]@{ Path = 'README.md'; Bytes = $utf8.GetBytes('Репозиторий расширений') }
+            $seed = New-GhCommit -Gh $gh -Parent '' -Changes @($seedFile) -Message 'Начальный коммит'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $seed -Create
+
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep'
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            $id = ''
+            if ($r.RunDir) { $id = Split-Path -Leaf $r.RunDir }
+            Check ((Get-GhHead -Gh $gh -Branch 'main').Sha -eq $seed) 'файлы прогона тронули main'
+            $head = (Get-GhHead -Gh $gh -Branch 'gate-runs').Sha
+            Check ([bool]$head) 'нет ветки gate-runs'
+            if ($head -and $id) {
+                Check (-not (Get-GhFakeAncestors $gh $head).ContainsKey($seed)) 'ветка gate-runs ответвлена от main, а должна быть сиротой'
+                $files = (Read-GhFakeCommit $gh $head).Files
+                foreach ($path in @('report.txt', 'summary.txt', 'run.log', 'verdict.json', 'README.md')) {
+                    Check ($files.ContainsKey(('runs/{0}/{1}' -f $id, $path))) ('в ветке нет runs/{0}/{1}' -f $id, $path)
+                }
+                $latest = ''
+                if ($files.ContainsKey('runs/latest.txt')) { $latest = ([System.Text.Encoding]::UTF8.GetString((Get-GhBlob $gh $files['runs/latest.txt']))).Trim() }
+                Check ($latest -eq $id) ("runs/latest.txt: «{0}», ждали {1}" -f $latest, $id)
+                Check (-not $files.ContainsKey('README.md')) 'в ветку gate-runs попали файлы main'
+                foreach ($blob in @($files.Values)) {
+                    Check (-not ([System.Text.Encoding]::UTF8.GetString((Get-GhBlob $gh $blob))).Contains($secret)) 'токен в выложенном файле'
+                }
+            }
+            $sent = @(Get-ChildItem -LiteralPath $http -Filter 'dispatch-*.json' | Sort-Object Name)
+            Check ($sent.Count -ge 1) 'итог прогона не ушёл'
+            if ($sent.Count -ge 1 -and $id) {
+                $body = [string](([System.IO.File]::ReadAllText($sent[$sent.Count - 1].FullName, $utf8) | ConvertFrom-Json).client_payload.body)
+                Check ($body.Contains(('https://github.com/owner/ext/tree/gate-runs/runs/{0}' -f $id))) 'в итоге нет ссылки на файлы прогона'
+            }
+            if ($r.RunDir) {
+                $statePath = Join-Path $r.RunDir 'publish.json'
+                $state = [System.IO.File]::ReadAllText($statePath, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check ($state.filesSent -eq 'final') 'publish.json: не отмечено, что файлы ушли'
+                # Итог ушёл, а файлы - нет (как без связи с git); в папке - новый текстовый файл, файл с токеном и двоичные.
+                [System.IO.File]::WriteAllText($statePath, '{"wanted":"final","sent":"final","message":"","filesWanted":"final","filesSent":"","filesError":"нет связи"}', $utf8Bom)
+                [System.IO.File]::WriteAllText((Join-Path $r.RunDir 'extra.txt'), 'дослано следующим запуском', $utf8Bom)
+                [System.IO.File]::WriteAllText((Join-Path $r.RunDir 'leak.txt'), ('токен ' + $secret), $utf8Bom)
+                $ansi = [System.Text.Encoding]::GetEncoding(1251)
+                [System.IO.File]::WriteAllText((Join-Path $r.RunDir 'designer.log'), ('пароль ' + $secret), $ansi)
+                [System.IO.File]::WriteAllText((Join-Path $r.RunDir 'clean.log'), 'обычный журнал', $ansi)
+                New-Item -ItemType Directory -Path (Join-Path $r.RunDir 'epf') -Force | Out-Null
+                [System.IO.File]::WriteAllBytes((Join-Path $r.RunDir 'epf\old.txt'), [byte[]]@(65, 66))
+                [System.IO.File]::WriteAllBytes((Join-Path $r.RunDir 'saved.cfe'), [byte[]]@(0, 1, 2, 3))
+            }
+            Reset-FakeState $sb
+            $next = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep'
+            Check-Common $next
+            Check (@($next.Output | Where-Object { $_ -match [regex]::Escape($secret) }).Count -eq 0) 'токен в выводе'
+            Check (@($next.Output | Where-Object { $_ -match 'нашёлся секрет' }).Count -gt 0) 'не сказано, что в файле прогона нашёлся секрет'
+            $head = (Get-GhHead -Gh $gh -Branch 'gate-runs').Sha
+            if ($head -and $id) {
+                $files = (Read-GhFakeCommit $gh $head).Files
+                Check ($files.ContainsKey(('runs/{0}/extra.txt' -f $id))) 'файлы прогона, не ушедшие в прошлый раз, не досланы'
+                Check (-not $files.ContainsKey(('runs/{0}/leak.txt' -f $id))) 'выложен файл с токеном'
+                Check (-not $files.ContainsKey(('runs/{0}/designer.log' -f $id))) 'выложен журнал Windows-1251 с секретом'
+                Check ($files.ContainsKey(('runs/{0}/clean.log' -f $id))) 'чистый журнал Windows-1251 пропущен'
+                Check (-not $files.ContainsKey(('runs/{0}/saved.cfe' -f $id)) -and -not $files.ContainsKey(('runs/{0}/epf/old.txt' -f $id))) 'выложены двоичные файлы или папка epf'
+                $readmeKey = 'runs/{0}/README.md' -f $id
+                $readme = ''
+                if ($files.ContainsKey($readmeKey)) { $readme = [System.Text.Encoding]::UTF8.GetString((Get-GhBlob $gh $files[$readmeKey])) }
+                Check ($readme.Contains('leak.txt') -and $readme.Contains('секрет')) 'в README.md нет, что leak.txt не выложен из-за секрета'
+                Check (-not $readme.Contains($secret)) 'токен в README.md'
+                $state = [System.IO.File]::ReadAllText((Join-Path $r.RunDir 'publish.json'), $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check ($state.filesSent -eq 'final') 'publish.json: дослав файлы, не отмечено, что они ушли'
+                if ($next.RunDir) {
+                    $nextId = Split-Path -Leaf $next.RunDir
+                    Check ($files.ContainsKey(('runs/{0}/summary.txt' -f $nextId))) 'файлы следующего прогона не ушли'
+                    $latest = ''
+                    if ($files.ContainsKey('runs/latest.txt')) { $latest = ([System.Text.Encoding]::UTF8.GetString((Get-GhBlob $gh $files['runs/latest.txt']))).Trim() }
+                    Check ($latest -eq $nextId) ("runs/latest.txt после второго прогона: «{0}», ждали {1}" -f $latest, $nextId)
+                }
+            }
+            Check ((Get-GhHead -Gh $gh -Branch 'main').Sha -eq $seed) 'второй прогон тронул main'
         }
     },
     @{

@@ -171,6 +171,7 @@ $script:JobsLockRelease = $false
 # Проверка конфигурации, которая идёт параллельно с остальными шагами, и ожидаемые длительности шагов плана
 # (для оценки, сколько осталось всего прогона).
 $script:BackgroundCheck = $null
+$script:ProcessingBuild = $null
 # Что запустить параллельной проверкой, когда основному ходу конфигуратор больше не нужен (Start-PendingBackgroundCheck).
 $script:BackgroundCheckPending = $null
 $script:RunPlanExpected = [ordered]@{}
@@ -184,6 +185,7 @@ $script:CoveragePending = $null
 $script:GateActionsDir = ''
 $script:GateActions = @()
 $script:GateActionsEpf = ''
+$script:VerifiedActionPackage = $null
 $script:GateActionsProblem = ''
 $script:GateActionsNeeded = $false
 $script:PlanActionsDir = ''
@@ -2416,6 +2418,7 @@ function Test-DeliveryPath {
 }
 # Меню и вопросы (ui.ps1): из ci.exe их рисует ci.exe, без него - консоль.
 . (Join-Path $Root 'locks.ps1')
+. (Join-Path $Root 'post-update.ps1')
 . (Join-Path $Root 'ui.ps1')
 Initialize-Ui -Channel $UiChannel
 
@@ -2870,6 +2873,7 @@ function Get-PhaseInputs {
     $selfCheckKeys = @('RunSelfCheck', 'SelfCheckDocs', 'SelfCheckForms', 'SelfCheckPost', 'SelfCheckSkipDocs', 'SelfCheckNotOlder', 'ExchangeMode', 'ExchangeQueuePerType', 'ExchangeQueueTotal')
     $selfCheckFile = Resolve-RootPath ([string](Get-Setting $cfg 'SelfCheckEpf' 'tools\ВыполнитьПослеОбновления.epf'))
     switch ($Phase) {
+        'load' { $keys = @('ProcessingAllForms') }
         'before' { $keys = $selfCheckKeys; $files['SelfCheckEpf'] = $selfCheckFile; $flags['-SkipSelfCheck'] = [bool]$SkipSelfCheck }
         'checks' {
             $keys = @('CheckOnly', 'RunCheckConfig', 'CheckConfigFlags', 'RunCheckModules', 'CheckModulesFlags', 'RunCheckCanApply')
@@ -3436,7 +3440,9 @@ function Set-ResumeKitFields {
         }
     }
     foreach ($proc in $kitProcessings) {
-        $prev = @(@(Get-UiField $prevKit 'processings' @()) | Where-Object { [string](Get-UiField $_ 'name' '') -eq $proc.Name } | Select-Object -First 1)
+        $prev = @(@(Get-UiField $prevKit 'processings' @()) | Where-Object {
+            [string](Get-UiField $_ 'name' '') -eq $proc.Name -and [string](Get-UiField $_ 'targetRef' '') -eq $proc.TargetRef
+        } | Select-Object -First 1)
         if ($prev.Count -eq 0) { continue }
         $old = $prev[0]
         if ($kept -and [bool](Get-UiField $old 'touched' $false)) {
@@ -5182,6 +5188,7 @@ function Invoke-GateActionsStep {
     foreach ($action in $script:GateActions) { $lines.Add(('action=' + $action.Id)) }
     [System.IO.File]::WriteAllLines($paramsFile, [string[]]$lines, $Utf8Bom)
 
+    $testedHash = (Get-FileHash -LiteralPath $script:GateActionsEpf -Algorithm SHA256).Hash
     $timeoutSec = [int](Get-Setting $cfg 'ActionsTimeoutSec' 1800)
     $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -User $adminUser -Password $adminPassword) + @(
         '/DisableStartupDialogs', '/DisableStartupMessages',
@@ -5269,6 +5276,17 @@ function Invoke-GateActionsStep {
         if ($script:GateActions.Count -eq 0) { $parts.Add('действий нет') }
         elseif ($status -ne 'ok' -and -not $failed) { $stepStatus = 'FAIL'; $parts.Add(('итог обработки: {0}' -f $status)) }
     }
+    if ($stepStatus -eq 'OK' -and $script:GateActions.Count -gt 0) {
+        $ids = @($script:GateActions | ForEach-Object { $_.Id })
+        try {
+            Assert-ActionResult -Lines $result -Ids $ids
+            $script:VerifiedActionPackage = [pscustomobject]@{ ids = $ids; sha256 = $testedHash
+                done = [string](Get-Setting $cfg 'ActionsRegister' ''); history = [string](Get-Setting $cfg 'HistoryRegister' '')
+                commit = $commit; branch = $KitBranch }
+            $proofFile = Join-Path $RunDir 'actions\verified.json'
+            [IO.File]::WriteAllText($proofFile, ($script:VerifiedActionPackage | ConvertTo-Json -Depth 3), $Utf8Bom)
+        } catch { $script:VerifiedActionPackage = $null; $stepStatus = 'FAIL'; $parts.Add($_.Exception.Message) }
+    }
     if ($historyText) { $parts.Add($historyText) }
     if ($logRows.Count -gt 0) { $parts.Add(('журнал действий - actions\log.txt: {0}' -f ((@($logRows | Select-Object -First 3)) -join ' | '))) }
     Add-StatFact -Title $stepName -Seconds $watch.Elapsed.TotalSeconds -Status $stepStatus
@@ -5286,14 +5304,18 @@ function Start-DesignerBackground {
     param([string[]]$Command, [string]$LogName, [int]$TimeoutSec, [string]$Title, [string]$FileKey)
     $logPath = Join-Path $RunDir $LogName
     $argLine = ($designerBase + $Command + @('/Out', ('"{0}"' -f $logPath))) -join ' '
-    Write-RunLog ("> {0} {1} (параллельно)" -f (Split-Path -Leaf $v8), [regex]::Replace([regex]::Replace($argLine, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"'))
-    Write-Host ("  ...  {0}: начато в {1}, идёт параллельно с остальными шагами, итог - перед вердиктом" -f $Title, (Get-Date -Format 'HH:mm:ss')) -ForegroundColor DarkGray
+    $marker = '(параллельно)'
+    if (-not $FileKey) { $marker = '(фоновая сборка)' }
+    Write-RunLog ("> {0} {1} {2}" -f (Split-Path -Leaf $v8), [regex]::Replace([regex]::Replace($argLine, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"'), $marker)
+    Write-Host ("  ...  {0}: начато в {1}, идёт параллельно с остальными шагами" -f $Title, (Get-Date -Format 'HH:mm:ss')) -ForegroundColor DarkGray
+    $expected = [double](Get-ExpectedStepSeconds $Title)
+    $startedUtc = [datetime]::UtcNow
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $process = Start-Process -FilePath $v8 -ArgumentList $argLine -PassThru
     $null = $process.Handle
     return [pscustomobject]@{
-        Process = $process; Watch = $watch; Log = $logPath; TimeoutSec = $TimeoutSec; Title = $Title; FileKey = $FileKey
-        Expected = [double](Get-ExpectedStepSeconds $Title); Command = $Command; LogName = $LogName
+        Process = $process; Watch = $watch; Log = $logPath; TimeoutSec = $TimeoutSec; Title = $Title; FileKey = $FileKey; TimedOut = $false
+        StartedUtc = $startedUtc; Expected = $expected; Command = $Command; LogName = $LogName
     }
 }
 
@@ -6390,10 +6412,10 @@ function Invoke-KitRollback {
             # Внешняя обработка: прежняя версия записывается в справочник тем же режимом regepf, новая
             # снимается режимом unregepf - по имени объекта и ссылке элемента вместе, чужой элемент не заденет.
             $proc = $entry.Processing
-            $rollbackDir = Join-Path (Join-Path $processingsDir $proc.Name) 'rollback'
+            $rollbackDir = Join-Path (Get-ProcessingDirectory $proc) 'rollback'
             if ($entry.Action -eq 'epfrestore') {
                 $done = 'прежняя версия записана в справочник'
-                $session = Invoke-ProcessingSession -Mode 'regepf' -OutDir $rollbackDir -TextFile $entry.Backup -Name $proc.FileName -Title ("Вернуть в справочник прежнюю {0}" -f $proc.Name)
+                $session = Invoke-ProcessingSession -Mode 'regepf' -OutDir $rollbackDir -TextFile $entry.Backup -Name $proc.FileName -Ref $proc.TargetRef -Title ("Вернуть в справочник прежнюю {0}" -f $proc.Name)
             }
             else {
                 $done = 'снята из справочника: публикация «Отключена», помечена на удаление'
@@ -6697,6 +6719,61 @@ function Get-BlockingSessions {
     return $lines.ToArray()
 }
 
+# Один конфигуратор собирает следующий файл, пока тонкий клиент работает с текущей карточкой.
+function Get-ProcessingDirectory {
+    param($Processing)
+    $name = $Processing.Name
+    if ($Processing.TargetRef) { $name += '~' + $Processing.TargetRef }
+    return (Join-Path $processingsDir $name)
+}
+
+function Get-ProcessingBuildArgs {
+    param($Processing)
+    $dir = Get-ProcessingDirectory $Processing
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $file = Join-Path $dir $Processing.FileName
+    return @{
+        Command = @('/LoadExternalDataProcessorOrReportFromFiles', ('"{0}"' -f $Processing.Xml), ('"{0}"' -f $file))
+        LogName = ("build_{0}.log" -f (Split-Path -Leaf $dir))
+        TimeoutSec = $timeoutLoadSec
+        Title = ("Собрать {0} из файлов" -f $Processing.Name)
+    }
+}
+
+function Stop-ProcessingBuild {
+    $build = $script:ProcessingBuild
+    if ($null -ne $build -and -not $build.Process.HasExited) {
+        try { $build.Process.Kill() } catch [System.InvalidOperationException] { }
+        $build.Process.WaitForExit()
+    }
+}
+
+function Complete-ProcessingBuild {
+    param([hashtable]$BuildArgs)
+    $build = $script:ProcessingBuild
+    if ($null -eq $build) { return (Invoke-Designer @BuildArgs) }
+    $wait = [System.Diagnostics.Stopwatch]::StartNew()
+    $finished = Wait-UiProcess -Process $build.Process -Watch $build.Watch -TimeoutSec $build.TimeoutSec -Title $build.Title -Expected $build.Expected
+    if (-not $finished) { $build.TimedOut = $true; Stop-ProcessingBuild }
+    $build.Process.WaitForExit()
+    $seconds = [Math]::Max(0.0, ($build.Process.ExitTime.ToUniversalTime() - $build.StartedUtc).TotalSeconds)
+    $timedOut = $build.TimedOut -or ($seconds -gt $build.TimeoutSec)
+    $wait.Stop()
+    $code = $build.Process.ExitCode
+    $build.Process.Dispose()
+    $script:ProcessingBuild = $null
+    Write-RunLog ("  Фоновая сборка {0}: секунд={1} ждали={2} код={3} таймаут={4}" -f $build.Title, [int]$seconds, [int]$wait.Elapsed.TotalSeconds, $code, $timedOut)
+    $lines = @(Read-V8Log $build.Log)
+    if (-not $timedOut -and $code -ne 0 -and (Test-DesignerBusy $lines)) {
+        Write-RunLog ("{0}: конфигуратор был занят, повтор после записи карточки" -f $build.Title)
+        return (Invoke-Designer @BuildArgs)
+    }
+    $status = 'FAIL'
+    if ($timedOut) { $status = 'TIMEOUT' } elseif ($code -eq 0) { $status = 'OK' }
+    Add-StatFact -Title $build.Title -Seconds $seconds -Status $status
+    return [pscustomobject]@{ ExitCode = $code; TimedOut = $timedOut; Seconds = [int]$seconds; Log = $build.Log; Lines = $lines }
+}
+
 function Invoke-ProcessingSession {
     # Один сеанс «Выполнить после обновления» в режиме regepf или unregepf.
     # regepf - записать обработку в справочник «Дополнительные отчёты и обработки»: новую добавить,
@@ -6713,6 +6790,7 @@ function Invoke-ProcessingSession {
     $launch.Add(("out={0}" -f $OutDir))
     $launch.Add(("name={0}" -f $Name))
     if ($Mode -eq 'regepf') {
+        if ([bool](Get-Setting $cfg 'ProcessingAllForms' $false) -and -not $TextFile) { $launch.Add('allforms=1') }
         $newB64 = Join-Path $OutDir 'new.b64'
         if ($TextFile) { Copy-Item -LiteralPath $TextFile -Destination $newB64 -Force }
         else { [System.IO.File]::WriteAllText($newB64, [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($File)), [System.Text.Encoding]::ASCII) }
@@ -6740,6 +6818,11 @@ function Invoke-ProcessingSession {
     $null = $process.Handle
     $state = ''
     while ($true) {
+        $build = $script:ProcessingBuild
+        if ($null -ne $build -and -not $build.Process.HasExited -and $build.Watch.Elapsed.TotalSeconds -ge $build.TimeoutSec) {
+            $build.TimedOut = $true
+            Stop-ProcessingBuild
+        }
         if (Test-Path -LiteralPath $resultFile) { $state = 'result'; break }
         if ($process.HasExited) {
             Start-Sleep -Seconds 2
@@ -7668,8 +7751,12 @@ foreach ($item in $kitItems) {
 # сначала собирает конфигуратор. Запись делает «Выполнить после обновления» (режим regepf) через БСП, как
 # загрузка из файла в форме элемента; прежняя версия перед записью ложится в epf\<имя>\old.b64 - это откат.
 $processingsDir = Join-Path $RunDir 'epf'
-foreach ($proc in $kitProcessings) {
+$parallelBuild = [bool](Get-Setting $cfg 'ParallelProcessingBuild' $true)
+for ($procIndex = 0; $procIndex -lt $kitProcessings.Count; $procIndex++) {
+    $proc = $kitProcessings[$procIndex]
     if ($loadReused) { break }
+    # В продолжении прежний Loaded относится к предыдущей попытке записи этой карточки.
+    $proc.Loaded = $false
     $registerName = "Записать в справочник {0}" -f $proc.Name
     if (-not $proceed) {
         Add-StepResult -Name $registerName -Status 'SKIP' -Detail 'пропущено: предыдущий шаг не прошёл'
@@ -7685,17 +7772,14 @@ foreach ($proc in $kitProcessings) {
         $proceed = $false
         continue
     }
-    $procDir = Join-Path $processingsDir $proc.Name
-    $targetRef = ''
-    if ($null -ne $proc.PSObject.Properties['TargetRef']) { $targetRef = [string]$proc.TargetRef }
-    if ($targetRef) { $procDir = Join-Path $processingsDir ('{0}~{1}' -f $proc.Name, $targetRef.Substring(0, 8)) }
+    $procDir = Get-ProcessingDirectory $proc
+    $targetRef = $proc.TargetRef
 
     if ($proc.Kind -eq 'epfdir') {
-        $buildName = "Собрать {0} из файлов" -f $proc.Name
-        New-Item -ItemType Directory -Path $procDir -Force | Out-Null
+        $buildArgs = Get-ProcessingBuildArgs $proc
+        $buildName = $buildArgs.Title
         $builtFile = Join-Path $procDir $proc.FileName
-        $result = Invoke-Designer -Command @('/LoadExternalDataProcessorOrReportFromFiles', ('"{0}"' -f $proc.Xml), ('"{0}"' -f $builtFile)) `
-            -LogName ("build_{0}.log" -f $proc.Name) -TimeoutSec $timeoutLoadSec -Title $buildName
+        $result = Complete-ProcessingBuild $buildArgs
         if ($result.ExitCode -eq 0 -and -not $result.TimedOut -and -not (Test-Path -LiteralPath $builtFile)) {
             Add-StepResult -Name $buildName -Status 'FAIL' -Detail ("конфигуратор отработал без ошибки, а файла {0} нет" -f $proc.FileName) -Log $result.Log -Seconds $result.Seconds
             $proceed = $false
@@ -7714,6 +7798,18 @@ foreach ($proc in $kitProcessings) {
             Add-StepResult -Name $registerName -Status 'FAIL' -Detail ("sha256 файла {0}, а в git записан {1}: не ставлю" -f $actualSha, $proc.ExpectSha256)
             $proceed = $false
             continue
+        }
+    }
+    if ($parallelBuild -and $procIndex + 1 -lt $kitProcessings.Count) {
+        $nextProcessing = $kitProcessings[$procIndex + 1]
+        if ($nextProcessing.Kind -eq 'epfdir') {
+            try {
+                $nextBuild = Get-ProcessingBuildArgs $nextProcessing
+                $script:ProcessingBuild = Start-DesignerBackground @nextBuild
+            }
+            catch {
+                Write-RunLog ("Сборка {0} начнётся по очереди: {1}" -f $nextProcessing.Name, $_.Exception.Message)
+            }
         }
     }
     $proc.Tried = $true
@@ -7772,6 +7868,7 @@ foreach ($proc in $kitProcessings) {
     $detail = "{0} {1} {2}" -f $proc.What, $proc.ObjectName, $what
     if ($proc.OldVersion -or $proc.NewVersion) { $detail += (", версия {0} -> {1}" -f $(if ($proc.OldVersion) { $proc.OldVersion } else { '-' }), $(if ($proc.NewVersion) { $proc.NewVersion } else { '-' })) }
     $detail += (", вид {0}, команд {1}, форм {2}" -f (Get-Setting $values 'kind' '?'), (Get-Setting $values 'commands' '?'), (Get-Setting $values 'forms' '?'))
+    if ($values.ContainsKey('formprobes')) { $detail += (", выполнено проб форм {0}" -f $values['formprobes']) }
     $problems = New-Object System.Collections.Generic.List[string]
     if ($session.Status -ne 'done') { $problems.Add($session.Message) }
     if ([string](Get-Setting $values 'check' '') -eq 'error') { $problems.Add(("не подключилась после записи: {0}" -f (Get-Setting $values 'checkerror' ''))) }
@@ -7780,14 +7877,21 @@ foreach ($proc in $kitProcessings) {
         Add-StepResult -Name $registerName -Status 'FAIL' -Detail ($detail + '. ' + ($problems -join ' | ')) -Log $session.ResultFile -Seconds $session.Seconds
     }
     else {
-        Add-StepResult -Name $registerName -Status 'OK' -Detail ($detail + '; подключается, объект и формы создаются') -Log $session.ResultFile -Seconds $session.Seconds
+        Add-StepResult -Name $registerName -Status 'OK' -Detail ($detail + '; объект подключён, проверка завершена') -Log $session.ResultFile -Seconds $session.Seconds
         $proc.Loaded = $true
     }
 }
 
+# После ошибки записи следующая сборка могла уже начаться. Завершаем свой процесс до других вызовов конфигуратора.
+if ($null -ne $script:ProcessingBuild) {
+    Stop-ProcessingBuild
+    $script:ProcessingBuild.Process.Dispose()
+    $script:ProcessingBuild = $null
+}
+
 if (-not $loadReused) {
     if (($kitItems.Count + $kitProcessings.Count) -eq 0) { Set-PhaseState 'load' 'na' }
-    elseif ($proceed) { Set-PhaseState 'load' 'done' }
+    elseif ($proceed -and @($kitProcessings | Where-Object { -not $_.Loaded }).Count -eq 0) { Set-PhaseState 'load' 'done' }
     else { Set-PhaseState 'load' 'failed' }
 }
 
@@ -8006,7 +8110,13 @@ if ($canaryState) { Set-PhaseState 'canary' $canaryState }
 # в историю. После канареечного входа: в базу, которая не открывается, действия не пустить.
 $script:StepPhase = 'actions'
 $actionsState = 'done'
-if (Restore-Phase 'actions') { $actionsState = '' }
+if (Restore-Phase 'actions') {
+    $actionsState = ''
+    $proofFile = Join-Path $RunDir 'actions\verified.json'
+    if (Test-Path -LiteralPath $proofFile) {
+        $script:VerifiedActionPackage = Get-Content -LiteralPath $proofFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    }
+}
 elseif (-not $script:GateActionsNeeded) { $actionsState = 'na' }
 elseif (-not $proceed -or $script:StopRun) {
     Add-StepResult -Name 'Действия после обновления' -Status 'SKIP' -Detail 'пропущено: загрузка не прошла'
@@ -8259,6 +8369,8 @@ function Write-RunSummary {
         preparation = @($script:PrepLines)
         gateVersion = $script:GateVersion
         resume      = $resumeInfo
+        verifiedActions = $script:VerifiedActionPackage
+        requestedActionIds = @($script:GateActions | ForEach-Object { $_.Id })
         checkedState = $script:CheckedState
     }
     [System.IO.File]::WriteAllText((Join-Path $RunDir 'verdict.json'), ($summary | ConvertTo-Json -Depth 6), $Utf8Bom)
@@ -8576,7 +8688,9 @@ if ($decision -ne 'rolledBack' -and $decision -ne 'rollbackFailed') {
 }
 
 }
-finally { Clear-TestBaseLocks }
+finally {
+    try { Stop-ProcessingBuild } finally { Clear-TestBaseLocks }
+}
 Invoke-RunPublish -Stage 'final'
 
 exit $exitCode

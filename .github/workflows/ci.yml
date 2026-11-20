@@ -49,6 +49,24 @@ jobs:
         working-directory: src/merge1c
         run: go build -o ../../gate/test/merge1c.exe .
 
+      - name: Сборка
+        shell: pwsh
+        run: |
+          $stamp = ''
+          if ($env:GITHUB_REF_TYPE -eq 'tag') { $stamp = $env:GITHUB_REF_NAME.TrimStart('v') }
+          Push-Location src/build
+          if ($stamp) { go run . -root ../.. -out dist -stamp $stamp } else { go run . -root ../.. -out dist }
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Pop-Location
+          Remove-Item dist/*.exe
+
+      - name: Приёмка из установленного ZIP без системного Python
+        shell: powershell
+        run: |
+          $bundle = @(Get-ChildItem dist/ci-gate_*.zip -File)
+          if ($bundle.Count -ne 1) { throw 'Expected exactly one gate ZIP' }
+          & ./gate/test/portable-python-ci.ps1 -Bundle $bundle[0].FullName
+
       - name: Тесты гейта без 1С (Windows PowerShell 5.1)
         shell: powershell
         run: |
@@ -62,17 +80,6 @@ jobs:
           name: tests-last-run
           path: gate/test/last-run.txt
           if-no-files-found: ignore
-
-      - name: Сборка
-        shell: pwsh
-        run: |
-          $stamp = ''
-          if ($env:GITHUB_REF_TYPE -eq 'tag') { $stamp = $env:GITHUB_REF_NAME.TrimStart('v') }
-          Push-Location src/build
-          if ($stamp) { go run . -root ../.. -out dist -stamp $stamp } else { go run . -root ../.. -out dist }
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          Pop-Location
-          Remove-Item dist/*.exe
 
       - uses: actions/upload-artifact@v4
         with:

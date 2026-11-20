@@ -528,6 +528,12 @@ function New-ActionsKit {
             $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $kit) -Fake @{ actions = @(@{ log = @('второе сделано') }) }
             Check-Common $r
             Check-Step $r 'Действия после обновления' 'OK'
+            if ($r.RunDir) {
+                $verdict = Get-Content -LiteralPath (Join-Path $r.RunDir 'verdict.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+                $hash = (Get-FileHash -LiteralPath (Join-Path $r.RunDir 'actions\ДействияПослеОбновления.epf')).Hash
+                Check ($verdict.verifiedActions.sha256 -eq $hash) 'в вердикте указан другой исполнитель действий'
+                Check (($verdict.verifiedActions.ids -join ',') -ceq '20261121-01-первое,20261121-02-второе') 'не зафиксирован порядок действий'
+            }
             $step = Get-Step $r 'Действия после обновления'
             if ($null -ne $step) {
                 Check ([string]$step.detail -match 'выполнено сейчас: 20261121-01-первое, 20261121-02-второе') ("в итоге шага не то: {0}" -f $step.detail)
@@ -576,7 +582,11 @@ function New-ActionsKit {
                 '20261121-03-третье' = (New-ActionText 'Третье' 'Значение = 3;')
             }
             $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $kit) -Fake @{ actions = @(@{ fail = '20261121-02-второе' }) }
-            Check-Common $r; Check-Verdict $r 'RED' 1
+            Check-Common $r
+            if ($r.RunDir) {
+                $verdict = Get-Content -LiteralPath (Join-Path $r.RunDir 'verdict.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+                Check ($null -eq $verdict.verifiedActions) 'упавшие действия разрешены для рабочей базы'
+            }; Check-Verdict $r 'RED' 1
             Check-Step $r 'Действия после обновления' 'FAIL'
             $step = Get-Step $r 'Действия после обновления'
             if ($null -ne $step) {

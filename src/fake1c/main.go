@@ -42,14 +42,15 @@ import (
 )
 
 type designerRule struct {
-	Match  []string `json:"match"`
-	Exit   int      `json:"exit"`
-	Log    string   `json:"log"`
-	Sleep  float64  `json:"sleep"`
-	Times  int      `json:"times"`
-	Hang   bool     `json:"hang"`
-	NoLog  bool     `json:"noLog"`
-	NoDump bool     `json:"noDump"`
+	Match            []string `json:"match"`
+	Exit             int      `json:"exit"`
+	Log              string   `json:"log"`
+	Sleep            float64  `json:"sleep"`
+	Times            int      `json:"times"`
+	Hang             bool     `json:"hang"`
+	NoLog            bool     `json:"noLog"`
+	NoDump           bool     `json:"noDump"`
+	WaitRegistration string   `json:"waitRegistration"`
 }
 
 type task struct {
@@ -90,18 +91,20 @@ type canary struct {
 }
 
 type processing struct {
-	Status     string   `json:"status"`
-	Message    string   `json:"message"`
-	ObjName    string   `json:"objname"`
-	ObjVersion string   `json:"objversion"`
-	OldVersion string   `json:"oldversion"`
-	IsNew      string   `json:"isnew"`
-	Ref        string   `json:"ref"`
-	Check      string   `json:"check"`
-	CheckError string   `json:"checkerror"`
-	FormErrors []string `json:"formerror"`
-	Old        string   `json:"old"`
-	NoResult   bool     `json:"noresult"`
+	Status          string   `json:"status"`
+	Message         string   `json:"message"`
+	ObjName         string   `json:"objname"`
+	ObjVersion      string   `json:"objversion"`
+	OldVersion      string   `json:"oldversion"`
+	IsNew           string   `json:"isnew"`
+	Ref             string   `json:"ref"`
+	Check           string   `json:"check"`
+	CheckError      string   `json:"checkerror"`
+	FormErrors      []string `json:"formerror"`
+	NamedFormErrors []string `json:"namedFormErrors"`
+	WaitBuild       string   `json:"waitBuild"`
+	Old             string   `json:"old"`
+	NoResult        bool     `json:"noresult"`
 }
 
 type unitCase struct {
@@ -413,6 +416,12 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 			writeUTF8(filepath.Join(filepath.Dir(root), name, "Ext", "ObjectModule.bsl"), string(trimBOM(data)))
 		}
 		if strings.EqualFold(a, "/LoadExternalDataProcessorOrReportFromFiles") && i+2 < len(args) {
+			if rule.WaitRegistration != "" {
+				marker := filepath.Join(filepath.Dir(filepath.Dir(args[i+2])), rule.WaitRegistration, "register", "started.txt")
+				if !waitForFile(marker) {
+					return 1
+				}
+			}
 			_ = os.MkdirAll(filepath.Dir(args[i+2]), 0o755)
 			_ = os.WriteFile(args[i+2], []byte("FAKEEPF "+filepath.Base(args[i+2])), 0o644)
 		}
@@ -897,8 +906,25 @@ func precheckRun(c precheck, dir string) {
 	writeUTF8(dir+"result.txt", strings.Join(result, "\n"))
 }
 
+func waitForFile(path string) bool {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return false
+}
+
 func processingRun(mode string, r processing, dir string, p map[string]string) {
 	writeUTF8(dir+"started.txt", "started=20261117.999999")
+	if r.WaitBuild != "" {
+		built := filepath.Join(dir, "..", "..", r.WaitBuild, r.WaitBuild+".epf")
+		if !waitForFile(built) {
+			r.Status, r.Message = "failed", "не дождался фоновой сборки"
+		}
+	}
 	if r.NoResult {
 		time.Sleep(time.Hour)
 	}
@@ -934,6 +960,9 @@ func processingRun(mode string, r processing, dir string, p map[string]string) {
 			"isnew="+isNew, "ref="+ref, "kind=ДополнительнаяОбработка", "commands=1", "forms=1", "check="+check)
 		if r.CheckError != "" {
 			lines = append(lines, "checkerror="+r.CheckError)
+		}
+		if p["allforms"] == "1" {
+			r.FormErrors = append(r.FormErrors, r.NamedFormErrors...)
 		}
 		for _, f := range r.FormErrors {
 			lines = append(lines, "formerror="+f)
