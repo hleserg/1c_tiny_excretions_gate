@@ -3438,7 +3438,9 @@ function Set-ResumeKitFields {
         }
     }
     foreach ($proc in $kitProcessings) {
-        $prev = @(@(Get-UiField $prevKit 'processings' @()) | Where-Object { [string](Get-UiField $_ 'name' '') -eq $proc.Name } | Select-Object -First 1)
+        $prev = @(@(Get-UiField $prevKit 'processings' @()) | Where-Object {
+            [string](Get-UiField $_ 'name' '') -eq $proc.Name -and [string](Get-UiField $_ 'targetRef' '') -eq $proc.TargetRef
+        } | Select-Object -First 1)
         if ($prev.Count -eq 0) { continue }
         $old = $prev[0]
         if ($kept -and [bool](Get-UiField $old 'touched' $false)) {
@@ -6396,10 +6398,10 @@ function Invoke-KitRollback {
             # Внешняя обработка: прежняя версия записывается в справочник тем же режимом regepf, новая
             # снимается режимом unregepf - по имени объекта и ссылке элемента вместе, чужой элемент не заденет.
             $proc = $entry.Processing
-            $rollbackDir = Join-Path (Join-Path $processingsDir $proc.Name) 'rollback'
+            $rollbackDir = Join-Path (Get-ProcessingDirectory $proc) 'rollback'
             if ($entry.Action -eq 'epfrestore') {
                 $done = 'прежняя версия записана в справочник'
-                $session = Invoke-ProcessingSession -Mode 'regepf' -OutDir $rollbackDir -TextFile $entry.Backup -Name $proc.FileName -Title ("Вернуть в справочник прежнюю {0}" -f $proc.Name)
+                $session = Invoke-ProcessingSession -Mode 'regepf' -OutDir $rollbackDir -TextFile $entry.Backup -Name $proc.FileName -Ref $proc.TargetRef -Title ("Вернуть в справочник прежнюю {0}" -f $proc.Name)
             }
             else {
                 $done = 'снята из справочника: публикация «Отключена», помечена на удаление'
@@ -7739,6 +7741,8 @@ $parallelBuild = [bool](Get-Setting $cfg 'ParallelProcessingBuild' $true)
 for ($procIndex = 0; $procIndex -lt $kitProcessings.Count; $procIndex++) {
     $proc = $kitProcessings[$procIndex]
     if ($loadReused) { break }
+    # В продолжении прежний Loaded относится к предыдущей попытке записи этой карточки.
+    $proc.Loaded = $false
     $registerName = "Записать в справочник {0}" -f $proc.Name
     if (-not $proceed) {
         Add-StepResult -Name $registerName -Status 'SKIP' -Detail 'пропущено: предыдущий шаг не прошёл'

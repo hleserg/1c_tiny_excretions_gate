@@ -1181,7 +1181,10 @@ $tests = @(
                 $kit = Join-Path $sb 'inbox'
                 $null = Add-InboxFile $sb 'Альфа\Альфа.xml' ($epfDump.Replace('Печать', 'Альфа'))
                 $null = Add-InboxFile $sb 'Бета\Бета.xml' ($epfDump.Replace('Печать', 'Бета'))
-                $fake = @{ regepf = @(@{ status = 'done'; waitBuild = 'Бета' }, @{ status = 'done' }) }
+                $fake = @{
+                    regepf = @(@{ status = 'done'; waitBuild = 'Бета' }, @{ status = 'done' })
+                    designer = @(@{ match = @('Бета.xml'); waitRegistration = 'Альфа' })
+                }
                 if ($broken) {
                     $fake.regepf = @(@{ status = 'done' })
                     $fake.designer = @(@{ match = @('/LoadExternalDataProcessorOrReportFromFiles', 'Бета.xml'); exit = 1; log = 'Ошибка сборки' })
@@ -1206,8 +1209,23 @@ $tests = @(
         }
     },
     @{
+        Name = 'gate-processing-target-rollback'
+        Text = 'откат обновления карточки по ref возвращает файл именно в выбранную карточку'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb 'Печать.epf'
+            $ref = '11111111-2222-3333-4444-555555555555'
+            [IO.File]::WriteAllText(($file + '.gate.json'), ('{"ref":"' + $ref + '"}'), $utf8)
+            $fake = @{ regepf = @(@{ status = 'done'; old = 'прежний файл'; formerror = @('отказ формы') }, @{ status = 'done' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Rollback' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'RED' 1
+            Check ((Get-Calls $r @('/Cregepf', ('ref=' + $ref))).Count -eq 2) 'при откате пропала ссылка на исходную карточку'
+        }
+    },
+    @{
         Name = 'gate-processing-form-scope'
-        Text = 'ошибку отдельной именованной формы проверяет диагностический режим; отказ формы входа блокирует в обоих режимах'
+        Text = 'ошибку отдельной именованной формы проверяет диагностический режим'
         Run = {
             param($Name)
             foreach ($strict in @($false, $true)) {

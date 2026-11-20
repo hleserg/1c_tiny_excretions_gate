@@ -42,14 +42,15 @@ import (
 )
 
 type designerRule struct {
-	Match  []string `json:"match"`
-	Exit   int      `json:"exit"`
-	Log    string   `json:"log"`
-	Sleep  float64  `json:"sleep"`
-	Times  int      `json:"times"`
-	Hang   bool     `json:"hang"`
-	NoLog  bool     `json:"noLog"`
-	NoDump bool     `json:"noDump"`
+	Match            []string `json:"match"`
+	Exit             int      `json:"exit"`
+	Log              string   `json:"log"`
+	Sleep            float64  `json:"sleep"`
+	Times            int      `json:"times"`
+	Hang             bool     `json:"hang"`
+	NoLog            bool     `json:"noLog"`
+	NoDump           bool     `json:"noDump"`
+	WaitRegistration string   `json:"waitRegistration"`
 }
 
 type task struct {
@@ -415,6 +416,12 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 			writeUTF8(filepath.Join(filepath.Dir(root), name, "Ext", "ObjectModule.bsl"), string(trimBOM(data)))
 		}
 		if strings.EqualFold(a, "/LoadExternalDataProcessorOrReportFromFiles") && i+2 < len(args) {
+			if rule.WaitRegistration != "" {
+				marker := filepath.Join(filepath.Dir(filepath.Dir(args[i+2])), rule.WaitRegistration, "register", "started.txt")
+				if !waitForFile(marker) {
+					return 1
+				}
+			}
 			_ = os.MkdirAll(filepath.Dir(args[i+2]), 0o755)
 			_ = os.WriteFile(args[i+2], []byte("FAKEEPF "+filepath.Base(args[i+2])), 0o644)
 		}
@@ -899,23 +906,25 @@ func precheckRun(c precheck, dir string) {
 	writeUTF8(dir+"result.txt", strings.Join(result, "\n"))
 }
 
+func waitForFile(path string) bool {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return false
+}
+
 func processingRun(mode string, r processing, dir string, p map[string]string) {
+	writeUTF8(dir+"started.txt", "started=20261117.999999")
 	if r.WaitBuild != "" {
-		// Первая регистрация может закончиться только после сборки следующего файла.
 		built := filepath.Join(dir, "..", "..", r.WaitBuild, r.WaitBuild+".epf")
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			if _, err := os.Stat(built); err == nil {
-				break
-			}
-			if time.Now().After(deadline) {
-				r.Status, r.Message = "failed", "не дождался фоновой сборки"
-				break
-			}
-			time.Sleep(25 * time.Millisecond)
+		if !waitForFile(built) {
+			r.Status, r.Message = "failed", "не дождался фоновой сборки"
 		}
 	}
-	writeUTF8(dir+"started.txt", "started=20261117.999999")
 	if r.NoResult {
 		time.Sleep(time.Hour)
 	}
