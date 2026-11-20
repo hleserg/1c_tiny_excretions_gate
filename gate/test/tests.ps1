@@ -877,6 +877,25 @@ $tests = @(
         }
     },
     @{
+        Name = 'gate-checked-state'
+        Text = 'прогон с настроенной рабочей: снимок temp (хеш-суммы расширений) в verdict.json до вопроса про комплект; без ProdBase снимка нет'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $file = Add-InboxFile $sb $cfeName
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Com (New-ComState)
+            Check-Common $r
+            if ($null -eq $r.Verdict) { Check $false 'нет verdict.json'; return }
+            $checked = $r.Verdict.checkedState
+            Check ($null -ne $checked -and [bool]$checked.ok) ("снимок temp не снялся: {0}" -f $(if ($null -ne $checked) { $checked.error } else { 'нет checkedState' }))
+            if ($null -ne $checked -and [bool]$checked.ok) { Check ([string]$checked.extensions.'Адаптация'.hash -eq 'h2') ("хеш Адаптация в снимке: {0}" -f $checked.extensions.'Адаптация'.hash) }
+            $plain = New-Sandbox ($Name + '-noprod')
+            $file2 = Add-InboxFile $plain $cfeName
+            $r2 = Invoke-Script -Sandbox $plain -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file2)
+            if ($r2.RunDir) { Check (-not (Test-Path -LiteralPath (Join-Path $r2.RunDir 'checked-state.json'))) 'снимок temp без настроенной рабочей' }
+        }
+    },
+    @{
         Name = 'gate-selfcheck-known-tiles'
         Text = 'экран хода самопроверки: предупреждение, которое уже есть в эталоне, уходит в «известные» своего шага (сверка по тексту), новая ошибка - нет; параллельная проверка конфигурации названа в плане; сеансам «до» и «после» переданы свои заголовок и пояснение экрана'
         Run = {
@@ -1887,6 +1906,87 @@ $tests = @(
         }
     },
     @{
+        Name = 'deploy-snapshot-temp'
+        Text = 'снимок temp для прогона (deploy -SnapshotTemp): хеш-суммы расширений и обработок в файл, рабочую не трогает'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $file = Join-Path $sb 'snap.json'
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '2' $printNew))
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments ('-SnapshotTemp "{0}"' -f $file) -Com $com
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            if (-not (Test-Path -LiteralPath $file)) { Check $false 'нет файла снимка'; return }
+            $snap = [System.IO.File]::ReadAllText($file, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+            Check ([bool]$snap.ok) ("снимок не снялся: {0}" -f $snap.error)
+            Check ([string]$snap.extensions.'Адаптация'.hash -eq 'h2') ("хеш Адаптация в снимке: {0}" -f $snap.extensions.'Адаптация'.hash)
+            Check ($null -ne $snap.processings.'Печать' -and [string]$snap.processings.'Печать'.hash) 'в снимке нет обработки Печать'
+            Check (@($r.ComLog | Where-Object { $_ -match 'erp_base' }).Count -eq 0) 'снимок temp обращался к рабочей'
+        }
+    },
+    @{
+        Name = 'deploy-checked-state'
+        Text = 'зелёный прогон со снимком: совпало - обновление без вопроса про гейт; temp изменён после прогона - вопрос «состав расходится», «нет» - ничего не загружено'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $runDir = Join-Path $sb 'runs\20261117-090000'
+            New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+            $checked = @{ ok = $true; extensions = @{ 'Адаптация' = @{ version = '1.0.0.h2'; hash = 'h2' }; 'Доработки' = @{ version = '1.0.0.1'; hash = 'hd' } }; processings = @{} }
+            $verdict = @{ verdict = 'GREEN'; kit = 'inbox\тест'; kitDecision = 'kept'; kitSource = 'git owner/ext@0123456789abcdef0123456789abcdef01234567'; steps = @(); checkedState = $checked }
+            [System.IO.File]::WriteAllText((Join-Path $runDir 'verdict.json'), (ConvertTo-Json -InputObject $verdict -Depth 6), $utf8)
+            $same = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить выбранные' },
+                @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
+                $deployNameAnswer)
+            Check-DeployCommon $same
+            Check ($same.ExitCode -eq 0) ("совпало: код возврата {0}, ждали 0" -f $same.ExitCode)
+            Check (@($same.Output | Where-Object { $_ -match 'состав совпадает с проверенным прогоном 20261117-090000' }).Count -gt 0) 'нет строки о совпадении с проверенным'
+            $record = Get-DeployRecord $sb
+            if ($null -ne $record) {
+                Check ([string]$record.gate.kitSource -eq 'git owner/ext@0123456789abcdef0123456789abcdef01234567') ("kitSource в deploy.json: {0}" -f $record.gate.kitSource)
+                Check (@($record.gate.installed | Where-Object { $_.name -eq 'Адаптация' -and $_.hash -eq 'h2' }).Count -eq 1) 'в deploy.json нет выпущенного хеша Адаптация'
+            }
+            else { Check $false 'нет deploy.json' }
+            Start-Sleep -Seconds 2
+            Reset-FakeState $sb
+            $other = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com (New-ComState -TempHash 'h3') -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить выбранные' },
+                @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
+                @{ Kind = 'confirm'; Header = 'состав расходится с проверенным прогоном 20261117-090000: Адаптация: в temp не то'; Yes = $false })
+            Check ($other.ExitCode -eq 0) ("расходится: код возврата {0}, ждали 0" -f $other.ExitCode)
+            Check ($other.Unexpected.Count -eq 0 -and $other.UnusedAnswers -eq 0) ("temp изменён после прогона, а вопроса не было: " + ($other.Unexpected -join ' | '))
+            Check ((Get-Calls $other @('/LoadCfg')).Count -eq 0) 'после «нет» что-то загружено'
+        }
+    },
+    @{
+        Name = 'deploy-prepared-uses-prepared-run'
+        Text = 'подготовили с красным прогоном A, потом прошёл зелёный B: «подготовленным» показывает и спрашивает по A'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $runA = Join-Path $sb 'runs\20261117-090000'
+            New-Item -ItemType Directory -Path $runA -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $runA 'verdict.json'), (ConvertTo-Json -InputObject @{ verdict = 'RED'; kit = 'A'; kitDecision = 'kept'; steps = @() } -Depth 5), $utf8)
+            $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Prepare' -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Подготовка обновления erp_base'; Item = '^Подготовить все' },
+                @{ Kind = 'confirm'; Header = 'гейт 20261117-090000 красный'; Yes = $true },
+                @{ Kind = 'text'; Header = 'Причина выпуска'; Text = 'дефект в неиспользуемом отчёте' },
+                $deployNameAnswer)
+            Check ($first.ExitCode -eq 0) ("подготовка: код возврата {0}, ждали 0" -f $first.ExitCode)
+            $runB = Join-Path $sb 'runs\20261117-100000'
+            New-Item -ItemType Directory -Path $runB -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $runB 'verdict.json'), (ConvertTo-Json -InputObject @{ verdict = 'GREEN'; kit = 'B'; kitDecision = 'kept'; steps = @() } -Depth 5), $utf8)
+            Start-Sleep -Seconds 2
+            Reset-FakeState $sb
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ApplyPrepared' -Answers @(
+                @{ Kind = 'confirm'; Header = 'гейт 20261117-090000 красный'; Yes = $false })
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check ($r.Unexpected.Count -eq 0 -and $r.UnusedAnswers -eq 0) ("«подготовленным» не спросил про красный A: " + ($r.Unexpected -join ' | '))
+            Check ((Get-Calls $r @('/UpdateDBCfg')).Count -eq 0) 'после «нет» конфигурация БД обновлена'
+        }
+    },
+    @{
         Name = 'deploy-update-fail-rollback'
         Text = 'обновление БД рабочей не прошло: откат к резервной копии, итог rolledBack, блокировки сняты'
         Run = {
@@ -2229,7 +2329,7 @@ $tests = @(
             Start-Sleep -Seconds 2
             Reset-FakeState $sb
             $changed = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ApplyPrepared' -Com (New-ComState -TempHash 'h3') -Answers @(
-                @{ Kind = 'confirm'; Header = 'После подготовки было изменено'; Yes = $false })
+                @{ Kind = 'confirm'; Header = 'после подготовки изменено'; Yes = $false })
             Check ($changed.ExitCode -eq 0) ("отказ обновлять подготовленным: код возврата {0}, ждали 0" -f $changed.ExitCode)
             Check ($changed.Unexpected.Count -eq 0 -and $changed.UnusedAnswers -eq 0) 'temp изменён после подготовки, а вопроса не было'
             Check ((Get-Calls $changed @('/UpdateDBCfg')).Count -eq 0) 'после отказа конфигурация БД обновлена'
