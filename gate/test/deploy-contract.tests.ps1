@@ -426,6 +426,28 @@ function New-ActionsKit {
         }
     },
     @{
+        Name = 'deploy-close-sessions-unread'
+        Text = 'закрыть рабочую, а список сеансов не читается: вход и регламентные закрыты, но итог не «ЗАКРЫТА», а предупреждение; код возврата 1, сеансы вслепую не завершаются (ревью #44)'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-ComState -Sessions @(@{ id = 5; base = 'erp_base'; app = '1CV8C'; user = 'Пользователь'; host = 'pc1' })
+            $com['failSessions'] = @('erp_base')
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CloseBase' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Закрыть erp_base для пользователей: когда'; Item = '^Закрыть сейчас' },
+                @{ Kind = 'one'; Header = 'Вход в erp_base закрыть до какого времени'; Item = '^на час' },
+                @{ Kind = 'confirm'; Header = 'Закрыть erp_base\?'; Yes = $true })
+            Check-DeployCommon $r -LocksExpected $false
+            Check ($r.ExitCode -eq 1) ("код возврата {0}, ждали 1: закрытие не подтверждено" -f $r.ExitCode)
+            Check (@($r.Output | Where-Object { $_ -match 'сеансы прочитать не смог' }).Count -gt 0) 'не сказано, что сеансы не прочитаны'
+            Check (@($r.Output | Where-Object { $_ -match 'erp_base ЗАКРЫТА:' }).Count -eq 0) 'итог «ЗАКРЫТА», хотя сеансы не прочитаны'
+            Check (@($r.Output | Where-Object { $_ -match 'erp_base: ВХОД ЗАКРЫТ до .*завершены не все или не прочитаны' }).Count -eq 1) 'нет итога о неподтверждённом закрытии'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tTerminateSession ' }).Count -eq 0) 'сеансы завершались вслепую'
+            if ($null -ne $r.ComState) { Check ([bool]$r.ComState.bases.erp_base.sessionsDenied -and [bool]$r.ComState.bases.erp_base.scheduledJobsDenied) 'вход или регламентные не закрыты' }
+            Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\close\closed-erp_base.json')) 'нет файла закрытия: «Открыть» не снимет блокировки'
+        }
+    },
+    @{
         Name = 'menu-close-open'
         Text = 'меню гейта: рабочая открыта - «Закрыть рабочую базу» (t); есть файл закрытия - «Открыть рабочую базу» (u) и строка над меню'
         Run = {

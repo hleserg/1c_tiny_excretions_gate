@@ -2222,11 +2222,13 @@ function Wait-CloseWarning {
 }
 
 function Get-UserSessions {
-    # Сеансы базы, кроме конфигуратора; не прочитались - строки об этом в журнал и на экран.
+    # Сеансы базы, кроме конфигуратора. Failed - список не прочитан: пустой Users тогда не значит «никого нет»
+    # (ревью #44). Что не прочиталось - в журнал и на экран.
     param($Link, [string]$BaseName)
     $all = @(Get-BaseSessions $Link $BaseName)
-    foreach ($entry in @($all | Where-Object { $_.IsError })) { Write-Line ('  сеансы не прочитал: ' + $entry.Text) 'Yellow' }
-    return , @($all | Where-Object { -not $_.IsError -and -not $_.IsDesigner })
+    $errors = @($all | Where-Object { $_.IsError })
+    foreach ($entry in $errors) { Write-Line ('  сеансы не прочитал: ' + $entry.Text) 'Yellow' }
+    return [pscustomobject]@{ Users = @($all | Where-Object { -not $_.IsError -and -not $_.IsDesigner }); Failed = ($errors.Count -gt 0) }
 }
 
 function Invoke-CloseBase {
@@ -2356,19 +2358,27 @@ function Invoke-CloseBase {
         Write-CloseHistory ("{0} закрыта: вход до {1}, {2}; пользователь Windows {3}" -f $baseName, $until.ToString('dd.MM.yyyy HH:mm'), $jobsText, [Environment]::UserName)
 
         # Сеансы, кроме конфигуратора: завершить; зависший клиент или фоновое задание может уйти не сразу - до трёх раз.
-        $left = Get-UserSessions $link $baseName
+        # Список не прочитался - не «никого нет»: прочитать ещё раз, завершать - когда прочитался.
+        $seen = Get-UserSessions $link $baseName
         $stopped = 0
-        for ($try = 1; $try -le 3 -and $left.Count -gt 0; $try++) {
-            foreach ($line in @(Stop-BaseSessions -Link $link -BaseName $baseName)) {
-                Write-Line ('  ' + $line)
-                if ($line.EndsWith(' - завершён')) { $stopped++ }
+        for ($try = 1; $try -le 3 -and ($seen.Failed -or $seen.Users.Count -gt 0); $try++) {
+            if (-not $seen.Failed) {
+                try {
+                    foreach ($line in @(Stop-BaseSessions -Link $link -BaseName $baseName)) {
+                        Write-Line ('  ' + $line)
+                        if ($line.EndsWith(' - завершён')) { $stopped++ }
+                    }
+                }
+                catch { Write-Line ('  завершить сеансы не смог: ' + $_.Exception.Message) 'Yellow' }
             }
             Start-Sleep -Seconds 3
-            $left = Get-UserSessions $link $baseName
+            $seen = Get-UserSessions $link $baseName
         }
-        if ($left.Count -gt 0) {
-            Write-Line ("  не завершились сеансы: {0}" -f $left.Count) 'Yellow'
-            foreach ($entry in $left) { Write-Line ('    ' + $entry.Text) 'Yellow' }
+        $sessionsDone = (-not $seen.Failed -and $seen.Users.Count -eq 0)
+        if ($seen.Failed) { Write-Line '  сеансы прочитать не смог: завершены ли все, не знаю' 'Yellow' }
+        elseif ($seen.Users.Count -gt 0) {
+            Write-Line ("  не завершились сеансы: {0}" -f $seen.Users.Count) 'Yellow'
+            foreach ($entry in $seen.Users) { Write-Line ('    ' + $entry.Text) 'Yellow' }
         }
         $designers = @(Get-BaseSessions $link $baseName | Where-Object { -not $_.IsError -and $_.IsDesigner })
         if ($designers.Count -gt 0) {
@@ -2386,8 +2396,16 @@ function Invoke-CloseBase {
         }
 
         Write-Host ''
-        Write-Line ("{0} ЗАКРЫТА: вход закрыт до {1} (войти можно только с кодом разрешения UnlockCode), {2}, завершено сеансов: {3}." -f `
-            $baseName, $until.ToString('dd.MM.yyyy HH:mm'), $jobsText, $stopped) 'Green'
+        if ($sessionsDone) {
+            Write-Line ("{0} ЗАКРЫТА: вход закрыт до {1} (войти можно только с кодом разрешения UnlockCode), {2}, завершено сеансов: {3}." -f `
+                $baseName, $until.ToString('dd.MM.yyyy HH:mm'), $jobsText, $stopped) 'Green'
+        }
+        else {
+            # Вход закрыт, но что сеансов пользователей не осталось, не подтверждено: не зелёный итог и код возврата 1.
+            $script:CloseUnconfirmed = $true
+            Write-Line ("{0}: ВХОД ЗАКРЫТ до {1}, {2}, но сеансы пользователей завершены не все или не прочитаны (завершено: {3}). Проверь «Показать состояние баз»; оставшиеся - консоль кластера." -f `
+                $baseName, $until.ToString('dd.MM.yyyy HH:mm'), $jobsText, $stopped) 'Yellow'
+        }
         Write-Line ('  ' + (Get-OpenBaseHint $baseName) + '. Блокировки снимутся только те, что поставило закрытие.')
     }
     finally {
@@ -2485,7 +2503,9 @@ function Invoke-OpenBase {
 
 if ($CloseBase -and $OpenBase) { throw '-CloseBase и -OpenBase вместе не задаются: закрыть или открыть' }
 if ($CloseBase) {
+    $script:CloseUnconfirmed = $false
     Invoke-CloseBase $LocksBase
+    if ($script:CloseUnconfirmed) { exit 1 }
     exit 0
 }
 if ($OpenBase) {
