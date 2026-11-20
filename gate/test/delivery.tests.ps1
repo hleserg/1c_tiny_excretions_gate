@@ -147,7 +147,7 @@ $procs = @()
 if ($Kit) {
     foreach ($sub in @(Get-ChildItem -LiteralPath $Kit -Directory | Sort-Object Name)) {
         $lines += ('dir=' + $sub.Name)
-        if (Test-Path -LiteralPath (Join-Path $sub.FullName 'Configuration.xml')) { $items += @{ name = $sub.Name; loadTried = $true; touched = $true; version = 'stub' }; continue }
+        if (Test-Path -LiteralPath (Join-Path $sub.FullName 'Configuration.xml')) { $items += @{ name = $sub.Name; loadTried = $true; touched = $true; loaded = $true; version = 'stub' }; continue }
         $ref = ''
         $side = $sub.FullName + '.gate.json'
         if (Test-Path -LiteralPath $side) { $ref = [string]([System.IO.File]::ReadAllText($side) | ConvertFrom-Json).ref }
@@ -155,19 +155,19 @@ if ($Kit) {
         $name = $sub.Name
         if ($root.Count -gt 0) { $name = $root[0].BaseName }
         if (-not $ref) { $ref = '00000000-0000-0000-0000-00000000aaaa' }
-        $procs += @{ name = $name; objectName = $name; ref = $ref; touched = $true; tried = $true; targetRef = $ref; registration = 'назначение сохранено: 1' }
+        $procs += @{ name = $name; objectName = $name; ref = $ref; touched = $true; tried = $true; loaded = $true; targetRef = $ref; registration = 'назначение сохранено: 1' }
     }
     foreach ($file in @(Get-ChildItem -LiteralPath $Kit -File | Where-Object { $_.Extension -eq '.epf' -or $_.Extension -eq '.erf' })) {
         $lines += ('binary=' + $file.Name)
         $side = Join-Path $Kit ($file.Name + '.gate.json')
         $sha = ''
         if (Test-Path -LiteralPath $side) { $sha = [string]([System.IO.File]::ReadAllText($side) | ConvertFrom-Json).sha256; $lines += ('sha256=' + $sha) }
-        $procs += @{ name = $file.BaseName; objectName = $file.BaseName; ref = '00000000-0000-0000-0000-00000000bbbb'; touched = $true; tried = $true; expectSha256 = $sha }
+        $procs += @{ name = $file.BaseName; objectName = $file.BaseName; ref = '00000000-0000-0000-0000-00000000bbbb'; touched = $true; tried = $true; loaded = $true; expectSha256 = $sha }
     }
 }
 [System.IO.File]::WriteAllLines((Join-Path $dir 'stub.txt'), [string[]]$lines, (New-Object System.Text.UTF8Encoding($true)))
 if ($mode -eq 'CRASH') { Write-Host 'заглушка гейта: прогон оборвался'; exit 1 }
-$verdict = @{ verdict = $mode; kitDecision = ''; kitItems = $items; kitProcessings = $procs }
+$verdict = @{ verdict = $mode; runId = (Split-Path -Leaf $dir); kitDecision = ''; kitItems = $items; kitProcessings = $procs }
 [System.IO.File]::WriteAllText((Join-Path $dir 'verdict.json'), (ConvertTo-Json -InputObject $verdict -Depth 4), (New-Object System.Text.UTF8Encoding($true)))
 Write-Host ('заглушка гейта: прогон записан, ' + $mode)
 '@

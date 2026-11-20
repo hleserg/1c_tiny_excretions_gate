@@ -68,7 +68,9 @@ param(
     [Parameter(ParameterSetName = 'Run', Position = 0)]
     [string]$Kit = '',
 
+    # Файл настроек вместо config.psd1. И для -AcceptBaseline: эталон - той базы, чей это профиль (#12).
     [Parameter(ParameterSetName = 'Run')]
+    [Parameter(ParameterSetName = 'Accept')]
     [string]$Config = '',
 
     [Parameter(ParameterSetName = 'Run')]
@@ -174,6 +176,9 @@ $script:BackgroundCheckPending = $null
 $script:RunPlanExpected = [ordered]@{}
 # Регулярное выражение замечаний проверки конфигурации по модулям тестовых расширений (Get-UtCheckIgnorePattern).
 $script:UtCheckIgnore = ''
+# Итоги модульных тестов этого прогона (Read-UtJUnit) и карта покрытия, которая ждёт их (#16).
+$script:UtRunResults = $null
+$script:CoveragePending = $null
 # Действия после обновления (раздел 5.24): папка, действия, собранная обработка, что не так, нужен ли шаг; папка
 # действий прежнего прогона - для сверки при выборе продолжения.
 $script:GateActionsDir = ''
@@ -1323,6 +1328,9 @@ function Measure-Coverage {
         $parts = [regex]::Match($record, '^\[([^\]]+)\] (.*?) :: (.*)$')
         $kind = $parts.Groups[1].Value
         $key = $parts.Groups[2].Value
+        # ПРОПУСК - действие не выполнялось (нет данных, нечего печатать): объекты в нём не проверены, указание
+        # «покрывает:» в нём - тоже (#16).
+        if ($kind -eq 'ПРОПУСК') { continue }
         $hintFound = [regex]::Match($parts.Groups[3].Value, '(?i)покрывает:\s*(.+)$')
         if ($hintFound.Success) { $hintTexts.Add($hintFound.Groups[1].Value) }
         if ($key -eq 'КомпиляцияМодулей' -or $key.StartsWith('КомпиляцияМодулей/') -or $key.StartsWith('КомпиляцияМодулей|')) {
@@ -1336,9 +1344,7 @@ function Measure-Coverage {
             foreach ($match in $CoverageObjectRegex.Matches($record)) { [void]$compiled.Add($match.Value) }
             continue
         }
-        if ($kind -ne 'ПРОПУСК') {
-            foreach ($step in $CoverageWriteSteps) { if ($key -eq $step -or $key.StartsWith($step + '/') -or $key.StartsWith($step + '|')) { $wrote = $true } }
-        }
+        foreach ($step in $CoverageWriteSteps) { if ($key -eq $step -or $key.StartsWith($step + '/') -or $key.StartsWith($step + '|')) { $wrote = $true } }
         [void]$plain.AppendLine($record)
         foreach ($match in $CoverageObjectRegex.Matches($record)) { [void]$exercised.Add($match.Value) }
     }
@@ -1450,7 +1456,10 @@ function Invoke-CoverageStep {
     # самопроверки - чем это задето. Новое непокрытое (его не было в эталоне карты или там оно было покрыто) - жёлтое.
     # Эталон карты двигается сам, когда нового непокрытого нет, или ключом -AcceptBaseline.
     # Перехваты правил обмена считаются покрытыми шагом «Обмены», только если он что-то выгрузил (ExchangeRan).
-    param([string[]]$Records, [bool]$ExchangeRan = $false)
+    # TestResults - итоги модульных тестов этого прогона (Key, Status): @Проверяет считается только у теста, который
+    # зарегистрирован, не выключен и прошёл (OK) в этом прогоне, и ни один его вариант (контекст, параметры) не упал,
+    # а модуль загрузился (#16). Тесты не прогонялись - указания тестов не в счёт.
+    param([string[]]$Records, [bool]$ExchangeRan = $false, [object[]]$TestResults = $null)
     $stepName = 'Карта покрытия'
     $allItems = New-Object System.Collections.Generic.List[object]
     $problems = New-Object System.Collections.Generic.List[string]
@@ -1459,13 +1468,28 @@ function Invoke-CoverageStep {
     foreach ($extension in @($script:ExtensionDumps.Dirs.Keys)) {
         foreach ($item in (Get-CoverageItems -Dir $script:ExtensionDumps.Dirs[$extension] -Extension $extension)) { $allItems.Add($item) }
     }
-    # Модульные тесты: @Проверяет включённого теста - доработка проверяется (итог теста - в шаге «Модульные тесты»).
+    # Модульные тесты: @Проверяет теста, который выполнился в этом прогоне и прошёл, - доработка проверяется.
     $testHints = New-Object System.Collections.Generic.List[object]
+    $testsNote = ''
     if (@($unitTestExtensions).Count -gt 0) {
+        $passedTests = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        # ** Хлебников С.Ю. 20261120 Тест с упавшим вариантом (другой контекст, другие параметры) и тесты модуля, который
+        # не загрузился, покрытие не дают, даже если где-то прошли. Пропущенный вариант (SKIP) - ни за, ни против (#16).
+        $failedTests = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        $failedModules = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($result in @($TestResults | Where-Object { $null -ne $_ })) {
+            $resultKey = ([string]$result.Key -replace '\s*\[.*$', '')
+            if ($result.Status -eq 'OK') { [void]$passedTests.Add($resultKey) }
+            elseif ($result.Status -eq 'FAIL' -or $result.Status -eq 'ERROR') {
+                if ($result.Method) { [void]$failedTests.Add($resultKey) } else { [void]$failedModules.Add([string]$result.Module) }
+            }
+        }
+        # ** Хлебников С.Ю. 20261120 конец
+        if ($null -eq $TestResults) { $testsNote = '; модульные тесты в этом прогоне не выполнялись - их @Проверяет не учтены' }
         try {
             $catalogs = Get-UtCatalogs
             foreach ($catalog in $catalogs) {
-                foreach ($test in @($catalog.Tests | Where-Object { -not $_.Disabled -and $_.Checks })) {
+                foreach ($test in @($catalog.Tests | Where-Object { -not $_.Disabled -and $_.Registered -and $_.Checks -and $passedTests.Contains([string]$_.Key) -and -not $failedTests.Contains([string]$_.Key) -and -not $failedModules.Contains([string]$_.Module) })) {
                     foreach ($hint in (Get-CoverageHints -Texts @([string]$test.Checks) -Source ('тест ' + $test.Key))) { $testHints.Add($hint) }
                 }
             }
@@ -1502,7 +1526,8 @@ function Invoke-CoverageStep {
     if ($null -eq $reference) { $detail += '; эталона карты ещё нет, этот прогон станет им' }
     else { $detail += ("; нового непокрытого {0}" -f $newUncovered.Count) }
     if ($newUncovered.Count -gt 0) { $detail += ('. Новое непокрытое: ' + (@($newUncovered | Select-Object -First 3 | ForEach-Object { $_.Text }) -join ' | ')) }
-    if ($testHints.Count -gt 0) { $detail += ("; указаний тестов (@Проверяет) {0}" -f $testHints.Count) }
+    if ($testHints.Count -gt 0) { $detail += ("; указаний прошедших тестов (@Проверяет) {0}" -f $testHints.Count) }
+    $detail += $testsNote
     if ($receiveUnchecked.Count -gt 0) { $detail += ('. Изменён перехват правил обмена на загрузку, а загрузку ничто не проверяло (шаг «Обмены» только выгружает): ' + (@($receiveUnchecked | Select-Object -First 3) -join ' | ')) }
     $detail += '; карта - coverage.txt'
     if ($problems.Count -gt 0) { $detail += ('. ' + ($problems -join ' | ')) }
@@ -2914,6 +2939,8 @@ function Read-BaseExtensions {
     # Расширения базы из сведений самопроверки (info.txt, строки «ext=Имя|Версия|Состояние|Хеш-сумма»):
     # имя -> «версия|состояние|хеш». Тестовые расширения и движок тестов не в счёт: их гейт грузит сам в каждом
     # прогоне. $null - сведений нет или они записаны не целиком (нет строки fingerprint=).
+    # Основная конфигурация (config=) и платформа (platform=) - тоже: от них зависят проверки, и продолжение с
+    # другой типовой или платформой готовыми их брать не должно (#13). Ключи в скобках - не расширения.
     param([string]$InfoFile)
     if (-not $InfoFile -or -not (Test-Path -LiteralPath $InfoFile)) { return $null }
     $lines = @()
@@ -2925,6 +2952,8 @@ function Read-BaseExtensions {
         if ($null -eq $line) { continue }
         $clean = $line.TrimStart([char]0xFEFF)
         if ($clean.StartsWith('fingerprint=', [System.StringComparison]::Ordinal)) { $complete = $true }
+        if ($clean.StartsWith('config=', [System.StringComparison]::Ordinal) -and $clean.Length -gt 7) { $map['(основная конфигурация)'] = $clean.Substring(7).Trim(); continue }
+        if ($clean.StartsWith('platform=', [System.StringComparison]::Ordinal) -and $clean.Length -gt 9) { $map['(платформа)'] = $clean.Substring(9).Trim(); continue }
         if (-not $clean.StartsWith('ext=', [System.StringComparison]::Ordinal)) { continue }
         $parts = $clean.Substring(4).Split('|')
         $name = $parts[0].Trim()
@@ -3402,6 +3431,8 @@ function Set-ResumeKitFields {
         if ($kept) {
             $item.LoadTried = [bool](Get-UiField $prev[0] 'loadTried' $false)
             $item.Touched = [bool](Get-UiField $prev[0] 'touched' $false)
+            # Загрузка взята готовой: загружено ли целиком - как в прежнем прогоне.
+            if ($script:ResumeRun.Reused.ContainsKey('load')) { $item.Loaded = [bool](Get-UiField $prev[0] 'loaded' $false) }
         }
     }
     foreach ($proc in $kitProcessings) {
@@ -3420,6 +3451,7 @@ function Set-ResumeKitFields {
             $proc | Add-Member -NotePropertyName KeepRoot -NotePropertyValue $true -Force
         }
         if ($script:ResumeRun.Reused.ContainsKey('load')) {
+            if ($kept) { $proc.Loaded = [bool](Get-UiField $old 'loaded' $false) }
             $proc.NewVersion = [string](Get-UiField $old 'newVersion' '')
             $builtFile = [string](Get-UiField $old 'file' '')
             if ($builtFile -and (Test-Path -LiteralPath $builtFile)) { $proc.File = $builtFile }
@@ -3434,13 +3466,14 @@ function Save-RunState {
             [ordered]@{
                 name = $_.Name; kind = $_.Kind; path = $_.Path; hash = [string]$_.Hash; inboxItem = [string]$_.InboxItem
                 wasInBase = [string]$_.WasInBase; backup = [string]$_.Backup; loadTried = [bool]$_.LoadTried; touched = [bool]$_.Touched
+                loaded = [bool]$_.Loaded
             } })
     $processings = @($kitProcessings | ForEach-Object {
             [ordered]@{
                 name = $_.Name; kind = $_.Kind; path = $_.Path; hash = [string]$_.Hash; inboxItem = [string]$_.InboxItem; file = [string]$_.File
                 fileName = [string]$_.FileName; objectName = [string]$_.ObjectName; ref = [string]$_.Ref; isNew = [string]$_.IsNew
                 oldVersion = [string]$_.OldVersion; newVersion = [string]$_.NewVersion; oldB64 = [string]$_.OldB64; oldFile = [string]$_.OldFile
-                tried = [bool]$_.Tried; touched = [bool]$_.Touched
+                tried = [bool]$_.Tried; touched = [bool]$_.Touched; loaded = [bool]$_.Loaded
             } })
     $script:RunState.kit = [ordered]@{ items = $items; processings = $processings }
     try { [System.IO.File]::WriteAllText((Join-Path $RunDir 'resume.json'), (ConvertTo-Json -InputObject $script:RunState -Depth 8), $Utf8Bom) }
@@ -3582,7 +3615,8 @@ function Invoke-ResumeBaseCheck {
     }
     $diff = Compare-BaseExtensions -Expected $target -Actual $current
     if ($diff.Count -eq 0) {
-        Add-StepResult -Name $stepName -Status 'OK' -Detail ("база та же, что после загрузки в прогоне {0}: расширений {1}, хеш-суммы совпали" -f $prevName, $current.Count)
+        $extensionCount = @($current.Keys | Where-Object { -not ([string]$_).StartsWith('(') }).Count
+        Add-StepResult -Name $stepName -Status 'OK' -Detail ("база та же, что после загрузки в прогоне {0}: расширений {1}, хеш-суммы, версия типовой и платформа совпали" -f $prevName, $extensionCount)
         return
     }
     $diffText = ($diff -join '; ')
@@ -3969,6 +4003,8 @@ function Invoke-UtStep {
         Add-StepResult -Name $StepName -Status 'FAIL' -Detail ("отчёт jUnit не разобрался: {0}" -f $_.Exception.Message) -Log $session.Junit -Seconds $session.Seconds
         return
     }
+    # Для карты покрытия: что выполнилось и с каким итогом (одиночный тест кнопкой карту не строит).
+    if (-not $Filter) { $script:UtRunResults = @($results) }
     $expectedTests = @($known | Where-Object { $_.Registered -and -not $_.Disabled } | ForEach-Object { $_.Key })
     if ($Filter) { $expectedTests = @($Filter) }
     $reported = @{}
@@ -6855,7 +6891,7 @@ function New-KitProcessing {
     }
     return [pscustomobject]@{
         Name = $name; Kind = [string]$Entry.Kind; Path = $path; Xml = $xml; FileName = $fileName; File = $source
-        IsReport = $isReport; What = $what; Tried = $false; Touched = $false; IsNew = 'unknown'; Ref = ''; ObjectName = ''
+        IsReport = $isReport; What = $what; Tried = $false; Touched = $false; Loaded = $false; IsNew = 'unknown'; Ref = ''; ObjectName = ''
         OldVersion = ''; NewVersion = ''; OldB64 = ''; OldFile = ''; InboxItem = (Get-EntryInboxItem $Entry)
         TargetRef = $targetRef; ExpectSha256 = $expectSha; Registration = ''
     }
@@ -6959,7 +6995,7 @@ if (-not [string]::IsNullOrWhiteSpace($Kit)) {
                 throw "В имени файла $($file.Name) встречаются имена двух расширений: $extensionName и $($strangers -join ', '). Переименуй файл."
             }
             $nameParts = Split-KitName -ItemName $file.BaseName -ExtensionName $extensionName
-            $kitItems += [pscustomobject]@{ Name = $extensionName; Kind = 'cfe'; Path = $file.FullName; Version = ''; Source = $nameParts.Source; Label = $nameParts.Label; WasInBase = 'unknown'; Backup = ''; LoadTried = $false; Touched = $false; InboxItem = (Get-EntryInboxItem $entry) }
+            $kitItems += [pscustomobject]@{ Name = $extensionName; Kind = 'cfe'; Path = $file.FullName; Version = ''; Source = $nameParts.Source; Label = $nameParts.Label; WasInBase = 'unknown'; Backup = ''; LoadTried = $false; Touched = $false; Loaded = $false; InboxItem = (Get-EntryInboxItem $entry) }
             continue
         }
 
@@ -6981,7 +7017,7 @@ if (-not [string]::IsNullOrWhiteSpace($Kit)) {
         }
         if ([string]::IsNullOrWhiteSpace($extensionName)) { throw "В $configurationXml пустое имя расширения." }
         $nameParts = Split-KitName -ItemName $dir.Name -ExtensionName $extensionName
-        $kitItems += [pscustomobject]@{ Name = $extensionName; Kind = 'files'; Path = $dir.FullName; Version = $extensionVersion; Source = $nameParts.Source; Label = $nameParts.Label; WasInBase = 'unknown'; Backup = ''; LoadTried = $false; Touched = $false; InboxItem = (Get-EntryInboxItem $entry) }
+        $kitItems += [pscustomobject]@{ Name = $extensionName; Kind = 'files'; Path = $dir.FullName; Version = $extensionVersion; Source = $nameParts.Source; Label = $nameParts.Label; WasInBase = 'unknown'; Backup = ''; LoadTried = $false; Touched = $false; Loaded = $false; InboxItem = (Get-EntryInboxItem $entry) }
     }
 
     $duplicates = @($kitItems | Group-Object -Property Name | Where-Object { $_.Count -gt 1 })
@@ -7186,9 +7222,11 @@ if ($processingOnly) { Write-RunLog 'План: комплект только и�
 if (-not $processingOnly -and $runExchangeRules) { $planSteps.Add('Правила обмена') }
 if (-not $processingOnly -and ($runSelfCheck -or $SkipSelfCheck)) {
     if ($kitItems.Count -gt 0) { $planSteps.Add('Самопроверка после загрузки') } else { $planSteps.Add('Самопроверка') }
-    if ($runCoverage -and -not $SkipSelfCheck) { $planSteps.Add('Карта покрытия') }
+    # С модульными тестами карта покрытия - после них (#16).
+    if ($runCoverage -and -not $SkipSelfCheck -and -not ($runUnitTests -and -not $processingOnly)) { $planSteps.Add('Карта покрытия') }
 }
 if ($runUnitTests -and -not $processingOnly) { $planSteps.Add('Модульные тесты') }
+if ($runUnitTests -and -not $processingOnly -and $runCoverage -and -not $SkipSelfCheck -and ($runSelfCheck -or $SkipSelfCheck)) { $planSteps.Add('Карта покрытия') }
 # Параллельная проверка конфигурации кончается последней - перед вердиктом. Её итог может появиться и раньше
 # (шагу понадобился конфигуратор - гейт её дождался): экрану она названа параллельной, чтобы ранний итог
 # не закрывал шаги, которые ещё идут.
@@ -7582,6 +7620,8 @@ foreach ($item in $kitItems) {
         if ($answer -ne '1') { break }
     }
     $proceed = Add-SimpleStep -Name ("Обновить конфигурацию БД {0}" -f $item.Name) -Result $result -Blocking $true
+    # Загружено - только когда и загрузка, и обновление БД прошли: по этому «Загрузить из git» решает, на main ли temp.
+    $item.Loaded = $proceed
     if (-not $proceed -and $null -ne $script:UpdateBlockers -and @($script:UpdateBlockers).Count -gt 0) {
         $lastStep = $script:Steps[$script:Steps.Count - 1]
         $lastStep.detail = $lastStep.detail + '. Мешали: ' + (@($script:UpdateBlockers) -join '; ')
@@ -7705,6 +7745,7 @@ foreach ($proc in $kitProcessings) {
     }
     else {
         Add-StepResult -Name $registerName -Status 'OK' -Detail ($detail + '; подключается, объект и формы создаются') -Log $session.ResultFile -Seconds $session.Seconds
+        $proc.Loaded = $true
     }
 }
 
@@ -7896,7 +7937,8 @@ else {
                 Add-StepResult -Name $stepName -Status 'FAIL' -Detail ("расширения есть в базе, но не применились в сеансе: {0}" -f ($notApplied -join ', ')) -Log $outFile -Seconds $seconds
             }
             elseif ($extensionError.Count -gt 0) {
-                Add-StepResult -Name $stepName -Status 'OK' -Detail ("вошёл за {0} с; список расширений этому пользователю недоступен" -f $seconds) -Log $outFile -Seconds $seconds
+                # Вход удался, а применились ли расширения, неизвестно: список не прочитан. Это не OK (#17).
+                Add-StepResult -Name $stepName -Status 'WARN' -Detail ("вошёл за {0} с, но применение расширений не проверено: состав расширений не прочитан ({1})" -f $seconds, ([string]$extensionError[0]).Substring(9).Trim()) -Log $outFile -Seconds $seconds
             }
             else {
                 Add-StepResult -Name $stepName -Status 'OK' -Detail ("вошёл за {0} с, расширений в сеансе: {1}" -f $seconds, $activeCount) -Log $outFile -Seconds $seconds
@@ -8097,7 +8139,12 @@ else {
         # Обмены: итоги выгрузки «после» против «до» (с комплектом) или эталона (без комплекта).
         Invoke-ExchangeCompareStep -After $after.Exchange -BeforeFile $exchangeBeforeFile -WithKit ($kitItems.Count -gt 0)
         # Карта покрытия - по записям этой самопроверки; при неполном прогоне покрытие было бы занижено.
-        if ($runCoverage -and $after.State -eq 'done' -and -not $script:StopRun) { Invoke-CoverageStep -Records $after.Records -ExchangeRan ($after.Exchange.Count -gt 0) }
+        if ($runCoverage -and $after.State -eq 'done' -and -not $script:StopRun) {
+            # Модульные тесты идут после самопроверки: карта ждёт их итога, чтобы @Проверяет считался только у
+            # прошедших тестов (#16). Шаг карты остаётся в этапе самопроверки.
+            if ($runUnitTests -and -not $processingOnly) { $script:CoveragePending = @{ Records = $after.Records; ExchangeRan = ($after.Exchange.Count -gt 0) } }
+            else { Invoke-CoverageStep -Records $after.Records -ExchangeRan ($after.Exchange.Count -gt 0) }
+        }
         if ($after.Metrics.Count -gt 0 -or $beforeMetrics.Count -gt 0) {
             Invoke-MetricsStep -Before $beforeMetrics -After $after.Metrics
             # Замеры «до» уже в истории: продолжение цепочки второй раз их не пишет.
@@ -8124,6 +8171,16 @@ elseif ($runUnitTests -and -not $processingOnly) {
     Set-PhaseState 'unittests' $unitState
 }
 else { Set-PhaseState 'unittests' 'na' }
+# Карта покрытия, отложенная до итога модульных тестов: шаг - этапа самопроверки (продолжение берёт его с ним).
+if ($null -ne $script:CoveragePending) {
+    $pendingCoverage = $script:CoveragePending
+    $script:CoveragePending = $null
+    if (-not $script:StopRun) {
+        $script:StepPhase = 'selfcheck'
+        Invoke-CoverageStep -Records $pendingCoverage.Records -ExchangeRan $pendingCoverage.ExchangeRan -TestResults $script:UtRunResults
+        $script:StepPhase = 'unittests'
+    }
+}
 
 # Проверка конфигурации, которая шла параллельно: дождаться и оценить, как обычно.
 Start-PendingBackgroundCheck
@@ -8153,9 +8210,9 @@ function Write-RunSummary {
         runId       = $runId
         baseKey     = $baseKey
         kit         = $Kit
-        kitItems    = @($kitItems | ForEach-Object { [pscustomobject]@{ name = $_.Name; kind = $_.Kind; version = $_.Version; source = $_.Source; label = $_.Label; path = $_.Path; wasInBase = $_.WasInBase; loadTried = [bool]$_.LoadTried; touched = [bool]$_.Touched } })
+        kitItems    = @($kitItems | ForEach-Object { [pscustomobject]@{ name = $_.Name; kind = $_.Kind; version = $_.Version; source = $_.Source; label = $_.Label; path = $_.Path; wasInBase = $_.WasInBase; loadTried = [bool]$_.LoadTried; touched = [bool]$_.Touched; loaded = [bool]$_.Loaded } })
         kitSource   = $KitSource
-        kitProcessings = @($kitProcessings | ForEach-Object { [pscustomobject]@{ name = $_.Name; kind = $_.Kind; fileName = $_.FileName; isReport = $_.IsReport; path = $_.Path; file = $_.File; objectName = $_.ObjectName; ref = $_.Ref; isNew = $_.IsNew; oldVersion = $_.OldVersion; newVersion = $_.NewVersion; oldB64 = $_.OldB64; oldFile = $_.OldFile; touched = $_.Touched; tried = [bool]$_.Tried; targetRef = [string](Get-UiField $_ 'TargetRef' ''); expectSha256 = [string](Get-UiField $_ 'ExpectSha256' ''); registration = [string](Get-UiField $_ 'Registration' '') } })
+        kitProcessings = @($kitProcessings | ForEach-Object { [pscustomobject]@{ name = $_.Name; kind = $_.Kind; fileName = $_.FileName; isReport = $_.IsReport; path = $_.Path; file = $_.File; objectName = $_.ObjectName; ref = $_.Ref; isNew = $_.IsNew; oldVersion = $_.OldVersion; newVersion = $_.NewVersion; oldB64 = $_.OldB64; oldFile = $_.OldFile; touched = $_.Touched; tried = [bool]$_.Tried; loaded = [bool]$_.Loaded; targetRef = [string](Get-UiField $_ 'TargetRef' ''); expectSha256 = [string](Get-UiField $_ 'ExpectSha256' ''); registration = [string](Get-UiField $_ 'Registration' '') } })
         verdict     = $verdict
         failed      = $failed.Count
         warned      = $warned.Count

@@ -1328,12 +1328,13 @@ function Complete-DeliveryRun {
         if ($null -ne $verdict) {
             if ([string]$object['kind'] -eq 'extension') {
                 $entry = @(@($verdict.kitItems) | Where-Object { [string]$_.name -eq $name -or [string]$_.name -eq $folder }) | Select-Object -First 1
-                if ($null -ne $entry) { $loaded = [bool](Get-UiField $entry 'touched' $false); $detail = ('загружено, версия {0}' -f (Get-UiField $entry 'version' '')) }
+                if ($null -ne $entry) { $loaded = [bool](Get-UiField $entry 'loaded' (Get-UiField $entry 'touched' $false)); $detail = ('загружено, версия {0}' -f (Get-UiField $entry 'version' '')) }
             }
             else {
                 $entry = @(@($verdict.kitProcessings) | Where-Object { [string]$_.name -eq $name -or [string]$_.objectName -eq $name }) | Select-Object -First 1
                 if ($null -ne $entry) {
-                    $loaded = [bool](Get-UiField $entry 'touched' $false)
+                    # loaded - собрана и записана (с 20.11); у прогонов старше - touched.
+                    $loaded = [bool](Get-UiField $entry 'loaded' (Get-UiField $entry 'touched' $false))
                     $ref = [string](Get-UiField $entry 'ref' '')
                     $wanted = [string]$object['ref']
                     if ($wanted -and $ref -and $ref -ne $wanted) { $loaded = $false; $detail = ('записано не в ту карточку: {0}, ждали {1}' -f $ref, $wanted) }
