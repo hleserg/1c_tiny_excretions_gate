@@ -1225,6 +1225,42 @@ $tests = @(
         }
     },
     @{
+        # ** Хлебников С.Ю. 20261120
+        Name = 'gate-before-reason'
+        Text = 'самопроверка «до загрузки»: код обработки тот же - берётся из эталона; код обработки изменился - снимается заново, в итоге шага и в run.log сказано, что изменилось'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $srcA = 'a' * 64
+            $srcB = 'b' * 64
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ src = $srcA; build = '20261120.065748' }, @{ fingerprint = 'после'; src = $srcA; build = '20261120.065748' }) }
+            $first = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $first; Check-Verdict $first 'GREEN' 0
+            $last = Join-Path $sb 'baseline\erp_temp_test\selfcheck.last.txt'
+            Check ((Test-Path -LiteralPath $last) -and ([System.IO.File]::ReadAllText($last, $utf8).Contains('part:selfchecksrc=' + $srcA))) 'в selfcheck.last.txt нет состава отпечатка'
+            # Сборка другая, код тот же: обработка отвечает «то же» (отпечаток из кода), «до» не снимается.
+            Start-Sleep -Seconds 2
+            Remove-Item -LiteralPath (Join-Path $sb 'fake\fake1c-state.json') -Force -ErrorAction SilentlyContinue
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ fingerprint = 'после'; src = $srcA; build = '20261120.130631' }, @{ fingerprint = 'после'; src = $srcA; build = '20261120.130631' }) }
+            $same = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $same; Check-Verdict $same 'GREEN' 0
+            $step = Get-Step $same 'Самопроверка до загрузки'
+            Check ($null -ne $step -and [string]$step.detail -like 'не запускалась*') ("«до» снималась, хотя код обработки тот же: {0}" -f $(if ($null -ne $step) { $step.detail } else { 'нет шага' }))
+            # Код обработки изменился: повтор обязателен, причина - в итоге шага.
+            Start-Sleep -Seconds 2
+            Remove-Item -LiteralPath (Join-Path $sb 'fake\fake1c-state.json') -Force -ErrorAction SilentlyContinue
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ fingerprint = 'новый код'; src = $srcB; build = '20261120.165501' }, @{ fingerprint = 'после3'; src = $srcB; build = '20261120.165501' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $r
+            $step = Get-Step $r 'Самопроверка до загрузки'
+            Check ($null -ne $step -and [string]$step.detail -match 'снималось заново, потому что изменился код обработки самопроверки \(сборка 20261120\.130631 -> 20261120\.165501\)') ("нет причины полного прохода в итоге шага: {0}" -f $(if ($null -ne $step) { $step.detail } else { 'нет шага' }))
+            if ($r.RunDir) { Check ([System.IO.File]::ReadAllText((Join-Path $r.RunDir 'run.log'), $utf8).Contains('Самопроверка до загрузки выполнялась полностью: изменился код обработки самопроверки')) 'нет причины полного прохода в run.log' }
+        }
+    },
+    @{
         Name = 'gate-coverage-new-uncovered'
         Text = 'карта покрытия: первый прогон - эталон, во втором новый перехват без проверки и регламентное задание - жёлтый'
         Run = {

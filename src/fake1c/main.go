@@ -57,11 +57,14 @@ type selfcheck struct {
 	Ext         []string `json:"ext"`
 	Pack        string   `json:"pack"`
 	Fingerprint string   `json:"fingerprint"`
-	Tasks       []task   `json:"tasks"`
-	Status      string   `json:"status"`
-	NoStart     bool     `json:"nostart"`
-	ExitAfter   int      `json:"exitAfter"`
-	Sleep       float64  `json:"sleep"`
+	// Хеш исходников обработки (строка selfchecksrc в info.txt): как у обработки, входит в состав отпечатка.
+	Src       string  `json:"src"`
+	Build     string  `json:"build"`
+	Tasks     []task  `json:"tasks"`
+	Status    string  `json:"status"`
+	NoStart   bool    `json:"nostart"`
+	ExitAfter int     `json:"exitAfter"`
+	Sleep     float64 `json:"sleep"`
 }
 
 type canary struct {
@@ -485,7 +488,11 @@ func selfcheckRun(s selfcheck, dir, known string, start int) {
 	}
 	sum := sha256.Sum256([]byte(seed))
 	fingerprint := fmt.Sprintf("%x", sum)
-	info := []string{"selfcheck=20261117.999999", "base=erp_temp_test", "config=УправлениеПредприятием 2.5", "testbase=1",
+	build := s.Build
+	if build == "" {
+		build = "20261117.999999"
+	}
+	info := []string{"selfcheck=" + build, "selfchecksrc=" + s.Src, "base=erp_temp_test", "config=УправлениеПредприятием 2.5", "testbase=1",
 		"pack=" + pack, "packname=" + pack, "packreason=тест"}
 	for _, e := range ext {
 		info = append(info, "ext="+e)

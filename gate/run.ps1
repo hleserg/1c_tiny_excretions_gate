@@ -5197,13 +5197,19 @@ function Complete-BackgroundCheck {
     $phaseBefore = $script:StepPhase
     $script:StepPhase = 'checks'
     $background = $script:BackgroundCheck
+    # ** Хлебников С.Ю. 20261120 Сколько основной ход простоял, дожидаясь параллельной проверки: это время прогона,
+    # которое она не спрятала за другими шагами (разбор времени прогона, timeline.ps1).
+    $waitWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-RunLog ("  {0}: жду её перед вердиктом, она идёт уже {1} с" -f $background.Title, [int]$background.Watch.Elapsed.TotalSeconds)
+    # ** Хлебников С.Ю. 20261120 конец
     $finished = Wait-UiProcess -Process $background.Process -Watch $background.Watch -TimeoutSec $background.TimeoutSec -Title $background.Title -Expected $background.Expected
     $exitCode = $null
     if ($finished) { $background.Process.WaitForExit(); $exitCode = $background.Process.ExitCode }
     else { try { Stop-Process -Id $background.Process.Id -Force -ErrorAction Stop } catch { } }
     $background.Watch.Stop()
+    $waitWatch.Stop()
     $seconds = [int]$background.Watch.Elapsed.TotalSeconds
-    Write-RunLog ("  {0}: код={1} таймаут={2} секунд={3}" -f $background.Title, $exitCode, (-not $finished), $seconds)
+    Write-RunLog ("  {0}: код={1} таймаут={2} секунд={3} ждали={4}" -f $background.Title, $exitCode, (-not $finished), $seconds, [int]$waitWatch.Elapsed.TotalSeconds)
     $script:BackgroundCheck = $null
     $result = [pscustomobject]@{ ExitCode = $exitCode; TimedOut = (-not $finished); Seconds = $seconds; Log = $background.Log; Lines = @(Read-V8Log $background.Log) }
     if ($finished -and $exitCode -ne 0 -and $exitCode -ne 101 -and (Test-DesignerBusy $result.Lines)) {
@@ -5411,16 +5417,134 @@ function Save-SelfCheckReference {
 function Save-SelfCheckLastState {
     # Отпечаток состояния базы после самопроверки гейта. Пока он не изменился, состояние «до загрузки»
     # заново не снимается. Пустой (ненадёжный) отпечаток стирает прежний: тогда «до» снимается каждый раз.
-    param([string]$Fingerprint)
+    # ** Хлебников С.Ю. 20261120 Рядом с отпечатком - его состав (строки «part:» из info.txt обработки): по нему
+    # следующий прогон пишет, что именно изменилось, если «до загрузки» придётся снимать заново.
+    param([string]$Fingerprint, [string[]]$Parts = @())
     if (-not (Test-Path -LiteralPath $baselineDir)) { New-Item -ItemType Directory -Path $baselineDir -Force | Out-Null }
     if ($Fingerprint) {
-        $lastState = @(("fingerprint={0}" -f $Fingerprint), ("run={0}" -f $runId))
-        [System.IO.File]::WriteAllLines($selfCheckLastFile, [string[]]$lastState, $Utf8Bom)
+        $lastState = New-Object System.Collections.Generic.List[string]
+        $lastState.Add(("fingerprint={0}" -f $Fingerprint))
+        $lastState.Add(("run={0}" -f $runId))
+        foreach ($part in @($Parts | Where-Object { $_ })) { $lastState.Add(('part:' + $part)) }
+        [System.IO.File]::WriteAllLines($selfCheckLastFile, $lastState.ToArray(), $Utf8Bom)
     }
     elseif (Test-Path -LiteralPath $selfCheckLastFile) {
         Remove-Item -LiteralPath $selfCheckLastFile -Force
     }
 }
+
+# ** Хлебников С.Ю. 20261120 Состав отпечатка самопроверки: строки info.txt, из которых обработка его считает.
+# selfchecksrc - хеш кода обработки (обработка прежней версии его не пишет, у неё в отпечатке номер сборки selfcheck).
+$SelfCheckFingerprintKeys = @('selfcheck', 'selfchecksrc', 'config', 'params', 'docsboundary', 'pack', 'ext')
+
+function Get-SelfCheckFingerprintParts {
+    # Строки состава отпечатка из info.txt сеанса, в порядке файла. Файла нет - пустой массив.
+    param([string]$InfoFile)
+    $parts = New-Object System.Collections.Generic.List[string]
+    if (-not $InfoFile -or -not (Test-Path -LiteralPath $InfoFile)) { return $parts.ToArray() }
+    $lines = @()
+    try { $lines = @([System.IO.File]::ReadAllLines($InfoFile, [System.Text.Encoding]::UTF8)) } catch { return $parts.ToArray() }
+    foreach ($line in $lines) {
+        if ($null -eq $line) { continue }
+        $clean = $line.TrimStart([char]0xFEFF)
+        $position = $clean.IndexOf('=')
+        if ($position -le 0) { continue }
+        if ($SelfCheckFingerprintKeys -contains $clean.Substring(0, $position)) { $parts.Add($clean) }
+    }
+    return $parts.ToArray()
+}
+
+function Read-SelfCheckLastParts {
+    # Состав отпечатка прошлой самопроверки гейта из selfcheck.last.txt (строки «part:»). Гейт прежней версии
+    # состав не писал - пустой массив.
+    $parts = New-Object System.Collections.Generic.List[string]
+    if (-not (Test-Path -LiteralPath $selfCheckLastFile)) { return $parts.ToArray() }
+    $lines = @()
+    try { $lines = @([System.IO.File]::ReadAllLines($selfCheckLastFile, [System.Text.Encoding]::UTF8)) } catch { return $parts.ToArray() }
+    foreach ($line in $lines) {
+        if ($null -eq $line) { continue }
+        $clean = $line.TrimStart([char]0xFEFF)
+        if ($clean.StartsWith('part:', [System.StringComparison]::Ordinal)) { $parts.Add($clean.Substring(5)) }
+    }
+    return $parts.ToArray()
+}
+
+function Get-SelfCheckFingerprintChanges {
+    # Что изменилось в составе отпечатка между прошлой самопроверкой гейта и этой: по строке на изменение.
+    param([string[]]$Old, [string[]]$New)
+    $tables = @{ old = @{}; new = @{} }
+    $extensions = @{ old = [ordered]@{}; new = [ordered]@{} }
+    foreach ($side in @('old', 'new')) {
+        $lines = $Old
+        if ($side -eq 'new') { $lines = $New }
+        foreach ($line in @($lines)) {
+            if ($null -eq $line) { continue }
+            $position = $line.IndexOf('=')
+            if ($position -le 0) { continue }
+            $key = $line.Substring(0, $position)
+            $value = $line.Substring($position + 1)
+            if ($key -eq 'ext') { $extensions[$side][$value.Split('|')[0]] = $value.Split('|') }
+            else { $tables[$side][$key] = $value }
+        }
+    }
+    $changes = New-Object System.Collections.Generic.List[string]
+    $oldBuild = [string](Get-Setting $tables.old 'selfcheck' '')
+    $newBuild = [string](Get-Setting $tables.new 'selfcheck' '')
+    $oldSource = [string](Get-Setting $tables.old 'selfchecksrc' '')
+    $newSource = [string](Get-Setting $tables.new 'selfchecksrc' '')
+    if ($oldSource -and $newSource) {
+        if ($oldSource -ne $newSource) { $changes.Add(("изменился код обработки самопроверки (сборка {0} -> {1})" -f $oldBuild, $newBuild)) }
+    }
+    elseif ($newSource) {
+        $changes.Add(("отпечаток теперь считается по коду обработки, а не по номеру сборки (сборка {0} -> {1}): после такого обновления гейта «до загрузки» снимается один раз" -f $oldBuild, $newBuild))
+    }
+    elseif ($oldSource) {
+        $changes.Add(("у обработки самопроверки нет хеша исходников (собрана не сборщиком гейта?), в отпечатке номер сборки {0}" -f $newBuild))
+    }
+    elseif ($oldBuild -ne $newBuild) {
+        $changes.Add(("другая сборка обработки самопроверки: {0} -> {1}" -f $oldBuild, $newBuild))
+    }
+    $named = [ordered]@{ config = 'конфигурация'; params = 'параметры самопроверки'; docsboundary = 'граница даты документов'; pack = 'пакет сценариев' }
+    foreach ($key in @($named.Keys)) {
+        $was = [string](Get-Setting $tables.old $key '')
+        $now = [string](Get-Setting $tables.new $key '')
+        if ($was -ne $now) { $changes.Add(("{0}: {1} -> {2}" -f $named[$key], $was, $now)) }
+    }
+    foreach ($name in @($extensions.new.Keys)) {
+        if (-not $extensions.old.Contains($name)) { $changes.Add(("расширение {0}: появилось" -f $name)); continue }
+        $was = [string[]]$extensions.old[$name]
+        $now = [string[]]$extensions.new[$name]
+        $what = New-Object System.Collections.Generic.List[string]
+        if ($was.Count -gt 1 -and $now.Count -gt 1 -and $was[1] -ne $now[1]) { $what.Add(("версия {0} -> {1}" -f $was[1], $now[1])) }
+        if ($was.Count -gt 2 -and $now.Count -gt 2 -and $was[2] -ne $now[2]) { $what.Add(("{0} -> {1}" -f $was[2], $now[2])) }
+        if ($what.Count -eq 0 -and ($was -join '|') -ne ($now -join '|')) { $what.Add('загружено заново без смены версии (другая хеш-сумма)') }
+        if ($what.Count -gt 0) { $changes.Add(("расширение {0}: {1}" -f $name, ($what.ToArray() -join ', '))) }
+    }
+    foreach ($name in @($extensions.old.Keys)) {
+        if (-not $extensions.new.Contains($name)) { $changes.Add(("расширение {0}: удалено" -f $name)) }
+    }
+    return $changes.ToArray()
+}
+
+function Get-SelfCheckBeforeReason {
+    # Почему самопроверка «до загрузки» выполнялась полностью, а не взята из эталона: условие и, если отпечаток
+    # другой, изменившиеся части. Known - отпечаток прошлой самопроверки, который передавался обработке.
+    param([string]$Known, [string]$Fingerprint, [string[]]$Parts)
+    if ($FreshBefore) { return 'задан ключ -FreshBefore' }
+    if (-not (Test-Path -LiteralPath $selfCheckReferenceFile)) { return 'эталона самопроверки ещё нет' }
+    if (-not (Test-Path -LiteralPath $selfCheckLastFile)) {
+        return 'нет отпечатка прошлой самопроверки гейта (прошлый прогон откатил комплект, отпечаток был ненадёжным или самопроверки ещё не было)'
+    }
+    if (-not $Known) { return 'отпечаток прошлой самопроверки в selfcheck.last.txt не похож на отпечаток' }
+    if (-not $Fingerprint) { return 'отпечаток этого прогона ненадёжный: обработка не получила хеш-сумму расширения' }
+    if ($Fingerprint -eq $Known) { return 'отпечаток тот же, но обработка выполнила самопроверку' }
+    $oldParts = @(Read-SelfCheckLastParts)
+    if ($oldParts.Count -eq 0) { return 'отпечаток другой; что в нём изменилось, не узнать: прошлый гейт записал отпечаток без состава' }
+    $changes = @(Get-SelfCheckFingerprintChanges -Old $oldParts -New $Parts)
+    if ($changes.Count -eq 0) { return 'отпечаток другой, а записанный состав тот же' }
+    return ($changes -join '; ')
+}
+# ** Хлебников С.Ю. 20261120 конец
 
 function Get-SelfCheckScreenText {
     # Шапка экрана хода в окне 1С: что это за сеанс самопроверки и зачем он запущен - по имени шага прогона.
@@ -5740,6 +5864,8 @@ function Invoke-SelfCheck {
     $firstInfo = $sessions[0].Info
     $candidate = [string](Get-Setting $firstInfo 'fingerprint' '')
     if ($candidate -match '^[0-9a-f]{64}$' -and [string](Get-Setting $firstInfo 'fingerprintreliable' '0') -eq '1') { $fingerprint = $candidate }
+    # ** Хлебников С.Ю. 20261120 Из чего отпечаток посчитан - для Save-SelfCheckLastState и Get-SelfCheckBeforeReason.
+    $fingerprintParts = @(Get-SelfCheckFingerprintParts (Join-Path $sessions[0].Dir 'info.txt'))
 
     $lastSession = $sessions[$sessions.Count - 1]
     $watch.Stop()
@@ -5748,6 +5874,7 @@ function Invoke-SelfCheck {
         Records     = $records.ToArray()
         Problems    = $problems.ToArray()
         Fingerprint = $fingerprint
+        FingerprintParts = $fingerprintParts
         Seconds     = [int]$watch.Elapsed.TotalSeconds
         Journal     = $journalPath
         Snapshots   = $snapshots
@@ -6866,11 +6993,16 @@ elseif ($kitItems.Count -gt 0 -and -not $selfCheckOff) {
         Add-StepResult -Name $stepName -Status 'OK' -Detail $detail -Seconds $before.Seconds
     }
     elseif ($before.State -eq 'done' -or $before.State -eq 'incomplete') {
+        # ** Хлебников С.Ю. 20261120 Почему «до» снималась полностью - до записи нового отпечатка: сравнивается с прошлым.
+        $fullReason = Get-SelfCheckBeforeReason -Known $known -Fingerprint $before.Fingerprint -Parts $before.FingerprintParts
+        Write-RunLog ('Самопроверка до загрузки выполнялась полностью: ' + $fullReason)
+        # ** Хлебников С.Ю. 20261120 конец
         Save-SelfCheckReference -Records $before.Records -Label 'before' -Fingerprint $before.Fingerprint -Snapshots $before.Snapshots -Exchange $before.Exchange
-        Save-SelfCheckLastState -Fingerprint $before.Fingerprint
+        Save-SelfCheckLastState -Fingerprint $before.Fingerprint -Parts $before.FingerprintParts
         $beforeMetrics = $before.Metrics
         if ($before.Exchange.Count -gt 0) { $exchangeBeforeFile = Join-Path $RunDir 'selfcheck-before.exchange.txt' }
         $detail = "состояние до загрузки снято и стало эталоном самопроверки: записей {0}, из них ошибок {1}; {2} мин" -f $before.Records.Count, $errorsBefore, $minutes
+        $detail += ('; снималось заново, потому что ' + $fullReason) # ** Хлебников С.Ю. 20261120
         if ($before.Problems.Count -gt 0) {
             $detail += ('. Прогон неполный: ' + ($before.Problems -join ' | '))
             Add-StepResult -Name $stepName -Status 'WARN' -Detail $detail -Log $before.Journal -Seconds $before.Seconds
@@ -7434,7 +7566,7 @@ else {
         Add-StepResult -Name $afterName -Status 'FAIL' -Detail (Get-SelfCheckFailure $after) -Log $after.Journal -Seconds $after.Seconds
     }
     else {
-        Save-SelfCheckLastState -Fingerprint $after.Fingerprint
+        Save-SelfCheckLastState -Fingerprint $after.Fingerprint -Parts $after.FingerprintParts
 
         if (Test-Path -LiteralPath $selfCheckReferenceFile) {
             New-Item -ItemType Directory -Path $referenceCopyDir -Force | Out-Null
