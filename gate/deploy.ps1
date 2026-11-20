@@ -3233,10 +3233,13 @@ function Invoke-GitImport {
     foreach ($name in @($binaries.Keys | Sort-Object)) {
         $entry = $binaries[$name]
         $wanted = ([string]$entry.sha256).ToLowerInvariant()
-        $inTemp = @($snapshot.Processings | Where-Object { ([string]$_.Hash).Replace('-', '').ToLowerInvariant() -eq $wanted })
-        if ($inTemp.Count -gt 0) { continue }
         $ref = [string]$entry.ref
         if (-not $ref -and $manifestRefs.ContainsKey($name)) { $ref = [string]$manifestRefs[$name].ref }
+        # Уже стоит - только если этот файл в той самой карточке (по ссылке; новая - по имени объекта), а не где-то в
+        # справочнике: у одноимённых карточек может быть тот же файл.
+        $inTemp = @($snapshot.Processings | Where-Object {
+                ([string]$_.Hash).Replace('-', '').ToLowerInvariant() -eq $wanted -and $(if ($ref) { [string]$_.Ref -eq $ref } else { [string]$_.ObjName -eq [string]$entry.objectName }) })
+        if ($inTemp.Count -gt 0) { continue }
         $toLoad.Add([pscustomobject]@{ Kind = 'binary'; Name = $name; Prefix = ('binaries/' + $name + '/'); Ref = $ref; Binary = $entry })
     }
     foreach ($name in @($tracked.Extensions | Where-Object { @($headTracked.Extensions) -notcontains $_ })) { Write-Line ("  в {0} больше нет расширения {1}: из {2} не убираю" -f $Setup.Branch, $name, $script:TempBase) 'Yellow' }

@@ -104,6 +104,14 @@ function New-DReportFiles {
     return @{ ($Name + '.xml') = $root; ($Name + '/Ext/ObjectModule.bsl') = $module }
 }
 
+function New-DProcFiles {
+    # Выгрузка внешней обработки (архивом - подставной .epf с исходниками).
+    param([string]$Name, [string]$Body = 'Процедура Открыть() КонецПроцедуры')
+    $root = New-DText @('<?xml version="1.0" encoding="UTF-8"?>', '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">',
+        "`t<ExternalDataProcessor uuid=""eeeeeeee-0000-0000-0000-0000000000f2"">", "`t`t<Properties>", ("`t`t`t<Name>{0}</Name>" -f $Name), "`t`t</Properties>", "`t</ExternalDataProcessor>", '</MetaDataObject>')
+    return @{ ($Name + '.xml') = $root; ($Name + '/Ext/ObjectModule.bsl') = (New-DText @($Body)) }
+}
+
 function New-DeliverySandbox {
     # Песочница git (как у «Загрузить из git») и первая выгрузка temp, принятая владельцем.
     param([string]$Name, [hashtable]$Extra = @{}, $Com, $Dumps)
@@ -433,6 +441,49 @@ function Check-DeliveryCommon {
             Check ($stubs.Count -eq 1 -and $stubs[0].Contains('binary=Закрытая.epf') -and $stubs[0].Contains('sha256=' + $sha)) ("загрузка не по записи в git: " + ($stubs -join ' / '))
             $report = [System.IO.File]::ReadAllText((Join-Path $sb ('deliveries\{0}\report.md' -f $state.id)), $utf8)
             Check ($report.Contains($sha) -and $report.Contains('не разбирается')) 'в отчёте нет хеша и границы проверки'
+            # Та же обработка следующей поставкой уже с исходниками: запись binaries/ убирается, грузятся исходники.
+            Reset-FakeState $sb
+            $null = New-DZip -Path (Join-Path $sb 'Входящие\Закрытая_открытая.epf') -Files (New-DProcFiles -Name 'Закрытая')
+            $open = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{ dumps = (New-DDumps) } -Com $null
+            Check-DeliveryCommon $open
+            $second = @(Get-DeliveryStates $sb | Where-Object { $_.id -ne $state.id })
+            Check ($second.Count -eq 1 -and [string]$second[0].verdict -eq 'GREEN') ("поставка исходниками: " + (@($second | ForEach-Object { '{0} {1} {2}' -f $_.status, $_.verdict, $_.note }) -join '; '))
+            $files = Get-GhFiles -Gh $gh -Commit (Get-GhHead -Gh $gh -Branch 'main').Sha
+            Check (-not $files.ContainsKey('binaries/Закрытая/Закрытая.epf') -and $files.ContainsKey('processings/Закрытая/Закрытая.xml')) 'файл целиком не заменён исходниками'
+            $manifest = Get-DMainText $gh 'binaries/manifest.json'
+            Check ($null -eq $manifest -or -not $manifest.Contains('Закрытая')) 'в binaries/manifest.json осталась прежняя запись'
+            $stubs = Get-DStubs $sb
+            Check ($stubs.Count -eq 2 -and $stubs[1].Contains('dir=Закрытая') -and -not $stubs[1].Contains('binary=Закрытая.epf')) ("вторая загрузка - не исходники: " + ($stubs -join ' / '))
+        }
+    },
+    @{
+        Name = 'delivery-human-merge'
+        Text = 'Приёмка без автослияния (DeliveryAutoMerge = $false): зелёный PR ждёт человека, в temp ничего; человек слил - следующий проход не пересобирает кандидат, а грузит main и проверяет: GREEN, слияние записано как ручное.'
+        Run = {
+            param($Name)
+            $com = New-ComState
+            $sb = New-DeliverySandbox $Name -Com $com -Dumps (New-DDumps) -Extra @{ DeliveryAutoMerge = $false }
+            $gh = Get-FakeGh $sb
+            $null = New-DZip -Path (Join-Path $sb 'Входящие\Доработки.cfe') -Files (New-DExtFiles -Module (New-DModule -Extra 'Сумма * 0.3'))
+            $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{ dumps = (New-DDumps) } -Com $null
+            Check-DeliveryCommon $first
+            $state = @(Get-DeliveryStates $sb)[0]
+            Check ([string]$state.status -eq 'waiting-merge') ("без автослияния статус {0} ({1})" -f $state.status, $state.note)
+            Check ((Get-DStubs $sb).Count -eq 0) 'до слияния гейт запускался'
+            Check (@($first.Output | Where-Object { $_ -match 'merge_checked.py .* --merge ' }).Count -gt 0) 'не сказано, как слить'
+            # Человек слил PR (здесь - main на коммит кандидата).
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha ([string]$state.pr.head)
+            $pulls = (Get-DPulls $sb).Count
+            Reset-FakeState $sb
+            $second = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{ dumps = (New-DDumps) } -Com $null
+            Check-DeliveryCommon $second
+            $state = @(Get-DeliveryStates $sb)[0]
+            Check ([string]$state.status -eq 'done' -and [string]$state.verdict -eq 'GREEN') ("после ручного слияния: {0} {1} ({2})" -f $state.status, $state.verdict, $state.note)
+            Check ([string]$state.merged.how -eq 'человек') 'слияние не записано как ручное'
+            Check ((Get-DPulls $sb).Count -eq $pulls) 'после ручного слияния открыт новый PR'
+            $stubs = Get-DStubs $sb
+            Check ($stubs.Count -eq 1 -and $stubs[0] -match ('KitSource=git owner/ext@' + (Get-GhHead -Gh $gh -Branch 'main').Sha) -and $stubs[0] -match 'dir=Доработки') ("загрузка после ручного слияния: " + ($stubs -join ' / '))
+            Check (@($second.Output | Where-Object { $_ -match 'уже в main: кандидат не пересобираю' }).Count -gt 0) 'кандидат пересобирали после слияния'
         }
     },
     @{

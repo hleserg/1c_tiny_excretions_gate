@@ -1055,7 +1055,19 @@ function Publish-DeliveryCandidate {
     foreach ($entry in @($known)) { if ($null -ne $entry) { $binaries += $entry } }
     $binaryChanged = $false
     foreach ($object in @($Result['objects'])) {
-        if ([string]$object['status'] -ne 'opaque') { continue }
+        $objectStatus = [string]$object['status']
+        $objectFolder = ([string]$object['repoPath']).Split('/')[-1]
+        if ([string]$object['kind'] -eq 'processing' -and ($objectStatus -eq 'changed' -or $objectStatus -eq 'new')) {
+            # Раньше принят файлом целиком, теперь пришёл исходниками: запись binaries/ убирается, иначе загрузка
+            # продолжала бы ставить прежний файл.
+            if (@($binaries | Where-Object { [string]$_['folder'] -eq $objectFolder }).Count -gt 0) {
+                $binaries = @($binaries | Where-Object { [string]$_['folder'] -ne $objectFolder })
+                foreach ($stale in @($baseFiles.Keys | Where-Object { $_.StartsWith('binaries/' + $objectFolder + '/') })) { $changes.Add([pscustomobject]@{ Path = $stale; Kind = 'delete'; File = ''; Sha = '' }) }
+                $binaryChanged = $true
+            }
+            continue
+        }
+        if ($objectStatus -ne 'opaque') { continue }
         $file = @(@($State['files']) | Where-Object { $null -ne $_['object'] -and [string]$_['object']['repoPath'] -eq [string]$object['repoPath'] })[0]
         $folder = [string]$file['object']['folder']
         $name = [string]$file['name']
@@ -1066,6 +1078,8 @@ function Publish-DeliveryCandidate {
             if ($baseFiles.ContainsKey($path)) { $kind = 'change' }
             $changes.Add([pscustomobject]@{ Path = $path; Kind = $kind; File = [string]$file['path']; Sha = $sha })
         }
+        # Прежний файл целиком под другим именем и исходники этой папки - не то, что теперь стоит: убираются.
+        foreach ($stale in @($baseFiles.Keys | Where-Object { ($_.StartsWith('binaries/' + $folder + '/') -and $_ -ne $path) -or $_.StartsWith('processings/' + $folder + '/') })) { $changes.Add([pscustomobject]@{ Path = $stale; Kind = 'delete'; File = ''; Sha = '' }) }
         $binaries = @($binaries | Where-Object { [string]$_['folder'] -ne $folder })
         $binaries += [ordered]@{ folder = $folder; objectName = [string]$file['object']['name']; file = $name; sha256 = [string]$file['sha256']; ref = [string]$file['object']['ref']; delivery = [string]$State['id'] }
         $binaryChanged = $true
@@ -1542,6 +1556,15 @@ function Invoke-DeliveryStep {
         if (-not $sync.Ready) { return }
         $base = (Get-GhHead -Gh $Setup.Gh -Branch $Setup.Branch).Sha
         $ready = ($null -ne $State['pr'] -and [string]$State['pr']['base'] -eq $base -and @('rebuild', 'waiting-decision', 'waiting-temp', 'received') -notcontains [string]$State['status'])
+        # PR кандидата уже в main (слил человек или прежний проход): не пересобирать - main и есть результат, дальше
+        # применение и проверка.
+        if (-not $ready -and $null -ne $State['pr'] -and [int]$State['pr']['number'] -gt 0) {
+            $prPull = Get-GhPull -Gh $Setup.Gh -Number ([int]$State['pr']['number'])
+            if ($prPull.Merged -or (Test-GhContains -Gh $Setup.Gh -Branch $Setup.Branch -Commit ([string]$State['pr']['head']))) {
+                Write-DeliveryEvent $D $State 'merged-seen' ("PR #{0} уже в main: кандидат не пересобираю, гружу main {1}" -f $State['pr']['number'], (Get-GitShort $base)) 'Green'
+                $ready = $true
+            }
+        }
         if ([string]$State['status'] -eq 'loading' -and $null -ne $State['load']) { $ready = $true }
         if (-not $ready) {
             # 3. Сопоставление (карточки - по справочнику temp, только что прочитанному).
