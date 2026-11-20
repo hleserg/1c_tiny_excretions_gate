@@ -837,7 +837,8 @@ function Invoke-MergeCheckedScript {
 function Get-DeliveryObjects {
     # Объекты поставки, которые идут в объединение (сопоставлены и не отклонены).
     param($State)
-    return , @(@($State['files']) | Where-Object { $null -ne $_['object'] -and [string]$_['object']['repoPath'] -and [string]$_['status'] -ne 'rejected' })
+    # Без запятой: вызывающие берут @(Get-DeliveryObjects ...) и перебирают по одному.
+    return @(@($State['files']) | Where-Object { $null -ne $_['object'] -and [string]$_['object']['repoPath'] -and [string]$_['status'] -ne 'rejected' })
 }
 
 function Invoke-DeliveryMerge {
@@ -850,7 +851,7 @@ function Invoke-DeliveryMerge {
     $outRoot = Join-Path $dir 'merged'
     foreach ($path in @($oursRoot, $outRoot)) { if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force } }
     $baseFiles = Get-GhFiles -Gh $Setup.Gh -Commit $Base
-    $objects = Get-DeliveryObjects $State
+    $objects = @(Get-DeliveryObjects $State)
     $prefixes = @($objects | ForEach-Object { [string]$_['object']['repoPath'] + '/' }) + @('deliveries/', 'processings/manifest.json', 'binaries/manifest.json')
     $null = Save-GhFiles -Gh $Setup.Gh -Commit $Base -Prefixes $prefixes -Target $oursRoot -Expected $baseFiles
     $null = Update-DeliveryHistory -D $D -Setup $Setup -Head $Base
@@ -862,7 +863,9 @@ function Invoke-DeliveryMerge {
         if ([bool]$file['opaque']) { continue }
         $oursDir = Join-Path $oursRoot $repo.Replace('/', '\')
         $diff = (& $D.Merge paths -ours $oursDir -theirs ([string]$file['dump'])) | Out-String
-        foreach ($rel in @(ConvertFrom-Json -InputObject $diff)) { $paths.Add(($repo + '/' + [string]$rel)) }
+        # PowerShell 5.1: ConvertFrom-Json отдаёт массив одним объектом - в переменную, потом перебор.
+        $rels = ConvertFrom-Json -InputObject $diff
+        foreach ($rel in $rels) { $paths.Add(($repo + '/' + [string]$rel)) }
     }
     Save-DeliveryBlobs -D $D -Setup $Setup -Paths $paths.ToArray()
     $ledgers = @()
@@ -1014,7 +1017,8 @@ function Get-DeliveryChanges {
             Add-GitSnapshotFiles -Files $oursFiles -Dir $oursDir -Prefix ($repo + '/')
             foreach ($path in @($oursFiles.Keys)) { $remote[$path] = Get-GitBlobSha ([System.IO.File]::ReadAllBytes($oursFiles[$path])) }
         }
-        foreach ($change in @(Compare-GitSnapshot -Local $local -Remote $remote -Prefixes @($repo + '/'))) { $changes.Add($change) }
+        $compared = Compare-GitSnapshot -Local $local -Remote $remote -Prefixes @($repo + '/')
+        foreach ($change in $compared) { $changes.Add($change) }
     }
     return , $changes
 }
