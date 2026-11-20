@@ -436,16 +436,16 @@ function Resolve-DeliveryTargets {
             $name = [string]$identity['name']
             $repo = 'extensions/' + $name
             $oursDir = Join-Path $Ours ('extensions\' + $name)
-            $ours = Get-OursIdentity $oursDir
+            $oursIdentity = Get-OursIdentity $oursDir
             $note = ''
-            if ($null -eq $ours) {
+            if ($null -eq $oursIdentity) {
                 # По UUID - может, расширение переименовали.
                 foreach ($dir in @(Get-ChildItem -LiteralPath (Join-Path $Ours 'extensions') -Directory -ErrorAction SilentlyContinue)) {
                     $other = Get-OursIdentity $dir.FullName
-                    if ($null -ne $other -and $other.Uuid -eq [string]$identity['uuid']) { $repo = 'extensions/' + $dir.Name; $ours = $other; $note = ('в git это расширение называется {0} (тот же UUID)' -f $dir.Name) }
+                    if ($null -ne $other -and $other.Uuid -eq [string]$identity['uuid']) { $repo = 'extensions/' + $dir.Name; $oursIdentity = $other; $note = ('в git это расширение называется {0} (тот же UUID)' -f $dir.Name) }
                 }
             }
-            if ($null -eq $ours) {
+            if ($null -eq $oursIdentity) {
                 $key = 'newext:' + $name + ':' + [string]$identity['uuid']
                 $choice = [string]$State['decisions'][$key]
                 if (-not $choice) {
@@ -456,7 +456,7 @@ function Resolve-DeliveryTargets {
                 if (-not $choice) { $ok = $false; continue }
                 if ($choice -eq 'ours') { $file['status'] = 'rejected'; $file['object'] = [ordered]@{ kind = 'extension'; name = $name; repoPath = ''; title = $name; note = 'отклонено: новое расширение не принято' }; continue }
             }
-            $file['object'] = [ordered]@{ kind = 'extension'; name = $name; repoPath = $repo; title = ('расширение ' + $name); folder = ($repo.Split('/')[1]); ref = ''; note = $note; isNew = ($null -eq $ours) }
+            $file['object'] = [ordered]@{ kind = 'extension'; name = $name; repoPath = $repo; title = ('расширение ' + $name); folder = ($repo.Split('/')[1]); ref = ''; note = $note; isNew = ($null -eq $oursIdentity) }
             continue
         }
         # Обработка или отчёт.
@@ -1368,7 +1368,9 @@ function Complete-DeliveryRun {
                 if ($null -ne $entry) { $loaded = [bool](Get-UiField $entry 'loaded' (Get-UiField $entry 'touched' $false)); $detail = ('загружено, версия {0}' -f (Get-UiField $entry 'version' '')) }
             }
             else {
-                $entry = @(@($verdict.kitProcessings) | Where-Object { [string]$_.name -eq $name -or [string]$_.objectName -eq $name }) | Select-Object -First 1
+                # По имени объекта, по папке (переименованная - под прежним именем папки) или по целевой карточке.
+                $wantedRef = [string]$object['ref']
+                $entry = @(@($verdict.kitProcessings) | Where-Object { [string]$_.name -eq $name -or [string]$_.objectName -eq $name -or [string]$_.name -eq $folder -or ($wantedRef -and [string](Get-UiField $_ 'targetRef' '') -eq $wantedRef) }) | Select-Object -First 1
                 if ($null -ne $entry) {
                     # loaded - собрана и записана (с 20.11); у прогонов старше - touched.
                     $loaded = [bool](Get-UiField $entry 'loaded' (Get-UiField $entry 'touched' $false))
