@@ -11,7 +11,7 @@ if ($RequireStandardUser) {
 }
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ('gate-python-' + [guid]::NewGuid())
 $kit = Join-Path $work 'комплект'
-$target = Join-Path $work 'папка гейта'
+$target = Join-Path $work "папка гейта 'тест'"
 $oldPath = $env:Path
 $oldUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 try {
@@ -35,6 +35,28 @@ print(json.dumps({"ok": bool(sys.flags.isolated), "exe": sys.executable, "arg": 
         if (-not $result.Ok -or $result.Data.exe -ine $expected -or $result.Data.arg -cne 'проверка') {
             throw ("не прошла проверка запуска из поставки: {0}" -f $result.Error)
         }
+    }
+    # Исполняем текст, который оператор копирует из журнала. Скрипт пробы только печатает свои аргументы.
+    $savedPath = $env:Path
+    Push-Location $work
+    try {
+        $env:Path = ''
+        $manualScript = "проверка приёмки 'с кавычкой'.py"
+        [IO.File]::WriteAllText((Join-Path $work $manualScript), 'import json, sys; print(json.dumps([sys.flags.isolated, sys.executable, sys.argv[1:]]))', [Text.UTF8Encoding]::new($false))
+        $sha = '0123456789012345678901234567890123456789'
+        $line = Format-DeliveryManualCommand -D @{Python='python'; MergeCheckedPath=$manualScript} -Number 23 -Merge $sha
+        $start = $line.IndexOf("& '", [StringComparison]::Ordinal)
+        if ($start -lt 0) { throw 'в журнале нет команды PowerShell' }
+        $raw = & ([ScriptBlock]::Create($line.Substring($start)))
+        if ($LASTEXITCODE) { throw 'команда из журнала не выполнилась' }
+        $data = $raw | ConvertFrom-Json
+        if ($data[0] -ne 1 -or $data[1] -ine $expected -or ($data[2] -join ',') -cne ("23,--merge," + $sha)) {
+            throw 'команда из журнала потеряла интерпретатор, номер PR или ожидаемый SHA'
+        }
+        Write-Host 'Команда ручного слияния проверена с пустым PATH на скрипте без записи.'
+    } finally {
+        Pop-Location
+        $env:Path = $savedPath
     }
 } finally {
     $env:Path = $oldPath
