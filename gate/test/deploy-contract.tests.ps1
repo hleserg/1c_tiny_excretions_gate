@@ -153,6 +153,21 @@ function New-ContractCatalogLink {
         }
     },
     @{
+        Name = 'deploy-contract-gate-no-agent'
+        Text = 'прогон гейта на серверной тестовой базе, агент сервера не ответил вовсе: прогон идёт до вердикта без блокировок и списка сеансов и говорит об этом'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $file = Add-InboxFile $sb $cfeName
+            # В run.ps1 агент сервера - только настоящий COM, на машине тестов его нет: это и есть «агент не ответил».
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Com (New-ComState)
+            Check-Common $r
+            Check ($null -ne $r.Verdict) 'прогон без агента сервера не дошёл до вердикта'
+            Check (@($r.Output | Where-Object { $_ -match 'блокировку регламентных заданий поставить не смог' }).Count -gt 0) 'нет строки о том, что блокировку заданий поставить не удалось'
+            Check (@($r.Output | Where-Object { $_ -match 'сеансы проверить не смог' }).Count -gt 0) 'нет строки о том, что сеансы проверить не удалось'
+        }
+    },
+    @{
         Name = 'deploy-contract-existing-locks'
         Text = 'очистка без собственных изменений сохраняет исходные свойства ИБ в fakecom'
         Run = {

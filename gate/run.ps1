@@ -6166,7 +6166,12 @@ Save-RunState
 
 # Меню «Тесты» (ключ -Tests): только тестовые расширения, без комплекта, подготовки базы, проверок и вердикта гейта.
 if ($Tests) {
-    if (-not $script:FileBase -and $Tests -ne 'Take') { $null = Get-TestBaseInfoBase (Connect-TestBaseAgent) }
+    if (-not $script:FileBase -and $Tests -ne 'Take') {
+        # Цель в кластере запоминается с начала запуска. Не определилась - как и в прогоне: стоп только на двух
+        # регистрациях одного имени, в остальном гейт в кластере ничего не трогает и идёт дальше.
+        try { $null = Get-TestBaseInfoBase (Connect-TestBaseAgent) }
+        catch { if ($_.Exception.Message -match '^Неоднозначная цель') { throw } }
+    }
     if ($unitTestExtensions.Count -eq 0) { throw 'модульных тестов нет: в config.psd1 пустой UnitTestExtensions' }
     $serviceFailed = 0
     if ($Tests -eq 'Take') {
@@ -6309,8 +6314,9 @@ if (-not [string]::IsNullOrEmpty($script:FileBase)) {
 }
 else {
     $prepLink = Connect-TestBaseAgent
-    $prepTarget = Get-TestBaseInfoBase $prepLink
+    $prepTarget = $null
     try {
+        $prepTarget = Get-TestBaseInfoBase $prepLink
         if (Set-GateJobsLock $script:TestLockState $prepTarget { param($t) Read-TestBaseInfoBase $t }) {
             if ($script:JobsLockRelease) { Add-PrepLine 'поставил блокировку регламентных заданий; в конце прогона сниму (-ReleaseJobsLock)' 'Green' }
             else { Add-PrepLine 'поставил блокировку регламентных заданий; она остаётся и после прогона' 'Green' }
@@ -6318,6 +6324,10 @@ else {
         else { Add-PrepLine 'блокировка регламентных заданий уже стоит' }
     }
     catch {
+        # Одно имя базы на две регистрации - настройка противоречива, на этом прогон встаёт (#5).
+        # Остальное (агент сервера не ответил, кластер или база не пустили, адрес кластера не сошёлся с Server) -
+        # цели в кластере нет: гейт там ничего не трогает, прогон идёт без блокировок и списка сеансов.
+        if ($_.Exception.Message -match '^Неоднозначная цель') { throw }
         $prepTarget = $null
         Add-PrepLine ("блокировку регламентных заданий поставить не смог: {0}. Поставь её в консоли кластера (erp_temp - Свойства) или задай AdminUser с паролем" -f $_.Exception.Message) 'Yellow'
     }
