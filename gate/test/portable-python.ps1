@@ -19,6 +19,10 @@ try {
     $env:Path = "$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
     & (Join-Path $kit 'install.ps1') -Target $target -Unattended
     if ($LASTEXITCODE) { throw 'ошибка установки комплекта' }
+    $fresh = Import-PowerShellDataFile -LiteralPath (Join-Path $target 'config.psd1')
+    if ($fresh.ContainsKey('DeliveryAutoMerge')) {
+        throw 'Новая установка задала локальный режим слияния и перекрыла настройку площадки'
+    }
     . (Join-Path $target 'delivery.ps1')
     function Write-RunLog { param([string]$Line) Write-Host $Line }
     $probe = Join-Path $work 'проверка приёмки.py'
