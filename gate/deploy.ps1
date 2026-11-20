@@ -3226,6 +3226,8 @@ function Invoke-GitImport {
         # <имя>~<ссылка> - не основной элемент с этим именем объекта: без ссылки из manifest.json загрузка писала бы в
         # основной - такую не гружу.
         if ($name.Contains('~') -and -not $ref) { Write-Line ("  {0}: в {1} не такая, как в {2}, но это не основной элемент справочника с этим именем и его ссылки нет в manifest.json - не гружу" -f $prefix.TrimEnd('/'), $Setup.Branch, $script:TempBase) 'Yellow'; continue }
+        # Помеченный на удаление элемент не обновляется: запись в него - не то, что ждут от правки в git.
+        if ($name.Contains('~') -and [bool](Get-UiField $manifestRefs[$name] 'deleted' $false)) { Write-Line ("  {0}: в {1} не такая, как в {2}, но это не основной элемент справочника с этим именем, он помечен на удаление - не гружу" -f $prefix.TrimEnd('/'), $Setup.Branch, $script:TempBase) 'Yellow'; continue }
         $toLoad.Add([pscustomobject]@{ Kind = 'processing'; Name = $name; Prefix = $prefix; Ref = $ref; Binary = $null })
     }
     foreach ($name in @($binaries.Keys | Sort-Object)) {

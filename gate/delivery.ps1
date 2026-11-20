@@ -461,11 +461,15 @@ function Resolve-DeliveryTargets {
         }
         # Обработка или отчёт.
         $objName = [string]$identity['name']
-        $candidates = @($Cards | Where-Object { [string]$_.ObjName -eq $objName })
+        # Помеченные на удаление карточки - не цель поставки (загрузка в них не пишет).
+        $candidates = @($Cards | Where-Object { [string]$_.ObjName -eq $objName -and -not [bool]$_.Deleted })
+        $deletedOnly = @($Cards | Where-Object { [string]$_.ObjName -eq $objName -and [bool]$_.Deleted }).Count
         $label = 'обработка'
         if ([bool]$identity['isReport']) { $label = 'отчёт' }
         if ($candidates.Count -eq 0) {
-            $file['object'] = [ordered]@{ kind = 'processing'; name = $objName; repoPath = ('processings/' + $objName); title = ('{0} {1} (новая карточка)' -f $label, $objName); folder = $objName; ref = ''; note = 'новый объект: такой карточки в temp нет'; isNew = $true }
+            $newNote = 'новый объект: такой карточки в temp нет'
+            if ($deletedOnly -gt 0) { $newNote = ('новая карточка: в temp есть только помеченные на удаление карточки {0} ({1})' -f $objName, $deletedOnly) }
+            $file['object'] = [ordered]@{ kind = 'processing'; name = $objName; repoPath = ('processings/' + $objName); title = ('{0} {1} (новая карточка)' -f $label, $objName); folder = $objName; ref = ''; note = $newNote; isNew = $true }
             continue
         }
         $picked = $null
@@ -486,7 +490,6 @@ function Resolve-DeliveryTargets {
                         $targets = (@($card.Targets) | Where-Object { $_ }) -join ', '
                         if (-not $targets) { $targets = 'нет' }
                         $cardState = [string]$card.Use
-                        if ($card.Deleted) { $cardState += ', помечена на удаление' }
                         $notes += ("- «{0}», {1}, версия {2}, {3}; назначение: {4}; ссылка {5}" -f $card.Title, $card.Kind, $card.Version, $cardState, $targets, $card.Ref)
                         $options += , @([string]$card.Ref, ("«{0}» - {1}, назначение: {2}" -f $card.Title, $cardState, $targets))
                     }
