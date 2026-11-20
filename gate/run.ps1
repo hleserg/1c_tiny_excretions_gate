@@ -184,6 +184,7 @@ $script:CoveragePending = $null
 $script:GateActionsDir = ''
 $script:GateActions = @()
 $script:GateActionsEpf = ''
+$script:VerifiedActionPackage = $null
 $script:GateActionsProblem = ''
 $script:GateActionsNeeded = $false
 $script:PlanActionsDir = ''
@@ -2416,6 +2417,7 @@ function Test-DeliveryPath {
 }
 # Меню и вопросы (ui.ps1): из ci.exe их рисует ci.exe, без него - консоль.
 . (Join-Path $Root 'locks.ps1')
+. (Join-Path $Root 'post-update.ps1')
 . (Join-Path $Root 'ui.ps1')
 Initialize-Ui -Channel $UiChannel
 
@@ -5182,6 +5184,7 @@ function Invoke-GateActionsStep {
     foreach ($action in $script:GateActions) { $lines.Add(('action=' + $action.Id)) }
     [System.IO.File]::WriteAllLines($paramsFile, [string[]]$lines, $Utf8Bom)
 
+    $testedHash = (Get-FileHash -LiteralPath $script:GateActionsEpf -Algorithm SHA256).Hash
     $timeoutSec = [int](Get-Setting $cfg 'ActionsTimeoutSec' 1800)
     $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -User $adminUser -Password $adminPassword) + @(
         '/DisableStartupDialogs', '/DisableStartupMessages',
@@ -5268,6 +5271,17 @@ function Invoke-GateActionsStep {
         if ($notRun.Count -gt 0) { $parts.Add(('не выполнялись: {0}' -f ($notRun -join ', '))) }
         if ($script:GateActions.Count -eq 0) { $parts.Add('действий нет') }
         elseif ($status -ne 'ok' -and -not $failed) { $stepStatus = 'FAIL'; $parts.Add(('итог обработки: {0}' -f $status)) }
+    }
+    if ($stepStatus -eq 'OK' -and $script:GateActions.Count -gt 0) {
+        $ids = @($script:GateActions | ForEach-Object { $_.Id })
+        try {
+            Assert-ActionResult -Lines $result -Ids $ids
+            $script:VerifiedActionPackage = [pscustomobject]@{ ids = $ids; sha256 = $testedHash
+                done = [string](Get-Setting $cfg 'ActionsRegister' ''); history = [string](Get-Setting $cfg 'HistoryRegister' '')
+                commit = $commit; branch = $KitBranch }
+            $proofFile = Join-Path $RunDir 'actions\verified.json'
+            [IO.File]::WriteAllText($proofFile, ($script:VerifiedActionPackage | ConvertTo-Json -Depth 3), $Utf8Bom)
+        } catch { $script:VerifiedActionPackage = $null; $stepStatus = 'FAIL'; $parts.Add($_.Exception.Message) }
     }
     if ($historyText) { $parts.Add($historyText) }
     if ($logRows.Count -gt 0) { $parts.Add(('журнал действий - actions\log.txt: {0}' -f ((@($logRows | Select-Object -First 3)) -join ' | '))) }
@@ -8006,7 +8020,13 @@ if ($canaryState) { Set-PhaseState 'canary' $canaryState }
 # в историю. После канареечного входа: в базу, которая не открывается, действия не пустить.
 $script:StepPhase = 'actions'
 $actionsState = 'done'
-if (Restore-Phase 'actions') { $actionsState = '' }
+if (Restore-Phase 'actions') {
+    $actionsState = ''
+    $proofFile = Join-Path $RunDir 'actions\verified.json'
+    if (Test-Path -LiteralPath $proofFile) {
+        $script:VerifiedActionPackage = Get-Content -LiteralPath $proofFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    }
+}
 elseif (-not $script:GateActionsNeeded) { $actionsState = 'na' }
 elseif (-not $proceed -or $script:StopRun) {
     Add-StepResult -Name 'Действия после обновления' -Status 'SKIP' -Detail 'пропущено: загрузка не прошла'
@@ -8259,6 +8279,8 @@ function Write-RunSummary {
         preparation = @($script:PrepLines)
         gateVersion = $script:GateVersion
         resume      = $resumeInfo
+        verifiedActions = $script:VerifiedActionPackage
+        requestedActionIds = @($script:GateActions | ForEach-Object { $_.Id })
         checkedState = $script:CheckedState
     }
     [System.IO.File]::WriteAllText((Join-Path $RunDir 'verdict.json'), ($summary | ConvertTo-Json -Depth 6), $Utf8Bom)

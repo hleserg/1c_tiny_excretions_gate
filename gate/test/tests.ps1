@@ -54,7 +54,7 @@ function New-Sandbox {
     param([string]$Name, [hashtable]$Config = @{})
     $dir = Join-Path $workRoot $Name
     foreach ($sub in @('bin', 'tools', 'inbox', 'fake')) { New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null }
-    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'delivery.ps1', 'cluster-target.ps1', 'locks.ps1', 'timeline.ps1', 'selfcheck-compare.ps1')) {
+    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'delivery.ps1', 'cluster-target.ps1', 'locks.ps1', 'post-update.ps1', 'timeline.ps1', 'selfcheck-compare.ps1')) {
         Copy-Item -LiteralPath (Join-Path $ciRoot $script) -Destination $dir
     }
     # Объединение поставок (раздел 5.26): merge1c.exe рядом с fake1c.exe (собирает CI).
@@ -2139,6 +2139,52 @@ $tests = @(
             Check ([string]$snap.extensions.'Адаптация'.hash -eq 'h2') ("хеш Адаптация в снимке: {0}" -f $snap.extensions.'Адаптация'.hash)
             Check ($null -ne $snap.processings.'Печать' -and [string]$snap.processings.'Печать'.hash) 'в снимке нет обработки Печать'
             Check (@($r.ComLog | Where-Object { $_ -match 'erp_base' }).Count -eq 0) 'снимок temp обращался к рабочей'
+        }
+    },
+    @{
+        Name = 'deploy-actions'
+        Text = 'Проверенный на temp исполнитель работает под блокировкой без переустановки расширений; сбой второй транзакции сохраняет частичный итог, повтор пропускает завершённое.'
+        Run = {
+            param($Name)
+            $config = $deployConfig.Clone()
+            $config['ActionsRegister'] = 'ВыполненныеДействия'
+            $config['HistoryRegister'] = 'ЖурналОбновлений'
+            $sb = New-Sandbox $Name -Config $config
+            $runDir = Join-Path $sb 'runs\20261117-090000'
+            $actionDir = Join-Path $runDir 'actions'
+            New-Item -ItemType Directory -Path $actionDir -Force | Out-Null
+            $epf = Join-Path $actionDir 'ДействияПослеОбновления.epf'
+            [IO.File]::WriteAllBytes($epf, [byte[]]@(65,66))
+            $ids = @('20261117-01-Первое','20261117-02-Второе')
+            $proof = @{ ids = $ids; sha256 = (Get-FileHash -LiteralPath $epf).Hash; commit = ''; branch = ''
+                done = $config.ActionsRegister; history = $config.HistoryRegister }
+            $checked = @{ ok = $true; extensions = @{ 'Адаптация' = @{ hash = 'h2' }; 'Доработки' = @{ hash = 'hd' } }; processings = @{} }
+            $verdict = @{ baseKey = 'erp_temp_test'; verdict = 'GREEN'; kit = ''; steps = @(); kitDecision = ''; gateVersion = 'test'
+                checkedState = $checked; requestedActionIds = $ids; verifiedActions = $proof; kitProcessings = @() }
+            [IO.File]::WriteAllText((Join-Path $runDir 'verdict.json'), ($verdict | ConvertTo-Json -Depth 6), $utf8)
+            $answers = @(@{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Выполнить только проверенные действия' }, $deployNameAnswer)
+            $com = New-ComState -ProdHash 'h2'
+            $failedRun = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers $answers -Fake @{ actions = @(@{ fail = $ids[1] }) }
+            Check-DeployCommon $failedRun
+            Check ($failedRun.ExitCode -ne 0) 'частичное выполнение вернуло успех'
+            $record = Get-DeployRecord $sb
+            Check ($null -ne $record -and $record.outcome -eq 'actionsFailed') 'не сохранён исход действий'
+            Check (-not (Test-Path -LiteralPath (Join-Path $runDir 'released.txt'))) 'частичное выполнение принято как выпуск'
+            Reset-FakeState $sb
+            $retry = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers $answers -Fake @{ actions = @(@{ already = @($ids[0]) }) }
+            Check-DeployCommon $retry
+            Check ($retry.ExitCode -eq 0) 'повтор действий вернул ошибку'
+            $record = Get-DeployRecord $sb
+            if ($null -ne $record) {
+                $result = [IO.File]::ReadAllText((Join-Path $record.Dir 'actions\result.txt'))
+                Check ($result.Contains(($ids[0] + '|already')) -and $result.Contains(($ids[1] + '|done'))) 'итог повтора не совпал'
+            }
+            [IO.File]::WriteAllBytes($epf, [byte[]]@(67))
+            Reset-FakeState $sb
+            $changed = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @($answers[0])
+            Check ($changed.ExitCode -ne 0 -and ($changed.Output -join ' ') -match 'отличается от проверенной') 'подмена EPF прошла до подтверждения рабочей'
+            Check (@($changed.Calls | Where-Object { $_.Line -match 'actions;in=' }).Count -eq 0) 'запущен другой исполнитель'
+
         }
     },
     @{
