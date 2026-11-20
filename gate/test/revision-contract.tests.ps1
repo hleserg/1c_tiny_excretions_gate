@@ -146,7 +146,12 @@ function Invoke-RevisionPartialImport {
             # Реализация может начать с проверок автоматически. В этом случае ответ останется неиспользованным.
             Check (-not $r.TimedOut -and $r.Unexpected.Count -eq 0 -and -not $r.Stderr) 'продолжение не завершилось штатно'
             Check-Verdict $r 'GREEN' 0
-            $probe = Get-Content -LiteralPath (Join-Path $r.RunDir 'resume-check\info.txt') -Encoding UTF8
+            $probeFile = Join-Path $r.RunDir 'resume-check\info.txt'
+            if (-not (Test-Path -LiteralPath $probeFile)) {
+                Check $false ('нет сеанса проверки базы; конец вывода: ' + ((@($r.Output) | Select-Object -Last 12) -join ' | '))
+                return
+            }
+            $probe = Get-Content -LiteralPath $probeFile -Encoding UTF8
             Check ($probe -contains $currentConfig[0]) 'проверка базы не увидела новую версию типовой'
             $oldExt = @($oldLines | Where-Object { $_.StartsWith('ext=') } | Sort-Object)
             $newExt = @($probe | Where-Object { $_.StartsWith('ext=') } | Sort-Object)
