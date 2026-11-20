@@ -16,6 +16,8 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"flag"
@@ -31,6 +33,10 @@ import (
 )
 
 const placeholder = "00000000.000000" // метка версии в исходниках, сборщик ставит на её место штамп
+
+// Метка хеша исходников в модуле объекта «Выполнить после обновления» (функция ХешИсходников): сборщик ставит на её
+// место SHA-256 собранных исходников без штампа сборки.
+const sourceHashMark = "@@ХЕШ ИСХОДНИКОВ@@"
 
 var (
 	root    string
@@ -132,6 +138,19 @@ func replaceCounted(text, old, new string, expected int, label string) string {
 		fail("%s: «%s» встречается %d раз, ожидалось %d", label, old, n, expected)
 	}
 	return strings.ReplaceAll(text, old, new)
+}
+
+// SHA-256 исходников обработки в том виде, в каком они идут в архив, но до штампа сборки (метки версии и метка
+// хеша на месте): меняется, только когда меняется код ядра, пакетов или форма. Части разделены именами и длинами,
+// чтобы перенос текста из одного файла в другой тоже менял хеш.
+func processingSourceHash(parts ...string) string {
+	h := sha256.New()
+	for i, part := range parts {
+		fmt.Fprintf(h, "%d:%d\n", i, len(part))
+		io.WriteString(h, part)
+		io.WriteString(h, "\n")
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 type entry struct {
@@ -561,19 +580,25 @@ func buildProcessing(packs []pack) []entry {
 		fail("в обработке остались метки @@ПАКЕТЫ")
 	}
 
+	// Хеш исходников обработки вместе с пакетами - до штампа: две сборки одного кода дают один хеш. Обработка кладёт
+	// его в отпечаток состояния базы вместо версии сборки (ХешИсходников модуля объекта).
+	rootXML := readText(filepath.Join(root, "epf", "ВыполнитьПослеОбновления.xml"))
+	formMeta := readText(filepath.Join(src, "Forms", "Форма.xml"))
+	object = replaceCounted(object, sourceHashMark, processingSourceHash(rootXML, object, form, formXML, formMeta), 1, "модуль объекта")
+
 	object = replaceCounted(object, placeholder, stamp, 1, "модуль объекта")
 	form = replaceCounted(form, placeholder, stamp, strings.Count(form, placeholder), "модуль формы")
 	if strings.Count(form, stamp) < 2 {
 		fail("модуль формы: меток версии меньше двух")
 	}
-	rootXML := replaceCounted(readText(filepath.Join(root, "epf", "ВыполнитьПослеОбновления.xml")), placeholder, stamp, 1, "ВыполнитьПослеОбновления.xml")
+	rootXML = replaceCounted(rootXML, placeholder, stamp, 1, "ВыполнитьПослеОбновления.xml")
 
 	files := []entry{
 		{"ВыполнитьПослеОбновления.xml", windowsBytes(rootXML, true)},
 		{"ВыполнитьПослеОбновления/Ext/ObjectModule.bsl", windowsBytes(object, true)},
 		{"ВыполнитьПослеОбновления/Forms/Форма/Ext/Form/Module.bsl", windowsBytes(form, true)},
 		{"ВыполнитьПослеОбновления/Forms/Форма/Ext/Form.xml", windowsBytes(formXML, true)},
-		{"ВыполнитьПослеОбновления/Forms/Форма.xml", windowsBytes(readText(filepath.Join(src, "Forms", "Форма.xml")), true)},
+		{"ВыполнитьПослеОбновления/Forms/Форма.xml", windowsBytes(formMeta, true)},
 	}
 	for _, f := range files {
 		if strings.HasSuffix(f.Name, ".xml") {
@@ -665,8 +690,8 @@ func goBuild(dir, out, ldflags string) []byte {
 func buildGate() []entry {
 	gate := filepath.Join(root, "gate")
 	version := "Версия " + placeholder + "."
-	scripts := []string{"run.ps1", "deploy.ps1", "nightly.ps1", "report.ps1", "settings.ps1", "stats.ps1", "ui.ps1", "unittests.ps1", "unittests-cli.ps1", "update.ps1", "publish.ps1", "github.ps1", "cluster-target.ps1", "locks.ps1", "check.ps1", "test/tests.ps1", "test/fakecom.ps1", "test/deploy-contract.tests.ps1"}
-	stamped := map[string]bool{"run.ps1": true, "deploy.ps1": true, "nightly.ps1": true, "report.ps1": true, "settings.ps1": true, "stats.ps1": true, "unittests-cli.ps1": true, "update.ps1": true, "publish.ps1": true, "github.ps1": true, "test/tests.ps1": true, "test/fakecom.ps1": true}
+	scripts := []string{"run.ps1", "deploy.ps1", "nightly.ps1", "report.ps1", "settings.ps1", "stats.ps1", "ui.ps1", "unittests.ps1", "unittests-cli.ps1", "update.ps1", "publish.ps1", "github.ps1", "cluster-target.ps1", "locks.ps1", "timeline.ps1", "selfcheck-compare.ps1", "check.ps1", "test/tests.ps1", "test/fakecom.ps1", "test/deploy-contract.tests.ps1"}
+	stamped := map[string]bool{"run.ps1": true, "deploy.ps1": true, "nightly.ps1": true, "report.ps1": true, "settings.ps1": true, "stats.ps1": true, "unittests-cli.ps1": true, "update.ps1": true, "publish.ps1": true, "github.ps1": true, "timeline.ps1": true, "selfcheck-compare.ps1": true, "test/tests.ps1": true, "test/fakecom.ps1": true}
 	var files []entry
 	texts := map[string]string{}
 	for _, s := range scripts {
