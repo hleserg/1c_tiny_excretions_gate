@@ -749,10 +749,16 @@ func buildGate() []entry {
 func clashCheck(texts map[string]string) {
 	vars := map[string]bool{}
 	re := regexp.MustCompile(`\$script:([A-Za-z_][A-Za-z0-9_]*)`)
-	for _, s := range []string{"ui.ps1", "stats.ps1", "unittests.ps1", "github.ps1", "delivery.ps1"} {
+	for _, s := range []string{"ui.ps1", "stats.ps1", "unittests.ps1", "github.ps1"} {
 		for _, m := range re.FindAllStringSubmatch(texts[s], -1) {
 			vars[strings.ToLower(m[1])] = true
 		}
+	}
+	// delivery.ps1 подключается точкой в deploy.ps1 и нарочно читает его переменные ($script:TempBase, $script:RunDir и
+	// др.): проверяются только те, что он сам присваивает.
+	assigned := regexp.MustCompile(`\$script:([A-Za-z_][A-Za-z0-9_]*)\s*=[^=]`)
+	for _, m := range assigned.FindAllStringSubmatch(texts["delivery.ps1"], -1) {
+		vars[strings.ToLower(m[1])] = true
 	}
 	top := regexp.MustCompile(`(?m)^\$(?:script:)?([A-Za-z_][A-Za-z0-9_]*)\s*=`)
 	param := regexp.MustCompile(`\]\s*\$([A-Za-z_][A-Za-z0-9_]*)`)
