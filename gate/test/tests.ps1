@@ -57,7 +57,7 @@ function New-Sandbox {
     foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'delivery.ps1', 'cluster-target.ps1', 'locks.ps1', 'timeline.ps1', 'selfcheck-compare.ps1')) {
         Copy-Item -LiteralPath (Join-Path $ciRoot $script) -Destination $dir
     }
-    # Объединение поставок (раздел 5.25): merge1c.exe рядом с fake1c.exe (собирает CI).
+    # Объединение поставок (раздел 5.26): merge1c.exe рядом с fake1c.exe (собирает CI).
     foreach ($mergeExe in @((Join-Path $here 'merge1c.exe'), (Join-Path $ciRoot 'merge1c.exe'))) {
         if (Test-Path -LiteralPath $mergeExe) { Copy-Item -LiteralPath $mergeExe -Destination $dir; break }
     }
@@ -4490,7 +4490,7 @@ $tests = @(
 # Тесты площадки (приватный репозиторий): файл подключается точкой и возвращает массив тестов; ему доступны
 # песочница, запуск скрипта и проверки отсюда.
 $tests = @($tests) + @(. (Join-Path $here 'deploy-contract.tests.ps1'))
-# Приёмка поставок подрядчика (раздел 5.25).
+# Приёмка поставок подрядчика (раздел 5.26).
 $tests = @($tests) + @(. (Join-Path $here 'delivery.tests.ps1'))
 if ($Extra) { $tests = @($tests) + @(. $Extra) }
 

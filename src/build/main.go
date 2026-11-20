@@ -734,7 +734,7 @@ func buildGate() []entry {
 	files = append(files, entry{"ci/readme.txt", windowsBytes(manual, true)})
 	files = append(files, entry{"ci/ci.exe", goBuild(filepath.Join(root, "src", "ci-tui"), filepath.Join(outDir, "ci.exe"), "-s -w -X main.version="+stamp)})
 	files = append(files, entry{"ci/test/fake1c.exe", goBuild(filepath.Join(root, "src", "fake1c"), filepath.Join(outDir, "fake1c.exe"), "-s -w")})
-	// Объединение поставок подрядчика (deploy.ps1 -Delivery, раздел 5.25 руководства).
+	// Объединение поставок подрядчика (deploy.ps1 -Delivery, раздел 5.26 руководства).
 	files = append(files, entry{"ci/merge1c.exe", goBuild(filepath.Join(root, "src", "merge1c"), filepath.Join(outDir, "merge1c.exe"), "-s -w")})
 	// Установщик - в архиве рядом с папкой ci.
 	for _, f := range []string{"install.ps1", "install.cmd"} {
