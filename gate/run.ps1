@@ -5823,10 +5823,13 @@ function Write-SelfCheckLaneSignal {
     if ($Signal -and -not $Lane.Signals.Contains($Signal)) { $Lane.Signals.Add($Signal) }
     if ($null -eq $Lane.Current -or $Lane.Signals.Count -eq 0) { return }
     $path = Join-Path $Lane.Current.OutDir 'par.txt'
-    $temp = $path + '.tmp'
-    [System.IO.File]::WriteAllLines($temp, $Lane.Signals.ToArray(), $Utf8Bom)
-    if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
-    Move-Item -LiteralPath $temp -Destination $path -Force
+    # Файл пишется на месте, а не заменой: удалить файл, который сеанс сейчас читает, Windows не даст. Открыт без
+    # права записи - повтор. Короткий файл пишется целиком; недописанное сеанс прочтёт как «сигнала нет» и перечитает.
+    for ($try = 1; $try -le 20; $try++) {
+        try { [System.IO.File]::WriteAllLines($path, $Lane.Signals.ToArray(), $Utf8Bom); return }
+        catch { Start-Sleep -Milliseconds 250 }
+    }
+    Write-RunLog ("Самопроверка: сигнал исполнителю {0} не записался в {1}" -f $Lane.Number, $path)
 }
 
 function Start-SelfCheckLane {
