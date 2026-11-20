@@ -427,7 +427,7 @@ function New-ActionsKit {
     },
     @{
         Name = 'menu-close-open'
-        Text = 'меню гейта: рабочая открыта - «Закрыть рабочую базу» (s); есть файл закрытия - «Открыть рабочую базу» (t) и строка над меню'
+        Text = 'меню гейта: рабочая открыта - «Закрыть рабочую базу» (t); есть файл закрытия - «Открыть рабочую базу» (u) и строка над меню'
         Run = {
             param($Name)
             $sb = New-Sandbox $Name -Config $deployConfig
@@ -449,7 +449,7 @@ function New-ActionsKit {
             $menu = & $menuOf $r
             Check ($null -ne $menu) 'нет вопроса меню'
             if ($null -ne $menu) {
-                Check ((& $keyOf $menu 'Закрыть рабочую базу') -eq 's') 'у «Закрыть рабочую базу» клавиша не s (или пункта нет)'
+                Check ((& $keyOf $menu 'Закрыть рабочую базу') -eq 't') 'у «Закрыть рабочую базу» клавиша не t (или пункта нет)'
                 Check ((& $keyOf $menu 'Открыть рабочую базу') -eq '') 'при открытой рабочей есть «Открыть рабочую базу»'
             }
             $closeDir = Join-Path $sb 'deploy\close'
@@ -460,7 +460,7 @@ function New-ActionsKit {
             $menu2 = & $menuOf $r2
             Check ($null -ne $menu2) 'нет вопроса меню при закрытой рабочей'
             if ($null -ne $menu2) {
-                Check ((& $keyOf $menu2 'Открыть рабочую базу') -eq 't') 'у «Открыть рабочую базу» клавиша не t (или пункта нет)'
+                Check ((& $keyOf $menu2 'Открыть рабочую базу') -eq 'u') 'у «Открыть рабочую базу» клавиша не u (или пункта нет)'
                 Check ((& $keyOf $menu2 'Закрыть рабочую базу') -eq '') 'при закрытой рабочей есть «Закрыть рабочую базу»'
                 Check (@($menu2.notes | Where-Object { [string]$_ -match 'рабочая erp_base закрыта гейтом' }).Count -eq 1) 'над меню нет строки о закрытой рабочей'
             }

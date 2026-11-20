@@ -4343,7 +4343,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         @('runs', 'Тестовая база', '7'), @('tests', 'Тестовая база', '8'), @('templocks', 'Тестовая база', 'q'),
         @('precheck', 'Рабочая база', '9'), @('applyprep', 'Рабочая база', 'a'), @('prepare', 'Рабочая база', 'b'),
         @('cancelprep', 'Рабочая база', 'c'), @('deploy', 'Рабочая база', 'd'), @('rollback', 'Рабочая база', 'e'),
-        @('basestate', 'Рабочая база', 'f'), @('prodclose', 'Рабочая база', 's'), @('prodopen', 'Рабочая база', 't'), @('prodlocks', 'Рабочая база', 'r'),
+        @('basestate', 'Рабочая база', 'f'), @('prodclose', 'Рабочая база', 't'), @('prodopen', 'Рабочая база', 'u'), @('prodlocks', 'Рабочая база', 'r'),
         @('cmpext', 'Сравнить и забрать', 'g'), @('cmpepf', 'Сравнить и забрать', 'h'), @('pullext', 'Сравнить и забрать', 'i'),
         @('pullepf', 'Сравнить и забрать', 'j'), @('gitprod', 'Сравнить и забрать', 'k'),
         @('settings', 'Гейт', 'l'), @('update', 'Гейт', 'm'), @('stats', 'Гейт', 'n'), @('comcheck', 'Гейт', 'o'), @('exit', 'Гейт', 'p'))
