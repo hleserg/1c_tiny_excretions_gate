@@ -3129,6 +3129,60 @@ $tests = @(
         }
     },
     @{
+        Name = 'git-typical-noversion'
+        Text = 'типовая в git: в typical.json коммит без версии (до 20.11.2026 версия читалась пустой - свойства COM 1С) - версия коммита из его Configuration.xml; та же, что в temp, - дописывается, без вопроса и без выгрузки; другая - вопрос и выгрузка'
+        Run = {
+            param($Name)
+            $gitCommand = Get-Command git -ErrorAction SilentlyContinue
+            if ($null -eq $gitCommand) { Write-Host '       пропущен: нет git в PATH'; return }
+            $gitExe = $gitCommand.Source
+            $sb = New-GitSandbox $Name -Extra @{ TypicalRepo = 'owner/typical'; TypicalMinFreeGB = 1 }
+            $bare = Join-Path $sb 'typical-remote.git'
+            $null = & $gitExe init --bare --quiet $bare 2>&1
+            $env:CI_FAKE_GIT_EXE = $gitExe
+            $env:CI_FAKE_GIT_REMOTE = $bare
+            try {
+                $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
+                $com.bases.erp_temp_test['config'] = @{ name = 'ERP'; synonym = 'ERP завода'; version = '2.5.22.149' }
+                $dumps = New-GitDumps
+                $dumps['@config'] = @{ 'Configuration.xml' = '<MetaDataObject><Configuration><Properties><Name>ERP</Name><Version>2.5.22.149</Version></Properties></Configuration></MetaDataObject>'; 'Catalogs/Items.xml' = '<Items/>' }
+                $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = $dumps } -Com $com -Answers ($gitBootstrapAnswers + @(@{ Kind = 'confirm'; Header = 'Выгрузить и типовую'; Yes = $true }))
+                Check-DeployCommon $first -LocksExpected $false
+                $sha = ([string](& $gitExe --git-dir=$bare rev-parse main 2>&1)).Trim()
+                $stateFile = Join-Path $sb 'git\typical\typical.json'
+                $blank = { [System.IO.File]::WriteAllText($stateFile, (ConvertTo-Json -InputObject ([ordered]@{ repo = 'owner/typical'; name = ''; version = ''; commit = $sha; time = '2026-11-20 02:10:00' })), $utf8) }
+                # Та же версия в temp: дописать, не выгружать.
+                & $blank
+                Reset-FakeState $sb
+                $same = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = $dumps } -Com $com
+                Check-DeployCommon $same -LocksExpected $false
+                Check ($same.Unexpected.Count -eq 0) ("коммит без версии, та же версия - а вопросы: " + ($same.Unexpected -join ' | '))
+                Check (@($same.Output | Where-Object { $_ -match 'без версии, в нём та же версия - дописал' }).Count -eq 1) 'не сказано, что версия дописана'
+                $sameDumps = Get-Calls $same @('/DumpConfigToFiles')
+                Check (@($sameDumps | Where-Object { -not $_.Line.Contains('-Extension') }).Count -eq 0) 'коммит без версии, та же версия: типовая выгружалась заново'
+                $state = [System.IO.File]::ReadAllText($stateFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check ($state.version -eq '2.5.22.149' -and $state.name -eq 'ERP' -and $state.commit -eq $sha) ("typical.json после дописывания: версия «{0}», имя «{1}», коммит «{2}»" -f $state.version, $state.name, $state.commit)
+                # temp обновили после того запуска: версию не приписывать, а выгрузить.
+                & $blank
+                $com.bases.erp_temp_test['config']['version'] = '2.5.23.10'
+                $dumps['@config']['Configuration.xml'] = '<MetaDataObject><Configuration><Properties><Name>ERP</Name><Version>2.5.23.10</Version></Properties></Configuration></MetaDataObject>'
+                Reset-FakeState $sb
+                $next = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = $dumps } -Com $com -Answers @(@{ Kind = 'confirm'; Header = 'Выгрузить и типовую'; Yes = $true })
+                Check-DeployCommon $next -LocksExpected $false
+                Check ($next.Unexpected.Count -eq 0) ("коммит без версии, другая версия - неожиданные вопросы: " + ($next.Unexpected -join ' | '))
+                Check (@($next.Output | Where-Object { $_ -match 'без версии; версия в нём - 2\.5\.22\.149, .* - 2\.5\.23\.10: выгружаю как новую' }).Count -eq 1) 'не сказано, что версия в коммите другая'
+                $nextDumps = Get-Calls $next @('/DumpConfigToFiles')
+                Check (@($nextDumps | Where-Object { -not $_.Line.Contains('-Extension') }).Count -eq 1) 'коммит без версии, другая версия: типовая не выгружалась'
+                $state = [System.IO.File]::ReadAllText($stateFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check ($state.version -eq '2.5.23.10' -and $state.commit -ne $sha) ("typical.json после выгрузки новой: версия «{0}», коммит «{1}»" -f $state.version, $state.commit)
+            }
+            finally {
+                Remove-Item -Path 'env:CI_FAKE_GIT_EXE' -ErrorAction SilentlyContinue
+                Remove-Item -Path 'env:CI_FAKE_GIT_REMOTE' -ErrorAction SilentlyContinue
+            }
+        }
+    },
+    @{
         Name = 'git-portable-download'
         Text = 'портативный git: нет tools\git - последний MinGit 64 бита (не busybox) из релизов git-for-windows, сверка sha256 с digest релиза, распаковка в tools\git; второй раз не скачивает; не та сумма - отказ, tools\git не появляется'
         Run = {
