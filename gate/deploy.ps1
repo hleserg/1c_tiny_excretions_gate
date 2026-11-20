@@ -552,7 +552,8 @@ function Wait-ProdWarnLock {
         if ((Get-Date) -lt $lockAt) {
             $until = [datetime]$script:WarnLockUntil
             $message = "Идёт обновление расширений, база заблокирована до {0}" -f $until.ToString('HH:mm')
-            Set-GateSessionLock $script:ProdLockState $target ((Get-Date).AddMinutes(-30)) $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:ProdBase }
+            try { Set-GateSessionLock $script:ProdLockState $target ((Get-Date).AddMinutes(-30)) $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:ProdBase } }
+            finally { Save-ProdLockFile }
             Write-Line '  блокировка начала сеансов действует с этой минуты' 'Green'
             Write-RunLog 'Начало блокировки сеансов перенесено на сейчас'
             $script:ProdClosedAt = Get-Date
@@ -615,6 +616,7 @@ function Clear-ProdLocks {
                 Write-Line ('  ' + $downtime)
                 Write-RunLog $downtime
             }
+            Save-ProdLockFile
             return
         }
         catch {
@@ -623,7 +625,123 @@ function Clear-ProdLocks {
         }
         break
     }
+    Save-ProdLockFile
 }
+
+# ** Хлебников С.Ю. 20261120 Блокировки этого запуска - в файле locks.json папки запуска (#29): что стояло до запуска
+# (Before), что поставил он сам в том виде, в каком вернул кластер (Expected), ставил ли запрет регламентных (JobsSet),
+# метка в сообщении. Снял всё - файла нет. Процесс погиб - по файлу при следующем запуске снимается только своё.
+function ConvertTo-LockJson {
+    # Настройки запрета сеансов -> для JSON: даты - строкой с точным временем ('o'), чтобы прочитать их назад без потерь.
+    param($Settings)
+    if ($null -eq $Settings) { return $null }
+    $out = [ordered]@{}
+    foreach ($key in @($Settings.Keys)) {
+        $value = $Settings[$key]
+        if ($value -is [datetime]) { $value = $value.ToString('o') }
+        $out[$key] = $value
+    }
+    return $out
+}
+
+function ConvertFrom-LockJson {
+    # Назад в hashtable для Test-GateSessionSettings / Restore-GateLocks.
+    param($Settings)
+    if ($null -eq $Settings) { return $null }
+    $out = @{}
+    foreach ($prop in $Settings.PSObject.Properties) {
+        $value = $prop.Value
+        if (($prop.Name -eq 'DeniedFrom' -or $prop.Name -eq 'DeniedTo') -and $null -ne $value -and [string]$value) {
+            $value = [datetime]::Parse([string]$value, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+        }
+        elseif ($prop.Name -eq 'SessionsDenied') { $value = [bool]$value }
+        elseif ($prop.Name -eq 'DeniedFrom' -or $prop.Name -eq 'DeniedTo') { $value = $null }
+        $out[$prop.Name] = $value
+    }
+    return $out
+}
+
+function Save-ProdLockFile {
+    $lockFile = Join-Path $script:RunDir 'locks.json'
+    $state = $script:ProdLockState
+    try {
+        if ($null -eq $state -or (-not $state.Expected.Count -and -not $state.JobsSet)) {
+            if (Test-Path -LiteralPath $lockFile) { Remove-Item -LiteralPath $lockFile -Force }
+            return
+        }
+        $processStart = ''
+        try { $processStart = (Get-Process -Id $PID).StartTime.ToString('yyyy-MM-ddTHH:mm:ss') } catch { $processStart = '' }
+        $record = [ordered]@{
+            base = $script:ProdBase; pid = $PID; processStart = $processStart; marker = $state.Marker; jobsSet = [bool]$state.JobsSet
+            before = (ConvertTo-LockJson $state.Before); expected = @(foreach ($one in $state.Expected) { ConvertTo-LockJson $one })
+        }
+        Save-DeployJournalFile -Path $lockFile -Record $record
+    }
+    catch { Write-RunLog ('locks.json не записался: ' + $_.Exception.Message) }
+}
+
+function Resolve-InterruptedLocks {
+    # locks.json запусков, чей процесс уже не живёт: что из блокировок рабочей до сих пор их, и - по вопросу - снять
+    # только своё (Restore-GateLocks возвращает запрет сеансов к параметрам до запуска). Чужое и изменённое не трогается.
+    # Возвращает, у скольких запусков нашлись свои блокировки (снятые или оставленные).
+    if (-not (Test-Path -LiteralPath $deployRoot)) { return 0 }
+    $found = 0
+    foreach ($dir in @(Get-ChildItem -LiteralPath $deployRoot -Directory | Where-Object { $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name)) {
+        $lockFile = Join-Path $dir.FullName 'locks.json'
+        if (-not (Test-Path -LiteralPath $lockFile)) { continue }
+        if ($dir.FullName -eq $script:RunDir) { continue }
+        $record = $null
+        try { $record = (Get-Content -LiteralPath $lockFile -Raw -Encoding UTF8) | ConvertFrom-Json } catch { continue }
+        if ([string](Get-JsonValue $record 'base' '') -ne $script:ProdBase) { continue }
+        $lockPid = [int](Get-JsonValue $record 'pid' 0)
+        if ($lockPid -gt 0) {
+            $alive = Get-Process -Id $lockPid -ErrorAction SilentlyContinue
+            if ($null -ne $alive) {
+                $startText = ''
+                try { $startText = $alive.StartTime.ToString('yyyy-MM-ddTHH:mm:ss') } catch { $startText = '' }
+                if (-not $startText -or $startText -eq [string](Get-JsonValue $record 'processStart' '')) { throw ("обновление {0} {1} ещё идёт (процесс {2}): дождись его конца" -f $script:ProdBase, $dir.Name, $lockPid) }
+            }
+        }
+        $state = New-GateLockState
+        $state.Marker = [string](Get-JsonValue $record 'marker' '')
+        $state.JobsSet = [bool](Get-JsonValue $record 'jobsSet' $false)
+        $state.Before = ConvertFrom-LockJson (Get-JsonValue $record 'before' $null)
+        $state.Expected = @(foreach ($one in @(Get-JsonValue $record 'expected' @())) { ConvertFrom-LockJson $one })
+        $target = Get-BaseInfo -Link (Connect-ClusterAgent) -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+        $now = Read-BaseInfoAgain $target $script:ProdBase
+        $own = New-Object System.Collections.Generic.List[string]
+        $foreign = New-Object System.Collections.Generic.List[string]
+        if ($state.Expected.Count) {
+            if ($null -ne $state.Before -and (Test-GateSessionLock $state $now)) { $own.Add('блокировка начала сеансов (поставил прерванный запуск; вернётся к параметрам до него)') }
+            else {
+                $state.Expected = @()
+                if ([bool]$now.SessionsDenied) { $foreign.Add('блокировка начала сеансов стоит, но не та, что ставил прерванный запуск - не трогаю') }
+            }
+        }
+        if ($state.JobsSet) {
+            if ([bool]$now.ScheduledJobsDenied) { $own.Add('запрет регламентных заданий (ставил прерванный запуск; владельца у флага нет - если его с тех пор поставил кто-то другой, ответь «нет»)') }
+            else { $state.JobsSet = $false }
+        }
+        Write-RunLog ("Блокировки прерванного обновления {0}: своих {1}, чужих {2}" -f $dir.Name, $own.Count, $foreign.Count)
+        if ($own.Count -eq 0) {
+            foreach ($line in $foreign) { Write-Line ('  ' + $line) 'Yellow' }
+            Write-Line ("  блокировок прерванного обновления {0} на {1} нет" -f $dir.Name, $script:ProdBase) 'Green'
+            Remove-Item -LiteralPath $lockFile -Force
+            continue
+        }
+        $found++
+        Show-UiTitle -Text ("Прерванное обновление {0} оставило на {1} блокировки" -f $dir.Name, $script:ProdBase) -Kind 'bad' -More (@($own.ToArray()) + @($foreign.ToArray()))
+        if (-not (Test-UiCanAsk)) { Write-Line '  не снимаю: спросить некого. Снять - консоль кластера или deploy в меню гейта.' 'Yellow'; continue }
+        $release = Confirm-Ui -Question ("Снять блокировки {0}, оставленные прерванным обновлением {1}: {2}?" -f $script:ProdBase, $dir.Name, ($own -join '; ')) -Yes 'Да, снять' -No 'Нет, оставить' -DefaultNo
+        if ($release -ne $true) { Write-Line '  оставил как есть. Снять потом - этим же вопросом при следующем запуске или в консоли кластера.' 'Yellow'; continue }
+        $released = Restore-GateLocks $state $target $true { param($t) Read-BaseInfoAgain $t $script:ProdBase }
+        if ($released) { Write-Line ("Снял с {0}: {1} (оставило прерванное обновление {2})." -f $script:ProdBase, $released, $dir.Name) 'Green' }
+        Write-RunLog ("Сняты блокировки прерванного обновления {0}: {1}" -f $dir.Name, $released)
+        Remove-Item -LiteralPath $lockFile -Force
+    }
+    return $found
+}
+# ** Хлебников С.Ю. 20261120 конец
 
 #endregion
 
@@ -3622,7 +3740,7 @@ function Resolve-InterruptedDeploys {
         Save-DeployJournalFile -Path $jsonFile -Record $record
         Write-RunLog ("Прерванное обновление {0}: {1}" -f $dir.Name, ($lines -join ' | '))
         $more = @($lines.ToArray()) + @(
-            'Блокировки рабочей обрыв мог оставить: посмотреть - «Состояние баз», снять - консоль кластера.',
+            'Блокировки, которые ставил этот запуск, - выше, отдельным вопросом; остальные - «Состояние баз» и консоль кластера.',
             'Откатить то, что успело, - «Откатить рабочую базу»: это обновление в списке с пометкой ПРЕРВАНО (вернутся только объекты с копией).',
             'Проверить рабочую - «Проверить рабочую базу (только читает)».')
         Show-UiTitle -Text ("Обновление {0} {1} прервано (процесс не закончил)" -f $script:ProdBase, $dir.Name) -Kind 'bad' -More $more
@@ -3632,8 +3750,9 @@ function Resolve-InterruptedDeploys {
 # ** Хлебников С.Ю. 20261120 конец
 
 if (-not $Prepare -and -not $CancelPrepared) {
+    $lockedBefore = Resolve-InterruptedLocks
     $interrupted = Resolve-InterruptedDeploys
-    if ($interrupted -gt 0 -and -not $Rollback) {
+    if (($interrupted -gt 0 -or $lockedBefore -gt 0) -and -not $Rollback) {
         Write-Line 'Сначала - разобраться с прерванным обновлением (см. выше). Выход, ничего не менял.' 'Yellow'
         exit 0
     }
@@ -4377,7 +4496,9 @@ if ($needExclusive) {
     $prepLink = Connect-ClusterAgent
     $prepTarget = Get-BaseInfo -Link $prepLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
     try {
-        if (Set-GateJobsLock $script:ProdLockState $prepTarget { param($t) Read-BaseInfoAgain $t $script:ProdBase }) {
+        $jobsLocked = Set-GateJobsLock $script:ProdLockState $prepTarget { param($t) Read-BaseInfoAgain $t $script:ProdBase }
+        Save-ProdLockFile
+        if ($jobsLocked) {
             Write-Line '  поставил блокировку регламентных заданий на время обновления; в конце сниму' 'Green'
         }
         else { Write-Line '  блокировка регламентных заданий уже стоит, оставляю её' }
@@ -4481,7 +4602,8 @@ if ($needExclusive) {
         else {
             $message = "Обновление программы: в {0} база закрывается (не дольше чем до {1}). Сохраните работу и выйдите из программы до {0}." -f $start.ToString('HH:mm'), $until.ToString('HH:mm')
         }
-        Set-GateSessionLock $script:ProdLockState $Target $from $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:ProdBase }
+        try { Set-GateSessionLock $script:ProdLockState $Target $from $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:ProdBase } }
+        finally { Save-ProdLockFile }
         if ($null -eq $StartAt) {
             $script:ProdClosedAt = Get-Date
             Write-Line ("  поставил блокировку начала сеансов до {0}; сниму в конце" -f $until.ToString('HH:mm')) 'Green'

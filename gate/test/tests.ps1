@@ -480,6 +480,27 @@ function New-ComState {
     }
 }
 
+function New-InterruptedLockCom {
+    # Рабочая после обрыва deploy: стоит блокировка начала сеансов с кодом по умолчанию и запрет регламентных.
+    param([string]$Message)
+    $com = New-ComState -ProdJobsDenied $true
+    $prod = $com.bases.erp_base
+    $prod.sessionsDenied = $true; $prod.permissionCode = '0'; $prod.deniedMessage = $Message
+    $prod.deniedFrom = '2026-11-17T22:30:00'; $prod.deniedTo = '2026-11-18T01:00:00'
+    return $com
+}
+
+function Write-InterruptedLockFile {
+    # locks.json запуска 20261117-230000, чей процесс уже не живёт: до него запрета не было.
+    param([string]$Sandbox, [string]$Marker, [bool]$JobsSet)
+    $dir = Join-Path $Sandbox 'deploy\20261117-230000'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $record = @{ base = 'erp_base'; pid = 999999; processStart = '2026-11-17T23:00:00'; marker = $Marker; jobsSet = $JobsSet
+        before = @{ SessionsDenied = $false; PermissionCode = ''; DeniedMessage = ''; DeniedFrom = $null; DeniedTo = $null }
+        expected = @(@{ SessionsDenied = $true; PermissionCode = '0'; DeniedMessage = ('Обновление [{0}]' -f $Marker); DeniedFrom = '2026-11-17T22:30:00.0000000'; DeniedTo = '2026-11-18T01:00:00.0000000' }) }
+    [System.IO.File]::WriteAllText((Join-Path $dir 'locks.json'), (ConvertTo-Json -InputObject $record -Depth 6), $utf8)
+}
+
 function New-PrintProcessing {
     param([string]$Version, [string]$Content)
     return @{ objName = 'Печать'; title = 'Печать актов'; version = $Version; kind = 'Печатная форма'; content = $Content }
@@ -2029,6 +2050,62 @@ $tests = @(
         }
     },
     @{
+        Name = 'deploy-interrupted-locks-own'
+        Text = 'оборвавшийся deploy оставил свою блокировку сеансов и запрет регламентных (locks.json): следующий запуск спрашивает и возвращает как было до него'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-InterruptedLockCom -Message 'Обновление [abc123]'
+            Write-InterruptedLockFile $sb -Marker 'abc123' -JobsSet $true
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @(
+                @{ Kind = 'confirm'; Header = 'оставленные прерванным обновлением'; Yes = $true })
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            $prod = $r.ComState.bases.erp_base
+            Check (-not [bool]$prod.sessionsDenied) 'своя блокировка начала сеансов осталась'
+            Check (-not [bool]$prod.scheduledJobsDenied) 'свой запрет регламентных остался'
+            Check ([string]$prod.deniedMessage -eq '') ("сообщение не вернулось к прежнему: «{0}»" -f $prod.deniedMessage)
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'deploy\20261117-230000\locks.json'))) 'locks.json не убран после снятия'
+            Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0) 'после разбора блокировок что-то загружено'
+        }
+    },
+    @{
+        Name = 'deploy-interrupted-locks-foreign'
+        Text = 'после обрыва блокировку сеансов поменяли (не та метка): deploy её не трогает, запрет регламентных - только по «да»; ответ «нет» оставляет всё'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-InterruptedLockCom -Message 'Чужие работы [zzz999]'
+            Write-InterruptedLockFile $sb -Marker 'abc123' -JobsSet $true
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @(
+                @{ Kind = 'confirm'; Header = 'оставленные прерванным обновлением'; Yes = $false })
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            $prod = $r.ComState.bases.erp_base
+            Check ([bool]$prod.sessionsDenied -and ([string]$prod.deniedMessage).Contains('zzz999')) 'чужая блокировка сеансов снята или изменена'
+            Check ([bool]$prod.scheduledJobsDenied) 'запрет регламентных снят без согласия'
+            Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\20261117-230000\locks.json')) 'locks.json убран, хотя блокировки оставлены'
+            $text = @($r.Output) -join "`n"
+            Check ($text.Contains('не та, что ставил прерванный запуск')) 'не сказано, что блокировка сеансов чужая'
+        }
+    },
+    @{
+        Name = 'deploy-interrupted-locks-none'
+        Text = 'locks.json от оборвавшегося запуска, а блокировок на рабочей уже нет: без вопросов убирает файл и идёт обычным путём'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            Write-InterruptedLockFile $sb -Marker 'abc123' -JobsSet $true
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить выбранные' },
+                @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
+                $deployRiskAnswer, $deployNameAnswer)
+            Check-DeployCommon $r
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'deploy\20261117-230000\locks.json'))) 'locks.json без блокировок не убран'
+            Check (@($r.Questions | Where-Object { $_.Contains('прерванным обновлением') }).Count -eq 0) 'спросил про блокировки, которых нет'
+        }
+    },
+    @{
         Name = 'deploy-journal-written'
         Text = 'обычное обновление: журнал deploy.json по ходу, в конце - updated без следов inProgress и .tmp'
         Run = {
@@ -2043,6 +2120,9 @@ $tests = @(
             if ($null -eq $record) { Check $false 'нет deploy.json'; return }
             Check ($record.outcome -eq 'updated') ("итог {0}" -f $record.outcome)
             Check (-not (Test-Path -LiteralPath (Join-Path $record.Dir 'deploy.json.tmp'))) 'остался deploy.json.tmp'
+            Check (-not (Test-Path -LiteralPath (Join-Path $record.Dir 'locks.json'))) 'после снятия блокировок остался locks.json'
+            $comLog = Join-Path $sb 'fake\com.log'
+            if (Test-Path -LiteralPath $comLog) { Check ([System.IO.File]::ReadAllText($comLog, $utf8).Contains('sessionsDenied=1')) 'обновление шло без блокировки сеансов - locks.json не проверен' }
             $log = Join-Path $record.Dir 'run.log'
             if (Test-Path -LiteralPath $log) { Check (-not ([System.IO.File]::ReadAllText($log, $utf8).Contains('Журнал обновления не записался'))) 'журнал обновления не записался' }
         }
