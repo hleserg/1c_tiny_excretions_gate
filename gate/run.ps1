@@ -2798,6 +2798,17 @@ function Get-ResumeFileStamp {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Get-GateActionsStamp {
+    # Отпечаток папки действий (имена и содержимое файлов): по нему продолжение видит, что действия поменялись.
+    param([string]$Dir)
+    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) { return 'нет действий' }
+    $parts = @(Get-ChildItem -LiteralPath $Dir -File | Where-Object { $_.Extension -ieq '.bsl' } | Sort-Object Name | ForEach-Object {
+            '{0}={1}' -f $_.Name, (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash })
+    if ($parts.Count -eq 0) { return 'нет действий' }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    return [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes(($parts -join "`n")))).Replace('-', '')
+}
+
 function Get-PhaseInputs {
     # От чего, кроме базы, зависит итог этапа: настройки, ключи запуска, файлы обработок. Изменилось что-то из этого -
     # этап готовым не берётся. Значения - строками.
@@ -4906,17 +4917,6 @@ function Get-GateActions {
             })
     }
     return , $list.ToArray()
-}
-
-function Get-GateActionsStamp {
-    # Отпечаток папки действий (имена и содержимое файлов): по нему продолжение видит, что действия поменялись.
-    param([string]$Dir)
-    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) { return 'нет действий' }
-    $parts = @(Get-ChildItem -LiteralPath $Dir -File | Where-Object { $_.Extension -ieq '.bsl' } | Sort-Object Name | ForEach-Object {
-            '{0}={1}' -f $_.Name, (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash })
-    if ($parts.Count -eq 0) { return 'нет действий' }
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    return [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes(($parts -join "`n")))).Replace('-', '')
 }
 
 function New-GateActionsSource {
