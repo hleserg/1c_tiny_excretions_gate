@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     .\report.cmd runs\20261117-021500
-        Разобрать прогон и записать report.txt в его папку. Гейт вызывает разбор сам после вердикта.
+        Разобрать прогон и записать report.txt и junit.xml в его папку. Гейт вызывает разбор сам после вердикта.
 
     Что разбирается:
     - шаги, которые не прошли: загрузка, обновление БД, вход, самопроверка - причина по тексту лога;
@@ -323,6 +323,128 @@ function Format-Short {
 #endregion
 
 #region Разбор
+
+function ConvertTo-JUnitText {
+    # Управляющие символы из консольного лога недопустимы в XML 1.0.
+    param([string]$Value)
+    return ($Value -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]', [string][char]0xFFFD)
+}
+
+function Get-JUnitCases {
+    param($Step, [string]$Directory)
+    $name = [string](Get-JsonProperty $Step 'name' '')
+    $status = [string](Get-JsonProperty $Step 'status' '')
+    $logLeaf = ([string](Get-JsonProperty $Step 'log' '') -split '[\\/]')[-1]
+    $kind = ''
+    $current = ''
+    $changes = ''
+    if ($name -eq 'Правила обмена') {
+        $kind = 'exchange'; $current = 'exchange-rules.txt'; $changes = 'exchange-rules.new.txt'
+    } elseif ($name -eq 'Самопроверка' -or $name.StartsWith('Самопроверка после')) {
+        $kind = 'self'; $current = 'selfcheck-after.norm.txt'; $changes = 'selfcheck-after.new.txt'
+    } elseif ($name.StartsWith('Самопроверка до загрузки') -or $name.StartsWith('Самопроверка группы')) {
+        if ($logLeaf -match '^(selfcheck-[^.]*)\.journal\.txt$') {
+            $kind = 'capture'; $current = $Matches[1] + '.norm.txt'
+        }
+    } elseif ($logLeaf -match '^(check(?:config|modules|canapply)[^.]*)\.log$') {
+        $kind = 'check'; $current = $Matches[1] + '.norm.txt'; $changes = $Matches[1] + '.new.txt'
+    }
+    $rows = New-Object System.Collections.Generic.List[object]
+    if ($current) {
+        $dir = $Directory
+        $from = [string](Get-JsonProperty $Step 'from' '')
+        if ($from -match '^\d{8}-\d{6}$' -and -not (Test-Path -LiteralPath (Join-Path $dir $current))) {
+            $dir = Join-Path (Split-Path -Parent $Directory) $from
+        }
+        $new = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        if ($changes) { foreach ($record in @(Read-RecordSet (Join-Path $dir $changes))) { [void]$new.Add($record) } }
+        $detail = [string](Get-JsonProperty $Step 'detail' '')
+        $noReference = $kind -eq 'check' -and $detail.Contains('эталона нет')
+        foreach ($record in @(Read-RecordSet (Join-Path $dir $current))) {
+            $result = 'OK'; $note = ''
+            if ($kind -eq 'capture') {
+                $note = 'Запись самопроверки без сравнения с эталоном'
+            } elseif ($noReference) {
+                $result = $status; $note = 'Эталона нет'
+            } elseif ($new.Contains($record)) {
+                if ($kind -eq 'check') {
+                    # Ключи тяжести из Get-RecordKind (run.ps1) шире шаблонов пояснений в report.txt.
+                    $blocking = $record.StartsWith('{') -or $record.Contains('Неразрешимые ссылки') -or
+                        (-not $record.Contains('Возможно ошибочн') -and -not $record.Contains('Отсутствует обработчик'))
+                    $result = 'WARN'
+                    if ($blocking -and $status -eq 'FAIL') { $result = 'FAIL' }
+                } elseif ($status -eq 'FAIL' -and $record.StartsWith('[ОШИБКА]')) {
+                    $result = 'FAIL'
+                } else {
+                    $result = 'WARN'
+                }
+                $note = 'Новая запись'
+            } elseif ($record.StartsWith('[ОШИБКА]') -or $record.StartsWith('[ВНИМАНИЕ]') -or
+                      $record.StartsWith('[ПРОПУСК]') -or $kind -eq 'check') {
+                $note = 'Учтено в эталоне'
+            }
+            # При первом снятии эталона gate допускает отдельные записи: шаг бывает OK или WARN.
+            if ($status -eq 'OK' -and $result -ne 'OK') { $result = 'OK' }
+            $rows.Add([pscustomobject]@{ Name = $record; Status = $result; Note = $note })
+        }
+    }
+    # Например, шаг мог упасть при запуске конфигуратора или получить предупреждение о смене снимка.
+    $represented = @($rows | Where-Object { $_.Status -eq $status -or ($status -eq 'SKIP' -and $_.Status -eq 'WARN') }).Count -gt 0
+    if ($rows.Count -eq 0 -or ($status -ne 'OK' -and -not $represented)) {
+        $rows.Add([pscustomobject]@{ Name = $name; Status = $status; Note = [string](Get-JsonProperty $Step 'detail' '') })
+    }
+    return $rows.ToArray()
+}
+
+function Write-GateJUnit {
+    param([string]$Directory, [string]$Run, [object[]]$Checks)
+    $doc = New-Object System.Xml.XmlDocument
+    $top = $doc.CreateElement('testsuites')
+    [void]$doc.AppendChild($top)
+    $top.SetAttribute('name', (ConvertTo-JUnitText $Run))
+    $total = 0; $failures = 0; $skipped = 0; $seconds = 0
+    foreach ($step in $Checks) {
+        $title = ConvertTo-JUnitText ([string](Get-JsonProperty $step 'name' ''))
+        $duration = [int](Get-JsonProperty $step 'seconds' 0)
+        $suite = $doc.CreateElement('testsuite')
+        [void]$top.AppendChild($suite)
+        $suite.SetAttribute('name', $title)
+        $suite.SetAttribute('time', [string]$duration)
+        $cases = @(Get-JUnitCases $step $Directory)
+        $bad = 0; $missed = 0
+        foreach ($item in $cases) {
+            $test = $doc.CreateElement('testcase')
+            [void]$suite.AppendChild($test)
+            $test.SetAttribute('classname', $title)
+            $test.SetAttribute('name', (ConvertTo-JUnitText $item.Name))
+            $tag = ''
+            if ($item.Status -eq 'FAIL') { $tag = 'failure'; $bad++ }
+            elseif ($item.Status -in @('WARN', 'SKIP')) { $tag = 'skipped'; $missed++ }
+            elseif ($item.Note) { $tag = 'system-out' }
+            if ($tag) {
+                $entry = $doc.CreateElement($tag)
+                $entry.InnerText = ConvertTo-JUnitText $item.Note
+                [void]$test.AppendChild($entry)
+            }
+        }
+        $suite.SetAttribute('tests', [string]$cases.Count)
+        $suite.SetAttribute('failures', [string]$bad)
+        $suite.SetAttribute('skipped', [string]$missed)
+        $total += $cases.Count; $failures += $bad; $skipped += $missed; $seconds += $duration
+    }
+    $top.SetAttribute('tests', [string]$total)
+    $top.SetAttribute('failures', [string]$failures)
+    $top.SetAttribute('skipped', [string]$skipped)
+    $top.SetAttribute('time', [string]$seconds)
+    $path = Join-Path $Directory 'junit.xml'
+    $temp = $path + '.' + [guid]::NewGuid() + '.tmp'
+    try {
+        $doc.Save($temp)
+        Move-Item -LiteralPath $temp -Destination $path -Force
+    } finally {
+        if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force }
+    }
+}
 
 $meta = Get-Content -LiteralPath (Join-Path $RunDir 'verdict.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $runId = [string](Get-JsonProperty $meta 'runId' (Split-Path -Leaf $RunDir))
@@ -1001,6 +1123,7 @@ $report.Add('Подробности: summary.txt, *.new.txt, selfcheck-after.jou
 
 $reportPath = Join-Path $RunDir 'report.txt'
 [System.IO.File]::WriteAllLines($reportPath, $report.ToArray(), $Utf8Bom)
+Write-GateJUnit -Directory $RunDir -Run $runId -Checks $steps
 
 if (-not $Quiet) {
     Write-Host ''
