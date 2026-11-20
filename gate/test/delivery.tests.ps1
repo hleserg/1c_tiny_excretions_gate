@@ -478,7 +478,7 @@ function Check-DeliveryCommon {
             $print = Get-DMainText $gh 'processings/Печать/Печать/Ext/ObjectModule.bsl'
             Check ($null -ne $print -and $print.Contains('НоваяПроцедура')) 'обработка не в выбранной карточке'
             $report = [System.IO.File]::ReadAllText((Join-Path $sb ('deliveries\{0}\report.md' -f $state.id)), $utf8)
-            foreach ($word in @('Доработки_v9.cfe', 'Печать.epf', 'ОтчётПродаж.erf', 'Закрытая.epf', $closedSha, 'Решено человеком', 'Регистрация в справочнике', 'Сборка в технической базе', 'Цепочка', $refMain)) {
+            foreach ($word in @('Доработки_v9.cfe', 'Печать.epf', 'ОтчётПродаж.erf', 'Закрытая.epf', $closedSha, 'Решено человеком', 'Регистрация в справочнике', 'Сборка в технической базе', 'Граница проверки', 'Цепочка', $refMain)) {
                 Check ($report.Contains($word)) ("в отчёте нет «{0}»" -f $word)
             }
             Check (-not $report.Contains('Ждёт решения')) 'в отчёте GREEN-поставки есть неразобранные решения'

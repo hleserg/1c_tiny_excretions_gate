@@ -967,6 +967,7 @@ function Test-DeliveryBuild {
     foreach ($object in @($Result['objects'])) {
         $index++
         $status = [string]$object['status']
+        if ($status -eq 'opaque') { $notes.Add(('{0}: файл целиком - из исходников не собирается, ставится как пришёл (проверка - открытие и регистрация после загрузки)' -f $object['name'])); continue }
         if ($status -ne 'changed' -and $status -ne 'new') { continue }
         $dir = Join-Path $outRoot ([string]$object['repoPath']).Replace('/', '\')
         if ([string]$object['kind'] -eq 'extension') {
@@ -1441,6 +1442,16 @@ function Get-DeliveryReport {
         $lines.Add('## Сборка в технической базе')
         $lines.Add('')
         foreach ($note in @($State['build']['notes'])) { $lines.Add(('- ' + $note)) }
+        $lines.Add('')
+    }
+    # Граница проверки: что у файла целиком проверено, а что - нет.
+    $opaqueFiles = @(@($State['files']) | Where-Object { [bool]$_['opaque'] -and [string]$_['status'] -ne 'rejected' })
+    if ($opaqueFiles.Count -gt 0) {
+        $lines.Add('## Граница проверки')
+        $lines.Add('')
+        foreach ($file in $opaqueFiles) {
+            $lines.Add(('- `{0}` ({1}): исходники не выгружаются - {2}. Проверено: SHA-256 `{3}` совпадает с принятым в git (binaries/manifest.json), файл открывается и регистрируется в карточке. Не проверено: код, макеты и формы внутри файла.' -f $file['name'], $file['actualKind'], $file['opaqueReason'], $file['sha256']))
+        }
         $lines.Add('')
     }
     # Регистрация в справочнике (команды, назначение, публикация) - отдельно от изменений кода.
