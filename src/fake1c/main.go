@@ -33,12 +33,14 @@ import (
 )
 
 type designerRule struct {
-	Match []string `json:"match"`
-	Exit  int      `json:"exit"`
-	Log   string   `json:"log"`
-	Sleep float64  `json:"sleep"`
-	Times int      `json:"times"`
-	Hang  bool     `json:"hang"`
+	Match  []string `json:"match"`
+	Exit   int      `json:"exit"`
+	Log    string   `json:"log"`
+	Sleep  float64  `json:"sleep"`
+	Times  int      `json:"times"`
+	Hang   bool     `json:"hang"`
+	NoLog  bool     `json:"noLog"`
+	NoDump bool     `json:"noDump"`
 }
 
 type task struct {
@@ -100,6 +102,7 @@ type unitRun struct {
 	Code        string            `json:"code"`
 	// NoExitCode - отчёт пишется, кода возврата нет (движок упал после отчёта); Hang - сколько секунд клиент
 	// после этого ещё висит.
+	NoReport   bool    `json:"noReport"`
 	NoExitCode bool    `json:"noexitcode"`
 	Hang       float64 `json:"hang"`
 }
@@ -262,13 +265,13 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 	if rule.Sleep > 0 {
 		time.Sleep(time.Duration(rule.Sleep * float64(time.Second)))
 	}
-	if out := valueAfter(args, "/Out"); out != "" {
+	if out := valueAfter(args, "/Out"); out != "" && !rule.NoLog {
 		writeUTF8(out, rule.Log)
 	}
 	if rule.Exit != 0 {
 		return rule.Exit
 	}
-	if file := valueAfter(args, "/DumpCfg"); file != "" {
+	if file := valueAfter(args, "/DumpCfg"); file != "" && !rule.NoDump {
 		_ = os.MkdirAll(filepath.Dir(file), 0o755)
 		_ = os.WriteFile(file, []byte("FAKECFE "+valueAfter(args, "-Extension")), 0o644)
 	}
@@ -793,7 +796,7 @@ func unitRun1(u unitRun, configPath string) {
 		b.WriteString(`</testsuite>`)
 	}
 	b.WriteString(`</testsuites>`)
-	if cfg.ReportPath != "" {
+	if cfg.ReportPath != "" && !u.NoReport {
 		_ = os.MkdirAll(filepath.Dir(cfg.ReportPath), 0o755)
 		_ = os.WriteFile(cfg.ReportPath, []byte(b.String()), 0o644)
 	}

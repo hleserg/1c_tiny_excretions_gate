@@ -13,8 +13,6 @@ jobs:
   gate:
     name: Скрипты, тесты без 1С, сборка
     runs-on: windows-latest
-    permissions:
-      contents: write   # релиз по тегу
     steps:
       - uses: actions/checkout@v4
 
@@ -64,7 +62,7 @@ jobs:
         shell: pwsh
         run: |
           $stamp = ''
-          if ('${{ github.ref_type }}' -eq 'tag') { $stamp = '${{ github.ref_name }}'.TrimStart('v') }
+          if ($env:GITHUB_REF_TYPE -eq 'tag') { $stamp = $env:GITHUB_REF_NAME.TrimStart('v') }
           Push-Location src/build
           if ($stamp) { go run . -root ../.. -out dist -stamp $stamp } else { go run . -root ../.. -out dist }
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -75,15 +73,7 @@ jobs:
         with:
           name: dist
           path: dist/*.zip
-
-      - name: Релиз
-        if: github.ref_type == 'tag'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: pwsh
-        run: |
-          $notes = 'Сборка ${{ github.ref_name }}. Установка: распаковать ci-gate_*.zip и запустить install.cmd.'
-          gh release create '${{ github.ref_name }}' (Get-ChildItem dist/*.zip).FullName --title '${{ github.ref_name }}' --notes $notes
+          if-no-files-found: error
 
   bsl:
     name: BSL Language Server
@@ -135,3 +125,22 @@ jobs:
             bsl-report
             bsl-console.txt
           if-no-files-found: ignore
+
+  release:
+    name: Публикация проверенной сборки
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [gate, bsl]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Релиз
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.zip --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$GITHUB_REF_NAME" --notes "Сборка $GITHUB_REF_NAME. Установка: распаковать ci-gate_*.zip и запустить install.cmd."
