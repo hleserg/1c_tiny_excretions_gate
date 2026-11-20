@@ -576,7 +576,7 @@ $items = @()
 if ($Kit) {
     foreach ($sub in @(Get-ChildItem -LiteralPath $Kit -Directory | Sort-Object Name)) { $lines += ('dir=' + $sub.Name) }
     foreach ($file in @(Get-ChildItem -LiteralPath $Kit -Recurse -File)) { $lines += ('file=' + $file.FullName.Substring($Kit.TrimEnd('\').Length + 1).Replace('\', '/')) }
-    $items = @(Get-ChildItem -LiteralPath $Kit -Directory | Where-Object { $_.Name -ne 'actions' } | ForEach-Object { @{ name = $_.Name; loadTried = $true; touched = $true } })
+    $items = @(Get-ChildItem -LiteralPath $Kit -Directory | Where-Object { $_.Name -ne 'actions' } | ForEach-Object { @{ name = $_.Name; loadTried = $true; touched = $true; loaded = $true } })
 }
 # Действия после обновления: как обработка гейта - каждое выполнено, кроме тех, где в тексте «УПАДИ».
 $actions = $ActionsDir
@@ -595,7 +595,7 @@ if ($actions) {
     [System.IO.File]::WriteAllLines((Join-Path $dir 'actions.txt'), [string[]]$result, (New-Object System.Text.UTF8Encoding($true)))
 }
 [System.IO.File]::WriteAllLines((Join-Path $dir 'stub.txt'), [string[]]$lines, (New-Object System.Text.UTF8Encoding($true)))
-$verdict = @{ verdict = 'GREEN'; kitDecision = ''; kitItems = $items; kitProcessings = @() }
+$verdict = @{ verdict = 'GREEN'; runId = (Split-Path -Leaf $dir); kitDecision = ''; kitItems = $items; kitProcessings = @() }
 [System.IO.File]::WriteAllText((Join-Path $dir 'verdict.json'), (ConvertTo-Json -InputObject $verdict -Depth 4), (New-Object System.Text.UTF8Encoding($true)))
 Write-Host 'заглушка гейта: прогон записан'
 exit 0
