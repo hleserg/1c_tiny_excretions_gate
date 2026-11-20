@@ -270,6 +270,203 @@ function New-ActionsKit {
             Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase erp_base ' }).Count -eq 0) 'тронута рабочая база'
         }
     },
+    # ** Хлебников С.Ю. 20261120 Закрыть базу для пользователей и открыть её (-CloseBase/-OpenBase).
+    @{
+        Name = 'deploy-close-prod-warn-open'
+        Text = 'закрыть рабочую: предупреждение (блокировка сеансов с будущего времени), в срок - запрет регламентных, потом завершение сеансов, конфигуратор оставлен по ответу; блокировки остаются до «Открыть», оно снимает их и проверяет вход без кода'
+        Run = {
+            param($Name)
+            $config = $deployConfig.Clone()
+            $config['CloseWarnMinutes'] = 0.1
+            $sb = New-Sandbox $Name -Config $config
+            $com = New-ComState -Sessions @(
+                @{ id = 5; base = 'erp_base'; app = '1CV8C'; user = 'Пользователь'; host = 'pc1' },
+                @{ id = 7; base = 'erp_base'; app = 'Designer'; user = 'Разработчик'; host = 'pc3' },
+                @{ id = 6; base = 'erp_temp_test'; app = '1CV8C'; user = 'Тест'; host = 'pc2' })
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CloseBase' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Закрыть erp_base для пользователей: когда'; Item = '^Предупредить пользователей' },
+                @{ Kind = 'one'; Header = 'Вход в erp_base закрыть до какого времени'; Item = '^на 3 часа' },
+                @{ Kind = 'confirm'; Header = 'Закрыть erp_base\?'; Yes = $true },
+                @{ Kind = 'one'; Header = 'Пользователи erp_base предупреждены'; Wait = $true },
+                @{ Kind = 'one'; Header = 'В erp_base открыт конфигуратор'; Item = '^Оставить' })
+            Check-DeployCommon $r -LocksExpected $false
+            Check ($r.ExitCode -eq 0) ("закрытие: код возврата {0}, ждали 0" -f $r.ExitCode)
+            $writes = @($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase erp_base ' })
+            Check ($writes.Count -gt 0) 'свойства рабочей не записывались'
+            if ($writes.Count -gt 0) {
+                $fromSec = [int]([regex]::Match($writes[0], 'deniedFromSec=(-?\d+)').Groups[1].Value)
+                Check ($writes[0] -match 'sessionsDenied=1' -and $writes[0] -match 'scheduledJobsDenied=0') ("первая запись - не блокировка сеансов без запрета регламентных: {0}" -f $writes[0])
+                Check ($fromSec -gt 0) ("блокировка начала сеансов не с будущего времени: начало через {0} с" -f $fromSec)
+                Check ($writes[0] -match 'message=.*Сохраните работу') ("в блокировке нет предупреждения пользователям: {0}" -f $writes[0])
+            }
+            Check (@($r.Questions | Where-Object { $_ -match 'Пользователи erp_base предупреждены' }).Count -eq 1) 'не было ожидания после предупреждения'
+            $comLog = @($r.ComLog)
+            $jobsAt = -1; $stopAt = -1
+            for ($i = 0; $i -lt $comLog.Count; $i++) {
+                if ($jobsAt -lt 0 -and $comLog[$i] -match '\tUpdateInfoBase erp_base scheduledJobsDenied=1') { $jobsAt = $i }
+                if ($stopAt -lt 0 -and $comLog[$i] -match '\tTerminateSession 5$') { $stopAt = $i }
+            }
+            Check ($jobsAt -ge 0) 'запрет регламентных заданий не ставили'
+            Check ($stopAt -ge 0) 'сеанс пользователя рабочей не завершён'
+            Check ($jobsAt -ge 0 -and $stopAt -gt $jobsAt) 'сеансы завершены раньше, чем запрещены регламентные задания'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tTerminateSession 7$' }).Count -eq 0) 'конфигуратор завершён, хотя ответ - оставить'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tTerminateSession 6$' }).Count -eq 0) 'завершён сеанс тестовой базы'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase erp_temp_test ' }).Count -eq 0) 'тронута тестовая база'
+            if ($null -ne $r.ComState) {
+                $prod = $r.ComState.bases.erp_base
+                Check ([bool]$prod.sessionsDenied -and [bool]$prod.scheduledJobsDenied) 'после закрытия нет блокировки сеансов или запрета регламентных'
+                Check ([string]$prod.permissionCode -ceq '0') ("код разрешения «{0}», ждали UnlockCode" -f $prod.permissionCode)
+                Check ([string]$prod.deniedMessage -match '^Технические работы, вход в программу закрыт до ') ("сообщение после закрытия: {0}" -f $prod.deniedMessage)
+            }
+            $closeFile = Join-Path $sb 'deploy\close\closed-erp_base.json'
+            Check (Test-Path -LiteralPath $closeFile) 'нет файла закрытия'
+            if (Test-Path -LiteralPath $closeFile) {
+                $record = [System.IO.File]::ReadAllText($closeFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check ($record.status -eq 'closed' -and [bool]$record.jobsSet -and [string]$record.target -ceq $script:ProdTargetId) ("файл закрытия: status {0}, jobsSet {1}, target {2}" -f $record.status, $record.jobsSet, $record.target)
+            }
+            $runDirs = @(Get-ChildItem -LiteralPath (Join-Path $sb 'deploy') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8}-\d{6}$' })
+            Check ($runDirs.Count -eq 0) 'закрытие создало папку запуска обновления'
+
+            # Открыть: снимает своё, файл закрытия убран, вход без кода разрешения.
+            $o = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-OpenBase' -Answers @(
+                @{ Kind = 'confirm'; Header = 'Открыть erp_base: снять блокировку начала сеансов и запрет регламентных заданий'; Yes = $true })
+            Check-DeployCommon $o
+            Check ($o.ExitCode -eq 0) ("открытие: код возврата {0}, ждали 0" -f $o.ExitCode)
+            Check (-not (Test-Path -LiteralPath $closeFile)) 'после открытия остался файл закрытия'
+            Check (@($o.Output | Where-Object { $_ -match '\[OK\] Вход без кода разрешения: вошёл' }).Count -gt 0) 'после открытия нет входа без кода разрешения'
+            Check (@($o.Output | Where-Object { $_ -match 'Простой erp_base: \d+ ч \d\d мин' }).Count -gt 0) 'нет строки о простое'
+            $history = Join-Path $sb 'deploy\close\history.log'
+            $historyText = ''
+            if (Test-Path -LiteralPath $history) { $historyText = [System.IO.File]::ReadAllText($history, $utf8) }
+            Check ($historyText.Contains('erp_base закрыта') -and $historyText.Contains('erp_base открыта')) ("в history.log нет закрытия и открытия: {0}" -f $historyText.Trim())
+        }
+    },
+    @{
+        Name = 'deploy-close-prod-cancel'
+        Text = 'закрыть рабочую: отмена во время предупреждения - блокировка сеансов возвращена как была, сеансы не завершены, запрета регламентных и файла закрытия нет'
+        Run = {
+            param($Name)
+            $config = $deployConfig.Clone()
+            $config['CloseWarnMinutes'] = 5
+            $sb = New-Sandbox $Name -Config $config
+            $com = New-ComState -Sessions @(@{ id = 5; base = 'erp_base'; app = '1CV8C'; user = 'Пользователь'; host = 'pc1' })
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CloseBase' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Закрыть erp_base для пользователей: когда'; Item = '^Предупредить пользователей' },
+                @{ Kind = 'one'; Header = 'Вход в erp_base закрыть до какого времени'; Item = '^на час' },
+                @{ Kind = 'confirm'; Header = 'Закрыть erp_base\?'; Yes = $true },
+                @{ Kind = 'one'; Header = 'Пользователи erp_base предупреждены'; Item = '^Отмена' })
+            Check-DeployCommon $r
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check (@($r.Output | Where-Object { $_ -match 'закрытие отменено' }).Count -gt 0) 'не сказано, что закрытие отменено'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tTerminateSession ' }).Count -eq 0) 'после отмены завершены сеансы'
+            Check (@($r.ComLog | Where-Object { $_ -match 'scheduledJobsDenied=1' }).Count -eq 0) 'после отмены ставили запрет регламентных'
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'deploy\close\closed-erp_base.json'))) 'после отмены остался файл закрытия'
+        }
+    },
+    @{
+        Name = 'deploy-close-keeps-foreign'
+        Text = 'закрыть рабочую сразу, когда регламентные уже запрещены: запрет остаётся чужим; повторное закрытие отказывает; «Открыть» возвращает прежние параметры блокировки сеансов и не трогает чужой запрет регламентных'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-ComState -ProdJobsDenied $true
+            $com.bases.erp_base.permissionCode = 'прежний'
+            $com.bases.erp_base.deniedMessage = 'Прежнее сообщение'
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CloseBase' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Закрыть erp_base для пользователей: когда'; Item = '^Закрыть сейчас' },
+                @{ Kind = 'one'; Header = 'Вход в erp_base закрыть до какого времени'; Item = '^на час' },
+                @{ Kind = 'confirm'; Header = 'Закрыть erp_base\?'; Yes = $true })
+            Check-DeployCommon $r -LocksExpected $false
+            Check ($r.ExitCode -eq 0) ("закрытие: код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check (@($r.Output | Where-Object { $_ -match 'регламентные задания были запрещены до закрытия' }).Count -gt 0) 'не сказано, что запрет регламентных был до закрытия'
+            $lock = @($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase erp_base ' })
+            Check ($lock.Count -eq 1) ("записей свойств рабочей {0}, ждали одну (блокировка сеансов сразу)" -f $lock.Count)
+            if ($lock.Count -eq 1) { Check ([int]([regex]::Match($lock[0], 'deniedFromSec=(-?\d+)').Groups[1].Value) -lt 0) 'блокировка «сразу» стоит с будущего времени' }
+            $closeFile = Join-Path $sb 'deploy\close\closed-erp_base.json'
+            if (Test-Path -LiteralPath $closeFile) {
+                $record = [System.IO.File]::ReadAllText($closeFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check (-not [bool]$record.jobsSet) 'в файле закрытия чужой запрет регламентных записан своим'
+            }
+            else { Check $false 'нет файла закрытия' }
+
+            $again = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CloseBase'
+            Check-DeployCommon $again -LocksExpected $false
+            Check (@($again.Output | Where-Object { $_ -match 'erp_base уже закрыта гейтом' }).Count -gt 0) 'повторное закрытие не сказало, что база уже закрыта'
+            Check (@($again.ComLog | Where-Object { $_ -match '\tUpdateInfoBase erp_base ' }).Count -eq 1) 'повторное закрытие записало свойства рабочей'
+
+            $o = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-OpenBase' -Answers @(
+                @{ Kind = 'confirm'; Header = 'Открыть erp_base: снять блокировку начала сеансов\?'; Yes = $true })
+            Check-DeployCommon $o -LocksExpected $false
+            Check ($o.ExitCode -eq 0) ("открытие: код возврата {0}, ждали 0" -f $o.ExitCode)
+            if ($null -ne $o.ComState) {
+                $prod = $o.ComState.bases.erp_base
+                Check (-not [bool]$prod.sessionsDenied) 'после открытия осталась блокировка начала сеансов'
+                Check ([bool]$prod.scheduledJobsDenied) 'открытие сняло запрет регламентных, который стоял до закрытия'
+                Check ([string]$prod.permissionCode -ceq 'прежний' -and [string]$prod.deniedMessage -ceq 'Прежнее сообщение') ("параметры блокировки сеансов не возвращены: код {0}, сообщение {1}" -f $prod.permissionCode, $prod.deniedMessage)
+            }
+            Check (-not (Test-Path -LiteralPath $closeFile)) 'после открытия остался файл закрытия'
+        }
+    },
+    @{
+        Name = 'deploy-close-refuse-locked'
+        Text = 'закрыть рабочую, когда на ней уже стоит блокировка начала сеансов: отказ без вопросов, свойства и сеансы не тронуты, файла закрытия нет'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-ComState -Sessions @(@{ id = 5; base = 'erp_base'; app = '1CV8C'; user = 'Пользователь'; host = 'pc1' })
+            $com.bases.erp_base.sessionsDenied = $true
+            $com.bases.erp_base.permissionCode = 'чужой'
+            $com.bases.erp_base.deniedMessage = 'Регламентные работы'
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CloseBase' -Com $com
+            Check-DeployCommon $r -LocksExpected $false
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check (@($r.Output | Where-Object { $_ -match 'уже стоит блокировка начала сеансов' }).Count -gt 0) 'не сказано, что блокировка уже стоит'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase |\tTerminateSession ' }).Count -eq 0) 'отказ что-то поменял в кластере'
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'deploy\close\closed-erp_base.json'))) 'появился файл закрытия'
+        }
+    },
+    @{
+        Name = 'menu-close-open'
+        Text = 'меню гейта: рабочая открыта - «Закрыть рабочую базу» (s); есть файл закрытия - «Открыть рабочую базу» (t) и строка над меню'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $menuOf = {
+                param($Result)
+                $line = @($Result.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Гейт расширений') } | Select-Object -First 1)
+                if ($line.Count -eq 0) { return $null }
+                return ($line[0].Substring(5) | ConvertFrom-Json)
+            }
+            $keyOf = {
+                param($Menu, [string]$Label)
+                $labels = @($Menu.items | ForEach-Object { [string]$_ }); $keys = @($Menu.keys | ForEach-Object { [string]$_ })
+                $at = [array]::IndexOf($labels, $Label)
+                if ($at -lt 0) { return '' }
+                return $keys[$at]
+            }
+            $r = Invoke-Script -Sandbox $sb -Com (New-ComState) -Answers @(@{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
+            Check ($r.Unexpected.Count -eq 0 -and $r.UnusedAnswers -eq 0) ("вопросы: неожиданные {0}, неиспользованные ответы {1}" -f ($r.Unexpected -join ' | '), $r.UnusedAnswers)
+            $menu = & $menuOf $r
+            Check ($null -ne $menu) 'нет вопроса меню'
+            if ($null -ne $menu) {
+                Check ((& $keyOf $menu 'Закрыть рабочую базу') -eq 's') 'у «Закрыть рабочую базу» клавиша не s (или пункта нет)'
+                Check ((& $keyOf $menu 'Открыть рабочую базу') -eq '') 'при открытой рабочей есть «Открыть рабочую базу»'
+            }
+            $closeDir = Join-Path $sb 'deploy\close'
+            New-Item -ItemType Directory -Path $closeDir -Force | Out-Null
+            $record = @{ base = 'erp_base'; status = 'closed'; closedAt = '20.11.2026 10:00:00'; until = '20.11.2026 13:00'; jobsSet = $true; marker = 'abc123'; expected = @() }
+            [System.IO.File]::WriteAllText((Join-Path $closeDir 'closed-erp_base.json'), (ConvertTo-Json -InputObject $record -Depth 4), $utf8Bom)
+            $r2 = Invoke-Script -Sandbox $sb -Com $null -Answers @(@{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
+            $menu2 = & $menuOf $r2
+            Check ($null -ne $menu2) 'нет вопроса меню при закрытой рабочей'
+            if ($null -ne $menu2) {
+                Check ((& $keyOf $menu2 'Открыть рабочую базу') -eq 't') 'у «Открыть рабочую базу» клавиша не t (или пункта нет)'
+                Check ((& $keyOf $menu2 'Закрыть рабочую базу') -eq '') 'при закрытой рабочей есть «Закрыть рабочую базу»'
+                Check (@($menu2.notes | Where-Object { [string]$_ -match 'рабочая erp_base закрыта гейтом' }).Count -eq 1) 'над меню нет строки о закрытой рабочей'
+            }
+        }
+    },
+    # ** Хлебников С.Ю. 20261120 конец
     @{
         Name = 'menu-manual-locks'
         Text = 'меню гейта: «Блокировки тестовой базы» (q) и «Блокировки рабочей базы» (r) запускают блокировки руками для своей базы'

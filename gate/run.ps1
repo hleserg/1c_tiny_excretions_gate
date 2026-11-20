@@ -4343,7 +4343,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         @('runs', 'Тестовая база', '7'), @('tests', 'Тестовая база', '8'), @('templocks', 'Тестовая база', 'q'),
         @('precheck', 'Рабочая база', '9'), @('applyprep', 'Рабочая база', 'a'), @('prepare', 'Рабочая база', 'b'),
         @('cancelprep', 'Рабочая база', 'c'), @('deploy', 'Рабочая база', 'd'), @('rollback', 'Рабочая база', 'e'),
-        @('basestate', 'Рабочая база', 'f'), @('prodlocks', 'Рабочая база', 'r'),
+        @('basestate', 'Рабочая база', 'f'), @('prodclose', 'Рабочая база', 's'), @('prodopen', 'Рабочая база', 't'), @('prodlocks', 'Рабочая база', 'r'),
         @('cmpext', 'Сравнить и забрать', 'g'), @('cmpepf', 'Сравнить и забрать', 'h'), @('pullext', 'Сравнить и забрать', 'i'),
         @('pullepf', 'Сравнить и забрать', 'j'), @('gitprod', 'Сравнить и забрать', 'k'),
         @('settings', 'Гейт', 'l'), @('update', 'Гейт', 'm'), @('stats', 'Гейт', 'n'), @('comcheck', 'Гейт', 'o'), @('exit', 'Гейт', 'p'))
@@ -4356,6 +4356,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         # Подпись пункта не меняется; переменное (сколько в inbox, какой прогон, какая версия, что подготовлено) и
         # подробности - в пояснении: его показывают серым рядом с подписью.
         $menu = New-Object System.Collections.Generic.List[object]
+        $closeNote = ''
         if ($usable.Count -gt 0) { $menu.Add((New-MenuItem 'kit' 'Прогон с обновлением из inbox' ('обновлений в inbox: {0}' -f $usable.Count))) }
         $menu.Add((New-MenuItem 'asis' 'Прогон на том, что есть в базе'))
         # Последний прогон не зелёный - его можно продолжить с упавшего шага, не гоняя всё заново.
@@ -4402,6 +4403,30 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
                 $menu.Add((New-MenuItem 'cancelprep' 'Отменить подготовку рабочей' 'вернуть расширения к применённым версиям'))
             }
             $menu.Add((New-MenuItem 'basestate' 'Показать состояние баз' 'блокировки и сеансы'))
+            # ** Хлебников С.Ю. 20261120 Закрыть рабочую для пользователей и открыть (deploy.ps1 -CloseBase/-OpenBase). Закрыта -
+            # есть deploy\close\closed-<рабочая>.json: тогда вместо «Закрыть» - «Открыть» и строка над меню.
+            $closeProd = [string](Get-Setting $cfg 'ProdBase' '')
+            $closeFile = ''
+            if ($closeProd) { $closeFile = Join-Path (Join-Path (Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))) 'close') ('closed-{0}.json' -f $closeProd) }
+            if ($closeFile -and (Test-Path -LiteralPath $closeFile)) {
+                $closeHint = 'снять блокировки, поставленные закрытием'
+                try {
+                    $closeState = [System.IO.File]::ReadAllText($closeFile, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                    $closeWhen = [string](Get-UiField $closeState 'closedAt' '')
+                    if ([string](Get-UiField $closeState 'status' '') -ne 'closed') { $closeHint = 'закрытие не закончено - снять то, что оно поставило' }
+                    elseif ($closeWhen) { $closeHint = ('закрыта {0}, вход до {1}' -f $closeWhen, [string](Get-UiField $closeState 'until' '?')) }
+                }
+                catch { $closeHint = 'файл закрытия не читается - смотри «Показать состояние баз»' }
+                $menu.Add((New-MenuItem 'prodopen' 'Открыть рабочую базу' $closeHint))
+                $closeNote = ('рабочая {0} закрыта гейтом для пользователей ({1}): открыть - «Открыть рабочую базу»' -f $closeProd, $closeHint)
+            }
+            else {
+                $closeMinutes = [double](Get-Setting $cfg 'CloseWarnMinutes' 10)
+                $closeWarnText = 'сразу'
+                if ($closeMinutes -gt 0) { $closeWarnText = ('через {0} мин' -f $closeMinutes) }
+                $menu.Add((New-MenuItem 'prodclose' 'Закрыть рабочую базу' ('предупредить пользователей, {0} завершить сеансы, запретить вход и регламентные' -f $closeWarnText)))
+            }
+            # ** Хлебников С.Ю. 20261120 конец
             # Блокировки руками (deploy.ps1 -ManualLocks): поставить или снять, каждое изменение - выбором человека.
             $menu.Add((New-MenuItem 'templocks' 'Блокировки тестовой базы' ('{0}: поставить или снять начало сеансов, регламентные задания' -f $script:Base)))
             $menu.Add((New-MenuItem 'prodlocks' 'Блокировки рабочей базы' ('{0}: поставить или снять начало сеансов, регламентные задания' -f [string](Get-Setting $cfg 'ProdBase' 'рабочая'))))
@@ -4432,6 +4457,8 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             }
             catch { $notes += 'ночной прогон: nightly\last.json не читается' }
         }
+        # ** Хлебников С.Ю. 20261120 Рабочая закрыта гейтом - строкой над меню, пока не откроют.
+        if ($closeNote) { $notes += $closeNote }
         if ($usable.Count -eq 0) { $notes += 'в inbox нет обновлений расширений и обработок: прогон с обновлением недоступен' }
         # На экран - в порядке слотов: группа за группой, заголовок группы - у её первого показанного пункта.
         $menuShown = New-Object System.Collections.Generic.List[object]
@@ -4511,6 +4538,15 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
                 if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -ManualLocks -LocksBase $locksWhich -UiChannel $UiChannel }
                 else { & (Join-Path $Root 'deploy.ps1') -ManualLocks -LocksBase $locksWhich }
             }
+            catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+            Wait-UiAcknowledge
+            continue
+        }
+        if ($choice -eq 'prodclose' -or $choice -eq 'prodopen') {
+            # ** Хлебников С.Ю. 20261120 Закрыть или открыть рабочую (deploy.ps1 -CloseBase/-OpenBase) - и обратно в меню.
+            $closeArgs = @{ LocksBase = 'Prod'; CloseBase = ($choice -eq 'prodclose'); OpenBase = ($choice -eq 'prodopen') }
+            if ($UiChannel) { $closeArgs['UiChannel'] = $UiChannel }
+            try { & (Join-Path $Root 'deploy.ps1') @closeArgs }
             catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
             Wait-UiAcknowledge
             continue
