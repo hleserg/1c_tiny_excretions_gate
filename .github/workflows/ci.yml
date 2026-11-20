@@ -64,7 +64,7 @@ jobs:
         shell: powershell
         run: |
           $bundle = @(Get-ChildItem dist/ci-gate_*.zip -File)
-          if ($bundle.Count -ne 1) { throw 'ожидается один комплект гейта' }
+          if ($bundle.Count -ne 1) { throw 'Expected exactly one gate ZIP' }
           & ./gate/test/portable-python-ci.ps1 -Bundle $bundle[0].FullName
 
       - name: Тесты гейта без 1С (Windows PowerShell 5.1)
