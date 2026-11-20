@@ -1607,7 +1607,18 @@ $tests = @(
             $sb = New-Sandbox $Name
             $r = Invoke-Script -Sandbox $sb -Script 'nightly.ps1' -Arguments '-Install -At 23:15'
             Check ($r.ExitCode -eq 1) ("код возврата {0}, ждали 1" -f $r.ExitCode)
-            Check (@($r.Output | Where-Object { $_ -match 'окно 22:00-02:00' }).Count -gt 0) 'нет объяснения про окно 22:00-02:00'
+            Check (@($r.Output | Where-Object { $_ -match 'часы 22:00-02:00' }).Count -gt 0) 'нет объяснения про часы 22:00-02:00'
+        }
+    },
+    @{
+        Name = 'nightly-install-denied-custom'
+        Text = 'ночной прогон: запретные часы из настроек (NightlyDeniedFrom/To), 03:00 при запрете 02-05 не принимается'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ NightlyDeniedFrom = 2; NightlyDeniedTo = 5 }
+            $r = Invoke-Script -Sandbox $sb -Script 'nightly.ps1' -Arguments '-Install -At 03:00'
+            Check ($r.ExitCode -eq 1) ("код возврата {0}, ждали 1" -f $r.ExitCode)
+            Check (@($r.Output | Where-Object { $_ -match 'часы 02:00-05:00' }).Count -gt 0) 'нет объяснения про часы 02:00-05:00'
         }
     },
     @{
@@ -1767,6 +1778,112 @@ $tests = @(
             Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
             Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0) 'после «нет» что-то загружено'
             Check (@($r.ComLog | Where-Object { $_ -match 'UpdateInfoBase' }).Count -eq 0) 'после «нет» трогали свойства рабочей'
+        }
+    },
+    @{
+        Name = 'deploy-red-gate-reason'
+        Text = 'гейт красный, выпуск с причиной: причина в deploy.json и отчёте, released.txt в прогоне, эталон не принят, прогон остаётся RED'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $runDir = Join-Path $sb 'runs\20261117-090000'
+            New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+            $verdict = @{ verdict = 'RED'; kit = 'inbox\тест'; kitDecision = 'kept'; steps = @(@{ name = 'Модульные тесты'; status = 'FAIL'; detail = 'новых падений 2' }) }
+            [System.IO.File]::WriteAllText((Join-Path $runDir 'verdict.json'), (ConvertTo-Json -InputObject $verdict -Depth 5), $utf8)
+            [System.IO.File]::WriteAllLines((Join-Path $runDir 'unittests.txt'), [string[]]@("FAIL`tМодуль.Тест`tТаблица не найдена"), $utf8Bom)
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить все' },
+                @{ Kind = 'confirm'; Header = 'красный'; Yes = $true },
+                @{ Kind = 'text'; Header = 'Причина выпуска'; Text = '' },
+                @{ Kind = 'text'; Header = 'Причина выпуска'; Text = 'тест упал в подготовке данных' },
+                $deployNameAnswer)
+            Check-DeployCommon $r
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            $record = Get-DeployRecord $sb
+            Check ($null -ne $record) 'нет deploy.json'
+            if ($null -ne $record) {
+                Check ($record.outcome -eq 'updated') ("итог {0}, ждали updated" -f $record.outcome)
+                Check ([bool]$record.riskAccepted) 'riskAccepted не записан'
+                Check ([string]$record.riskReason -eq 'тест упал в подготовке данных') ("причина в deploy.json: «{0}»" -f $record.riskReason)
+                $article = Join-Path $record.Dir 'article.html'
+                if (Test-Path -LiteralPath $article) { Check ([System.IO.File]::ReadAllText($article, $utf8).Contains('Причина выпуска: тест упал в подготовке данных')) 'в отчёте нет причины выпуска' }
+            }
+            $released = Join-Path $runDir 'released.txt'
+            Check (Test-Path -LiteralPath $released) 'в прогоне нет released.txt'
+            if (Test-Path -LiteralPath $released) {
+                $text = [System.IO.File]::ReadAllText($released, $utf8)
+                Check ($text -match 'riskAccepted=1' -and $text -match 'reason=тест упал в подготовке данных') ("released.txt: {0}" -f $text.Trim())
+            }
+            Check (-not (Test-Path -LiteralPath (Join-Path $runDir 'accepted.txt'))) 'красный прогон принят в эталон после выпуска'
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'baseline'))) 'после выпуска с красным гейтом появился эталон'
+            $after = [System.IO.File]::ReadAllText((Join-Path $runDir 'verdict.json'), $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+            Check ($after.verdict -eq 'RED') ("вердикт прогона после выпуска: {0}" -f $after.verdict)
+            Check (@($r.Output | Where-Object { $_ -match 'Эталон не тронут' }).Count -gt 0) 'нет строки «эталон не тронут»'
+            $runReport = Join-Path $runDir 'report.txt'
+            Check ((Test-Path -LiteralPath $runReport) -and [System.IO.File]::ReadAllText($runReport, $utf8).Contains('с отклонением, причина: тест упал в подготовке данных')) 'в report.txt прогона нет строки выпуска с причиной'
+        }
+    },
+    @{
+        Name = 'deploy-red-gate-no-reason'
+        Text = 'гейт красный, выпуск подтверждён, но причины нет (Esc): в рабочую ничего не грузится'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $runDir = Join-Path $sb 'runs\20261117-090000'
+            New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+            $verdict = @{ verdict = 'RED'; kit = 'inbox\тест'; kitDecision = 'kept'; steps = @() }
+            [System.IO.File]::WriteAllText((Join-Path $runDir 'verdict.json'), (ConvertTo-Json -InputObject $verdict -Depth 5), $utf8)
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить все' },
+                @{ Kind = 'confirm'; Header = 'красный'; Yes = $true },
+                @{ Kind = 'text'; Header = 'Причина выпуска'; Cancel = $true })
+            Check-DeployCommon $r
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0) 'без причины что-то загружено'
+            Check (@($r.ComLog | Where-Object { $_ -match 'UpdateInfoBase' }).Count -eq 0) 'без причины трогали свойства рабочей'
+            Check (-not (Test-Path -LiteralPath (Join-Path $runDir 'released.txt'))) 'без выпуска появился released.txt'
+        }
+    },
+    @{
+        Name = 'deploy-yellow-ask-accept'
+        Text = '«Обновить все» с жёлтым прогоном: после обновления вопрос про эталон, «не принимать» - эталон не тронут, released.txt без риска'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $runDir = Join-Path $sb 'runs\20261117-090000'
+            New-Item -ItemType Directory -Path $runDir -Force | Out-Null
+            $verdict = @{ verdict = 'YELLOW'; kit = 'inbox\тест'; kitDecision = 'kept'; steps = @(@{ name = 'Самопроверка после загрузки'; status = 'WARN'; detail = 'новое: 1' }) }
+            [System.IO.File]::WriteAllText((Join-Path $runDir 'verdict.json'), (ConvertTo-Json -InputObject $verdict -Depth 5), $utf8)
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить все' },
+                $deployNameAnswer,
+                @{ Kind = 'confirm'; Header = 'Принять новое прогона 20261117-090000'; Yes = $false })
+            Check-DeployCommon $r
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check (-not (Test-Path -LiteralPath (Join-Path $runDir 'accepted.txt'))) 'жёлтый принят в эталон, хотя ответили «не принимать»'
+            $released = Join-Path $runDir 'released.txt'
+            Check (Test-Path -LiteralPath $released) 'в прогоне нет released.txt'
+            if (Test-Path -LiteralPath $released) { Check ([System.IO.File]::ReadAllText($released, $utf8) -match 'riskAccepted=0') 'released.txt: выпуск жёлтого записан как риск' }
+        }
+    },
+    @{
+        Name = 'deploy-denied-hours'
+        Text = 'обновление рабочей в запретные часы: остановка до записи, в тексте - окно из настроек'
+        Run = {
+            param($Name)
+            $config = $deployConfig.Clone()
+            $hourNow = (Get-Date).Hour
+            $config['DeployDeniedFrom'] = $hourNow
+            $config['DeployDeniedTo'] = ($hourNow + 2) % 24
+            $sb = New-Sandbox $Name -Config $config
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить выбранные' },
+                @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
+                $deployRiskAnswer)
+            Check ($r.ExitCode -ne 0) 'в запретные часы deploy не остановился'
+            Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0) 'в запретные часы что-то загружено'
+            $window = 'с {0:00}:00 до {1:00}:00' -f (($hourNow + 2) % 24), $hourNow
+            Check (@($r.Output | Where-Object { $_.Contains('обновляем только ' + $window) }).Count -gt 0) ("нет объяснения с окном {0}" -f $window)
         }
     },
     @{
