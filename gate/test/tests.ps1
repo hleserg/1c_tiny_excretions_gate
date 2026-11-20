@@ -1881,6 +1881,13 @@ $tests = @(
             Check-DeployCommon $r
             Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
             Check (-not (Test-Path -LiteralPath (Join-Path $runDir 'accepted.txt'))) 'жёлтый принят в эталон, хотя ответили «не принимать»'
+            # Вопрос про эталон - после снятия блокировок рабочей, и Enter в нём - «не принимать».
+            $text = @($r.Output) -join "`n"
+            $locksAt = $text.IndexOf('Снял с erp_base')
+            if ($locksAt -lt 0) { $locksAt = $text.IndexOf('Блокировок на erp_base нет') }
+            $questionLine = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Принять новое прогона 20261117-090000') } | Select-Object -First 1)
+            Check ($questionLine.Count -eq 1 -and $locksAt -ge 0 -and $text.IndexOf($questionLine[0]) -gt $locksAt) 'вопрос про эталон задан до снятия блокировок рабочей'
+            if ($questionLine.Count -eq 1) { Check ($questionLine[0].Contains('"defaultNo":true')) 'в вопросе про эталон Enter не «не принимать»' }
             $released = Join-Path $runDir 'released.txt'
             Check (Test-Path -LiteralPath $released) 'в прогоне нет released.txt'
             if (Test-Path -LiteralPath $released) { Check ([System.IO.File]::ReadAllText($released, $utf8) -match 'riskAccepted=0') 'released.txt: выпуск жёлтого записан как риск' }
@@ -1999,8 +2006,11 @@ $tests = @(
             $journal = @{ runId = '20261117-230000'; time = '2026-11-17T23:00:00'; base = 'erp_base'; tempBase = 'erp_temp_test'; user = 'u'; mode = '2'; outcome = 'inProgress'
                 step = 'loading'; rollbackOf = ''; pid = 999999; processStart = '2026-11-17T23:00:00'; gate = $null; riskAccepted = $false; risks = @(); riskReason = ''
                 extensions = @(@{ name = 'Адаптация'; status = 'changed'; backup = 'before\erp_base_Адаптация_1.cfe'; oldVersion = '1.0.0.h1'; newVersion = '1.0.0.h2'; stage = 'loading'; oldHash = 'h1'; newHash = 'h2' })
-                processings = @(); light = @(); article = '' }
+                processings = @(@{ name = 'Печать'; fileName = 'Печать.epf'; action = 'register'; ref = ''; isNew = ''; backup = ''; file = ''; oldVersion = '1'; newVersion = '2'; stage = 'writing' }); light = @(); article = '' }
             [System.IO.File]::WriteAllText((Join-Path $dir 'deploy.json'), (ConvertTo-Json -InputObject $journal -Depth 6), $utf8)
+            # Сеанс записи обработки успел сохранить прежнюю версию (old.b64) и оборвался.
+            New-Item -ItemType Directory -Path (Join-Path $dir 'epf\Печать') -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $dir 'epf\Печать\old.b64'), 'c3RhcmF5YQ==', $utf8)
             $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com (New-ComState -ProdHash 'h2')
             Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
             Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
@@ -2009,6 +2019,8 @@ $tests = @(
             Check ($text.Contains('прервано') -and $text.Contains('Адаптация: шла загрузка; в конфигурации рабочей новая версия')) 'разбор прерванного не показал, что успело'
             $after = [System.IO.File]::ReadAllText((Join-Path $dir 'deploy.json'), $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
             Check ($after.outcome -eq 'interrupted') ("outcome после разбора: {0}" -f $after.outcome)
+            $proc = @($after.processings)[0]
+            Check ([string]$proc.backup -and (Test-Path -LiteralPath (Join-Path $dir ([string]$proc.backup)))) ("копия обработки из old.b64 не подхвачена: «{0}»" -f $proc.backup)
             Reset-FakeState $sb
             $rb = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Rollback' -Answers @(
                 @{ Kind = 'one'; Header = 'Откат erp_base'; Cancel = $true })
@@ -2872,6 +2884,7 @@ $tests = @(
             # Номер строки, GUID, длительность - не меняют причину; код ошибки меняет.
             Check ((ConvertTo-UtReasonKey 'FAIL' '{ОбщийМодуль.А.Модуль(12,3)}: строка 5: HTTP 403 за 2 с') -eq (ConvertTo-UtReasonKey 'FAIL' '{ОбщийМодуль.А.Модуль(80,1)}: строка 9: HTTP 403 за 15 с')) 'смена номера строки или длительности поменяла причину'
             Check ((ConvertTo-UtReasonKey 'FAIL' 'HTTP 403') -ne (ConvertTo-UtReasonKey 'FAIL' 'HTTP 503')) 'смена кода ошибки не поменяла причину'
+            Check ((ConvertTo-UtReasonKey 'FAIL' '{ОбщийМодуль.ПроверкаДоступа.Модуль(12)}: Доступ запрещен') -ne (ConvertTo-UtReasonKey 'FAIL' '{ОбщийМодуль.ОбменДанными.Модуль(80)}: Доступ запрещен')) 'другой модуль с тем же текстом - одна причина'
             Check ((ConvertTo-UtReasonKey 'FAIL' 'нет таблицы') -ne (ConvertTo-UtReasonKey 'ERROR' 'нет таблицы')) 'FAIL и ERROR с одним текстом - одна причина'
             Check ((Get-UtStatusTitle 'ERROR') -eq 'ERROR - ошибка выполнения' -and (Get-UtStatusTitle 'FAIL') -eq 'FAIL - не прошло утверждение') 'подписи ERROR/FAIL не те'
             # Эталон без полного принятия: OK из прогона, у падений и пропавших - прежние записи, новое падение не заносится.
@@ -3020,6 +3033,28 @@ $tests = @(
             $again = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ unittests = @($unitMinusFails) }
             Check-Common $again; Check-Verdict $again 'RED' 1
             Check-Step $again 'Модульные тесты' 'FAIL'
+        }
+    },
+    @{
+        Name = 'gate-unittests-keep-accept-failures'
+        Text = 'модульные тесты: после вердикта «Оставить и принять» - тот же вопрос про падения, «нет» - падение остаётся новым, scope=partial'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $unitConfig
+            $null = Add-UnitTestSource -Dir (Join-Path $sb 'tests')
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ absent = @('Тесты'); unittests = @($unitAllOk) }
+            Check-Verdict $r 'GREEN' 0
+            $file = Add-InboxFile $sb $cfeName
+            $red = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Ask' -f $file) -Fake @{ unittests = @($unitMinusFails) } -Answers @(
+                @{ Kind = 'one'; Header = 'оставить или откатить'; Item = '^Оставить и принять новое в эталон' },
+                @{ Kind = 'confirm'; Header = 'падают модульные тесты'; Yes = $false })
+            Check-Common $red; Check-Verdict $red 'RED' 1
+            if ($red.RunDir) {
+                $acceptedFile = Join-Path $red.RunDir 'accepted.txt'
+                Check ((Test-Path -LiteralPath $acceptedFile) -and [System.IO.File]::ReadAllText($acceptedFile, $utf8).Contains('scope=partial')) 'после «Оставить и принять» без падений нет scope=partial'
+            }
+            $again = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ unittests = @($unitMinusFails) }
+            Check-Common $again; Check-Verdict $again 'RED' 1
         }
     },
     @{

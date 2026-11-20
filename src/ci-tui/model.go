@@ -590,10 +590,6 @@ func (m model) viewHeader() string {
 	if m.width < minWidthForSteps {
 		title = " CI "
 	}
-	left := styleHeader.Render(title)
-	if m.context != "" {
-		left += styleAccent.Render(" " + m.context + " ")
-	}
 	state := ""
 	switch {
 	case m.running && !m.stopAsked.IsZero():
@@ -617,26 +613,69 @@ func (m model) viewHeader() string {
 		}
 		state += " " + verdictStyle(m.verdict).Render(" "+short+" ")
 	}
-	clock := styleDim.Render(time.Now().Format("15:04:05") + " ")
+	now := time.Now()
+	clockText := now.Format("15:04:05") + " "
 	// Скрипт давно молчит - когда было последнее сообщение; вывода «завис» нет: тихий шаг бывает и долгим.
-	if quiet := m.quietText(time.Now()); quiet != "" {
-		clock = styleDim.Render(quiet+" · ") + clock
+	quiet := m.quietText(now, false)
+	context := m.context
+	// ** Хлебников С.Ю. 20261120 Шапка - ровно в одну строку окна: сначала короче пометка о молчании, потом база
+	// с многоточием, в самом узком - без часов. Состояние («работает», «ждёт ответа») остаётся всегда.
+	fit := func() int {
+		w := lipgloss.Width(title) + lipgloss.Width(state) + lipgloss.Width(clockText)
+		if context != "" {
+			w += lipgloss.Width(context) + 2
+		}
+		if quiet != "" {
+			w += lipgloss.Width(quiet) + 3
+		}
+		return w
 	}
-	gap := m.width - lipgloss.Width(left) - lipgloss.Width(state) - lipgloss.Width(clock)
-	if gap < 1 {
-		gap = 1
+	if fit() > m.width && quiet != "" {
+		quiet = m.quietText(now, true)
 	}
-	return left + state + strings.Repeat(" ", gap) + clock
+	if over := fit() - m.width; over > 0 && context != "" {
+		runes := []rune(context)
+		keep := len(runes) - over - 1
+		if keep < 1 {
+			context = ""
+		} else {
+			context = string(runes[:keep]) + "…"
+		}
+	}
+	if fit() > m.width {
+		clockText = ""
+	}
+	if fit() > m.width {
+		quiet = ""
+	}
+	left := styleHeader.Render(title)
+	if context != "" {
+		left += styleAccent.Render(" " + context + " ")
+	}
+	right := ""
+	if quiet != "" {
+		right = quiet + " · "
+	}
+	right = styleDim.Render(right + clockText)
+	gap := m.width - lipgloss.Width(left) - lipgloss.Width(state) - lipgloss.Width(right)
+	if gap < 0 {
+		gap = 0
+	}
+	return left + state + strings.Repeat(" ", gap) + right
 }
 
 // quietText - «посл. сообщение 03:12 (5 мин)», если скрипт работает и молчит дольше минуты; иначе пусто.
-func (m model) quietText(now time.Time) string {
+// Short - коротко для узкого окна: «тихо 5 мин».
+func (m model) quietText(now time.Time, short bool) string {
 	if !m.running || m.lastOutput.IsZero() {
 		return ""
 	}
 	silent := now.Sub(m.lastOutput)
 	if silent < time.Minute {
 		return ""
+	}
+	if short {
+		return fmt.Sprintf("тихо %d мин", int(silent.Minutes()))
 	}
 	return fmt.Sprintf("посл. сообщение %s (%d мин)", m.lastOutput.Format("15:04"), int(silent.Minutes()))
 }
