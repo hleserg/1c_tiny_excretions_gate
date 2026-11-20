@@ -7774,6 +7774,7 @@ if ([string](Get-Setting $cfg 'ProdBase' '') -and (Test-Path -LiteralPath (Join-
 # ** Хлебников С.Ю. 20261120 конец
 
 # Итог пишется сразу: вопрос про комплект может ждать ответа сколько угодно.
+Write-RunLog ('Вердикт: ' + [string]$verdict) # ** Хлебников С.Ю. 20261120 отметка времени вердикта для разбора времени (timeline.ps1)
 Write-RunSummary -KitDecision '' -Aftermath @()
 
 function Invoke-RunReport {

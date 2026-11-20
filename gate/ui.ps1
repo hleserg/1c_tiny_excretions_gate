@@ -159,6 +159,14 @@ function Request-UiAnswer {
     $Question['poll'] = ($null -ne $Poll)
     $answerFile = Join-Path $script:UiChannelDir ("a-{0}.json" -f $id)
     if (Test-Path -LiteralPath $answerFile) { Remove-Item -LiteralPath $answerFile -Force }
+    # ** Хлебников С.Ю. 20261120 Вопрос и время до ответа - в журнал прогона (если у скрипта он есть): разбор
+    # времени (timeline.ps1) отделяет ожидание человека от работы гейта.
+    $askWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $askLogged = $false
+    if ($null -ne (Get-Command -Name 'Write-RunLog' -CommandType Function -ErrorAction SilentlyContinue)) {
+        try { Write-RunLog ('Вопрос оператору: ' + [string]$Question['header']); $askLogged = $true } catch { $askLogged = $false }
+    }
+    # ** Хлебников С.Ю. 20261120 конец
     Send-UiEvent $Question
     $nextPoll = (Get-Date).AddSeconds(3)
     while ($true) {
@@ -166,6 +174,7 @@ function Request-UiAnswer {
             Start-Sleep -Milliseconds 50
             $text = [System.IO.File]::ReadAllText($answerFile, [System.Text.Encoding]::UTF8)
             Remove-Item -LiteralPath $answerFile -Force -ErrorAction SilentlyContinue
+            if ($askLogged) { try { Write-RunLog ('Ответ оператора через {0} с' -f [int]$askWatch.Elapsed.TotalSeconds) } catch { } } # ** Хлебников С.Ю. 20261120
             return ($text | ConvertFrom-Json)
         }
         Test-UiStop
@@ -175,6 +184,7 @@ function Request-UiAnswer {
             try { $polled = [string](& $Poll) } catch { $polled = '' }
             if ($polled) {
                 Send-UiEvent @{ kind = 'cancel'; id = $id }
+                if ($askLogged) { try { Write-RunLog ('Вопрос снят без ответа через {0} с' -f [int]$askWatch.Elapsed.TotalSeconds) } catch { } } # ** Хлебников С.Ю. 20261120
                 return [pscustomobject]@{ polled = $polled }
             }
         }
