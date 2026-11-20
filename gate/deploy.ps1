@@ -1112,7 +1112,8 @@ function Get-DeployHistory {
         $record = $null
         if (Test-Path -LiteralPath $jsonFile) {
             try { $record = (Get-Content -LiteralPath $jsonFile -Raw -Encoding UTF8) | ConvertFrom-Json } catch { $record = $null }
-            if ($null -eq $record -or [string](Get-JsonValue $record 'outcome' '') -ne 'updated') { continue }
+            # Прерванное (после разбора при старте deploy - 'interrupted') тоже в списке: откат вернёт то, что успело.
+            if ($null -eq $record -or @('updated', 'interrupted') -notcontains [string](Get-JsonValue $record 'outcome' '')) { continue }
             if ([string](Get-JsonValue $record 'base' '') -ne $script:ProdBase) { continue }
         }
         else {
@@ -1165,6 +1166,7 @@ function Get-DeployLabel {
     }
     $flag = ''
     if ([bool](Get-JsonValue $Record 'riskAccepted' $false)) { $flag = ', НЕСМОТРЯ НА ГЕЙТ' }
+    if ([string](Get-JsonValue $Record 'outcome' '') -eq 'interrupted') { $flag += ', ПРЕРВАНО' }
     return ("{0:dd.MM.yyyy HH:mm}  расширений {1}, обработок {2}  ({3}{4}; {5})" -f $when, $extCount, $epfCount, (Get-DeployModeText $Record), $flag, $lightText)
 }
 
@@ -3421,6 +3423,128 @@ if ($CancelPrepared) {
     exit 1
 }
 
+# ** Хлебников С.Ю. 20261120 Журнал обновления (#29). deploy.json пишется с outcome = inProgress до первой записи
+# в рабочую и переписывается после каждого шага объекта (stage: pending, backup, loading, loaded, applying, applied;
+# у обработок writing, written) - заменой файла целиком, так что на диске всегда целый JSON. Процесс погиб
+# (окно закрыли, машина перезагрузилась) - при следующем запуске deploy журнал разбирается: что успело, сверка
+# рабочей по хеш-суммам (только чтение), запись становится «прервано» и попадает в список откатов.
+function Save-DeployJournalFile {
+    param([string]$Path, $Record)
+    $temp = $Path + '.tmp'
+    [System.IO.File]::WriteAllText($temp, (ConvertTo-Json -InputObject $Record -Depth 6), $Utf8Bom)
+    # [NullString]::Value - без резервной копии: $null PowerShell передал бы пустой строкой.
+    if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($temp, $Path, [NullString]::Value) }
+    else { [System.IO.File]::Move($temp, $Path) }
+}
+
+function Save-DeployJournal {
+    # Журнал этого запуска: что выбрано, стадия каждого объекта, резервные копии, хеш-суммы до и после.
+    param([string]$Step = '')
+    if (-not $script:JournalOn) { return }
+    $journal = [ordered]@{
+        runId = $runId; time = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss'); base = $script:ProdBase; tempBase = $script:TempBase
+        user = $env:USERNAME; mode = $mode; outcome = 'inProgress'; step = $Step; rollbackOf = $rollbackOf
+        pid = $PID; processStart = $script:JournalProcessStart
+        gate = $script:JournalGate; riskAccepted = $riskAccepted; risks = @($gateRisks); riskReason = $riskReason
+        extensions = @(foreach ($journalEntry in $selected) {
+                $journalBackup = ''
+                if ($journalEntry.Backup) { $journalBackup = 'before\' + (Split-Path -Leaf $journalEntry.Backup) }
+                [ordered]@{ name = $journalEntry.Name; status = $journalEntry.Status; backup = $journalBackup; oldVersion = $journalEntry.ProdVersion; newVersion = $journalEntry.TempVersion
+                    stage = [string]$journalEntry.Stage; oldHash = [string]$journalEntry.OldHash; newHash = [string]$journalEntry.NewHash }
+            })
+        processings = @(foreach ($journalProc in $selectedProcessings) {
+                $journalProcBackup = ''
+                if ((Get-JsonValue $journalProc 'Backup' '')) { $journalProcBackup = 'before\processings\' + (Split-Path -Leaf ([string]$journalProc.Backup)) }
+                [ordered]@{ name = $journalProc.ObjName; fileName = [string](Get-JsonValue $journalProc 'FileName' ''); action = [string](Get-JsonValue $journalProc 'Action' '')
+                    ref = [string](Get-JsonValue $journalProc 'Ref' ''); isNew = [string](Get-JsonValue $journalProc 'IsNew' ''); backup = $journalProcBackup
+                    oldVersion = [string](Get-JsonValue $journalProc 'ProdVersion' ''); newVersion = [string](Get-JsonValue $journalProc 'TempVersion' ''); stage = [string](Get-JsonValue $journalProc 'Stage' 'pending') }
+            })
+        light = @(); article = ''
+    }
+    try { Save-DeployJournalFile -Path (Join-Path $script:RunDir 'deploy.json') -Record $journal }
+    catch { Write-RunLog ('Журнал обновления не записался: ' + $_.Exception.Message) }
+}
+
+function Set-DeployStage {
+    param($Item, [string]$Stage)
+    $Item | Add-Member -NotePropertyName Stage -NotePropertyValue $Stage -Force
+    Save-DeployJournal -Step $Stage
+}
+
+function Resolve-InterruptedDeploys {
+    # Журналы inProgress, чей процесс уже не живёт: разбор, сверка рабочей (только чтение), outcome = interrupted.
+    # Возвращает, сколько нашлось.
+    if (-not (Test-Path -LiteralPath $deployRoot)) { return 0 }
+    $found = 0
+    foreach ($dir in @(Get-ChildItem -LiteralPath $deployRoot -Directory | Where-Object { $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name)) {
+        $jsonFile = Join-Path $dir.FullName 'deploy.json'
+        if (-not (Test-Path -LiteralPath $jsonFile)) { continue }
+        $record = $null
+        try { $record = (Get-Content -LiteralPath $jsonFile -Raw -Encoding UTF8) | ConvertFrom-Json } catch { continue }
+        if ([string](Get-JsonValue $record 'outcome' '') -ne 'inProgress') { continue }
+        if ([string](Get-JsonValue $record 'base' '') -ne $script:ProdBase) { continue }
+        $journalPid = [int](Get-JsonValue $record 'pid' 0)
+        $alive = $null
+        if ($journalPid -gt 0) { $alive = Get-Process -Id $journalPid -ErrorAction SilentlyContinue }
+        if ($null -ne $alive) {
+            $startText = ''
+            try { $startText = $alive.StartTime.ToString('yyyy-MM-ddTHH:mm:ss') } catch { $startText = '' }
+            if (-not $startText -or $startText -eq [string](Get-JsonValue $record 'processStart' '')) {
+                throw ("обновление {0} {1} ещё идёт (процесс {2}): дождись его конца" -f $script:ProdBase, $dir.Name, $journalPid)
+            }
+        }
+        $found++
+        $lines = New-Object System.Collections.Generic.List[string]
+        $prodNow = Get-ExtensionStates -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+        $stageNames = @{ pending = 'не начиналось'; backup = 'резервная копия снята, загрузки не было'; loading = 'шла загрузка'; loaded = 'загружено'; applying = 'шло обновление конфигурации БД'; applied = 'применено'; writing = 'шла запись'; written = 'записана' }
+        foreach ($item in @(Get-JsonValue $record 'extensions' @())) {
+            $stage = [string](Get-JsonValue $item 'stage' 'pending')
+            $stageText = $stage
+            if ($stageNames.ContainsKey($stage)) { $stageText = $stageNames[$stage] }
+            $nowText = 'сверить не удалось: хеш-сумма рабочей не прочитана'
+            if ($prodNow.Ok -and $prodNow.Items.ContainsKey([string]$item.name)) {
+                $nowHash = [string]$prodNow.Items[[string]$item.name].Hash
+                if ($nowHash -and $nowHash -eq [string](Get-JsonValue $item 'newHash' '')) { $nowText = 'в конфигурации рабочей новая версия (применена ли к БД - по журналу)' }
+                elseif ($nowHash -and $nowHash -eq [string](Get-JsonValue $item 'oldHash' '')) { $nowText = 'в рабочей прежняя версия' }
+                else { $nowText = 'исход неизвестен: хеш-сумма ни прежняя, ни новая' }
+            }
+            elseif ($prodNow.Ok) { $nowText = 'в рабочей его нет' }
+            $backupText = 'копии нет - откатом не вернуть'
+            if ([string](Get-JsonValue $item 'backup' '') -and (Test-Path -LiteralPath (Join-Path $dir.FullName ([string]$item.backup)))) { $backupText = 'копия есть' }
+            $lines.Add(("{0}: {1}; {2}; {3}" -f $item.name, $stageText, $nowText, $backupText))
+        }
+        foreach ($item in @(Get-JsonValue $record 'processings' @())) {
+            $stage = [string](Get-JsonValue $item 'stage' 'pending')
+            $stageText = $stage
+            if ($stageNames.ContainsKey($stage)) { $stageText = $stageNames[$stage] }
+            $backupText = 'копии нет - откатом не вернуть, проверить карточку руками'
+            if ([string](Get-JsonValue $item 'backup' '')) { $backupText = 'копия есть' }
+            if ($stage -eq 'writing') { $stageText = 'исход неизвестен (запись шла)' }
+            $lines.Add(("обработка {0}: {1}; {2}" -f $item.name, $stageText, $backupText))
+        }
+        $record.outcome = 'interrupted'
+        $record | Add-Member -NotePropertyName interruptCheck -NotePropertyValue @($lines.ToArray()) -Force
+        $record | Add-Member -NotePropertyName interruptFoundAt -NotePropertyValue ((Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')) -Force
+        Save-DeployJournalFile -Path $jsonFile -Record $record
+        Write-RunLog ("Прерванное обновление {0}: {1}" -f $dir.Name, ($lines -join ' | '))
+        $more = @($lines.ToArray()) + @(
+            'Блокировки рабочей обрыв мог оставить: посмотреть - «Состояние баз», снять - консоль кластера.',
+            'Откатить то, что успело, - «Откатить рабочую базу»: это обновление в списке с пометкой ПРЕРВАНО (вернутся только объекты с копией).',
+            'Проверить рабочую - «Проверить рабочую базу (только читает)».')
+        Show-UiTitle -Text ("Обновление {0} {1} прервано (процесс не закончил)" -f $script:ProdBase, $dir.Name) -Kind 'bad' -More $more
+    }
+    return $found
+}
+# ** Хлебников С.Ю. 20261120 конец
+
+if (-not $Prepare -and -not $CancelPrepared) {
+    $interrupted = Resolve-InterruptedDeploys
+    if ($interrupted -gt 0 -and -not $Rollback) {
+        Write-Line 'Сначала - разобраться с прерванным обновлением (см. выше). Выход, ничего не менял.' 'Yellow'
+        exit 0
+    }
+}
+
 #endregion
 #region Итог последнего прогона гейта
 
@@ -4485,12 +4609,40 @@ if ($Prepare -and -not $failed) {
 }
 # Дальше рабочая меняется: при предупреждении пользователей - дождаться закрытия базы.
 if (-not $failed -and $null -ne $script:WarnLockAt) { Wait-ProdWarnLock }
+# ** Хлебников С.Ю. 20261120 Журнал обновления - до первой записи в рабочую (не при подготовке: у неё prepared.json).
+$script:JournalOn = $false
+if (-not $failed -and -not $Prepare -and ($selected.Count + @($selectedProcessings).Count) -gt 0) {
+    $script:JournalOn = $true
+    try { $script:JournalProcessStart = (Get-Process -Id $PID).StartTime.ToString('yyyy-MM-ddTHH:mm:ss') } catch { $script:JournalProcessStart = '' }
+    $script:JournalGate = $null
+    if ($null -ne $lastRun) { $script:JournalGate = [ordered]@{ run = $lastRun.Name; verdict = [string](Get-JsonValue $lastVerdict 'verdict' '') } }
+    foreach ($journalEntry in $selected) {
+        $oldHashNow = ''
+        $newHashNow = ''
+        if ($mode -ne 'rollback' -and $mode -ne 'asis') {
+            if ((Get-Variable -Name prodStates -ErrorAction SilentlyContinue) -and $null -ne $prodStates -and $prodStates.Ok -and $prodStates.Items.ContainsKey($journalEntry.Name)) { $oldHashNow = [string]$prodStates.Items[$journalEntry.Name].Hash }
+            if ($mode -eq 'prepared') { $newHashNow = [string](Get-JsonValue $preparedByName[$journalEntry.Name] 'tempHash' '') }
+            elseif ((Get-Variable -Name tempStates -ErrorAction SilentlyContinue) -and $null -ne $tempStates -and $tempStates.Ok -and $tempStates.Items.ContainsKey($journalEntry.Name)) { $newHashNow = [string]$tempStates.Items[$journalEntry.Name].Hash }
+        }
+        $journalEntry | Add-Member -NotePropertyName OldHash -NotePropertyValue $oldHashNow -Force
+        $journalEntry | Add-Member -NotePropertyName NewHash -NotePropertyValue $newHashNow -Force
+        $startStage = 'pending'
+        if ($journalEntry.Backup) { $startStage = 'backup' }
+        if ($mode -eq 'prepared') { $startStage = 'loaded' }
+        $journalEntry | Add-Member -NotePropertyName Stage -NotePropertyValue $startStage -Force
+    }
+    foreach ($journalProc in $selectedProcessings) { $journalProc | Add-Member -NotePropertyName Stage -NotePropertyValue 'pending' -Force }
+    Save-DeployJournal -Step 'start'
+}
+# ** Хлебников С.Ю. 20261120 конец
 
 if (-not $failed -and $mode -ne 'asis' -and $mode -ne 'prepared') {
     foreach ($entry in $selected) {
+        Set-DeployStage $entry 'loading'
         $result = Invoke-Designer -BaseName $script:ProdBase -Command @('/LoadCfg', ('"{0}"' -f $entry.NewFile), '-Extension', $entry.Name) `
             -LogName ("load_{0}.log" -f $entry.Name) -TimeoutSec $timeoutLoadSec -Title ("Загрузить {0} в {1}" -f $entry.Name, $script:ProdBase)
         if ($result.ExitCode -eq 0 -or $result.TimedOut) { $entry.Loaded = $true; $touched.Add($entry) }
+        if ($result.ExitCode -eq 0) { Set-DeployStage $entry 'loaded' }
         if ($result.ExitCode -ne 0) {
             Write-Line ("[FAIL] Загрузить {0} в {1}: {2}" -f $entry.Name, $script:ProdBase, $result.Text) 'Red'
             $failed = $true; break
@@ -4532,6 +4684,7 @@ if ($Prepare) {
 if (-not $failed) {
     foreach ($entry in $selected) {
         $attempt = 0
+        if ($script:JournalOn) { Set-DeployStage $entry 'applying' }
         while ($true) {
             $attempt++
             $result = Invoke-Designer -BaseName $script:ProdBase -Command @('/UpdateDBCfg', '-Extension', $entry.Name) `
@@ -4552,6 +4705,7 @@ if (-not $failed) {
             $failed = $true; break
         }
         Write-Line ("[OK]   Обновить конфигурацию БД {0}: {1} с" -f $entry.Name, $result.Seconds) 'Green'
+        if ($script:JournalOn) { Set-DeployStage $entry 'applied' }
     }
 }
 
@@ -4580,16 +4734,19 @@ if (-not $failed -and $selectedProcessings.Count -gt 0) {
                 $proc.RemovedFile = Join-Path $removedDir $proc.FileName
                 Copy-Item -LiteralPath $proc.TempFile -Destination $proc.RemovedFile -Force
             }
+            Set-DeployStage $proc 'writing'
             $session = Invoke-ProdProcessing -Mode 'unregepf' -OutDir $procDir -Name $proc.ObjName -Ref $proc.Ref -Title $title
             if (-not $session.Done -or $session.Status -ne 'done') {
                 Write-Line ("[FAIL] {0}: {1}" -f $title, $session.Message) 'Red'
                 $failed = $true; break
             }
             $touchedProcessings.Add($proc)
+            Set-DeployStage $proc 'written'
             Write-Line ("[OK]   {0}: публикация «Отключена», пометка удаления" -f $title) 'Green'
             continue
         }
 
+        Set-DeployStage $proc 'writing'
         $session = Invoke-ProdProcessing -Mode 'regepf' -OutDir $procDir -File $proc.Source -TextFile $proc.SourceB64 -Name $proc.FileName -Title $title
         $values = $session.Values
         $proc.Ref = [string](Get-Setting $values 'ref' '')
@@ -4598,6 +4755,7 @@ if (-not $failed -and $selectedProcessings.Count -gt 0) {
         $isNewText = [string](Get-Setting $values 'isnew' '')
         if ($isNewText -eq '1') { $proc.IsNew = 'yes' } elseif ($isNewText -eq '0') { $proc.IsNew = 'no' }
         if ($session.OldB64) { $proc.Backup = Write-ProcessingBackup -Proc $proc -OldB64 $session.OldB64 }
+        if ($session.Done -and ($session.Status -eq 'done' -or $proc.Ref)) { Set-DeployStage $proc 'written' } else { Save-DeployJournal -Step 'writing' }
         if (-not $session.Done) {
             # Итога нет: записалась ли обработка, неизвестно. Прежняя версия успела сохраниться - откат возможен.
             $touchedProcessings.Add($proc)

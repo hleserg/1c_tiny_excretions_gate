@@ -1987,6 +1987,54 @@ $tests = @(
         }
     },
     @{
+        Name = 'deploy-journal-interrupted'
+        Text = 'обновление оборвалось (журнал inProgress, процесса нет): deploy разбирает - что успело, сверка рабочей, «прервано»; откат видит его в списке'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $dir = Join-Path $sb 'deploy\20261117-230000'
+            New-Item -ItemType Directory -Path (Join-Path $dir 'before') -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $dir 'before\erp_base_Адаптация_1.cfe'), 'старая', $utf8)
+            $journal = @{ runId = '20261117-230000'; time = '2026-11-17T23:00:00'; base = 'erp_base'; tempBase = 'erp_temp_test'; user = 'u'; mode = '2'; outcome = 'inProgress'
+                step = 'loading'; rollbackOf = ''; pid = 999999; processStart = '2026-11-17T23:00:00'; gate = $null; riskAccepted = $false; risks = @(); riskReason = ''
+                extensions = @(@{ name = 'Адаптация'; status = 'changed'; backup = 'before\erp_base_Адаптация_1.cfe'; oldVersion = '1.0.0.h1'; newVersion = '1.0.0.h2'; stage = 'loading'; oldHash = 'h1'; newHash = 'h2' })
+                processings = @(); light = @(); article = '' }
+            [System.IO.File]::WriteAllText((Join-Path $dir 'deploy.json'), (ConvertTo-Json -InputObject $journal -Depth 6), $utf8)
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com (New-ComState -ProdHash 'h2')
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            Check ((Get-Calls $r @('fake\erp_base', '/LoadCfg')).Count -eq 0) 'при разборе прерванного что-то загружено в рабочую'
+            $text = @($r.Output) -join "`n"
+            Check ($text.Contains('прервано') -and $text.Contains('Адаптация: шла загрузка; в конфигурации рабочей новая версия')) 'разбор прерванного не показал, что успело'
+            $after = [System.IO.File]::ReadAllText((Join-Path $dir 'deploy.json'), $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+            Check ($after.outcome -eq 'interrupted') ("outcome после разбора: {0}" -f $after.outcome)
+            Reset-FakeState $sb
+            $rb = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Rollback' -Answers @(
+                @{ Kind = 'one'; Header = 'Откат erp_base'; Cancel = $true })
+            Check (@($rb.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Откат erp_base') -and $_.Contains('ПРЕРВАНО') }).Count -ge 1) ("в списке отката нет прерванного: " + ($rb.Questions -join ' | '))
+            Check ((Get-Calls $rb @('/LoadCfg')).Count -eq 0) 'отменённый откат что-то загрузил'
+        }
+    },
+    @{
+        Name = 'deploy-journal-written'
+        Text = 'обычное обновление: журнал deploy.json по ходу, в конце - updated без следов inProgress и .tmp'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить выбранные' },
+                @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
+                $deployRiskAnswer, $deployNameAnswer)
+            Check-DeployCommon $r
+            $record = Get-DeployRecord $sb
+            if ($null -eq $record) { Check $false 'нет deploy.json'; return }
+            Check ($record.outcome -eq 'updated') ("итог {0}" -f $record.outcome)
+            Check (-not (Test-Path -LiteralPath (Join-Path $record.Dir 'deploy.json.tmp'))) 'остался deploy.json.tmp'
+            $log = Join-Path $record.Dir 'run.log'
+            if (Test-Path -LiteralPath $log) { Check (-not ([System.IO.File]::ReadAllText($log, $utf8).Contains('Журнал обновления не записался'))) 'журнал обновления не записался' }
+        }
+    },
+    @{
         Name = 'deploy-update-fail-rollback'
         Text = 'обновление БД рабочей не прошло: откат к резервной копии, итог rolledBack, блокировки сняты'
         Run = {
