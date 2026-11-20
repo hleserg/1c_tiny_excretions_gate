@@ -105,11 +105,12 @@ function New-DReportFiles {
 }
 
 function New-DProcFiles {
-    # Выгрузка внешней обработки (архивом - подставной .epf с исходниками).
-    param([string]$Name, [string]$Body = 'Процедура Открыть() КонецПроцедуры')
-    $root = New-DText @('<?xml version="1.0" encoding="UTF-8"?>', '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">',
-        "`t<ExternalDataProcessor uuid=""eeeeeeee-0000-0000-0000-0000000000f2"">", "`t`t<Properties>", ("`t`t`t<Name>{0}</Name>" -f $Name), "`t`t</Properties>", "`t</ExternalDataProcessor>", '</MetaDataObject>')
-    return @{ ($Name + '.xml') = $root; ($Name + '/Ext/ObjectModule.bsl') = (New-DText @($Body)) }
+    # Выгрузка внешней обработки (архивом - подставной .epf с исходниками). Root - имя корневого файла (по умолчанию Name).
+    param([string]$Name, [string]$Body = 'Процедура Открыть() КонецПроцедуры', [string]$Uuid = 'eeeeeeee-0000-0000-0000-0000000000f2', [string]$Root = '')
+    if (-not $Root) { $Root = $Name }
+    $xml = New-DText @('<?xml version="1.0" encoding="UTF-8"?>', '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" version="2.20">',
+        ("`t<ExternalDataProcessor uuid=""{0}"">" -f $Uuid), "`t`t<Properties>", ("`t`t`t<Name>{0}</Name>" -f $Name), "`t`t</Properties>", "`t</ExternalDataProcessor>", '</MetaDataObject>')
+    return @{ ($Root + '.xml') = $xml; ($Root + '/Ext/ObjectModule.bsl') = (New-DText @($Body)) }
 }
 
 function New-DeliverySandbox {
@@ -454,6 +455,46 @@ function Check-DeliveryCommon {
             Check ($null -eq $manifest -or -not $manifest.Contains('Закрытая')) 'в binaries/manifest.json осталась прежняя запись'
             $stubs = Get-DStubs $sb
             Check ($stubs.Count -eq 2 -and $stubs[1].Contains('dir=Закрытая') -and -not $stubs[1].Contains('binary=Закрытая.epf')) ("вторая загрузка - не исходники: " + ($stubs -join ' / '))
+        }
+    },
+    @{
+        Name = 'delivery-epf-renamed'
+        Text = 'Приёмка: обработка пришла под новым именем объекта, но с тем же UUID, что у папки в git, - вопрос «переименованная?» с карточкой; «обновить» - объединение с прежней папкой, загрузка в прежнюю карточку по ссылке, новой карточки нет; имя объекта в git - новое.'
+        Run = {
+            param($Name)
+            $refPrint = '55555555-5555-5555-5555-555555555555'
+            $uuid = 'ffffffff-0000-0000-0000-0000000000a1'
+            $cards = @(@{ objName = 'Печать'; title = 'Печать актов'; version = '1'; kind = 'Печатная форма'; content = $printOld; ref = $refPrint; use = 'Используется'; targets = @('Документ.Заказ') })
+            $com = New-ComState -TempProcessings $cards
+            $sb = New-DeliverySandbox $Name -Com $com -Dumps (New-DDumps)
+            $gh = Get-FakeGh $sb
+            # В git - выгрузка конфигуратором (с UUID корня), как после настоящей «Выгрузить temp в git».
+            $head = (Get-GhHead -Gh $gh -Branch 'main').Sha
+            $git = New-DProcFiles -Name 'Печать' -Body $printOld -Uuid $uuid
+            $withUuid = New-GhCommit -Gh $gh -Parent $head -Changes @(
+                [pscustomobject]@{ Path = 'processings/Печать/Печать.xml'; Bytes = $utf8.GetBytes($git['Печать.xml']) },
+                [pscustomobject]@{ Path = 'processings/Печать/Печать/Ext/ObjectModule.bsl'; Bytes = $utf8.GetBytes($git['Печать/Ext/ObjectModule.bsl']) }) -Message 'выгрузка с UUID'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $withUuid
+            $null = New-DZip -Path (Join-Path $sb 'Входящие\ПечатьАктов.epf') -Files (New-DProcFiles -Name 'ПечатьАктов' -Body $printNew -Uuid $uuid)
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{ dumps = (New-DDumps) } -Com $null -Answers @(
+                @{ Kind = 'one'; Header = 'переименованная Печать'; Item = '^Обновить Печать' },
+                @{ Kind = 'one'; Header = 'свойство Name'; Item = '^Взять поставку' })
+            Check-DeliveryCommon $r
+            $question = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('переименованная') })
+            Check ($question.Count -eq 1 -and $question[0].Contains('Печать актов') -and $question[0].Contains($uuid)) 'в вопросе о переименовании нет карточки и UUID'
+            $state = @(Get-DeliveryStates $sb)[0]
+            Check ([string]$state.verdict -eq 'GREEN') ("итог {0}: {1}" -f $state.verdict, $state.note)
+            Check ([string]$state.files[0].object.ref -eq $refPrint -and [string]$state.files[0].object.repoPath -eq 'processings/Печать') ("сопоставлено не с прежней карточкой: {0} {1}" -f $state.files[0].object.repoPath, $state.files[0].object.ref)
+            $root = Get-DMainText $gh 'processings/Печать/Печать.xml'
+            Check ($null -ne $root -and $root.Contains('<Name>ПечатьАктов</Name>')) 'новое имя объекта не попало в git'
+            $module = Get-DMainText $gh 'processings/Печать/Печать/Ext/ObjectModule.bsl'
+            Check ($null -ne $module -and $module.Contains('НоваяПроцедура')) 'правка поставки не в прежней папке'
+            $files = Get-GhFiles -Gh $gh -Commit (Get-GhHead -Gh $gh -Branch 'main').Sha
+            Check (@($files.Keys | Where-Object { $_ -like 'processings/ПечатьАктов*' }).Count -eq 0) 'появилась папка новой карточки'
+            $stubs = Get-DStubs $sb
+            Check ($stubs.Count -eq 1 -and $stubs[0] -match 'dir=Печать\r?\n') ("комплект: " + ($stubs -join ' / '))
+            $result = @($state.result.objects)
+            Check ($result.Count -eq 1 -and ([string]$result[0].detail).Contains($refPrint)) 'загружено не в прежнюю карточку'
         }
     },
     @{

@@ -467,6 +467,43 @@ function Resolve-DeliveryTargets {
         $label = 'обработка'
         if ([bool]$identity['isReport']) { $label = 'отчёт' }
         if ($candidates.Count -eq 0) {
+            # Переименованная: под другим именем объекта, но с тем же UUID корня, что у папки в git.
+            $renamed = $null
+            if ([string]$identity['uuid']) {
+                foreach ($dir in @(Get-ChildItem -LiteralPath (Join-Path $Ours 'processings') -Directory -ErrorAction SilentlyContinue)) {
+                    $other = Get-OursIdentity $dir.FullName
+                    if ($null -ne $other -and [string]$other.Uuid -eq [string]$identity['uuid'] -and [string]$other.Name -ne $objName) { $renamed = [pscustomobject]@{ Folder = $dir.Name; Name = [string]$other.Name }; break }
+                }
+            }
+            if ($null -ne $renamed) {
+                $oldRef = ''
+                foreach ($entry in $manifest) { if ($null -ne $entry -and [string]$entry['folder'] -eq $renamed.Folder) { $oldRef = [string]$entry['ref'] } }
+                $oldCard = @($Cards | Where-Object { $oldRef -and [string]$_.Ref -eq $oldRef }) | Select-Object -First 1
+                $cardText = 'карточки в temp нет'
+                if ($null -ne $oldCard) { $cardText = ('карточка «{0}», {1}, назначение: {2}' -f $oldCard.Title, $oldCard.Use, ((@($oldCard.Targets) | Where-Object { $_ }) -join ', ')) }
+                $key = 'rename:' + $objName + ':' + [string]$identity['uuid']
+                $choice = [string]$State['decisions'][$key]
+                if (-not $choice) {
+                    $notes = @(
+                        ("Файл {0} (sha256 {1}): {2} {3}, UUID {4}." -f $file['name'], ([string]$file['sha256']).Substring(0, 12), $label, $objName, $identity['uuid']),
+                        ("В git с тем же UUID - processings/{0}: {1} {2}; {3}." -f $renamed.Folder, $label, $renamed.Name, $cardText),
+                        ("Обновить: в карточку запишется {0} {1} (имя объекта поменяется), следующая выгрузка temp перенесёт папку в git обычным PR." -f $label, $objName),
+                        ("Новая карточка: {0} {1} рядом, прежняя {2} остаётся как есть." -f $label, $objName, $renamed.Name),
+                        'Рекомендую: обновить, если подрядчик переименовал свою обработку; новую - если это другая обработка, сделанная копированием.')
+                    $choice = Request-DeliveryChoice -D $D -State $State -Key $key -Unattended:$Unattended -Header ("Поставка {0}: {1} {2} - переименованная {3}?" -f $State['id'], $label, $objName, $renamed.Name) -Notes $notes `
+                        -Options @(@('update', ('Обновить {0} (переименована)' -f $renamed.Name)), @('new', ('Новая карточка {0}' -f $objName)))
+                }
+                if (-not $choice) { $ok = $false; continue }
+                if ($choice -eq 'update') {
+                    $file['object'] = [ordered]@{
+                        kind = 'processing'; name = $objName; repoPath = ('processings/' + $renamed.Folder); folder = $renamed.Folder; ref = $oldRef
+                        title = ('{0} {1} (переименована из {2})' -f $label, $objName, $renamed.Name); note = ('переименована: в git и справочнике - {0} (тот же UUID)' -f $renamed.Name); isNew = $false; renamedFrom = $renamed.Name
+                        cardUse = $(if ($null -ne $oldCard) { [string]$oldCard.Use } else { '' }); cardTargets = $(if ($null -ne $oldCard) { @($oldCard.Targets) } else { @() })
+                        cardFileHash = $(if ($null -ne $oldCard) { ([string]$oldCard.Hash).Replace('-', '').ToLowerInvariant() } else { '' })
+                    }
+                    continue
+                }
+            }
             $newNote = 'новый объект: такой карточки в temp нет'
             if ($deletedOnly -gt 0) { $newNote = ('новая карточка: в temp есть только помеченные на удаление карточки {0} ({1})' -f $objName, $deletedOnly) }
             $file['object'] = [ordered]@{ kind = 'processing'; name = $objName; repoPath = ('processings/' + $objName); title = ('{0} {1} (новая карточка)' -f $label, $objName); folder = $objName; ref = ''; note = $newNote; isNew = $true }
