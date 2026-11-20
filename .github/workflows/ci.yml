@@ -24,7 +24,7 @@ jobs:
       - name: go vet и go test
         shell: pwsh
         run: |
-          foreach ($m in 'ci-tui', 'fake1c', 'build') {
+          foreach ($m in 'ci-tui', 'fake1c', 'build', 'merge1c') {
             Push-Location "src/$m"
             go vet ./...
             if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -43,6 +43,11 @@ jobs:
         shell: pwsh
         working-directory: src/fake1c
         run: go build -o ../../gate/test/fake1c.exe .
+
+      - name: Объединение поставок (merge1c)
+        shell: pwsh
+        working-directory: src/merge1c
+        run: go build -o ../../gate/test/merge1c.exe .
 
       - name: Тесты гейта без 1С (Windows PowerShell 5.1)
         shell: powershell

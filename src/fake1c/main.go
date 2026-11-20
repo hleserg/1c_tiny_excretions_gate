@@ -19,9 +19,17 @@
 // Загрузка расширения из файлов (/LoadConfigFromFiles <папка> -Extension <имя>) запоминает папку в каталоге журнала
 // (ext\<имя>); выгрузка этого расширения (/DumpConfigToFiles) отдаёт потом её файлы - как настоящая база. Расширения
 // из списка absent до загрузки «нет в базе»: их выгрузка - код 1 и «не найдено».
+//
+// Приёмка поставок (техническая база: файловая, создана CREATEINFOBASE): у неё свой склад расширений (ext@<база>\<имя>).
+// /LoadCfg <файл> -Extension <имя> с файлом-архивом zip (подставной .cfe - архив выгрузки в файлы) кладёт его выгрузку
+// в склад, /DeleteCfg -Extension <имя> - убирает. /DumpExternalDataProcessorOrReportToFiles с архивом zip (подставной
+// .epf/.erf - архив выгрузки: <Имя>.xml и <Имя>/...) отдаёт его под именем корня; в архиве есть PROTECTED - код 1,
+// «модуль без исходного текста».
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -194,6 +202,13 @@ func main() {
 	} else if len(args) > 0 && strings.EqualFold(args[0], "ENTERPRISE") {
 		mode = "ENTERPRISE"
 		code = client(sc, args, state)
+	} else if len(args) > 1 && strings.EqualFold(args[0], "CREATEINFOBASE") {
+		// Файловая база, созданная так (техническая база приёмки), получает свой склад расширений - метка в её папке.
+		mode = "CREATEINFOBASE"
+		if path := createdFileBase(args[1]); path != "" {
+			_ = os.MkdirAll(path, 0o755)
+			_ = os.WriteFile(filepath.Join(path, createdMarker), []byte("fake1c"), 0o644)
+		}
 	}
 	// Гейт может держать два процесса 1С сразу (проверка конфигурации параллельно с остальными шагами):
 	// счётчики дописываются к тому, что лежит в файле сейчас, а не перезаписывают его прежней копией.
@@ -299,13 +314,40 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 	if rule.Exit != 0 {
 		return rule.Exit
 	}
+	if file := valueAfter(args, "/LoadCfg"); file != "" && logDir != "" {
+		if ext := valueAfter(args, "-Extension"); ext != "" {
+			if data, err := os.ReadFile(file); err == nil && bytes.HasPrefix(data, []byte("PK")) {
+				if !zipHas(data, "Configuration.xml") {
+					if out := valueAfter(args, "/Out"); out != "" {
+						writeUTF8(out, "Файл не является расширением конфигурации")
+					}
+					return 1
+				}
+				store := extStore(args, ext)
+				_ = os.RemoveAll(store)
+				if err := unzipTo(data, store, ""); err != nil {
+					if out := valueAfter(args, "/Out"); out != "" {
+						writeUTF8(out, "Файл не является расширением конфигурации: "+err.Error())
+					}
+					return 1
+				}
+			}
+		}
+	}
+	// Удаление расширения очищает склад только у базы, созданной подставной 1С (техническая база приёмки): у остальных
+	// склад остаётся, как раньше, - на нём держатся тесты, которые правят выгрузку «в базе» после прогона.
+	if hasArg(args, "/DeleteCfg") && logDir != "" && isFileBase(args) {
+		if ext := valueAfter(args, "-Extension"); ext != "" {
+			_ = os.RemoveAll(extStore(args, ext))
+		}
+	}
 	if file := valueAfter(args, "/DumpCfg"); file != "" && !rule.NoDump {
 		_ = os.MkdirAll(filepath.Dir(file), 0o755)
 		_ = os.WriteFile(file, []byte("FAKECFE "+valueAfter(args, "-Extension")), 0o644)
 	}
 	if dir := valueAfter(args, "/LoadConfigFromFiles"); dir != "" && logDir != "" {
 		ext := valueAfter(args, "-Extension")
-		store := filepath.Join(logDir, "ext", ext)
+		store := extStore(args, ext)
 		_ = os.RemoveAll(store)
 		copyTree(dir, store)
 	}
@@ -313,7 +355,7 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 		ext := valueAfter(args, "-Extension")
 		store := ""
 		if logDir != "" {
-			store = filepath.Join(logDir, "ext", ext)
+			store = extStore(args, ext)
 		}
 		loaded := false
 		if store != "" {
@@ -355,6 +397,18 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 			root := args[i+1]
 			name := strings.TrimSuffix(filepath.Base(root), filepath.Ext(root))
 			data, _ := os.ReadFile(args[i+2])
+			if bytes.HasPrefix(data, []byte("PK")) {
+				if zipHas(data, "PROTECTED") {
+					if out := valueAfter(args, "/Out"); out != "" {
+						writeUTF8(out, "Модуль без исходного текста: выгрузка в файлы невозможна")
+					}
+					return 1
+				}
+				if err := unzipTo(data, filepath.Dir(root), name); err != nil {
+					return 1
+				}
+				continue
+			}
 			writeUTF8(root, "<MetaDataObject><ExternalDataProcessor><Properties><Name>"+name+"</Name></Properties></ExternalDataProcessor></MetaDataObject>")
 			writeUTF8(filepath.Join(filepath.Dir(root), name, "Ext", "ObjectModule.bsl"), string(trimBOM(data)))
 		}
@@ -867,6 +921,9 @@ func processingRun(mode string, r processing, dir string, p map[string]string) {
 		}
 		ref := r.Ref
 		if ref == "" {
+			ref = p["ref"]
+		}
+		if ref == "" {
 			ref = "00000000-0000-0000-0000-000000000001"
 		}
 		check := r.Check
@@ -881,8 +938,116 @@ func processingRun(mode string, r processing, dir string, p map[string]string) {
 		for _, f := range r.FormErrors {
 			lines = append(lines, "formerror="+f)
 		}
+		// Что запись поменяла в карточке (как у обработки со сборки 20261120): с ref= назначение остаётся прежним.
+		kept := "0"
+		if p["ref"] != "" {
+			kept = "1"
+		}
+		lines = append(lines, "commandsold=Печать", "commandsnew=Печать", "targetsold=Документ.Заказ", "targetsnew=Документ.Заказ", "targetskept="+kept, "publication=Используется")
 	}
 	writeUTF8(dir+"result.txt", strings.Join(lines, "\n"))
+}
+
+// createdMarker - метка файловой базы, созданной подставной 1С (CREATEINFOBASE): у неё свой склад расширений.
+const createdMarker = "fake1c-created.txt"
+
+// createdFileBase - путь из File="<путь>" (или File=<путь>) команды CREATEINFOBASE.
+func createdFileBase(arg string) string {
+	if !strings.HasPrefix(strings.ToLower(arg), "file=") {
+		return ""
+	}
+	value := strings.TrimSpace(arg[5:])
+	value = strings.TrimSuffix(value, ";")
+	return strings.Trim(value, "\"")
+}
+
+// fileBasePath - папка файловой базы из /F"<путь>", если она создана подставной 1С; иначе пусто.
+func fileBasePath(args []string) string {
+	for _, a := range args {
+		if len(a) > 2 && (strings.HasPrefix(a, "/F") || strings.HasPrefix(a, "/f")) {
+			path := strings.Trim(a[2:], "\"")
+			if _, err := os.Stat(filepath.Join(path, createdMarker)); err == nil {
+				return path
+			}
+		}
+	}
+	return ""
+}
+
+// extStore - склад выгрузок расширения базы: ext\<имя>, как раньше (и у файловой базы тестов гейта); у файловой базы,
+// созданной CREATEINFOBASE (техническая база приёмки), - свой: ext@<папка базы>\<имя>, чтобы не смешивать с temp.
+func extStore(args []string, ext string) string {
+	if path := fileBasePath(args); path != "" {
+		return filepath.Join(logDir, "ext@"+filepath.Base(path), ext)
+	}
+	return filepath.Join(logDir, "ext", ext)
+}
+
+func isFileBase(args []string) bool {
+	return fileBasePath(args) != ""
+}
+
+func hasArg(args []string, key string) bool {
+	for _, a := range args {
+		if strings.EqualFold(a, key) {
+			return true
+		}
+	}
+	return false
+}
+
+func zipHas(data []byte, name string) bool {
+	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return false
+	}
+	for _, f := range r.File {
+		if f.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// unzipTo - архив в папку. Root - имя корня выгрузки обработки: <первая папка>.xml и <первая папка>/... ложатся как
+// <root>.xml и <root>/... (выгрузка обработки называется по корневому файлу).
+func unzipTo(data []byte, dir, root string) error {
+	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return err
+	}
+	first := ""
+	for _, f := range r.File {
+		if root != "" && strings.HasSuffix(f.Name, ".xml") && !strings.Contains(f.Name, "/") {
+			first = strings.TrimSuffix(f.Name, ".xml")
+		}
+	}
+	for _, f := range r.File {
+		if strings.HasSuffix(f.Name, "/") || f.Name == "PROTECTED" {
+			continue
+		}
+		name := f.Name
+		if root != "" && first != "" {
+			if name == first+".xml" {
+				name = root + ".xml"
+			} else if strings.HasPrefix(name, first+"/") {
+				name = root + "/" + strings.TrimPrefix(name, first+"/")
+			}
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(rc)
+		rc.Close()
+		target := filepath.Join(dir, filepath.FromSlash(name))
+		_ = os.MkdirAll(filepath.Dir(target), 0o755)
+		if err := os.WriteFile(target, buf.Bytes(), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // infobaseName - имя базы из ключа /S"сервер\база" (кавычки уже сняты разбором командной строки) или

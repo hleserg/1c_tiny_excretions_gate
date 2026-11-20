@@ -342,11 +342,12 @@ function New-GhCommit {
 
 function Set-GhBranch {
     # Ветку - на коммит. Create - новая ветка; иначе - перемотка вперёд (без force: чужие коммиты не теряются).
-    param($Gh, [string]$Branch, [string]$Sha, [switch]$Create)
+    # Force - перенос на любой коммит: только для своих веток (пересборка кандидата поставки поверх нового main).
+    param($Gh, [string]$Branch, [string]$Sha, [switch]$Create, [switch]$Force)
     if ($Gh.FakeDir) {
         $refs = Read-GhFakeRefs $Gh
         if ($Create -and $refs.ContainsKey($Branch)) { throw ("подставной GitHub: ветка {0} уже есть" -f $Branch) }
-        if (-not $Create -and $refs.ContainsKey($Branch) -and -not (Test-GhContains -Gh $Gh -Branch '' -Commit $refs[$Branch] -Head $Sha)) {
+        if (-not $Create -and -not $Force -and $refs.ContainsKey($Branch) -and -not (Test-GhContains -Gh $Gh -Branch '' -Commit $refs[$Branch] -Head $Sha)) {
             throw ("подставной GitHub: {0} не перематывается вперёд" -f $Branch)
         }
         $refs[$Branch] = $Sha
@@ -359,7 +360,9 @@ function Set-GhBranch {
         [void](Invoke-GhApi -Gh $Gh -Method 'POST' -Path ('/repos/{0}/git/refs' -f $Gh.Repo) -Body $body)
         return
     }
-    [void](Invoke-GhApi -Gh $Gh -Method 'PATCH' -Path ('/repos/{0}/git/refs/heads/{1}' -f $Gh.Repo, $Branch) -Body ('{"sha":"' + $Sha + '","force":false}'))
+    $forceText = 'false'
+    if ($Force) { $forceText = 'true' }
+    [void](Invoke-GhApi -Gh $Gh -Method 'PATCH' -Path ('/repos/{0}/git/refs/heads/{1}' -f $Gh.Repo, $Branch) -Body ('{"sha":"' + $Sha + '","force":' + $forceText + '}'))
 }
 
 function New-GhPull {
@@ -487,6 +490,183 @@ function Save-GhFiles {
     finally { $archive.Dispose() }
     Remove-Item -LiteralPath $zip -Force
     return $saved
+}
+
+#endregion
+
+#region Pull request, проверки, история (приёмка поставок, раздел 5.26)
+
+# Подставной GitHub: pulls\<номер>.closed - PR закрыт без слияния; ci.txt - строки «<head>\t<status>\t<conclusion>»,
+# ci-default.txt - то же для всех остальных head («completed\tsuccess», «in_progress\t», «completed\tfailure»);
+# pulls\<номер>.merge - «<base> <head> <merge>»: пробное слияние, которое GitHub держит для PR.
+
+function Read-GhFakePulls {
+    param($Gh)
+    $list = Join-Path $Gh.FakeDir 'pulls.txt'
+    $pulls = @()
+    if (Test-Path -LiteralPath $list) {
+        foreach ($line in [System.IO.File]::ReadAllLines($list, [System.Text.Encoding]::UTF8)) {
+            $parts = $line.Split("`t")
+            if ($parts.Count -ge 4) { $pulls += [pscustomobject]@{ Number = [int]$parts[0]; Head = $parts[1]; Base = $parts[2]; Title = $parts[3] } }
+        }
+    }
+    return $pulls
+}
+
+function Get-GhFakeMerge {
+    # Пробное слияние PR в подставном GitHub: base - предок head - слияние без конфликтов, дерево как у head;
+    # иначе - конфликт (сам подставной GitHub трёхстороннего слияния не умеет). Кешируется, как у GitHub.
+    param($Gh, [int]$Number, [string]$Base, [string]$Head)
+    $file = Join-Path (Join-Path $Gh.FakeDir 'pulls') ('{0}.merge' -f $Number)
+    if (Test-Path -LiteralPath $file) {
+        $parts = ([System.IO.File]::ReadAllText($file)).Trim().Split(' ')
+        if ($parts.Count -eq 3 -and $parts[0] -eq $Base -and $parts[1] -eq $Head) { return $parts[2] }
+    }
+    $ancestors = Get-GhFakeAncestors $Gh $Head
+    if (-not $ancestors.ContainsKey($Base)) { return '' }
+    $files = (Read-GhFakeCommit $Gh $Head).Files
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add(($Base + ' ' + $Head))
+    $lines.Add(('Merge pull request #{0}' -f $Number))
+    foreach ($path in @($files.Keys | Sort-Object)) { $lines.Add(('{0}{1}{2}' -f $path, "`t", $files[$path])) }
+    $text = ($lines -join "`n") + "`n"
+    $sha = Get-GitBlobSha ([System.Text.Encoding]::UTF8.GetBytes($text))
+    $dir = Join-Path $Gh.FakeDir 'commits'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    [System.IO.File]::WriteAllLines((Join-Path $dir ($sha + '.txt')), [string[]]$lines.ToArray(), (New-Object System.Text.UTF8Encoding($false)))
+    New-Item -ItemType Directory -Path (Split-Path -Parent $file) -Force | Out-Null
+    [System.IO.File]::WriteAllText($file, ('{0} {1} {2}' -f $Base, $Head, $sha))
+    return $sha
+}
+
+function Get-GhPull {
+    # Состояние PR: State (open, closed), Merged, Head, HeadRef, Base (sha текущей базы), BaseRef, Merge (пробное
+    # слияние, пусто - GitHub его ещё не посчитал или конфликт), Mergeable ($true, $false, $null - не посчитано), Url.
+    param($Gh, [int]$Number)
+    if ($Gh.FakeDir) {
+        $pull = @(Read-GhFakePulls $Gh | Where-Object { $_.Number -eq $Number }) | Select-Object -First 1
+        if ($null -eq $pull) { throw ("подставной GitHub: нет PR #{0}" -f $Number) }
+        $refs = Read-GhFakeRefs $Gh
+        $head = ''
+        if ($refs.ContainsKey($pull.Head)) { $head = $refs[$pull.Head] }
+        $base = ''
+        if ($refs.ContainsKey($pull.Base)) { $base = $refs[$pull.Base] }
+        $merged = ($head -and $base -and (Get-GhFakeAncestors $Gh $base).ContainsKey($head))
+        $state = 'open'
+        if ($merged -or (Test-Path -LiteralPath (Join-Path (Join-Path $Gh.FakeDir 'pulls') ('{0}.closed' -f $Number)))) { $state = 'closed' }
+        $merge = ''
+        $mergeable = $false
+        if ($state -eq 'open' -and $head -and $base) {
+            $merge = Get-GhFakeMerge -Gh $Gh -Number $Number -Base $base -Head $head
+            $mergeable = [bool]$merge
+        }
+        Write-GhFakeLog $Gh ("pull-get {0}" -f $Number)
+        return [pscustomobject]@{ Number = $Number; State = $state; Merged = [bool]$merged; Head = $head; HeadRef = $pull.Head; Base = $base; BaseRef = $pull.Base
+            Merge = $merge; Mergeable = $mergeable; Url = ('https://github.com/{0}/pull/{1}' -f $Gh.Repo, $Number); Title = $pull.Title }
+    }
+    $answer = Invoke-GhApi -Gh $Gh -Method 'GET' -Path ('/repos/{0}/pulls/{1}' -f $Gh.Repo, $Number)
+    $pull = $answer.Text | ConvertFrom-Json
+    $mergeable = $null
+    if ($null -ne $pull.mergeable) { $mergeable = [bool]$pull.mergeable }
+    $merge = ''
+    if ($null -ne $pull.merge_commit_sha -and -not [bool]$pull.merged) { $merge = [string]$pull.merge_commit_sha }
+    return [pscustomobject]@{ Number = [int]$pull.number; State = [string]$pull.state; Merged = [bool]$pull.merged; Head = [string]$pull.head.sha; HeadRef = [string]$pull.head.ref
+        Base = [string]$pull.base.sha; BaseRef = [string]$pull.base.ref; Merge = $merge; Mergeable = $mergeable; Url = [string]$pull.html_url; Title = [string]$pull.title }
+}
+
+function Find-GhPull {
+    # Открытый PR из ветки Head в Base. 0 - нет.
+    param($Gh, [string]$Head, [string]$Base)
+    if ($Gh.FakeDir) {
+        foreach ($pull in @(Read-GhFakePulls $Gh | Where-Object { $_.Head -eq $Head -and $_.Base -eq $Base } | Sort-Object Number -Descending)) {
+            if ((Get-GhPull -Gh $Gh -Number $pull.Number).State -eq 'open') { return [int]$pull.Number }
+        }
+        return 0
+    }
+    $owner = $Gh.Repo.Split('/')[0]
+    $answer = Invoke-GhApi -Gh $Gh -Method 'GET' -Path ('/repos/{0}/pulls?state=open&base={1}&head={2}' -f $Gh.Repo, [uri]::EscapeDataString($Base), [uri]::EscapeDataString($owner + ':' + $Head))
+    $list = @($answer.Text | ConvertFrom-Json)
+    if ($list.Count -gt 0) { return [int]$list[0].number }
+    return 0
+}
+
+function Set-GhPullBody {
+    # Текст PR (описание) заново: отчёт приёмки меняется с каждой пересборкой.
+    param($Gh, [int]$Number, [string]$Body)
+    if ($Gh.FakeDir) {
+        [System.IO.File]::WriteAllText((Join-Path (Join-Path $Gh.FakeDir 'pulls') ('{0}.md' -f $Number)), $Body, (New-Object System.Text.UTF8Encoding($false)))
+        Write-GhFakeLog $Gh ("pull-body {0}" -f $Number)
+        return
+    }
+    [void](Invoke-GhApi -Gh $Gh -Method 'PATCH' -Path ('/repos/{0}/pulls/{1}' -f $Gh.Repo, $Number) -Body ('{"body":' + (ConvertTo-GhJsonString $Body) + '}'))
+}
+
+function Add-GhComment {
+    # Комментарий к PR или issue.
+    param($Gh, [int]$Number, [string]$Body)
+    if ($Gh.FakeDir) {
+        $file = Join-Path (Join-Path $Gh.FakeDir 'pulls') ('{0}.comments.md' -f $Number)
+        New-Item -ItemType Directory -Path (Split-Path -Parent $file) -Force | Out-Null
+        [System.IO.File]::AppendAllText($file, ($Body + "`r`n---`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+        Write-GhFakeLog $Gh ("comment {0}" -f $Number)
+        return
+    }
+    [void](Invoke-GhApi -Gh $Gh -Method 'POST' -Path ('/repos/{0}/issues/{1}/comments' -f $Gh.Repo, $Number) -Body ('{"body":' + (ConvertTo-GhJsonString $Body) + '}'))
+}
+
+function Get-GhCiRun {
+    # Последний прогон проверки PR (workflow Workflow) для head: Status (queued, in_progress, completed, '' - нет),
+    # Conclusion (success, failure, ...), Title (у ERP static - «ERP static <merge sha>»), Url.
+    param($Gh, [string]$Head, [string]$Workflow, [string]$Merge = '')
+    if ($Gh.FakeDir) {
+        $status = ''
+        $conclusion = ''
+        $default = Join-Path $Gh.FakeDir 'ci-default.txt'
+        if (Test-Path -LiteralPath $default) {
+            $parts = ([System.IO.File]::ReadAllText($default)).Trim().Split("`t")
+            $status = $parts[0]
+            if ($parts.Count -gt 1) { $conclusion = $parts[1] }
+        }
+        $list = Join-Path $Gh.FakeDir 'ci.txt'
+        if (Test-Path -LiteralPath $list) {
+            foreach ($line in [System.IO.File]::ReadAllLines($list)) {
+                $parts = $line.Split("`t")
+                if ($parts.Count -ge 2 -and $parts[0] -eq $Head) { $status = $parts[1]; $conclusion = ''; if ($parts.Count -gt 2) { $conclusion = $parts[2] } }
+            }
+        }
+        Write-GhFakeLog $Gh ("ci {0} {1}/{2}" -f $Head, $status, $conclusion)
+        return [pscustomobject]@{ Status = $status; Conclusion = $conclusion; Title = ('ERP static ' + $Merge); Url = 'https://github.com/fake/actions'; Id = 1 }
+    }
+    $answer = Invoke-GhApi -Gh $Gh -Method 'GET' -Path ('/repos/{0}/actions/runs?event=pull_request&head_sha={1}&per_page=50' -f $Gh.Repo, $Head)
+    $runs = @(($answer.Text | ConvertFrom-Json).workflow_runs | Where-Object { [string]$_.path -eq $Workflow } | Sort-Object { [string]$_.created_at } -Descending)
+    if ($runs.Count -eq 0) { return [pscustomobject]@{ Status = ''; Conclusion = ''; Title = ''; Url = ''; Id = 0 } }
+    $run = $runs[0]
+    return [pscustomobject]@{ Status = [string]$run.status; Conclusion = [string]$run.conclusion; Title = [string]$run.display_title; Url = [string]$run.html_url; Id = [long]$run.id }
+}
+
+function Get-GhAncestors {
+    # Коммиты истории ветки или коммита (сам и предки, не больше Limit) - от новых к старым.
+    param($Gh, [string]$Sha, [int]$Limit = 300)
+    if ($Gh.FakeDir) {
+        $seen = Get-GhFakeAncestors $Gh $Sha
+        return @($seen.Keys | Sort-Object { $seen[$_] } | Select-Object -First $Limit)
+    }
+    $list = New-Object System.Collections.Generic.List[string]
+    for ($page = 1; $list.Count -lt $Limit; $page++) {
+        $answer = Invoke-GhApi -Gh $Gh -Method 'GET' -Path ('/repos/{0}/commits?sha={1}&per_page=100&page={2}' -f $Gh.Repo, $Sha, $page)
+        $found = [regex]::Matches($answer.Text, '\{"sha":"([0-9a-f]{40})","node_id"')
+        if ($found.Count -eq 0) { break }
+        foreach ($match in $found) { if ($list.Count -lt $Limit) { $list.Add($match.Groups[1].Value) } }
+        if ($found.Count -lt 100) { break }
+    }
+    return $list.ToArray()
+}
+
+function Get-GhBlob {
+    # Содержимое блоба по git-хешу: подставной - файл blobs\<хеш>, настоящий - Get-GhBlobBytes.
+    param($Gh, [string]$Sha)
+    if ($Gh.FakeDir) { return , [System.IO.File]::ReadAllBytes((Join-Path (Join-Path $Gh.FakeDir 'blobs') $Sha)) }
+    return , (Get-GhBlobBytes -Gh $Gh -Sha $Sha)
 }
 
 #endregion

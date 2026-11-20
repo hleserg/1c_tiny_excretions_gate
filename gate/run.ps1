@@ -2398,6 +2398,22 @@ foreach ($unitName in $unitTestExtensions) {
 # Обновления в inbox - каждое расширение (файл .cfe, каталог выгрузки, архив .zip) и каждая внешняя обработка
 # (файл .epf или .erf, каталог выгрузки обработки). Обработки гейт пока только показывает.
 $inboxDir = Resolve-RootPath ([string](Get-Setting $cfg 'InboxDir' 'inbox'))
+# «Входящие» приёмки поставок и её реестр (раздел 5.26): оттуда - только через git (deploy.ps1 -Delivery), прямой
+# загрузкой в temp ни меню, ни -Kit, ни продолжение прогона их не берут.
+$deliveryInboxDir = Resolve-RootPath ([string](Get-Setting $cfg 'DeliveryInboxDir' 'Входящие'))
+$deliveryStoreDir = Resolve-RootPath ([string](Get-Setting $cfg 'DeliveryDir' 'deliveries'))
+function Test-DeliveryPath {
+    # Путь внутри «Входящих» или реестра поставок.
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    foreach ($dir in @($deliveryInboxDir, $deliveryStoreDir)) {
+        if (-not $dir) { continue }
+        $root = [System.IO.Path]::GetFullPath($dir).TrimEnd('\')
+        if ($full -ieq $root -or $full.StartsWith($root + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
 # Меню и вопросы (ui.ps1): из ci.exe их рисует ci.exe, без него - консоль.
 . (Join-Path $Root 'locks.ps1')
 . (Join-Path $Root 'ui.ps1')
@@ -2492,6 +2508,8 @@ function Add-InboxItems {
     # Обход inbox. Каталог выгрузки - одно обновление, внутрь него поиск не заходит.
     param([string]$Dir, [int]$Depth, $Items)
     foreach ($child in @(Get-ChildItem -LiteralPath $Dir | Sort-Object Name)) {
+        # «Входящие» приёмки поставок внутри inbox - не обновления для прямой загрузки (раздел 5.26).
+        if (Test-DeliveryPath $child.FullName) { continue }
         $relative = $child.FullName.Substring($inboxDir.TrimEnd('\').Length + 1)
         if (-not $child.PSIsContainer) {
             $type = $child.Extension.ToLowerInvariant()
@@ -4339,7 +4357,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
     # «Обновить рабочую базу». Новый пункт меню - новая строка здесь (клавиши - из 1-9, a-z, без повторов).
     $menuSlots = @(
         @('kit', 'Тестовая база', '1'), @('asis', 'Тестовая база', '2'), @('resume', 'Тестовая база', '3'),
-        @('gitimport', 'Тестовая база', '4'), @('gitexport', 'Тестовая база', '5'), @('accept', 'Тестовая база', '6'),
+        @('gitimport', 'Тестовая база', '4'), @('gitexport', 'Тестовая база', '5'), @('delivery', 'Тестовая база', 's'), @('accept', 'Тестовая база', '6'),
         @('runs', 'Тестовая база', '7'), @('tests', 'Тестовая база', '8'), @('templocks', 'Тестовая база', 'q'),
         @('precheck', 'Рабочая база', '9'), @('applyprep', 'Рабочая база', 'a'), @('prepare', 'Рабочая база', 'b'),
         @('cancelprep', 'Рабочая база', 'c'), @('deploy', 'Рабочая база', 'd'), @('rollback', 'Рабочая база', 'e'),
@@ -4368,6 +4386,13 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         if ($gitRepo -and (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1'))) {
             $menu.Add((New-MenuItem 'gitimport' 'Загрузить из git' ('в {0} из {1}' -f $script:Base, $gitRepo)))
             $menu.Add((New-MenuItem 'gitexport' 'Выгрузить temp в git' ('правки {0} - веткой и pull request' -f $script:Base)))
+            # Приёмка поставок подрядчика (раздел 5.26): «Входящие» -> git -> CI -> temp -> гейт.
+            $deliveryWaiting = 0
+            if (Test-Path -LiteralPath $deliveryInboxDir) { $deliveryWaiting = @(Get-ChildItem -LiteralPath $deliveryInboxDir -ErrorAction SilentlyContinue).Count }
+            $deliveryOpen = 0
+            $deliveryIndex = Join-Path $deliveryStoreDir 'open.txt'
+            if (Test-Path -LiteralPath $deliveryIndex) { $deliveryOpen = @([System.IO.File]::ReadAllLines($deliveryIndex) | Where-Object { $_ }).Count }
+            $menu.Add((New-MenuItem 'delivery' 'Приёмка поставок' ('во «Входящих» {0}, в работе {1}' -f $deliveryWaiting, $deliveryOpen)))
             $menu.Add((New-MenuItem 'gitprod' 'Снимок внешних обработок рабочей в git' ('ветка {0}, рабочую только читает' -f [string](Get-Setting $cfg 'ExtensionsProdBranch' 'prod'))))
         }
         $acceptable = Get-AcceptableRun
@@ -4556,6 +4581,15 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             try {
                 if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -BaseState -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') -BaseState }
             }
+            catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+            Wait-UiAcknowledge
+            continue
+        }
+        if ($choice -eq 'delivery') {
+            # Приёмка поставок (deploy.ps1 -Delivery, раздел 5.26): вопросы - только решения по поставке. Потом - в меню.
+            $deliveryArgs = @{ Delivery = $true }
+            if ($UiChannel) { $deliveryArgs['UiChannel'] = $UiChannel }
+            try { & (Join-Path $Root 'deploy.ps1') @deliveryArgs }
             catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
             Wait-UiAcknowledge
             continue
@@ -6877,10 +6911,25 @@ function New-KitProcessing {
     }
     $what = 'внешняя обработка'
     if ($isReport) { $what = 'внешний отчёт' }
+    # <путь>.gate.json (кладёт «Загрузить из git», раздел 5.26): в какой элемент справочника писать и какой sha256
+    # должен быть у файла. Без него - как раньше: элемент с тем же именем объекта.
+    $targetRef = ''
+    $expectSha = ''
+    $sidecar = $path.TrimEnd('\') + '.gate.json'
+    if (Test-Path -LiteralPath $sidecar) {
+        try {
+            $target = [System.IO.File]::ReadAllText($sidecar, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+            if ($null -ne $target.PSObject.Properties['ref']) { $targetRef = [string]$target.ref }
+            if ($null -ne $target.PSObject.Properties['sha256']) { $expectSha = ([string]$target.sha256).ToLowerInvariant() }
+        }
+        catch { throw ("{0} не разобрался: {1}" -f $sidecar, $_.Exception.Message) }
+        if ($targetRef -and $targetRef -notmatch '^[0-9a-fA-F-]{36}$') { throw ("{0}: ref «{1}» - не уникальный идентификатор элемента" -f $sidecar, $targetRef) }
+    }
     return [pscustomobject]@{
         Name = $name; Kind = [string]$Entry.Kind; Path = $path; Xml = $xml; FileName = $fileName; File = $source
         IsReport = $isReport; What = $what; Tried = $false; Touched = $false; Loaded = $false; IsNew = 'unknown'; Ref = ''; ObjectName = ''
         OldVersion = ''; NewVersion = ''; OldB64 = ''; OldFile = ''; InboxItem = (Get-EntryInboxItem $Entry)
+        TargetRef = $targetRef; ExpectSha256 = $expectSha; Registration = ''
     }
 }
 
@@ -6909,6 +6958,9 @@ elseif ($script:MenuItems.Count -gt 0) {
 if (-not [string]::IsNullOrWhiteSpace($Kit)) {
     if ($script:MenuItems.Count -eq 0 -and $script:ResumeKitFound.Count -eq 0) {
     $kitPath = Resolve-RootPath $Kit
+    if (Test-DeliveryPath $kitPath) {
+        throw ("{0} - поставка подрядчика («Входящие» или реестр поставок): в temp она идёт только через git - приёмкой поставок (меню «Приёмка поставок», deploy.ps1 -Delivery), а не прямой загрузкой." -f $kitPath)
+    }
     $kitFound = @()
     if (Test-Path -LiteralPath (Join-Path $kitPath 'actions') -PathType Container) { $script:KitActionsDir = Join-Path $kitPath 'actions' }
 
@@ -7008,9 +7060,10 @@ if (-not [string]::IsNullOrWhiteSpace($Kit)) {
     if ($duplicates.Count -gt 0) {
         throw ("В комплекте расширение встречается дважды: {0}" -f (@($duplicates | ForEach-Object { $_.Name }) -join ', '))
     }
-    $duplicates = @($kitProcessings | Group-Object -Property Name | Where-Object { $_.Count -gt 1 })
+    # Одноимённые обработки в разные элементы справочника (ref из .gate.json) - можно; в один и тот же - нет.
+    $duplicates = @($kitProcessings | Group-Object -Property { '{0}|{1}' -f $_.Name, $_.TargetRef } | Where-Object { $_.Count -gt 1 })
     if ($duplicates.Count -gt 0) {
-        throw ("В комплекте внешняя обработка встречается дважды: {0}" -f (@($duplicates | ForEach-Object { $_.Name }) -join ', '))
+        throw ("В комплекте внешняя обработка встречается дважды: {0}" -f (@($duplicates | ForEach-Object { ($_.Name -split '\|')[0] }) -join ', '))
     }
 
     # Порядок загрузки = порядок в списке Extensions (нижний слой первым); незнакомые расширения идут последними.
@@ -7633,6 +7686,9 @@ foreach ($proc in $kitProcessings) {
         continue
     }
     $procDir = Join-Path $processingsDir $proc.Name
+    $targetRef = ''
+    if ($null -ne $proc.PSObject.Properties['TargetRef']) { $targetRef = [string]$proc.TargetRef }
+    if ($targetRef) { $procDir = Join-Path $processingsDir ('{0}~{1}' -f $proc.Name, $targetRef.Substring(0, 8)) }
 
     if ($proc.Kind -eq 'epfdir') {
         $buildName = "Собрать {0} из файлов" -f $proc.Name
@@ -7650,8 +7706,18 @@ foreach ($proc in $kitProcessings) {
         $proc.File = $builtFile
     }
 
+    # Файл целиком (раздел 5.26): ставится только с тем sha256, что записан в git.
+    if ($null -ne $proc.PSObject.Properties['ExpectSha256'] -and $proc.ExpectSha256) {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $actualSha = -join @($sha.ComputeHash([System.IO.File]::ReadAllBytes($proc.File)) | ForEach-Object { $_.ToString('x2') }) } finally { $sha.Dispose() }
+        if ($actualSha -ne $proc.ExpectSha256) {
+            Add-StepResult -Name $registerName -Status 'FAIL' -Detail ("sha256 файла {0}, а в git записан {1}: не ставлю" -f $actualSha, $proc.ExpectSha256)
+            $proceed = $false
+            continue
+        }
+    }
     $proc.Tried = $true
-    $session = Invoke-ProcessingSession -Mode 'regepf' -OutDir (Join-Path $procDir 'register') -File $proc.File -Name $proc.FileName -Title $registerName
+    $session = Invoke-ProcessingSession -Mode 'regepf' -OutDir (Join-Path $procDir 'register') -File $proc.File -Name $proc.FileName -Ref $targetRef -Title $registerName
     $values = $session.Values
     $proc.ObjectName = [string](Get-Setting $values 'objname' '')
     $proc.Ref = [string](Get-Setting $values 'ref' '')
@@ -7688,6 +7754,18 @@ foreach ($proc in $kitProcessings) {
         continue
     }
     $proc.Touched = $true
+    if ($targetRef -and $proc.Ref -and $proc.Ref -ne $targetRef) {
+        Add-StepResult -Name $registerName -Status 'FAIL' -Detail ("записалась не в тот элемент справочника: {0}, ждали {1}" -f $proc.Ref, $targetRef) -Log $session.ResultFile -Seconds $session.Seconds
+        $proceed = $false
+        continue
+    }
+    # Что поменяла запись в карточке (команды, назначение, публикация) - отдельно, для отчёта приёмки (раздел 5.26).
+    $registration = @()
+    foreach ($pair in @(@('commandsold', 'команды были'), @('commandsnew', 'команды стали'), @('targetsold', 'назначение было'), @('targetsnew', 'назначение стало'), @('publication', 'публикация'), @('targetskept', 'назначение сохранено'))) {
+        $value = [string](Get-Setting $values $pair[0] '')
+        if ($value) { $registration += ('{0}: {1}' -f $pair[1], $value) }
+    }
+    $proc.Registration = ($registration -join '; ')
 
     $what = 'обновлена'
     if ($proc.IsNew -eq 'yes') { $what = 'добавлена новым элементом' }
@@ -8170,7 +8248,7 @@ function Write-RunSummary {
         kit         = $Kit
         kitItems    = @($kitItems | ForEach-Object { [pscustomobject]@{ name = $_.Name; kind = $_.Kind; version = $_.Version; source = $_.Source; label = $_.Label; path = $_.Path; wasInBase = $_.WasInBase; loadTried = [bool]$_.LoadTried; touched = [bool]$_.Touched; loaded = [bool]$_.Loaded } })
         kitSource   = $KitSource
-        kitProcessings = @($kitProcessings | ForEach-Object { [pscustomobject]@{ name = $_.Name; kind = $_.Kind; fileName = $_.FileName; isReport = $_.IsReport; path = $_.Path; file = $_.File; objectName = $_.ObjectName; ref = $_.Ref; isNew = $_.IsNew; oldVersion = $_.OldVersion; newVersion = $_.NewVersion; oldB64 = $_.OldB64; oldFile = $_.OldFile; touched = $_.Touched; tried = [bool]$_.Tried; loaded = [bool]$_.Loaded } })
+        kitProcessings = @($kitProcessings | ForEach-Object { [pscustomobject]@{ name = $_.Name; kind = $_.Kind; fileName = $_.FileName; isReport = $_.IsReport; path = $_.Path; file = $_.File; objectName = $_.ObjectName; ref = $_.Ref; isNew = $_.IsNew; oldVersion = $_.OldVersion; newVersion = $_.NewVersion; oldB64 = $_.OldB64; oldFile = $_.OldFile; touched = $_.Touched; tried = [bool]$_.Tried; loaded = [bool]$_.Loaded; targetRef = [string](Get-UiField $_ 'TargetRef' ''); expectSha256 = [string](Get-UiField $_ 'ExpectSha256' ''); registration = [string](Get-UiField $_ 'Registration' '') } })
         verdict     = $verdict
         failed      = $failed.Count
         warned      = $warned.Count

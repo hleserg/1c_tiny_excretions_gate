@@ -188,6 +188,19 @@
     # Папка с обновлениями для меню гейта (.\run.cmd без ключей).
     InboxDir = 'inbox'
 
+    # Приёмка поставок подрядчика (раздел 5.26, deploy.ps1 -Delivery, меню «Приёмка поставок»): бинарники .cfe,
+    # .epf, .erf или папка комплекта во «Входящих» -> git (PR, CI) -> temp -> гейт. Отдельно от inbox: оттуда прямой
+    # загрузкой ничего не берётся. Техническая база - файловая, для разбора поставок (имя папки - как у тестовой).
+    DeliveryInboxDir = 'Входящие'
+    DeliveryDir = 'deliveries'
+    DeliveryTechBase = 'deliveries\tech-stand'
+    # Слияние PR самим гейтом через ci/merge_checked.py репозитория расширений - только если хеш файла в main равен
+    # закреплённому (DeliveryMergeCheckedBlob, git hash-object): изменённый CI сначала смотрит человек. Нужен Python 3.9+.
+    DeliveryAutoMerge = $false
+    # DeliveryMergeCheckedBlob = 'хеш блоба git'
+    DeliveryPython = 'python'
+    DeliveryCiWaitMin = 30
+
     # Статистика длительностей шагов (stats.ps1): папка журнала и за сколько дней брать записи для прогноза.
     StatsDir  = 'stats'
     StatsDays = 120
