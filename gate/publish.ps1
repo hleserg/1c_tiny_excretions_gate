@@ -437,10 +437,16 @@ function Get-RunFileList {
         try { $bytes = [System.IO.File]::ReadAllBytes($file.FullName) }
         catch { $skipped.Add(('{0}: не прочитался ({1})' -f $relative, $_.Exception.Message)); continue }
         $text = Read-RunFileText $bytes
+        # Конфигуратор пишет и в Windows-1251, иногда дописывает в уже созданный журнал.
+        # Проверяем те же байты в обеих кодировках до передачи исходного файла.
+        $ansiText = [System.Text.Encoding]::GetEncoding(1251).GetString($bytes)
         $leak = ''
         foreach ($secret in $Secrets) {
             if ($null -eq $secret) { continue }
-            if ($text.Contains([string]$secret.Value)) { $leak = [string]$secret.Name; break }
+            if ($text.Contains([string]$secret.Value) -or $ansiText.Contains([string]$secret.Value)) {
+                $leak = [string]$secret.Name
+                break
+            }
         }
         if ($leak) {
             $skipped.Add(('{0}: в тексте секрет (настройка {1}) - не выложен' -f $relative, $leak))

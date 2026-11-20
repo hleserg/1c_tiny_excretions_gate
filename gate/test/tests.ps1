@@ -3625,6 +3625,9 @@ $tests = @(
                 [System.IO.File]::WriteAllText($statePath, '{"wanted":"final","sent":"final","message":"","filesWanted":"final","filesSent":"","filesError":"нет связи"}', $utf8Bom)
                 [System.IO.File]::WriteAllText((Join-Path $r.RunDir 'extra.txt'), 'дослано следующим запуском', $utf8Bom)
                 [System.IO.File]::WriteAllText((Join-Path $r.RunDir 'leak.txt'), ('токен ' + $secret), $utf8Bom)
+                $ansi = [System.Text.Encoding]::GetEncoding(1251)
+                [System.IO.File]::WriteAllText((Join-Path $r.RunDir 'designer.log'), ('пароль ' + $secret), $ansi)
+                [System.IO.File]::WriteAllText((Join-Path $r.RunDir 'clean.log'), 'обычный журнал', $ansi)
                 New-Item -ItemType Directory -Path (Join-Path $r.RunDir 'epf') -Force | Out-Null
                 [System.IO.File]::WriteAllBytes((Join-Path $r.RunDir 'epf\old.txt'), [byte[]]@(65, 66))
                 [System.IO.File]::WriteAllBytes((Join-Path $r.RunDir 'saved.cfe'), [byte[]]@(0, 1, 2, 3))
@@ -3639,6 +3642,8 @@ $tests = @(
                 $files = (Read-GhFakeCommit $gh $head).Files
                 Check ($files.ContainsKey(('runs/{0}/extra.txt' -f $id))) 'файлы прогона, не ушедшие в прошлый раз, не досланы'
                 Check (-not $files.ContainsKey(('runs/{0}/leak.txt' -f $id))) 'выложен файл с токеном'
+                Check (-not $files.ContainsKey(('runs/{0}/designer.log' -f $id))) 'выложен журнал Windows-1251 с секретом'
+                Check ($files.ContainsKey(('runs/{0}/clean.log' -f $id))) 'чистый журнал Windows-1251 пропущен'
                 Check (-not $files.ContainsKey(('runs/{0}/saved.cfe' -f $id)) -and -not $files.ContainsKey(('runs/{0}/epf/old.txt' -f $id))) 'выложены двоичные файлы или папка epf'
                 $readmeKey = 'runs/{0}/README.md' -f $id
                 $readme = ''
