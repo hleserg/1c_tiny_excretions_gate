@@ -34,8 +34,8 @@
         БД, внешние обработки, проверки, отчёт. -CancelPrepared: вернуть расширения рабочей к применённым версиям.
 
     .\deploy.ps1 -GitExport / -GitImport
-        Репозиторий расширений (ExtensionsRepo, раздел 5.23): выгрузить temp в git - первый раз коммитом в main,
-        потом правки temp веткой temp/<время> и pull request; загрузить из git - проверка правок temp и обычный
+        Репозиторий расширений (ExtensionsRepo, раздел 5.23): выгрузить temp в git - ветка temp/<время> и pull
+        request, включая первую выгрузку. Загрузить из git - проверка правок temp и обычный
         прогон гейта с тем, что изменилось в main. Рабочую базу не трогает.
 
     Внешние обработки и отчёты справочника «Дополнительные отчёты и обработки» сравниваются так же:
@@ -1014,6 +1014,7 @@ function Get-ExtensionStates {
     if ($Password -and $message) { $message = $message.Replace($Password, '***') }
     if (-not $call.Ok -or -not ($call.Result -is [hashtable])) {
         if (-not $message) { $message = 'внешнее соединение ничего не вернуло' }
+        if (Test-SessionLockError $message) { $message = 'Начало сеанса с информационной базой запрещено' }
         Write-RunLog ("Расширения {0} через COM не получены: {1}" -f $BaseName, $message)
         return [pscustomobject]@{ Ok = $false; Error = $message; Items = @{} }
     }
@@ -2557,9 +2558,8 @@ function Select-GitTracked {
 }
 
 function New-GitTempBranch {
-    # Правки temp - коммитом поверх Base в ветку temp/<время> и pull request в main (NoPull - без него: гейт сам
-    # сливает ветку с main). Temp теперь соответствует этому коммиту. Возвращает Branch, Sha, Number, Url.
-    param($Setup, $State, [string]$Base, $Changes, [switch]$NoPull, [string]$Note = '')
+    # Снимок temp поверх Base. Только новая ветка и PR. Отмечаем снимок в state.json после создания PR.
+    param($Setup, $State, [string]$Base, $Changes, [string]$Note = '')
     $stamp = Get-Date
     $branchName = 'temp/' + $stamp.ToString('yyyyMMdd-HHmmss')
     # Такая ветка уже есть (две выгрузки в одну секунду) - с номером.
@@ -2572,7 +2572,8 @@ function New-GitTempBranch {
     $body = New-Object System.Collections.Generic.List[string]
     $body.Add(("Правки, сделанные прямо в {0}, - выгружены гейтом («Выгрузить temp в git»)." -f $script:TempBase))
     $body.Add('')
-    $body.Add(("Основа - коммит {0}: ему соответствовал {1} после прошлой загрузки или выгрузки." -f $Base, $script:TempBase))
+    $body.Add(("Основа снимка: {0}. Коммит для проверки: {1}." -f $Base, $sha))
+    $body.Add('Перед слиянием проверь разницу и дождись успешных проверок CI для текущей версии PR. Если проверок нет, оставь PR открытым.')
     $body.Add('')
     foreach ($line in $lines) { $body.Add(('- ' + $line)) }
     $body.Add('')
@@ -2586,49 +2587,34 @@ function New-GitTempBranch {
     if (@($Changes).Count -gt 200) { $body.Add(('    … и ещё {0}' -f (@($Changes).Count - 200))) }
     $body.Add('')
     $body.Add('</details>')
+    $title = "Правки temp {0}" -f $stamp.ToString('dd.MM.yyyy HH:mm')
+    if ($Note) { $title += ' (' + $Note + ')' }
+    try {
+        $pull = New-GhPull -Gh $Setup.Gh -Head $branchName -Base $Setup.Branch -Title $title -Body ($body -join "`n")
+    }
+    catch {
+        throw ("Снимок {0} в ветке {1}. Создание PR в {2} не подтверждено. Проверь открытые PR этой ветки на GitHub. Ошибка: {3}" -f $sha, $branchName, $Setup.Branch, $_.Exception.Message)
+    }
     $State['commit'] = $sha
     $State['how'] = 'export'
-    $made = [pscustomobject]@{ Branch = $branchName; Sha = $sha; Number = 0; Url = ''; Body = ($body -join "`n"); Stamp = $stamp }
-    if ($NoPull) {
-        Save-GitState $Setup $State
-        Write-Line ("Правки {0} - в ветке {1}, коммит {2}" -f $script:TempBase, $branchName, (Get-GitShort $sha)) 'Green'
-        return $made
-    }
-    Add-GitTempPull -Setup $Setup -State $State -Made $made -Note $Note
-    Write-Line ("Дальше: посмотреть и слить его в {0} на GitHub, потом «Загрузить из git»." -f $Setup.Branch)
-    return $made
-}
-
-function Add-GitTempPull {
-    # Pull request ветки с правками temp в main; ждём его слияния (pending в state.json).
-    param($Setup, $State, $Made, [string]$Note = '')
-    $title = "Правки temp {0}" -f $Made.Stamp.ToString('dd.MM.yyyy HH:mm')
-    $body = $Made.Body
-    if ($Note) { $title += ' (' + $Note + ')'; $body = ('**' + $Note + '.**' + "`n`n" + $body) }
-    $pull = New-GhPull -Gh $Setup.Gh -Head $Made.Branch -Base $Setup.Branch -Title $title -Body $body
-    $Made.Number = $pull.Number
-    $Made.Url = $pull.Url
-    $State['pendingBranch'] = $Made.Branch
+    $State['pendingBranch'] = $branchName
     $State['pendingNumber'] = $pull.Number
     $State['pendingUrl'] = $pull.Url
-    $State['pendingCommit'] = $Made.Sha
+    $State['pendingCommit'] = $sha
     Save-GitState $Setup $State
-    Write-Line ("Выгрузил: ветка {0}, коммит {1}, pull request #{2}: {3}" -f $Made.Branch, (Get-GitShort $Made.Sha), $pull.Number, $pull.Url) 'Green'
+    Write-Line ("Выгрузил: ветка {0}, коммит {1}, pull request #{2}: {3}" -f $branchName, (Get-GitShort $sha), $pull.Number, $pull.Url) 'Green'
+    Write-Line ("Проверь изменения и дождись зелёного CI в PR. Затем слей его в {0} через Create a merge commit и повтори «Загрузить из git»." -f $Setup.Branch)
+    return [pscustomobject]@{ Branch = $branchName; Sha = $sha; Number = $pull.Number; Url = $pull.Url }
 }
 
 function Invoke-GitExport {
-    # «Выгрузить temp в git»: в репозитории ещё ничего не ведётся - выбор и первый коммит прямо в main;
-    # иначе - сравнение temp с коммитом, которому он соответствует, и правки веткой и pull request.
+    # Первая и последующие выгрузки идут одним путём: снимок в новой ветке и PR.
     param($Setup, $State)
     $head = Get-GhHead -Gh $Setup.Gh -Branch $Setup.Branch
-    if (-not $head.Sha -and -not $head.Empty) { throw ("в {0} нет ветки {1}" -f $Setup.Repo, $Setup.Branch) }
-    $base = ''
-    $baseFiles = @{}
-    if ($head.Sha) {
-        $base = $head.Sha
-        if ([string]$State['commit']) { $base = [string]$State['commit'] }
-        $baseFiles = Get-GhFiles -Gh $Setup.Gh -Commit $base
-    }
+    if (-not $head.Sha) { throw ("В {0} нет ветки {1} для PR. Создай её с начальным коммитом, настрой проверки PR и повтори выгрузку." -f $Setup.Repo, $Setup.Branch) }
+    $base = $head.Sha
+    if ([string]$State['commit']) { $base = [string]$State['commit'] }
+    $baseFiles = Get-GhFiles -Gh $Setup.Gh -Commit $base
     $tracked = Get-GitFolders $baseFiles
     $bootstrap = (@($tracked.Extensions).Count -eq 0) -and -not $tracked.HasProcessings
     if ($bootstrap) {
@@ -2651,23 +2637,13 @@ function Invoke-GitExport {
     }
     foreach ($line in (Get-GitChangeLines $changes)) { Write-Line ('  ' + $line) }
     if ($bootstrap) {
-        $answer = Confirm-Ui -Question ("Положить это первым коммитом в {0} ({1})?" -f $Setup.Repo, $Setup.Branch) -Yes 'Положить' -No 'Отмена'
-        if (-not $answer) { Write-Line 'Отмена: ничего не выгружал.'; return }
-        $parent = $head.Sha
-        if (-not $parent) { $parent = Initialize-GhRepo -Gh $Setup.Gh -Branch $Setup.Branch -Readme (Get-GitReadme) -Message 'Репозиторий расширений: README' }
-        $attributes = Join-Path $Setup.Root '.gitattributes'
-        [System.IO.File]::WriteAllText($attributes, "* -text`n", (New-Object System.Text.UTF8Encoding($false)))
-        $changes += [pscustomobject]@{ Path = '.gitattributes'; Kind = 'add'; File = $attributes; Sha = (Get-GitBlobSha ([System.IO.File]::ReadAllBytes($attributes))) }
-        $what = @(@($tracked.Extensions) + @($(if ($tracked.HasProcessings) { 'внешние обработки' }))) -join ', '
-        $sha = New-GitVerifiedCommit -Setup $Setup -Parent $parent -Changes $changes -Message ("Выгрузка {0} в git: {1}" -f $script:TempBase, $what)
-        Set-GhBranch -Gh $Setup.Gh -Branch $Setup.Branch -Sha $sha
-        $State['commit'] = $sha
-        $State['how'] = 'export'
-        foreach ($name in @('pendingBranch', 'pendingUrl', 'pendingCommit')) { $State[$name] = '' }
-        $State['pendingNumber'] = 0
-        Save-GitState $Setup $State
-        Write-Line ("Положил в {0} ({1}): коммит {2}, https://github.com/{0}/commit/{3}" -f $Setup.Repo, $Setup.Branch, (Get-GitShort $sha), $sha) 'Green'
-        return
+        $repoFiles = [ordered]@{ 'README.md' = (Get-GitReadme); '.gitattributes' = "* -text`n" }
+        foreach ($path in $repoFiles.Keys) {
+            if ($baseFiles.ContainsKey($path)) { continue }
+            $file = Join-Path $Setup.Root $path
+            [System.IO.File]::WriteAllText($file, $repoFiles[$path], (New-Object System.Text.UTF8Encoding($false)))
+            $changes += [pscustomobject]@{ Path = $path; Kind = 'add'; File = $file; Sha = (Get-GitBlobSha ([System.IO.File]::ReadAllBytes($file))) }
+        }
     }
     $answer = Confirm-Ui -Question ("Выгрузить правки {0} веткой temp/<время> и открыть pull request в {1}?" -f $script:TempBase, $Setup.Branch) -Yes 'Выгрузить' -No 'Отмена'
     if (-not $answer) { Write-Line 'Отмена: ничего не выгружал.'; return }
@@ -2690,8 +2666,8 @@ function Save-GitImportResult {
 function Invoke-GitImport {
     # «Загрузить из git»: правили ли temp после прошлой загрузки (выгрузка и сравнение с известным коммитом), не висят
     # ли правки temp в неслитом pull request, потом - обычный прогон гейта отдельным процессом с тем, что изменилось
-    # в main. Правки temp можно слить с main (ветка temp/<время>, слияние на GitHub; конфликт - pull request, temp не
-    # трогается). Комплект оставлен и загрузилось всё - temp соответствует main. Unattended - без вопросов (ночью).
+    # в main. Правки temp можно сохранить веткой и PR. Загрузка после слияния - при следующем запуске.
+    # Комплект оставлен и загрузилось всё - temp соответствует main. Unattended - без вопросов (ночью).
     # Возвращает код прогона.
     param($Setup, $State, [switch]$Unattended)
     Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note 'загрузка не закончилась'
@@ -2722,37 +2698,25 @@ function Invoke-GitImport {
         foreach ($line in (Get-GitFileLines $drift)) { Write-Line ('    ' + $line) 'Yellow' }
         $driftBase = $known
         if (-not $driftBase) { $driftBase = $head.Sha }
-        if ($Unattended) {
-            # Без человека правки temp не сливаются и не затираются: ветка и pull request, temp как есть.
-            $made = New-GitTempBranch -Setup $Setup -State $State -Base $driftBase -Changes $drift -Note 'выгружено ночью'
+        $saveDrift = $true
+        if (-not $Unattended) {
+            $choice = Select-UiOne -Header ("В {0} правки после прошлой загрузки из git: что делать?" -f $script:TempBase) -Items @(
+                'Выгрузить правки temp в git (ветка и pull request), загрузку не делать',
+                ('Загрузить {0} всё равно: правки temp пропадут' -f $Setup.Branch),
+                'Отмена') -Danger @(1)
+            if ($choice -ne 0 -and $choice -ne 1) { Write-Line ("Отмена: {0} не трогаю." -f $script:TempBase); return 0 }
+            $saveDrift = $choice -eq 0
+        }
+        if ($saveDrift) {
+            $note = ''
+            if ($Unattended) { $note = 'выгружено ночью' }
+            $made = New-GitTempBranch -Setup $Setup -State $State -Base $driftBase -Changes $drift -Note $note
             Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note ("правки temp - веткой {0}, pull request #{1}; temp не трогал" -f $made.Branch, $made.Number)
             return 0
         }
-        $choice = Select-UiOne -Header ("В {0} правки после прошлой загрузки из git: что делать?" -f $script:TempBase) -Items @(
-            ('Слить правки temp с {0} и загрузить: правки - веткой temp/<время>, конфликт - pull request, temp не трогаю' -f $Setup.Branch),
-            'Выгрузить правки temp в git (ветка и pull request), загрузку не делать',
-            ('Загрузить {0} всё равно: правки temp пропадут' -f $Setup.Branch),
-            'Отмена') -Danger @(2)
-        if ($choice -eq 0) {
-            $made = New-GitTempBranch -Setup $Setup -State $State -Base $driftBase -Changes $drift -NoPull
-            $merge = Merge-GhBranch -Gh $Setup.Gh -Base $Setup.Branch -Head $made.Branch -Message ("Слияние правок {0} ({1}) с {2}" -f $script:TempBase, $made.Branch, $Setup.Branch)
-            if ($merge.Status -eq 'conflict') {
-                Add-GitTempPull -Setup $Setup -State $State -Made $made -Note ('конфликт со слиянием в ' + $Setup.Branch)
-                Write-Line ("Правки {0} и {1} задевают одно и то же: слить без человека нельзя. Разреши конфликт в pull request #{2}, потом «Загрузить из git». {0} не трогаю." -f $script:TempBase, $Setup.Branch, $made.Number) 'Yellow'
-                return 0
-            }
-            Write-Line ("Правки {0} слиты с {1}{2}." -f $script:TempBase, $Setup.Branch, $(if ($merge.Sha) { ': коммит ' + (Get-GitShort $merge.Sha) } else { '' })) 'Green'
-            $head = Get-GhHead -Gh $Setup.Gh -Branch $Setup.Branch
-            $headFiles = Get-GhFiles -Gh $Setup.Gh -Commit $head.Sha
-        }
-        elseif ($choice -eq 1) {
-            $null = New-GitTempBranch -Setup $Setup -State $State -Base $driftBase -Changes $drift
-            return 0
-        }
-        elseif ($choice -ne 2) { Write-Line ("Отмена: {0} не трогаю." -f $script:TempBase); return 0 }
-        else { Write-Line ("Загружаю {0} поверх правок {1}: так решили." -f $Setup.Branch, $script:TempBase) 'Yellow' }
+        Write-Line ("Загружаю {0} поверх правок {1}: так решили." -f $Setup.Branch, $script:TempBase) 'Yellow'
     }
-    elseif ([string]$State['pendingCommit'] -and -not (Test-GhContains -Gh $Setup.Gh -Branch $Setup.Branch -Commit ([string]$State['pendingCommit']))) {
+    elseif ([string]$State['pendingCommit'] -and -not (Test-GhContains -Gh $Setup.Gh -Branch '' -Head $head.Sha -Commit ([string]$State['pendingCommit']))) {
         if ($Unattended) {
             Write-Line ("Правки {0} из pull request #{1} ещё не в {2}: без человека {2} не гружу." -f $script:TempBase, $State['pendingNumber'], $Setup.Branch) 'Yellow'
             Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note ("pull request #{0} с правками temp не слит: main не грузил" -f $State['pendingNumber'])
@@ -2893,6 +2857,7 @@ function Invoke-GitProdSnapshot {
     # конфигуратором temp, manifest.json, PROD.md. Ветки prod нет - создаётся от main без расширений. Main не трогает.
     param($Setup)
     $prodBranch = [string](Get-Setting $cfg 'ExtensionsProdBranch' 'prod')
+    if ($prodBranch -eq 'main') { throw 'Для снимков рабочей укажи отдельную ветку в ExtensionsProdBranch (например, prod).' }
     if ($prodBranch -eq $Setup.Branch) { throw ("ExtensionsProdBranch и ExtensionsBranch - одна ветка ({0}): снимок рабочей затёр бы то, что должно стоять в temp" -f $prodBranch) }
     $main = Get-GhHead -Gh $Setup.Gh -Branch $Setup.Branch
     if (-not $main.Sha) { throw ("в {0} ({1}) пусто: сначала «Выгрузить temp в git»" -f $Setup.Repo, $Setup.Branch) }
@@ -3045,6 +3010,7 @@ function Invoke-GitTypical {
     # Репозиторий git - отдельно от выгрузки (repo.git): конфигуратор может стереть выгрузку и выгрузить заново.
     $repo = [string](Get-Setting $cfg 'TypicalRepo' '')
     if (-not $repo) { return }
+    if ($repo -eq [string](Get-Setting $cfg 'ExtensionsRepo' '')) { throw 'TypicalRepo совпадает с ExtensionsRepo. Для выгрузки типовой нужен отдельный репозиторий.' }
     $branch = [string](Get-Setting $cfg 'TypicalBranch' 'main')
     if ($repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw ("TypicalRepo «{0}» - не в виде владелец/имя" -f $repo) }
     $typicalRoot = Join-Path (Resolve-RootPath ([string](Get-Setting $cfg 'GitDir' 'git'))) ($repo.Split('/')[1])
@@ -3123,6 +3089,31 @@ function Invoke-GitTypical {
         ('Выгрузить типовую {0} в файлы' -f $script:TempBase), 'Типовая: git fetch (что сейчас в GitHub)', 'Типовая: git add (файлы - в pack)',
         'Типовая: git commit', 'Типовая: git repack (сжать объекты перед отправкой)', 'Типовая: git push (отправка в GitHub)')
     Update-TypicalDump -Dir $dump
+    # Конфигуратор может оставить повреждённый XML даже при наличии Configuration.xml.
+    # Прочитать потоками до записи git-индекса. Пути с # и % передавать как файлы, а не URI.
+    $xmlSettings = New-Object System.Xml.XmlReaderSettings
+    $xmlSettings.XmlResolver = $null
+    try {
+        Get-ChildItem -LiteralPath $dump -Filter '*.xml' -Recurse -File -ErrorAction Stop | ForEach-Object {
+            $xmlFile = $_.FullName
+            $stream = [System.IO.File]::OpenRead($xmlFile)
+            $reader = $null
+            try {
+                $reader = [System.Xml.XmlReader]::Create($stream, $xmlSettings)
+                while ($reader.Read()) { }
+            }
+            catch { throw ("Не удалось прочитать XML выгрузки типовой {0}: {1}" -f $xmlFile, $_.Exception.Message) }
+            finally {
+                if ($null -ne $reader) { $reader.Dispose() }
+                $stream.Dispose()
+            }
+        }
+    }
+    catch {
+        $marker = Join-Path $dump 'ConfigDumpInfo.xml'
+        if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force -ErrorAction Stop }
+        throw
+    }
     # Больше 50 МБ GitHub не любит (больше 100 МБ - не примет): такие файлы - мимо git, их список - в README.
     $dumpFull = [System.IO.Path]::GetFullPath($dump).TrimEnd('\', '/')
     $big = @(Get-ChildItem -LiteralPath $dump -Recurse -File | Where-Object { $_.Length -gt 50MB } | ForEach-Object { $_.FullName.Substring($dumpFull.Length + 1).Replace('\', '/') } | Sort-Object)

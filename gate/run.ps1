@@ -2159,6 +2159,10 @@ function Invoke-AcceptBaseline {
             continue
         }
         $acceptRecords = @(ConvertTo-CheckRecords $acceptLines)
+        if ($acceptRecords.Count -eq 0 -and -not (Test-Path -LiteralPath (Join-Path $acceptDir ($file.BaseName + '.norm.txt')))) {
+            Write-Host ("Пропущено: {0} - в прогоне нет подтверждённого результата проверки" -f $file.Name) -ForegroundColor Yellow
+            continue
+        }
         [System.IO.File]::WriteAllLines((Join-Path $baselineTarget ($file.BaseName + '.norm.txt')), [string[]]$acceptRecords, $Utf8Bom)
         Write-Host ("Принято как известное: {0}, записей {1}" -f $file.BaseName, $acceptRecords.Count)
     }
@@ -3838,10 +3842,31 @@ function Invoke-UtStep {
         Add-StepResult -Name $StepName -Status 'FAIL' -Detail ("отчёт jUnit не разобрался: {0}" -f $_.Exception.Message) -Log $session.Junit -Seconds $session.Seconds
         return
     }
+    $expectedTests = @($known | Where-Object { $_.Registered -and -not $_.Disabled } | ForEach-Object { $_.Key })
+    if ($Filter) { $expectedTests = @($Filter) }
+    $reported = @{}
+    foreach ($result in $results) {
+        if ($result.Method) { $reported[($result.Key -replace '\s*\[.*$', '')] = $true }
+    }
+    $missing = @($expectedTests | Where-Object { -not $reported.ContainsKey($_) })
+    $failed = @($results | Where-Object { Test-UtFailed $_.Status })
+    $issue = ''
+    if ($results.Count -eq 0) { $issue = 'в отчёте jUnit нет результатов тестов' }
+    elseif ($missing.Count -gt 0) {
+        $issue = 'в отчёте jUnit нет результатов запланированных тестов ({0}): {1}' -f $missing.Count, (($missing | Select-Object -First 5) -join ', ')
+        if ($failed.Count -gt 0) { $issue += ('. Ошибка: {0}' -f $failed[0].Message) }
+    }
+    elseif ($session.State -eq 'done' -and (($session.Code -notin @('0', '1')) -or (($session.Code -eq '1') -ne ($failed.Count -gt 0)))) {
+        $issue = 'код возврата YAxUnit «{0}», падений в jUnit: {1}' -f $session.Code, $failed.Count
+    }
+    if ($issue) {
+        # Отчёт остаётся в папке прогона. unittests.txt доступен для принятия вручную только после этой проверки.
+        Add-StepResult -Name $StepName -Status 'FAIL' -Detail $issue -Log $session.Junit -Seconds $session.Seconds
+        return
+    }
     $resultFile = Join-Path $RunDir 'unittests.txt'
     [System.IO.File]::WriteAllLines($resultFile, [string[]]@($results | ForEach-Object { Format-UtResultLine $_ }), $Utf8Bom)
     $comparison = Compare-UtResults -Current $results -BaselineFile $unitBaselineFile
-    $failed = @($results | Where-Object { Test-UtFailed $_.Status })
     $passed = @($results | Where-Object { $_.Status -eq 'OK' }).Count
     $skippedCount = @($results | Where-Object { $_.Status -eq 'SKIP' }).Count
     $detail = 'тестов {0}: прошло {1}, упало {2}' -f $results.Count, $passed, $failed.Count
@@ -4868,6 +4893,11 @@ function Add-CheckStep {
     if ($Blocking) { $badStatus = 'FAIL' }
 
     $records = @(ConvertTo-CheckRecords $Result.Lines)
+    if ($Result.ExitCode -eq 101 -and $records.Count -eq 0 -and -not $Result.TimedOut) {
+        # До исключения известных сообщений: у выполненной проверки с кодом 101 должна быть хотя бы одна запись.
+        Add-StepResult -Name $Name -Status $badStatus -Detail 'код 101, но в журнале конфигуратора нет замечаний или файл /Out отсутствует' -Log $Result.Log -Seconds $Result.Seconds
+        return
+    }
     # Замечания по модулям тестовых расширений (Get-UtCheckIgnorePattern) - не в счёт: их видно в шаге «Модульные тесты».
     $utIgnored = 0
     if ($script:UtCheckIgnore) {
@@ -5325,6 +5355,12 @@ function Get-SelfCheckFailure {
     $reason = $Run.Message
     if ([string]::IsNullOrEmpty($reason)) { $reason = ($Run.Problems -join ' | ') }
     return ("обработка открылась, но тестирование не началось: {0}" -f $reason)
+}
+
+function Test-KitBackupFile {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    return ((Get-Item -LiteralPath $Path -ErrorAction Stop).Length -gt 0)
 }
 
 function Get-ExtensionNamesBefore {
@@ -6496,6 +6532,12 @@ if (Restore-Phase 'backup') {
     # Прежние версии и копия эталона перед загрузкой - из первого прогона цепочки.
     if ($script:RunState.referenceSnapshotDir) { $referenceSnapshotDir = [string]$script:RunState.referenceSnapshotDir }
     Restore-ChainReferences
+    foreach ($item in $kitItems) {
+        if ($item.WasInBase -eq 'no' -or (Test-KitBackupFile $item.Backup)) { continue }
+        Add-StepResult -Name ("Проверить копию {0}" -f $item.Name) -Status 'FAIL' -Detail 'в предыдущем прогоне нет пригодной копии для отката'
+        $proceed = $false
+    }
+    if (-not $proceed) { Set-PhaseState 'backup' 'failed' }
 }
 elseif ($kitItems.Count -gt 0) {
     # Какие расширения были в базе до загрузки. Без самопроверки «до» это неизвестно; тогда про расширение
@@ -6518,26 +6560,31 @@ elseif ($kitItems.Count -gt 0) {
         $backupFile = Join-Path $beforeDir ("{0}_{1}_{2}.cfe" -f $baseKey, $item.Name, (Get-Date -Format 'yyyyMMdd'))
         $result = Invoke-Designer -Command @('/DumpCfg', ('"{0}"' -f $backupFile), '-Extension', $item.Name) `
             -LogName ("backup_{0}.log" -f $item.Name) -TimeoutSec $timeoutLoadSec -Title $stepName
-        $dumped = ($result.ExitCode -eq 0 -and -not $result.TimedOut -and (Test-Path -LiteralPath $backupFile))
+        $dumped = ($result.ExitCode -eq 0 -and -not $result.TimedOut -and (Test-KitBackupFile $backupFile))
 
         # Новым расширение считается, только когда сошлись оба признака: его нет в списке расширений
-        # из самопроверки и конфигуратор его не выгрузил. От этого зависит, удалять ли его при откате.
-        if ($listed -eq 'no' -and -not $dumped -and -not $result.TimedOut -and -not (Test-DesignerBusy $result.Lines)) {
+        # из самопроверки и конфигуратор сообщил, что расширение не найдено.
+        $missingExtension = ($result.Lines -match 'расширени[ея].*не найден|не найден[оа]? расширение')
+        if ($listed -eq 'no' -and $result.ExitCode -ne 0 -and -not $result.TimedOut -and $missingExtension -and -not (Test-DesignerBusy $result.Lines)) {
             $item.WasInBase = 'no'
             Add-StepResult -Name $stepName -Status 'OK' -Detail 'расширения в базе ещё нет, оно новое: сохранять нечего' -Log $result.Log -Seconds $result.Seconds
             continue
         }
-        $saved = Add-SimpleStep -Name $stepName -Result $result -Blocking $false
-        if ($saved -and $dumped) {
-            $item.Backup = $backupFile
-            $item.WasInBase = 'yes'
+        if ($listed -eq 'yes') { $item.WasInBase = 'yes' }
+        if (-not $result.TimedOut -and $result.ExitCode -eq 0 -and -not $dumped) {
+            Add-StepResult -Name $stepName -Status 'FAIL' -Detail 'конфигуратор вернул 0, но файл резервной копии отсутствует или пуст' -Log $result.Log -Seconds $result.Seconds
+            $proceed = $false
+            continue
         }
-        elseif ($listed -eq 'yes') {
-            $item.WasInBase = 'yes'
+        if (-not (Add-SimpleStep -Name $stepName -Result $result -Blocking $true)) {
+            $proceed = $false
+            continue
         }
+        $item.Backup = $backupFile
+        $item.WasInBase = 'yes'
     }
     $script:RunState.referenceSnapshotDir = $referenceSnapshotDir
-    Set-PhaseState 'backup' 'done'
+    if ($proceed) { Set-PhaseState 'backup' 'done' } else { Set-PhaseState 'backup' 'failed' }
 }
 else { Set-PhaseState 'backup' 'na' }
 

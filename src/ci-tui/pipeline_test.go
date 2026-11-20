@@ -169,7 +169,7 @@ func TestCloseEventQuitsAfterScript(t *testing.T) {
 	}
 
 	// Скрипт запущен заново (Enter после ошибки): прежняя просьба закрыться больше не действует.
-	again, _ := m.update(engineStartedMsg{eng: nil})
+	again, _ := m.update(engineStartedMsg{eng: &engine{}})
 	if am := again.(model); am.closeAfter || am.restartAfter {
 		t.Fatal("новый запуск скрипта унаследовал просьбу закрыть ci")
 	}
