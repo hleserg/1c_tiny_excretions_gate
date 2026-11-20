@@ -1449,7 +1449,8 @@ function Invoke-CoverageStep {
     # Эталон карты двигается сам, когда нового непокрытого нет, или ключом -AcceptBaseline.
     # Перехваты правил обмена считаются покрытыми шагом «Обмены», только если он что-то выгрузил (ExchangeRan).
     # TestResults - итоги модульных тестов этого прогона (Key, Status): @Проверяет считается только у теста, который
-    # зарегистрирован, не выключен и прошёл (OK) в этом прогоне (#16). Тесты не прогонялись - указания тестов не в счёт.
+    # зарегистрирован, не выключен и прошёл (OK) в этом прогоне, и ни один его вариант (контекст, параметры) не упал,
+    # а модуль загрузился (#16). Тесты не прогонялись - указания тестов не в счёт.
     param([string[]]$Records, [bool]$ExchangeRan = $false, [object[]]$TestResults = $null)
     $stepName = 'Карта покрытия'
     $allItems = New-Object System.Collections.Generic.List[object]
@@ -1464,12 +1465,23 @@ function Invoke-CoverageStep {
     $testsNote = ''
     if (@($unitTestExtensions).Count -gt 0) {
         $passedTests = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($result in @($TestResults | Where-Object { $null -ne $_ -and $_.Status -eq 'OK' })) { [void]$passedTests.Add(([string]$result.Key -replace '\s*\[.*$', '')) }
+        # ** Хлебников С.Ю. 20261120 Тест с упавшим вариантом (другой контекст, другие параметры) и тесты модуля, который
+        # не загрузился, покрытие не дают, даже если где-то прошли. Пропущенный вариант (SKIP) - ни за, ни против (#16).
+        $failedTests = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        $failedModules = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($result in @($TestResults | Where-Object { $null -ne $_ })) {
+            $resultKey = ([string]$result.Key -replace '\s*\[.*$', '')
+            if ($result.Status -eq 'OK') { [void]$passedTests.Add($resultKey) }
+            elseif ($result.Status -eq 'FAIL' -or $result.Status -eq 'ERROR') {
+                if ($result.Method) { [void]$failedTests.Add($resultKey) } else { [void]$failedModules.Add([string]$result.Module) }
+            }
+        }
+        # ** Хлебников С.Ю. 20261120 конец
         if ($null -eq $TestResults) { $testsNote = '; модульные тесты в этом прогоне не выполнялись - их @Проверяет не учтены' }
         try {
             $catalogs = Get-UtCatalogs
             foreach ($catalog in $catalogs) {
-                foreach ($test in @($catalog.Tests | Where-Object { -not $_.Disabled -and $_.Registered -and $_.Checks -and $passedTests.Contains([string]$_.Key) })) {
+                foreach ($test in @($catalog.Tests | Where-Object { -not $_.Disabled -and $_.Registered -and $_.Checks -and $passedTests.Contains([string]$_.Key) -and -not $failedTests.Contains([string]$_.Key) -and -not $failedModules.Contains([string]$_.Module) })) {
                     foreach ($hint in (Get-CoverageHints -Texts @([string]$test.Checks) -Source ('тест ' + $test.Key))) { $testHints.Add($hint) }
                 }
             }

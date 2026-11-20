@@ -102,6 +102,32 @@ function Check-UnconfirmedCanary {
         }
     },
     @{
+        Name = 'review-evidence-coverage-failed-variant'
+        Text = 'тест прошёл на сервере и упал на клиенте: его @Проверяет покрытие не даёт'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $unitConfig
+            $key = 'перехват|Адаптация|Документ.УчебноеСложение|модуль объекта|ОбработкаПроведения'
+            Set-EvidenceCoverageReference $sb $key
+            $module = $unitModuleClean.Replace('CommonModule.Пример.Сложить', 'Document.УчебноеСложение.ОбработкаПроведения').Replace('CommonModule.Пример.Вычесть', 'Document.УчебноеВычитание.ОбработкаПроведения')
+            $null = Add-UnitTestSource (Join-Path $sb 'tests') $module
+            $dump = New-EvidenceDocumentDump @('УчебноеСложение', 'УчебноеВычитание')
+            $cases = @(
+                @{ module = 'ОМ_Пример'; method = 'Сложение'; name = 'Сложение двух чисел'; status = 'ok'; context = 'Сервер' },
+                @{ module = 'ОМ_Пример'; method = 'Сложение'; name = 'Сложение двух чисел'; status = 'fail'; context = 'Клиент'; message = 'ожидали 4, а было 5' },
+                @{ module = 'ОМ_Пример'; method = 'Вычитание'; name = 'Вычитание'; status = 'ok' })
+            $fake = @{ absent = @('Тесты'); unittests = @(@{ cases = $cases }); dumps = @{ 'Адаптация' = $dump } }
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
+            Check-Common $r
+            $junit = [xml][System.IO.File]::ReadAllText((Join-Path $r.RunDir 'unittests\junit.xml'), $utf8)
+            $variants = @($junit.SelectNodes('//testcase') | Where-Object { $_.GetAttribute('classname') -eq 'ОМ_Пример.Сложение' })
+            Check ($variants.Count -eq 2) ('контроль JUnit: у теста Сложение ожидались два варианта, найдено {0}' -f $variants.Count)
+            Check-EvidenceCoverage $r.RunDir 'перехват|Адаптация|Документ.УчебноеВычитание|модуль объекта|ОбработкаПроведения' $true
+            Check-EvidenceCoverage $r.RunDir $key $false
+            Check-Step $r 'Карта покрытия' 'WARN'
+        }
+    },
+    @{
         Name = 'review-evidence-canary-temp-unconfirmed'
         Text = 'два успешных входа: подтверждённый состав даёт OK, нечитаемый состав отмечается в вердикте'
         Run = {
