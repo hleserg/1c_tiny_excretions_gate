@@ -22,6 +22,7 @@ deploy.ps1 берёт его вместо настоящего, когда за�
     "sessions": [ { "id": 1, "base": "<имя базы>", "app": "1CV8C", "user": "...", "host": "..." } ],
     "failConnect": [ "<имя базы>" ]      - внешнее соединение к этой базе падает
     "lockedConnect": [ "<имя базы>" ]    - в базе чужая блокировка начала сеансов (техработы)
+    "failSessions": [ "<имя базы>" ]     - список сеансов этой базы агент не отдаёт (ошибка)
   }
 
 Что умеет - то, чем пользуется deploy.ps1:
@@ -123,6 +124,7 @@ function New-FakeComAgent {
     $agent | Add-Member -MemberType ScriptMethod -Name GetInfoBaseSessions -Value {
         param($Cluster, $ShortBase)
         $state = Read-FakeComState $this.StateFile
+        if ((Get-FakeComList $state 'failSessions') -contains [string]$ShortBase.Name) { throw ("подставной COM: сеансы {0} не отдаются по сценарию" -f $ShortBase.Name) }
         $list = New-Object System.Collections.Generic.List[object]
         foreach ($session in (Get-FakeComList $state 'sessions')) {
             if ($session.base -ine $ShortBase.Name) { continue }

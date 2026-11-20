@@ -38,6 +38,12 @@
         request, включая первую выгрузку. Загрузить из git - проверка правок temp и обычный
         прогон гейта с тем, что изменилось в main. Рабочую базу не трогает.
 
+    .\deploy.ps1 -CloseBase / -OpenBase [-LocksBase Prod|Temp]
+        Закрыть базу для пользователей: предупредить (блокировка начала сеансов с времени через CloseWarnMinutes,
+        10 минут), в это время запретить регламентные задания и завершить оставшиеся сеансы; конфигуратор - по
+        вопросу. Блокировки остаются, пока базу не откроют: -OpenBase снимает только то, что поставило закрытие
+        (deploy\close\closed-<база>.json). Только с человеком у экрана.
+
     Внешние обработки и отчёты справочника «Дополнительные отчёты и обработки» сравниваются так же:
     изменённые и новые в temp можно обновить вместе с расширениями или отдельно («Обновить только
     внешние обработки»: без блокировок рабочей базы, без обновления конфигурации БД). Записывает их
@@ -81,6 +87,10 @@ param(
     # Поставить или снять руками блокировку начала сеансов и блокировку регламентных заданий базы LocksBase
     # (Temp - тестовая, Prod - рабочая). Только с человеком: каждое изменение - его выбором, на рабочей - с подтверждением.
     [switch]$ManualLocks,
+    # ** Хлебников С.Ю. 20261120 Закрыть базу LocksBase для пользователей (предупредить, через CloseWarnMinutes - запрет
+    # входа и регламентных, завершить сеансы) и открыть её снова: снять то, что поставило закрытие.
+    [switch]$CloseBase,
+    [switch]$OpenBase,
     [ValidateSet('Temp', 'Prod')]
     [string]$LocksBase = 'Prod',
     # Сравнить temp и рабочую и показать разницу: расширения (по выгрузкам в файлы) или внешние обработки. Только чтение.
@@ -927,6 +937,10 @@ $deployWarnMinutes = [double](Get-Setting $cfg 'DeployWarnMinutes' 10)
 if ($deployWarnMinutes -lt 0) { $deployWarnMinutes = 0 }
 $script:WarnLockAt = $null
 $script:WarnLockUntil = $null
+# ** Хлебников С.Ю. 20261120 Закрыть базу (-CloseBase): за сколько минут до закрытия предупреждать пользователей.
+# 0 - варианта с предупреждением нет, только «закрыть сейчас».
+$closeWarnMinutes = [double](Get-Setting $cfg 'CloseWarnMinutes' 10)
+if ($closeWarnMinutes -lt 0) { $closeWarnMinutes = 0 }
 $prodSelfCheckForms = [bool](Get-Setting $cfg 'ProdSelfCheckForms' $false)
 $prodSelfCheckTimeoutMin = [int](Get-Setting $cfg 'ProdSelfCheckTimeoutMin' 60)
 # Сколько ждать ответа на «оставить или откатить» после проверок на рабочей. Нет ответа - обновление
@@ -954,12 +968,14 @@ Initialize-Stats -Dir (Resolve-RootPath ([string](Get-Setting $cfg 'StatsDir' 's
 $deployRoot = Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))
 $mirrorRoot = Join-Path $deployRoot 'mirror'
 $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
-$viewOnly = ($BaseState -or $ManualLocks -or $CompareExtensions -or $CompareProcessings -or $ProdPreCheck -or $ComCheck -or $GitExport -or $GitImport -or $GitProd -or $GitTypical -or $Delivery)
+$viewOnly = ($BaseState -or $ManualLocks -or $CloseBase -or $OpenBase -or $CompareExtensions -or $CompareProcessings -or $ProdPreCheck -or $ComCheck -or $GitExport -or $GitImport -or $GitProd -or $GitTypical -or $Delivery)
 if ($viewOnly) {
     # Показать состояние или сравнить - не запуск обновления: своей папки запуска нет (в истории обновлений его не видно),
     # журнал - в deploy\state\run.log, каждый раз заново.
     $viewName = 'state'
     if ($ManualLocks) { $viewName = 'locks' }
+    # ** Хлебников С.Ю. 20261120 Закрыть и открыть базу: журнал - deploy\close\run.log, там же файл закрытия и history.log.
+    if ($CloseBase -or $OpenBase) { $viewName = 'close' }
     if ($CompareExtensions) { $viewName = 'compare-ext' } elseif ($CompareProcessings) { $viewName = 'compare-epf' } elseif ($ProdPreCheck) { $viewName = 'precheck' } elseif ($ComCheck) { $viewName = 'comcheck' } elseif ($GitExport -or $GitImport -or $GitProd -or $GitTypical) { $viewName = 'git' } elseif ($Delivery) { $viewName = 'delivery' }
     $script:RunDir = Join-Path $deployRoot $viewName
     New-Item -ItemType Directory -Path $script:RunDir -Force | Out-Null
@@ -1935,11 +1951,59 @@ function Format-LockDate {
     return $date.ToString('dd.MM.yyyy HH:mm')
 }
 
+# ** Хлебников С.Ю. 20261120 Закрытие базы (-CloseBase/-OpenBase): что поставило закрытие - в deploy\close\closed-<база>.json
+# (что стояло до него, что поставило оно само в том виде, как вернул кластер, ставило ли запрет регламентных, метка).
+# Файл есть - база закрыта этим пунктом или закрытие оборвалось; -OpenBase снимает по нему только своё.
+function Get-CloseFile {
+    param([string]$BaseName)
+    return (Join-Path (Join-Path $deployRoot 'close') ('closed-{0}.json' -f $BaseName))
+}
+
+function Read-CloseRecord {
+    # Запись закрытия базы. Нет файла - $null; не читается - исключение: что стоит на базе от закрытия, неизвестно.
+    param([string]$BaseName)
+    $file = Get-CloseFile $BaseName
+    if (-not (Test-Path -LiteralPath $file)) { return $null }
+    try { return ([System.IO.File]::ReadAllText($file, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json) }
+    catch {
+        throw ("файл закрытия {0} не читается ({1}): что поставило закрытие, неизвестно. Блокировки - «Блокировки рабочей базы» или консоль кластера, файл потом убрать руками" -f $file, $_.Exception.Message)
+    }
+}
+
+function Get-OpenBaseHint {
+    param([string]$BaseName)
+    if ($BaseName -ieq $script:ProdBase) { return 'открыть - пункт меню гейта «Открыть рабочую базу» (deploy.ps1 -OpenBase)' }
+    return 'открыть - deploy.ps1 -OpenBase -LocksBase Temp'
+}
+
+function Get-CloseRecordText {
+    # Одной строкой: закрыта или закрытие оборвалось, когда и кем, до какого времени вход, запрещало ли регламентные.
+    param($Record)
+    $text = 'закрыта гейтом'
+    if ([string](Get-JsonValue $Record 'status' '') -ne 'closed') { $text = 'закрытие гейтом не закончено' }
+    $when = [string](Get-JsonValue $Record 'closedAt' '')
+    if (-not $when) { $when = [string](Get-JsonValue $Record 'startedAt' '') }
+    if ($when) { $text += (' ' + $when) }
+    $by = [string](Get-JsonValue $Record 'by' '')
+    if ($by) { $text += (', пользователь Windows ' + $by) }
+    $until = [string](Get-JsonValue $Record 'until' '')
+    if ($until) { $text += (', вход закрыт до ' + $until) }
+    if ([bool](Get-JsonValue $Record 'jobsSet' $false)) { $text += ', регламентные задания запрещены' }
+    return $text
+}
+# ** Хлебников С.Ю. 20261120 конец
+
 function Show-BaseState {
     # Блокировки базы и сеансы - только чтение, ничего не меняется.
     param($Link, [string]$BaseName, [string]$User, [string]$Password)
     Write-Host ''
     Write-Line ("{0}" -f $BaseName) 'Cyan'
+    # ** Хлебников С.Ю. 20261120 Закрыта ли база пунктом «Закрыть» (файл закрытия).
+    try {
+        $closeRecord = Read-CloseRecord $BaseName
+        if ($null -ne $closeRecord) { Write-Line ('  {0}; {1}' -f (Get-CloseRecordText $closeRecord), (Get-OpenBaseHint $BaseName)) 'Yellow' }
+    }
+    catch { Write-Line ('  ' + $_.Exception.Message) 'Yellow' }
     try { $info = (Get-BaseInfo -Link $Link -BaseName $BaseName -User $User -Password $Password).InfoBase }
     catch { Write-Line ("  свойства базы в кластере не прочитал: {0}" -f $_.Exception.Message) 'Yellow'; $info = $null }
     if ($null -ne $info) {
@@ -2018,8 +2082,16 @@ function Invoke-ManualLocks {
             $labels = @('Поставить блокировку начала сеансов', 'Поставить блокировку регламентных заданий', 'Готово, выйти')
             if ($sessionsOn) { $labels[0] = 'Снять блокировку начала сеансов' }
             if ($jobsOn) { $labels[1] = 'Снять блокировку регламентных заданий' }
+            # ** Хлебников С.Ю. 20261120 База закрыта пунктом «Закрыть»: открывать лучше им - снимется и его запрет регламентных.
+            $lockNotes = New-Object System.Collections.Generic.List[string]
+            $lockNotes.Add('Сеансы, которые уже открыты, не завершаются.')
+            try {
+                $closeRecord = Read-CloseRecord $baseName
+                if ($null -ne $closeRecord) { $lockNotes.Add(('База {0}. Открывать лучше там же: снимется и запрет регламентных, поставленный закрытием; {1}.' -f (Get-CloseRecordText $closeRecord), (Get-OpenBaseHint $baseName))) }
+            }
+            catch { $lockNotes.Add($_.Exception.Message) }
             $answer = Read-UiChoice -Header ("Блокировки {0}: что сделать?" -f $baseName) -Keys $keys -Labels $labels -CancelKey '0' -DefaultKey '0' `
-                -Notes @('Сеансы, которые уже открыты, не завершаются.')
+                -Notes $lockNotes.ToArray()
             if ($answer -ne '1' -and $answer -ne '2') { break }
             $done = ''
             if ($answer -eq '1' -and -not $sessionsOn) {
@@ -2081,6 +2153,379 @@ if ($ManualLocks) {
     Invoke-ManualLocks $LocksBase
     exit 0
 }
+
+# ** Хлебников С.Ю. 20261120 Закрыть базу для пользователей и открыть её (-CloseBase/-OpenBase). Закрытие: предупреждение
+# (блокировка начала сеансов с времени через CloseWarnMinutes - клиенты БСП показывают предупреждение и в это время
+# закрываются сами), в это время запрет регламентных заданий и завершение оставшихся сеансов, конфигуратор - по
+# вопросу. Блокировки остаются до открытия - ради них пункт и нужен; что поставлено - в файле закрытия. Не дошло до
+# завершения сеансов (отмена, ошибка) - всё, что успело поставить, снимается сразу. Открытие снимает только своё.
+function Format-CloseMinutes {
+    param([double]$Minutes)
+    if ($Minutes -eq [Math]::Floor($Minutes)) { return ([string][int]$Minutes) }
+    return $Minutes.ToString('0.##', [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Save-CloseRecord {
+    # Файл закрытия - заменой (обрыв посреди записи не портит прежний); своих блокировок не осталось - файл убирается.
+    param([string]$BaseName, $State, $Info)
+    $file = Get-CloseFile $BaseName
+    if ($null -eq $State -or (-not $State.Expected.Count -and -not $State.JobsSet)) {
+        if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force }
+        return
+    }
+    New-Item -ItemType Directory -Path (Split-Path -Parent $file) -Force | Out-Null
+    $record = [ordered]@{}
+    foreach ($key in @($Info.Keys)) { $record[$key] = $Info[$key] }
+    $record['marker'] = $State.Marker
+    $record['jobsSet'] = [bool]$State.JobsSet
+    $record['before'] = ConvertTo-LockJson $State.Before
+    $record['expected'] = @(foreach ($one in $State.Expected) { ConvertTo-LockJson $one })
+    $temp = $file + '.tmp'
+    [System.IO.File]::WriteAllText($temp, (ConvertTo-Json -InputObject $record -Depth 6), $Utf8Bom)
+    # [NullString]::Value - без резервной копии: $null PowerShell передал бы пустой строкой.
+    if (Test-Path -LiteralPath $file) { [System.IO.File]::Replace($temp, $file, [NullString]::Value) }
+    else { [System.IO.File]::Move($temp, $file) }
+}
+
+function Get-CloseLockState {
+    # Блокировки закрытия из его файла - в том виде, в каком их ждут Test-GateSessionLock и Restore-GateLocks.
+    param($Record)
+    $state = New-GateLockState
+    $state.Marker = [string](Get-JsonValue $Record 'marker' '')
+    $state.JobsSet = [bool](Get-JsonValue $Record 'jobsSet' $false)
+    $state.Before = ConvertFrom-LockJson (Get-JsonValue $Record 'before' $null)
+    $state.Expected = @(foreach ($one in @(Get-JsonValue $Record 'expected' @())) { ConvertFrom-LockJson $one })
+    return $state
+}
+
+function Write-CloseHistory {
+    # Закрытия и открытия баз - в deploy\close\history.log, не стирается (run.log папки пишется каждый раз заново).
+    param([string]$Text)
+    $file = Join-Path (Join-Path $deployRoot 'close') 'history.log'
+    try { [System.IO.File]::AppendAllText($file, ("{0} {1}`r`n" -f (Get-Date -Format 'dd.MM.yyyy HH:mm:ss'), (Get-MaskedLine $Text)), $Utf8Bom) }
+    catch { Write-RunLog ('history.log не записался: ' + $_.Exception.Message) }
+}
+
+function Wait-CloseWarning {
+    # После предупреждения: ждать начала блокировки и ещё минуту (клиенты БСП проверяют её раз в минуту и закрываются
+    # сами), все вышли раньше - сразу. Ответ: '1' - не ждать, '2' - отмена, 'empty' - вышли все, 'time' - время вышло.
+    param([datetime]$LockAt)
+    $graceSec = [Math]::Min(70, [Math]::Max(3, [int]($closeWarnMinutes * 60)))
+    $script:CloseLockAt = $LockAt
+    $script:CloseDeadline = $LockAt.AddSeconds($graceSec)
+    $script:CloseLink = Connect-ClusterAgent
+    $script:CloseShown = ''
+    $header = "Пользователи {0} предупреждены: в {1} вход закрывается, в {2} оставшиеся сеансы завершу сам; все выйдут раньше - закрою сразу. Или:" -f `
+        $script:CloseBaseName, $LockAt.ToString('HH:mm'), $script:CloseDeadline.ToString('HH:mm:ss')
+    return (Read-UiChoice -Header $header -Dock -Keys @('1', '2') -CancelKey '2' -Labels @(
+            'Не ждать: закрыть сейчас и завершить сеансы',
+            'Отмена: снять предупреждение, базу не закрывать') -Poll {
+            $list = @(Get-BaseSessions $script:CloseLink $script:CloseBaseName)
+            $late = ((Get-Date) -ge $script:CloseDeadline)
+            if (@($list | Where-Object { $_.IsError }).Count -gt 0) { if ($late) { return 'time' }; return '' }
+            $users = @($list | Where-Object { -not $_.IsDesigner })
+            if ($users.Count -eq 0) { return 'empty' }
+            if ($late) { return 'time' }
+            $minutesLeft = [int][Math]::Ceiling(($script:CloseLockAt - (Get-Date)).TotalMinutes)
+            $shown = "вход закрыт, сеансов осталось: {0}" -f $users.Count
+            if ($minutesLeft -gt 0) { $shown = "до закрытия {0} мин, сеансов: {1}" -f $minutesLeft, $users.Count }
+            if ($shown -ne $script:CloseShown) { $script:CloseShown = $shown; Write-Host ('  ' + $shown) -ForegroundColor DarkGray }
+            return ''
+        })
+}
+
+function Get-UserSessions {
+    # Сеансы базы, кроме конфигуратора. Failed - список не прочитан: пустой Users тогда не значит «никого нет»
+    # (ревью #44). Что не прочиталось - в журнал и на экран.
+    param($Link, [string]$BaseName)
+    $all = @(Get-BaseSessions $Link $BaseName)
+    $errors = @($all | Where-Object { $_.IsError })
+    foreach ($entry in $errors) { Write-Line ('  сеансы не прочитал: ' + $entry.Text) 'Yellow' }
+    return [pscustomobject]@{ Users = @($all | Where-Object { -not $_.IsError -and -not $_.IsDesigner }); Failed = ($errors.Count -gt 0) }
+}
+
+function Invoke-CloseBase {
+    param([string]$Which)
+    $baseName = $script:TempBase; $user = $script:TempUser; $password = $script:TempPassword
+    if ($Which -eq 'Prod') { $baseName = $script:ProdBase; $user = $script:ProdUser; $password = $script:ProdPassword }
+    $isProd = ($Which -eq 'Prod')
+    # Для проверок внутри ожидания (Poll) и повторного чтения свойств: блок кода видит только переменные скрипта.
+    $script:CloseBaseName = $baseName
+    if (-not (Test-UiCanAsk)) { throw 'закрыть базу - только с человеком у экрана: запусти из меню гейта' }
+    # Пока идёт обновление рабочей или блокировки руками (deploy.lock занят), базу не закрываю: блокировки ведут они.
+    $guard = $null
+    try { $guard = [System.IO.File]::Open((Join-Path $deployRoot 'deploy.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
+    catch { throw 'deploy.lock занят другим запуском (обновление рабочей, блокировки руками): базу не закрываю, дождись его конца' }
+    $state = $null
+    $info = [ordered]@{}
+    # Дошли до завершения сеансов - блокировки остаются, что бы ни случилось дальше; до того - снимаются в finally.
+    $keep = $false
+    try {
+        Write-Line ("ЗАКРЫТЬ {0} ДЛЯ ПОЛЬЗОВАТЕЛЕЙ" -f $baseName) 'Cyan'
+        Write-RunLog ("Закрыть базу: {0}, пользователь Windows {1}" -f $baseName, [Environment]::UserName)
+        $record = Read-CloseRecord $baseName
+        if ($null -ne $record) {
+            Write-Line ("  {0} уже {1}; {2}" -f $baseName, (Get-CloseRecordText $record), (Get-OpenBaseHint $baseName)) 'Yellow'
+            return
+        }
+        $link = Connect-ClusterAgent
+        Show-BaseState -Link $link -BaseName $baseName -User $user -Password $password
+        $target = Get-BaseInfo -Link $link -BaseName $baseName -User $user -Password $password
+        $current = Read-BaseInfoAgain $target $baseName
+        if ([bool]$current.SessionsDenied) {
+            Write-Line ("  на {0} уже стоит блокировка начала сеансов: закрываю только базу без неё. Сними её («Блокировки рабочей базы» или консоль кластера) и закрой снова." -f $baseName) 'Yellow'
+            return
+        }
+
+        $keys = New-Object System.Collections.Generic.List[string]
+        $labels = New-Object System.Collections.Generic.List[string]
+        if ($closeWarnMinutes -gt 0) { $keys.Add('1'); $labels.Add(("Предупредить пользователей и закрыть через {0} мин" -f (Format-CloseMinutes $closeWarnMinutes))) }
+        $keys.Add('2'); $labels.Add('Закрыть сейчас, без предупреждения')
+        $keys.Add('0'); $labels.Add('Отмена')
+        $how = Read-UiChoice -Header ("Закрыть {0} для пользователей: когда?" -f $baseName) -Keys $keys.ToArray() -Labels $labels.ToArray() -CancelKey '0' -DefaultKey $keys[0] -Notes @(
+            'В назначенное время вход закрывается (кроме входа с кодом разрешения), регламентные задания запрещаются, оставшиеся сеансы завершаются; конфигуратор - по вопросу.',
+            ('Блокировки остаются, пока базу не откроют: {0}.' -f (Get-OpenBaseHint $baseName)))
+        if ($how -ne '1' -and $how -ne '2') { Write-Line '  отмена: ничего не менял'; return }
+        $warn = ($how -eq '1')
+        $lockAt = Get-Date
+        if ($warn) { $lockAt = $lockAt.AddSeconds($closeWarnMinutes * 60) }
+
+        $until1 = $lockAt.AddHours(1); $until3 = $lockAt.AddHours(3)
+        $night = Get-NextClockTime 2; $morning = Get-NextClockTime 8
+        if ($night -le $lockAt.AddMinutes(30)) { $night = $night.AddDays(1) }
+        if ($morning -le $lockAt.AddMinutes(30)) { $morning = $morning.AddDays(1) }
+        $period = Read-UiChoice -Header ("Вход в {0} закрыть до какого времени?" -f $baseName) -Keys @('1', '2', '3', '4', '0') -Labels @(
+            ('на час, до {0}' -f $until1.ToString('dd.MM HH:mm')), ('на 3 часа, до {0}' -f $until3.ToString('dd.MM HH:mm')),
+            ('до {0}' -f $night.ToString('dd.MM HH:mm')), ('до {0}' -f $morning.ToString('dd.MM HH:mm')), 'Отмена') -CancelKey '0' -DefaultKey '2' -Notes @(
+            'Открыть раньше - тем же меню. Срок - на случай, если забыть открыть: в это время вход откроется сам, а запрет регламентных заданий останется до «Открыть».')
+        $until = $null
+        switch ($period) { '1' { $until = $until1 } '2' { $until = $until3 } '3' { $until = $night } '4' { $until = $morning } }
+        if ($null -eq $until) { Write-Line '  отмена: ничего не менял'; return }
+
+        $whenText = 'Сейчас вход закроется'
+        if ($warn) { $whenText = ('Сейчас пользователи увидят предупреждение, в {0} вход закроется' -f $lockAt.ToString('HH:mm')) }
+        if ($isProd) {
+            $question = "Закрыть {0}? {1} до {2} (кроме входа с кодом разрешения), регламентные задания будут запрещены, оставшиеся сеансы - завершены." -f `
+                $baseName, $whenText, $until.ToString('dd.MM HH:mm')
+            if (-not (Confirm-Ui -Question $question -Yes 'Да, закрыть' -No 'Нет' -DefaultNo)) { Write-Line '  отмена: ничего не менял'; return }
+        }
+
+        $state = New-GateLockState
+        $info['base'] = $baseName
+        $info['which'] = $Which
+        $info['target'] = [string]$target.Identity
+        $info['status'] = 'warning'
+        $info['by'] = [Environment]::UserName
+        $info['startedAt'] = (Get-Date).ToString('dd.MM.yyyy HH:mm:ss')
+        $info['lockAt'] = $lockAt.ToString('dd.MM.yyyy HH:mm')
+        $info['until'] = $until.ToString('dd.MM.yyyy HH:mm')
+        $info['closedAt'] = ''
+        $from = $lockAt
+        $message = "Технические работы: в {0} программа закроется, вход будет закрыт до {1}. Сохраните работу и выйдите из программы до {0}." -f `
+            $lockAt.ToString('HH:mm'), $until.ToString('dd.MM HH:mm')
+        if (-not $warn) {
+            # Сразу: начало на 30 минут раньше - часы сервера и этой машины могут расходиться.
+            $from = $lockAt.AddMinutes(-30)
+            $message = "Технические работы, вход в программу закрыт до {0}" -f $until.ToString('dd.MM HH:mm')
+        }
+        try { Set-GateSessionLock $state $target $from $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:CloseBaseName } }
+        finally { Save-CloseRecord $baseName $state $info }
+        if ($warn) {
+            Write-Line ("  поставил блокировку начала сеансов с {0} до {1}: пользователи видят предупреждение, в {0} их программы закроются сами" -f $lockAt.ToString('HH:mm'), $until.ToString('dd.MM HH:mm')) 'Green'
+            Write-RunLog ("Предупреждение пользователей {0}: блокировка начала сеансов с {1}" -f $baseName, $lockAt.ToString('HH:mm:ss'))
+            $answer = Wait-CloseWarning $lockAt
+            if ($answer -eq '2') { Write-Line '  закрытие отменено: снимаю предупреждение, база остаётся открытой' 'Yellow'; return }
+            if ($answer -eq 'empty') { Write-Line ("  в {0} сеансов пользователей не осталось" -f $baseName) 'Green' }
+            if ($answer -eq 'time') { Write-Line ("  {0}: время вышло" -f (Get-Date -Format 'HH:mm')) }
+        }
+
+        # Свойства - заново: за время ожидания соединение с агентом могло устареть, новое подтверждает ту же цель.
+        $link = Connect-ClusterAgent
+        $target = Get-BaseInfo -Link $link -BaseName $baseName -User $user -Password $password
+        $current = Read-BaseInfoAgain $target $baseName
+        if (-not (Test-GateSessionLock $state $current)) { throw 'блокировку начала сеансов изменили или сняли во время предупреждения: базу не закрываю' }
+        # Регламентные - до завершения сеансов: иначе фоновые задания запустятся снова.
+        $jobsNew = $false
+        try { $jobsNew = Set-GateJobsLock $state $target { param($t) Read-BaseInfoAgain $t $script:CloseBaseName } }
+        finally { Save-CloseRecord $baseName $state $info }
+        if ($jobsNew) { Write-Line '  поставил блокировку регламентных заданий' 'Green' }
+        else { Write-Line '  регламентные задания были запрещены до закрытия: так и оставляю, при открытии этот запрет не снимется' }
+        if ($warn) {
+            # Сообщение - уже не предупреждение, а «вход закрыт»: его видит тот, кто пробует войти. Все вышли раньше
+            # или «не ждать» - начало блокировки ещё и переносится на сейчас, иначе до него в базу можно было бы войти.
+            $early = ((Get-Date) -lt $lockAt)
+            $from = $lockAt
+            if ($early) { $from = (Get-Date).AddMinutes(-30) }
+            $message = "Технические работы, вход в программу закрыт до {0}" -f $until.ToString('dd.MM HH:mm')
+            try { Set-GateSessionLock $state $target $from $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:CloseBaseName } }
+            finally { Save-CloseRecord $baseName $state $info }
+            if ($early) { Write-Line '  блокировка начала сеансов действует с этой минуты' 'Green' }
+        }
+
+        $info['status'] = 'closed'
+        $info['closedAt'] = (Get-Date).ToString('dd.MM.yyyy HH:mm:ss')
+        Save-CloseRecord $baseName $state $info
+        $keep = $true
+        $jobsText = 'регламентные задания запрещены'
+        if (-not $state.JobsSet) { $jobsText = 'регламентные задания были запрещены до закрытия' }
+        Write-CloseHistory ("{0} закрыта: вход до {1}, {2}; пользователь Windows {3}" -f $baseName, $until.ToString('dd.MM.yyyy HH:mm'), $jobsText, [Environment]::UserName)
+
+        # Сеансы, кроме конфигуратора: завершить; зависший клиент или фоновое задание может уйти не сразу - до трёх раз.
+        # Список не прочитался - не «никого нет»: прочитать ещё раз, завершать - когда прочитался.
+        $seen = Get-UserSessions $link $baseName
+        $stopped = 0
+        for ($try = 1; $try -le 3 -and ($seen.Failed -or $seen.Users.Count -gt 0); $try++) {
+            if (-not $seen.Failed) {
+                try {
+                    foreach ($line in @(Stop-BaseSessions -Link $link -BaseName $baseName)) {
+                        Write-Line ('  ' + $line)
+                        if ($line.EndsWith(' - завершён')) { $stopped++ }
+                    }
+                }
+                catch { Write-Line ('  завершить сеансы не смог: ' + $_.Exception.Message) 'Yellow' }
+            }
+            Start-Sleep -Seconds 3
+            $seen = Get-UserSessions $link $baseName
+        }
+        $sessionsDone = (-not $seen.Failed -and $seen.Users.Count -eq 0)
+        if ($seen.Failed) { Write-Line '  сеансы прочитать не смог: завершены ли все, не знаю' 'Yellow' }
+        elseif ($seen.Users.Count -gt 0) {
+            Write-Line ("  не завершились сеансы: {0}" -f $seen.Users.Count) 'Yellow'
+            foreach ($entry in $seen.Users) { Write-Line ('    ' + $entry.Text) 'Yellow' }
+        }
+        $designers = @(Get-BaseSessions $link $baseName | Where-Object { -not $_.IsError -and $_.IsDesigner })
+        if ($designers.Count -gt 0) {
+            foreach ($entry in $designers) { Write-Line ('  конфигуратор: ' + $entry.Text) 'Yellow' }
+            $script:CloseLink = $link
+            $answer = Read-UiChoice -Header ("В {0} открыт конфигуратор. Закрой его сам - увижу и продолжу, или:" -f $baseName) -Keys @('1', '2') -CancelKey '2' -DefaultKey '2' -Labels @(
+                'Закрыть отсюда (сеанс прерывается, несохранённые правки в нём пропадут)', 'Оставить конфигуратор открытым') -Poll {
+                $now = @(Get-BaseSessions $script:CloseLink $script:CloseBaseName)
+                if (@($now | Where-Object { $_.IsError }).Count -eq 0 -and @($now | Where-Object { $_.IsDesigner }).Count -eq 0) { return 'closed' }
+                return ''
+            }
+            if ($answer -eq '1') { foreach ($line in @(Stop-BaseSessions -Link $link -BaseName $baseName -Designers)) { Write-Line ('  ' + $line) } }
+            elseif ($answer -eq 'closed') { Write-Line '  конфигуратор закрыт' 'Green' }
+            else { Write-Line '  конфигуратор оставил открытым' }
+        }
+
+        Write-Host ''
+        if ($sessionsDone) {
+            Write-Line ("{0} ЗАКРЫТА: вход закрыт до {1} (войти можно только с кодом разрешения UnlockCode), {2}, завершено сеансов: {3}." -f `
+                $baseName, $until.ToString('dd.MM.yyyy HH:mm'), $jobsText, $stopped) 'Green'
+        }
+        else {
+            # Вход закрыт, но что сеансов пользователей не осталось, не подтверждено: не зелёный итог и код возврата 1.
+            $script:CloseUnconfirmed = $true
+            Write-Line ("{0}: ВХОД ЗАКРЫТ до {1}, {2}, но сеансы пользователей завершены не все или не прочитаны (завершено: {3}). Проверь «Показать состояние баз»; оставшиеся - консоль кластера." -f `
+                $baseName, $until.ToString('dd.MM.yyyy HH:mm'), $jobsText, $stopped) 'Yellow'
+        }
+        Write-Line ('  ' + (Get-OpenBaseHint $baseName) + '. Блокировки снимутся только те, что поставило закрытие.')
+    }
+    finally {
+        if (-not $keep -and $null -ne $state -and ($state.Expected.Count -or $state.JobsSet)) {
+            try {
+                $undoTarget = Get-BaseInfo -Link (Connect-ClusterAgent) -BaseName $baseName -User $user -Password $password
+                $released = Restore-GateLocks $state $undoTarget $true { param($t) Read-BaseInfoAgain $t $script:CloseBaseName }
+                if ($released) { Write-Line ("  снял с {0}: {1} - база открыта, как была до закрытия" -f $baseName, $released) 'Green' }
+                Write-RunLog ("Закрытие {0} не закончено, снято: {1}" -f $baseName, $released)
+            }
+            catch { Write-Line ("  НЕ СНЯЛ или не подтвердил снятие блокировок {0}: {1}. {2}; или консоль кластера." -f $baseName, $_.Exception.Message, (Get-OpenBaseHint $baseName)) 'Red' }
+            try { Save-CloseRecord $baseName $state $info } catch { Write-Line ('  файл закрытия не записался: ' + $_.Exception.Message) 'Red' }
+        }
+        if ($null -ne $guard) { $guard.Dispose() }
+    }
+}
+
+function Invoke-OpenBase {
+    # Открыть базу, закрытую -CloseBase: по файлу закрытия снять только своё - блокировку начала сеансов (к параметрам
+    # до закрытия, если её с тех пор не меняли) и запрет регламентных (если его ставило закрытие). Чужое не трогается.
+    # На рабочей потом - вход без кода разрешения, как после обновления.
+    param([string]$Which)
+    $baseName = $script:TempBase; $user = $script:TempUser; $password = $script:TempPassword
+    if ($Which -eq 'Prod') { $baseName = $script:ProdBase; $user = $script:ProdUser; $password = $script:ProdPassword }
+    $isProd = ($Which -eq 'Prod')
+    $script:CloseBaseName = $baseName
+    if (-not (Test-UiCanAsk)) { throw 'открыть базу - только с человеком у экрана: запусти из меню гейта' }
+    $guard = $null
+    try { $guard = [System.IO.File]::Open((Join-Path $deployRoot 'deploy.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
+    catch { throw 'deploy.lock занят другим запуском (обновление рабочей, блокировки руками, закрытие базы): дождись его конца' }
+    try {
+        Write-Line ("ОТКРЫТЬ {0} ДЛЯ ПОЛЬЗОВАТЕЛЕЙ" -f $baseName) 'Cyan'
+        Write-RunLog ("Открыть базу: {0}, пользователь Windows {1}" -f $baseName, [Environment]::UserName)
+        $record = Read-CloseRecord $baseName
+        $link = Connect-ClusterAgent
+        Show-BaseState -Link $link -BaseName $baseName -User $user -Password $password
+        if ($null -eq $record) {
+            Write-Line ("  {0} не закрывалась пунктом «Закрыть»: снимать нечего. Блокировки руками - «Блокировки рабочей базы»." -f $baseName) 'Yellow'
+            return
+        }
+        $target = Get-BaseInfo -Link $link -BaseName $baseName -User $user -Password $password
+        $savedTarget = [string](Get-JsonValue $record 'target' '')
+        if (-not $savedTarget -or $savedTarget -cne [string]$target.Identity) {
+            # Сверять нечего: файл про ту базу, где ставились блокировки, - он остаётся.
+            Write-Line ("  файл закрытия {0} записан для другого кластера или ИБ, чем в текущем профиле {1}\{2}: не сверяю и не снимаю. Блокировки той базы - консоль кластера." -f (Get-CloseFile $baseName), $script:Server, $baseName) 'Yellow'
+            Write-RunLog ("Файл закрытия: цель «{0}» не совпала с текущей" -f $savedTarget)
+            return
+        }
+        $state = Get-CloseLockState $record
+        $now = Read-BaseInfoAgain $target $baseName
+        $own = New-Object System.Collections.Generic.List[string]
+        if ($state.Expected.Count) {
+            if ($null -ne $state.Before -and (Test-GateSessionLock $state $now)) { $own.Add('блокировку начала сеансов') }
+            else {
+                $state.Expected = @()
+                if ([bool]$now.SessionsDenied) { Write-Line '  блокировка начала сеансов стоит, но не та, что ставило закрытие (её поменяли): не трогаю' 'Yellow' }
+            }
+        }
+        if ($state.JobsSet) {
+            if ([bool]$now.ScheduledJobsDenied) { $own.Add('запрет регламентных заданий') }
+            else { $state.JobsSet = $false }
+        }
+        if ($own.Count -eq 0) {
+            Write-Line ("  блокировок, поставленных закрытием, на {0} уже нет: убираю файл закрытия" -f $baseName) 'Green'
+            Save-CloseRecord $baseName $null @{}
+            Write-CloseHistory ("{0}: файл закрытия убран, блокировок закрытия на базе уже не было" -f $baseName)
+            return
+        }
+        if ($isProd -and -not (Confirm-Ui -Question ("Открыть {0}: снять {1}?" -f $baseName, ($own -join ' и ')) -Yes 'Да, открыть' -No 'Нет' -DefaultNo)) {
+            Write-Line '  оставил как есть: база закрыта'
+            return
+        }
+        $released = Restore-GateLocks $state $target $true { param($t) Read-BaseInfoAgain $t $script:CloseBaseName }
+        # Снятое подтверждено (иначе Restore-GateLocks остановился бы) - файл больше не нужен.
+        Save-CloseRecord $baseName $null @{}
+        if ($released) { Write-Line ("Снял с {0}: {1}." -f $baseName, $released) 'Green' }
+        $lockReleased = ($released -and ([string]$released).Contains('начала сеансов'))
+        $closedText = [string](Get-JsonValue $record 'closedAt' '')
+        $closedAt = [datetime]::MinValue
+        if ($lockReleased -and $closedText -and [datetime]::TryParseExact($closedText, 'dd.MM.yyyy HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$closedAt)) {
+            $span = (Get-Date) - $closedAt
+            if ($span.TotalSeconds -lt 0) { $span = [timespan]::Zero }
+            Write-Line ("  Простой {0}: {1} ч {2:00} мин (вход закрыт {3}, открыт {4})" -f $baseName, [int][Math]::Floor($span.TotalHours), $span.Minutes, $closedText, (Get-Date -Format 'dd.MM.yyyy HH:mm:ss'))
+        }
+        Write-CloseHistory ("{0} открыта, снял: {1}; пользователь Windows {2}" -f $baseName, $released, [Environment]::UserName)
+        if ($isProd -and $lockReleased) {
+            $plainLogin = Test-ProdPlainLogin
+            $plainColor = 'Green'
+            if ($plainLogin.Status -eq 'FAIL') { $plainColor = 'Red' } elseif ($plainLogin.Status -ne 'OK') { $plainColor = 'Yellow' }
+            Write-Line ("[{0}] Вход без кода разрешения: {1}" -f $plainLogin.Status, $plainLogin.Text) $plainColor
+        }
+    }
+    finally { if ($null -ne $guard) { $guard.Dispose() } }
+}
+
+if ($CloseBase -and $OpenBase) { throw '-CloseBase и -OpenBase вместе не задаются: закрыть или открыть' }
+if ($CloseBase) {
+    $script:CloseUnconfirmed = $false
+    Invoke-CloseBase $LocksBase
+    if ($script:CloseUnconfirmed) { exit 1 }
+    exit 0
+}
+if ($OpenBase) {
+    Invoke-OpenBase $LocksBase
+    exit 0
+}
+# ** Хлебников С.Ю. 20261120 конец
 
 function Get-ToolSourceHash {
     # Отпечаток выгрузки обработки в файлы: <Имя>.xml и папка <Имя>, путь и хеш каждого файла.
