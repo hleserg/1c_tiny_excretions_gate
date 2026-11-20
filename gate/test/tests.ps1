@@ -3585,8 +3585,10 @@ $tests = @(
             Check (@(& $stubs).Count -eq 1) 'выполненные действия запускались снова'
 
             # Правка расширения и новое действие, которое падает: комплект с папкой actions, в ней все действия.
+            # Модуль - байт в байт как его выгрузит подставная 1С (BOM): после загрузки temp на этом коммите.
+            $moduleBytes = [byte[]](@([byte]0xEF, [byte]0xBB, [byte]0xBF) + @($utf8.GetBytes('Процедура Д3() КонецПроцедуры')))
             $mixed = New-GhCommit -Gh $gh -Parent $withActions -Changes @(
-                [pscustomobject]@{ Path = 'extensions/Доработки/CommonModules/Д/Ext/Module.bsl'; Bytes = $utf8.GetBytes('Процедура Д3() КонецПроцедуры') },
+                [pscustomobject]@{ Path = 'extensions/Доработки/CommonModules/Д/Ext/Module.bsl'; Bytes = $moduleBytes },
                 [pscustomobject]@{ Path = ('actions/{0}.bsl' -f $third); Bytes = (& $action 'Падает' 'ВызватьИсключение "УПАДИ";') }) -Message 'расширение и действие'
             Set-GhBranch -Gh $gh -Branch 'main' -Sha $mixed
             Reset-FakeState $sb
