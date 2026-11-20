@@ -221,7 +221,8 @@ function Invoke-Script {
     if (Test-Path -LiteralPath $callsFile) {
         $calls = @([System.IO.File]::ReadAllLines($callsFile, $utf8) | ForEach-Object {
                 $parts = $_.Split("`t")
-                [pscustomobject]@{ Mode = $parts[1]; Code = [int]$parts[2]; Line = $parts[3] }
+                # Time - когда вызов закончился (подставная 1С пишет строку перед выходом), ЧЧ:мм:сс.мс.
+                [pscustomobject]@{ Time = $parts[0]; Mode = $parts[1]; Code = [int]$parts[2]; Line = $parts[3] }
             })
     }
     $runDir = ''
@@ -479,6 +480,30 @@ function New-ComState {
     }
 }
 
+# Идентификатор цели erp_base подставного кластера (кластер, имя, ИБ, СУБД) - как его пишет deploy в deploy.json.
+$script:ProdTargetId = '[["fake",1541,""],"erp_base","","[\"MSSQLServer\",\"fixture-db\",\"erp_base\"]"]'
+
+function New-InterruptedLockCom {
+    # Рабочая после обрыва deploy: стоит блокировка начала сеансов с кодом по умолчанию и запрет регламентных.
+    param([string]$Message)
+    $com = New-ComState -ProdJobsDenied $true
+    $prod = $com.bases.erp_base
+    $prod.sessionsDenied = $true; $prod.permissionCode = '0'; $prod.deniedMessage = $Message
+    $prod.deniedFrom = '2026-11-17T22:30:00'; $prod.deniedTo = '2026-11-18T01:00:00'
+    return $com
+}
+
+function Write-InterruptedLockFile {
+    # locks.json запуска 20261117-230000, чей процесс уже не живёт: до него запрета не было.
+    param([string]$Sandbox, [string]$Marker, [bool]$JobsSet, [string]$Target = $script:ProdTargetId)
+    $dir = Join-Path $Sandbox 'deploy\20261117-230000'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $record = @{ base = 'erp_base'; target = $Target; pid = 999999; processStart = '2026-11-17T23:00:00'; marker = $Marker; jobsSet = $JobsSet
+        before = @{ SessionsDenied = $false; PermissionCode = ''; DeniedMessage = ''; DeniedFrom = $null; DeniedTo = $null }
+        expected = @(@{ SessionsDenied = $true; PermissionCode = '0'; DeniedMessage = ('Обновление [{0}]' -f $Marker); DeniedFrom = '2026-11-17T22:30:00.0000000'; DeniedTo = '2026-11-18T01:00:00.0000000' }) }
+    [System.IO.File]::WriteAllText((Join-Path $dir 'locks.json'), (ConvertTo-Json -InputObject $record -Depth 6), $utf8)
+}
+
 function New-PrintProcessing {
     param([string]$Version, [string]$Content)
     return @{ objName = 'Печать'; title = 'Печать актов'; version = $Version; kind = 'Печатная форма'; content = $Content }
@@ -531,15 +556,31 @@ $gitBootstrapAnswers = @(
 
 # Заглушка run.ps1 для «Загрузить из git»: записывает, с каким комплектом её позвали, и итог прогона - всё загрузилось.
 $gitRunStub = @'
-param([string]$Kit = '', [string]$KitSource = '', [string]$Config = '', [string]$UiChannel = '', [string]$OnNotGreen = '', [string]$OnSessions = '')
+param([string]$Kit = '', [string]$KitSource = '', [string]$KitBranch = '', [string]$ActionsDir = '', [string]$Config = '', [string]$UiChannel = '', [string]$OnNotGreen = '', [string]$OnSessions = '')
 $dir = Join-Path $PSScriptRoot ('runs\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Path $dir -Force | Out-Null
-$lines = @(('Kit=' + $Kit), ('KitSource=' + $KitSource), ('OnNotGreen=' + $OnNotGreen), ('OnSessions=' + $OnSessions))
+$lines = @(('Kit=' + $Kit), ('KitSource=' + $KitSource), ('KitBranch=' + $KitBranch), ('ActionsDir=' + $ActionsDir), ('OnNotGreen=' + $OnNotGreen), ('OnSessions=' + $OnSessions))
 $items = @()
 if ($Kit) {
     foreach ($sub in @(Get-ChildItem -LiteralPath $Kit -Directory | Sort-Object Name)) { $lines += ('dir=' + $sub.Name) }
     foreach ($file in @(Get-ChildItem -LiteralPath $Kit -Recurse -File)) { $lines += ('file=' + $file.FullName.Substring($Kit.TrimEnd('\').Length + 1).Replace('\', '/')) }
-    $items = @(Get-ChildItem -LiteralPath $Kit -Directory | ForEach-Object { @{ name = $_.Name; loadTried = $true; touched = $true } })
+    $items = @(Get-ChildItem -LiteralPath $Kit -Directory | Where-Object { $_.Name -ne 'actions' } | ForEach-Object { @{ name = $_.Name; loadTried = $true; touched = $true } })
+}
+# Действия после обновления: как обработка гейта - каждое выполнено, кроме тех, где в тексте «УПАДИ».
+$actions = $ActionsDir
+if (-not $actions -and $Kit -and (Test-Path -LiteralPath (Join-Path $Kit 'actions'))) { $actions = Join-Path $Kit 'actions' }
+if ($actions) {
+    $result = @('actions=00000000.000000', 'done-register=ok')
+    $status = 'ok'
+    foreach ($file in @(Get-ChildItem -LiteralPath $actions -Filter '*.bsl' -File | Sort-Object Name)) {
+        $id = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+        $lines += ('actionfile=' + $id)
+        if ($status -ne 'ok') { $result += ('action=' + $id + '|notrun'); continue }
+        if ([System.IO.File]::ReadAllText($file.FullName) -match 'УПАДИ') { $result += ('action=' + $id + '|failed|Деление на 0'); $status = 'failed' }
+        else { $result += ('action=' + $id + '|done|5') }
+    }
+    $result += ('status=' + $status)
+    [System.IO.File]::WriteAllLines((Join-Path $dir 'actions.txt'), [string[]]$result, (New-Object System.Text.UTF8Encoding($true)))
 }
 [System.IO.File]::WriteAllLines((Join-Path $dir 'stub.txt'), [string[]]$lines, (New-Object System.Text.UTF8Encoding($true)))
 $verdict = @{ verdict = 'GREEN'; kitDecision = ''; kitItems = $items; kitProcessings = @() }
@@ -1880,6 +1921,13 @@ $tests = @(
             Check-DeployCommon $r
             Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
             Check (-not (Test-Path -LiteralPath (Join-Path $runDir 'accepted.txt'))) 'жёлтый принят в эталон, хотя ответили «не принимать»'
+            # Вопрос про эталон - после снятия блокировок рабочей, и Enter в нём - «не принимать».
+            $text = @($r.Output) -join "`n"
+            $locksAt = $text.IndexOf('Снял с erp_base')
+            if ($locksAt -lt 0) { $locksAt = $text.IndexOf('Блокировок на erp_base нет') }
+            $questionLine = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Принять новое прогона 20261117-090000') } | Select-Object -First 1)
+            Check ($questionLine.Count -eq 1 -and $locksAt -ge 0 -and $text.IndexOf($questionLine[0]) -gt $locksAt) 'вопрос про эталон задан до снятия блокировок рабочей'
+            if ($questionLine.Count -eq 1) { Check ($questionLine[0].Contains('"defaultNo":true')) 'в вопросе про эталон Enter не «не принимать»' }
             $released = Join-Path $runDir 'released.txt'
             Check (Test-Path -LiteralPath $released) 'в прогоне нет released.txt'
             if (Test-Path -LiteralPath $released) { Check ([System.IO.File]::ReadAllText($released, $utf8) -match 'riskAccepted=0') 'released.txt: выпуск жёлтого записан как риск' }
@@ -1998,8 +2046,11 @@ $tests = @(
             $journal = @{ runId = '20261117-230000'; time = '2026-11-17T23:00:00'; base = 'erp_base'; tempBase = 'erp_temp_test'; user = 'u'; mode = '2'; outcome = 'inProgress'
                 step = 'loading'; rollbackOf = ''; pid = 999999; processStart = '2026-11-17T23:00:00'; gate = $null; riskAccepted = $false; risks = @(); riskReason = ''
                 extensions = @(@{ name = 'Адаптация'; status = 'changed'; backup = 'before\erp_base_Адаптация_1.cfe'; oldVersion = '1.0.0.h1'; newVersion = '1.0.0.h2'; stage = 'loading'; oldHash = 'h1'; newHash = 'h2' })
-                processings = @(); light = @(); article = '' }
+                processings = @(@{ name = 'Печать'; fileName = 'Печать.epf'; action = 'register'; ref = ''; isNew = ''; backup = ''; file = ''; oldVersion = '1'; newVersion = '2'; stage = 'writing' }); light = @(); article = '' }
             [System.IO.File]::WriteAllText((Join-Path $dir 'deploy.json'), (ConvertTo-Json -InputObject $journal -Depth 6), $utf8)
+            # Сеанс записи обработки успел сохранить прежнюю версию (old.b64) и оборвался.
+            New-Item -ItemType Directory -Path (Join-Path $dir 'epf\Печать') -Force | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $dir 'epf\Печать\old.b64'), 'c3RhcmF5YQ==', $utf8)
             $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com (New-ComState -ProdHash 'h2')
             Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
             Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
@@ -2008,11 +2059,101 @@ $tests = @(
             Check ($text.Contains('прервано') -and $text.Contains('Адаптация: шла загрузка; в конфигурации рабочей новая версия')) 'разбор прерванного не показал, что успело'
             $after = [System.IO.File]::ReadAllText((Join-Path $dir 'deploy.json'), $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
             Check ($after.outcome -eq 'interrupted') ("outcome после разбора: {0}" -f $after.outcome)
+            $proc = @($after.processings)[0]
+            Check ([string]$proc.backup -and (Test-Path -LiteralPath (Join-Path $dir ([string]$proc.backup)))) ("копия обработки из old.b64 не подхвачена: «{0}»" -f $proc.backup)
             Reset-FakeState $sb
             $rb = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Rollback' -Answers @(
                 @{ Kind = 'one'; Header = 'Откат erp_base'; Cancel = $true })
             Check (@($rb.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Откат erp_base') -and $_.Contains('ПРЕРВАНО') }).Count -ge 1) ("в списке отката нет прерванного: " + ($rb.Questions -join ' | '))
             Check ((Get-Calls $rb @('/LoadCfg')).Count -eq 0) 'отменённый откат что-то загрузил'
+        }
+    },
+    @{
+        Name = 'deploy-interrupted-locks-own'
+        Text = 'оборвавшийся deploy оставил свою блокировку сеансов и запрет регламентных (locks.json): следующий запуск спрашивает и возвращает как было до него'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-InterruptedLockCom -Message 'Обновление [abc123]'
+            Write-InterruptedLockFile $sb -Marker 'abc123' -JobsSet $true
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @(
+                @{ Kind = 'confirm'; Header = 'оставленные прерванным обновлением'; Yes = $true })
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            $prod = $r.ComState.bases.erp_base
+            Check (-not [bool]$prod.sessionsDenied) 'своя блокировка начала сеансов осталась'
+            Check (-not [bool]$prod.scheduledJobsDenied) 'свой запрет регламентных остался'
+            Check ([string]$prod.deniedMessage -eq '') ("сообщение не вернулось к прежнему: «{0}»" -f $prod.deniedMessage)
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'deploy\20261117-230000\locks.json'))) 'locks.json не убран после снятия'
+            Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0) 'после разбора блокировок что-то загружено'
+        }
+    },
+    @{
+        Name = 'deploy-interrupted-locks-foreign'
+        Text = 'после обрыва блокировку сеансов поменяли (не та метка): deploy её не трогает, запрет регламентных - только по «да»; ответ «нет» оставляет всё'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-InterruptedLockCom -Message 'Чужие работы [zzz999]'
+            Write-InterruptedLockFile $sb -Marker 'abc123' -JobsSet $true
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @(
+                @{ Kind = 'confirm'; Header = 'оставленные прерванным обновлением'; Yes = $false })
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            $prod = $r.ComState.bases.erp_base
+            Check ([bool]$prod.sessionsDenied -and ([string]$prod.deniedMessage).Contains('zzz999')) 'чужая блокировка сеансов снята или изменена'
+            Check ([bool]$prod.scheduledJobsDenied) 'запрет регламентных снят без согласия'
+            Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\20261117-230000\locks.json')) 'locks.json убран, хотя блокировки оставлены'
+            $text = @($r.Output) -join "`n"
+            Check ($text.Contains('не та, что ставил прерванный запуск')) 'не сказано, что блокировка сеансов чужая'
+        }
+    },
+    @{
+        Name = 'deploy-interrupted-locks-other-target'
+        Text = 'locks.json записан для другого кластера с тем же именем базы: не сверяет и не снимает, файл остаётся'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-InterruptedLockCom -Message 'Обновление [abc123]'
+            Write-InterruptedLockFile $sb -Marker 'abc123' -JobsSet $true -Target 'другой-кластер|erp_base'
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Cancel = $true })
+            Check (@($r.Questions | Where-Object { $_.Contains('прерванным обновлением') }).Count -eq 0) 'спросил про блокировки чужой цели'
+            $prod = $r.ComState.bases.erp_base
+            Check ([bool]$prod.sessionsDenied -and [bool]$prod.scheduledJobsDenied) 'блокировки сняты по записи другой цели'
+            Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\20261117-230000\locks.json')) 'locks.json другой цели убран'
+        }
+    },
+    @{
+        Name = 'deploy-interrupted-locks-status-only'
+        Text = '-StatusOnly при оставшихся своих блокировках: показывает, но не спрашивает и не снимает'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-InterruptedLockCom -Message 'Обновление [abc123]'
+            Write-InterruptedLockFile $sb -Marker 'abc123' -JobsSet $true
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-StatusOnly' -Com $com
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            $prod = $r.ComState.bases.erp_base
+            Check ([bool]$prod.sessionsDenied -and [bool]$prod.scheduledJobsDenied) 'просмотр снял блокировки'
+            Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\20261117-230000\locks.json')) 'просмотр убрал locks.json'
+            Check ((@($r.Output) -join "`n").Contains('только просмотр: не снимаю')) 'просмотр не показал оставшиеся блокировки'
+        }
+    },
+    @{
+        Name = 'deploy-interrupted-locks-none'
+        Text = 'locks.json от оборвавшегося запуска, а блокировок на рабочей уже нет: без вопросов убирает файл и идёт обычным путём'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            Write-InterruptedLockFile $sb -Marker 'abc123' -JobsSet $true
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить выбранные' },
+                @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
+                $deployRiskAnswer, $deployNameAnswer)
+            Check-DeployCommon $r
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'deploy\20261117-230000\locks.json'))) 'locks.json без блокировок не убран'
+            Check (@($r.Questions | Where-Object { $_.Contains('прерванным обновлением') }).Count -eq 0) 'спросил про блокировки, которых нет'
         }
     },
     @{
@@ -2030,6 +2171,9 @@ $tests = @(
             if ($null -eq $record) { Check $false 'нет deploy.json'; return }
             Check ($record.outcome -eq 'updated') ("итог {0}" -f $record.outcome)
             Check (-not (Test-Path -LiteralPath (Join-Path $record.Dir 'deploy.json.tmp'))) 'остался deploy.json.tmp'
+            Check (-not (Test-Path -LiteralPath (Join-Path $record.Dir 'locks.json'))) 'после снятия блокировок остался locks.json'
+            $comLog = Join-Path $sb 'fake\com.log'
+            if (Test-Path -LiteralPath $comLog) { Check ([System.IO.File]::ReadAllText($comLog, $utf8).Contains('sessionsDenied=1')) 'обновление шло без блокировки сеансов - locks.json не проверен' }
             $log = Join-Path $record.Dir 'run.log'
             if (Test-Path -LiteralPath $log) { Check (-not ([System.IO.File]::ReadAllText($log, $utf8).Contains('Журнал обновления не записался'))) 'журнал обновления не записался' }
         }
@@ -2148,7 +2292,7 @@ $tests = @(
             Check ($text -match 'сообщение: Идёт обновление') 'нет сообщения блокировки'
             Check ($text -match 'Блокировка регламентных заданий: ВКЛЮЧЕНА') 'нет блокировки регламентных'
             Check ($text -match 'из них конфигураторов: 1') 'нет конфигуратора в сеансах'
-            Check (@($r.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'состояние баз что-то поменяло'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase |\tTerminateSession ' }).Count -eq 0) 'состояние баз что-то поменяло'
             Check (-not (Test-Path -LiteralPath (Join-Path $sb 'deploy\state\deploy.json'))) 'появился deploy.json'
             $runDirs = @(Get-ChildItem -LiteralPath (Join-Path $sb 'deploy') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8}-\d{6}$' })
             Check ($runDirs.Count -eq 0) 'показ состояния создал папку запуска обновления'
@@ -2169,7 +2313,7 @@ $tests = @(
             Check (@($r.Output | Where-Object { $_ -match 'Адаптация: версия 1\.0\.0\.h2, хеш-сумма есть' }).Count -eq 1) 'обычное чтение не показало расширение с версией'
             Check (@($r.Output | Where-Object { $_ -match 'ИТОГ: расширения erp_temp_test через внешнее соединение читаются: 2' }).Count -eq 1) 'нет итога проверки'
             Check (@($r.Calls).Count -eq 0) ("проверка запускала 1С: {0}" -f (@($r.Calls | ForEach-Object { $_.Line } | Select-Object -First 2) -join ' | '))
-            Check (@($r.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'проверка меняла блокировки или сеансы'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase |\tTerminateSession ' }).Count -eq 0) 'проверка меняла блокировки или сеансы'
             Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\comcheck\run.log')) 'нет журнала deploy\comcheck\run.log'
         }
     },
@@ -2208,7 +2352,7 @@ $tests = @(
             Check ((Get-Calls $r @('ENTERPRISE', 'precheck', 'fake\erp_base')).Count -eq 1) 'клиент рабочей в режиме precheck не запускался'
             Check ((Get-Calls $r @('ENTERPRISE', 'selfcheck')).Count -eq 0) 'запускалась полная самопроверка'
             Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0 -and (Get-Calls $r @('/UpdateDBCfg')).Count -eq 0) 'проверка что-то загружала'
-            Check (@($r.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'проверка меняла блокировки или сеансы'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase |\tTerminateSession ' }).Count -eq 0) 'проверка меняла блокировки или сеансы'
             Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\precheck\precheck.txt')) 'нет журнала deploy\precheck\precheck.txt'
             $runDirs = @(Get-ChildItem -LiteralPath (Join-Path $sb 'deploy') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8}-\d{6}$' })
             Check ($runDirs.Count -eq 0) 'проверка создала папку запуска обновления'
@@ -2242,7 +2386,7 @@ $tests = @(
             Check ($text -match 'не начала проверку за 5 с') 'нет причины «не начала проверку»'
             Check ($text -match 'пересоберёт её из поставки') 'нет подсказки про сборку обработки'
             Check ($r.Seconds -lt 90) ("ждал зависший клиент: {0} с" -f $r.Seconds)
-            Check (@($r.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'проверка меняла блокировки или сеансы'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase |\tTerminateSession ' }).Count -eq 0) 'проверка меняла блокировки или сеансы'
             Check (-not (Test-Path -LiteralPath (Join-Path $sb 'deploy\precheck\precheck.txt'))) 'журнал проверки появился, хотя проверки не было'
         }
     },
@@ -2281,7 +2425,7 @@ $tests = @(
             Check ((Get-Calls $first @('/DumpCfg', 'fake\erp_base', '\before\erp_base_Адаптация_')).Count -eq 1) 'подготовка не сняла резервную копию Адаптация'
             Check ((Get-Calls $first @('/LoadCfg', '-Extension Адаптация', 'fake\erp_base')).Count -eq 1) 'подготовка не загрузила Адаптация в рабочую ровно один раз'
             Check ((Get-Calls $first @('/UpdateDBCfg')).Count -eq 0) 'подготовка обновила конфигурацию БД'
-            Check (@($first.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'подготовка меняла блокировки или завершала сеансы'
+            Check (@($first.ComLog | Where-Object { $_ -match '\tUpdateInfoBase |\tTerminateSession ' }).Count -eq 0) 'подготовка меняла блокировки или завершала сеансы'
             Check ($null -eq (Get-DeployRecord $sb)) 'подготовка записала deploy.json: в истории обновлений её быть не должно'
             if (-not (Test-Path -LiteralPath $preparedFile)) { return }
             $state = [System.IO.File]::ReadAllText($preparedFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
@@ -2394,7 +2538,7 @@ $tests = @(
             if ($loads.Count -eq 1) { Check ($loads[0].Line.Contains('\before\erp_base_Адаптация_')) 'отмена грузила не резервную копию' }
             Check ((Get-Calls $r @('/UpdateDBCfg')).Count -eq 0) 'отмена подготовки обновила конфигурацию БД'
             Check ((Get-Calls $r @('/DeleteCfg')).Count -eq 0) 'отмена подготовки удаляла расширение'
-            Check (@($r.ComLog | Where-Object { $_ -match '^UpdateInfoBase|TerminateSession' }).Count -eq 0) 'подготовка или её отмена меняли блокировки или завершали сеансы'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase |\tTerminateSession ' }).Count -eq 0) 'подготовка или её отмена меняли блокировки или завершали сеансы'
             Check (-not (Test-Path -LiteralPath $preparedFile)) 'после отмены prepared.json остался'
         }
     },
@@ -2871,6 +3015,7 @@ $tests = @(
             # Номер строки, GUID, длительность - не меняют причину; код ошибки меняет.
             Check ((ConvertTo-UtReasonKey 'FAIL' '{ОбщийМодуль.А.Модуль(12,3)}: строка 5: HTTP 403 за 2 с') -eq (ConvertTo-UtReasonKey 'FAIL' '{ОбщийМодуль.А.Модуль(80,1)}: строка 9: HTTP 403 за 15 с')) 'смена номера строки или длительности поменяла причину'
             Check ((ConvertTo-UtReasonKey 'FAIL' 'HTTP 403') -ne (ConvertTo-UtReasonKey 'FAIL' 'HTTP 503')) 'смена кода ошибки не поменяла причину'
+            Check ((ConvertTo-UtReasonKey 'FAIL' '{ОбщийМодуль.ПроверкаДоступа.Модуль(12)}: Доступ запрещен') -ne (ConvertTo-UtReasonKey 'FAIL' '{ОбщийМодуль.ОбменДанными.Модуль(80)}: Доступ запрещен')) 'другой модуль с тем же текстом - одна причина'
             Check ((ConvertTo-UtReasonKey 'FAIL' 'нет таблицы') -ne (ConvertTo-UtReasonKey 'ERROR' 'нет таблицы')) 'FAIL и ERROR с одним текстом - одна причина'
             Check ((Get-UtStatusTitle 'ERROR') -eq 'ERROR - ошибка выполнения' -and (Get-UtStatusTitle 'FAIL') -eq 'FAIL - не прошло утверждение') 'подписи ERROR/FAIL не те'
             # Эталон без полного принятия: OK из прогона, у падений и пропавших - прежние записи, новое падение не заносится.
@@ -3019,6 +3164,28 @@ $tests = @(
             $again = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ unittests = @($unitMinusFails) }
             Check-Common $again; Check-Verdict $again 'RED' 1
             Check-Step $again 'Модульные тесты' 'FAIL'
+        }
+    },
+    @{
+        Name = 'gate-unittests-keep-accept-failures'
+        Text = 'модульные тесты: после вердикта «Оставить и принять» - тот же вопрос про падения, «нет» - падение остаётся новым, scope=partial'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $unitConfig
+            $null = Add-UnitTestSource -Dir (Join-Path $sb 'tests')
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ absent = @('Тесты'); unittests = @($unitAllOk) }
+            Check-Verdict $r 'GREEN' 0
+            $file = Add-InboxFile $sb $cfeName
+            $red = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Ask' -f $file) -Fake @{ unittests = @($unitMinusFails) } -Answers @(
+                @{ Kind = 'one'; Header = 'оставить или откатить'; Item = '^Оставить и принять новое в эталон' },
+                @{ Kind = 'confirm'; Header = 'падают модульные тесты'; Yes = $false })
+            Check-Common $red; Check-Verdict $red 'RED' 1
+            if ($red.RunDir) {
+                $acceptedFile = Join-Path $red.RunDir 'accepted.txt'
+                Check ((Test-Path -LiteralPath $acceptedFile) -and [System.IO.File]::ReadAllText($acceptedFile, $utf8).Contains('scope=partial')) 'после «Оставить и принять» без падений нет scope=partial'
+            }
+            $again = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ unittests = @($unitMinusFails) }
+            Check-Common $again; Check-Verdict $again 'RED' 1
         }
     },
     @{
@@ -3361,6 +3528,96 @@ $tests = @(
             }
             Check ((Read-GitStateFile $sb).commit -eq $merged) 'после прогона state.json не на main'
             Check (@($load.Output | Where-Object { $_ -match 'теперь на main' }).Count -eq 1) 'не сказано, что temp на main'
+        }
+    },
+    @{
+        Name = 'git-import-actions'
+        Text = '«Загрузить из git» и действия после обновления (actions/*.bsl в main): только новые действия - прогон без комплекта с -ActionsDir и -KitBranch, выполненные - в state.json, повтор - «загружать нечего»; с правкой расширения - действия папкой actions в комплекте, все; упавшее не записано выполненным и запускается следующей загрузкой'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
+            $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha (Read-GitStateFile $sb).pendingCommit
+            $head = (Get-GhHead -Gh $gh -Branch 'main').Sha
+            if (-not $head) { Check $false 'в тестовом репозитории отсутствует принятый снимок'; return }
+            $action = { param([string]$Title, [string]$Body) $utf8.GetBytes(("// @Действие {0}`r`n// @Зачем для теста`r`n// @Автор Тест`r`n// @Задача 1`r`n{1}`r`n" -f $Title, $Body)) }
+            $first = '20261120-01-Первое'
+            $second = '20261120-02-Второе'
+            $third = '20261121-01-Падает'
+            $withActions = New-GhCommit -Gh $gh -Parent $head -Changes @(
+                [pscustomobject]@{ Path = ('actions/{0}.bsl' -f $first); Bytes = (& $action 'Первое' 'Журнал.Добавить("1");') },
+                [pscustomobject]@{ Path = ('actions/{0}.bsl' -f $second); Bytes = (& $action 'Второе' 'Журнал.Добавить("2");') },
+                [pscustomobject]@{ Path = 'actions/README.md'; Bytes = $utf8.GetBytes('Действия после обновления') }) -Message 'действия'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $withActions
+            [System.IO.File]::WriteAllText((Join-Path $sb 'run.ps1'), $gitRunStub, $utf8Bom)
+            $stubs = { @(Get-ChildItem -LiteralPath (Join-Path $sb 'runs') -Recurse -Filter 'stub.txt' -ErrorAction SilentlyContinue | Sort-Object { $_.Directory.Name }) }
+
+            # Только действия: расширения temp на main, прогон без комплекта.
+            Reset-FakeState $sb
+            $only = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers @(
+                @{ Kind = 'confirm'; Header = 'Загрузить в erp_temp_test из main'; Yes = $true })
+            Check-DeployCommon $only -LocksExpected $false
+            Check ($only.ExitCode -eq 0) ("код {0}, ждали 0: {1}" -f $only.ExitCode, (($only.Output | Select-Object -Last 3) -join ' | '))
+            Check (@($only.Questions | Where-Object { $_ -match 'действия после обновления \(2\)' }).Count -eq 1) ('в вопросе не сказано, что загрузятся два новых действия: ' + ($only.Questions -join ' | '))
+            Check (@($only.Output | Where-Object { $_.Contains(('+ actions/{0}.bsl' -f $first)) }).Count -eq 1) 'новое действие не названо в том, что изменит загрузка'
+            $found = & $stubs
+            Check ($found.Count -eq 1) ("прогонов {0}, ждали один" -f $found.Count)
+            if ($found.Count -ge 1) {
+                $stub = [System.IO.File]::ReadAllText($found[0].FullName, $utf8)
+                Check ($stub -match '(?m)^Kit=\s*$' -and $stub -match '(?m)^ActionsDir=.*actions-') ("прогон только действий не без комплекта: " + $stub)
+                Check ($stub -match '(?m)^KitBranch=main\s*$' -and $stub -match ('KitSource=git owner/ext@' + $withActions.Substring(0, 7))) ("в прогон не переданы ветка и коммит: " + $stub)
+                Check ($stub -match ('actionfile=' + $first) -and $stub -match ('actionfile=' + $second)) ("в папке действий не оба действия: " + $stub)
+            }
+            $state = Read-GitStateFile $sb
+            Check ((@($state.actionsDone) -contains $first) -and (@($state.actionsDone) -contains $second)) ('state.json: выполненные действия не записаны: ' + (@($state.actionsDone) -join ', '))
+            Check ($state.commit -eq $withActions) 'после прогона действий state.json не на main'
+            Check (@($only.Output | Where-Object { $_ -match 'действия после обновления выполнены' }).Count -eq 1) 'не сказано, что действия выполнены'
+
+            # Повтор: всё выполнено - прогона нет.
+            Reset-FakeState $sb
+            $same = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{ dumps = (New-GitDumps) } -Com $com
+            Check-DeployCommon $same -LocksExpected $false
+            Check ($same.Unexpected.Count -eq 0) ("при повторе вопросы: " + ($same.Unexpected -join ' | '))
+            Check (@($same.Output | Where-Object { $_ -match 'загружать нечего' }).Count -eq 1) 'при выполненных действиях не сказано «загружать нечего»'
+            Check ((& $stubs).Count -eq 1) 'выполненные действия запускались снова'
+
+            # Правка расширения и новое действие, которое падает: комплект с папкой actions, в ней все действия.
+            $mixed = New-GhCommit -Gh $gh -Parent $withActions -Changes @(
+                [pscustomobject]@{ Path = 'extensions/Доработки/CommonModules/Д/Ext/Module.bsl'; Bytes = $utf8.GetBytes('Процедура Д3() КонецПроцедуры') },
+                [pscustomobject]@{ Path = ('actions/{0}.bsl' -f $third); Bytes = (& $action 'Падает' 'ВызватьИсключение "УПАДИ";') }) -Message 'расширение и действие'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $mixed
+            Reset-FakeState $sb
+            $kit = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers @(
+                @{ Kind = 'confirm'; Header = 'Загрузить в erp_temp_test из main'; Yes = $true })
+            Check-DeployCommon $kit -LocksExpected $false
+            $found = & $stubs
+            Check ($found.Count -eq 2) ("прогонов {0}, ждали два" -f $found.Count)
+            if ($found.Count -ge 2) {
+                $stub = [System.IO.File]::ReadAllText($found[1].FullName, $utf8)
+                Check ($stub -match '(?m)^Kit=.*kit-' -and $stub -match '(?m)^ActionsDir=\s*$') ("с правкой расширения не комплект: " + $stub)
+                Check ($stub -match 'dir=Доработки' -and $stub -match 'dir=actions' -and $stub -notmatch 'dir=Адаптация') ("в комплекте не то: " + $stub)
+                Check ($stub -match ('actionfile=' + $first) -and $stub -match ('actionfile=' + $third) -and $stub -notmatch 'actionfile=README') ("в комплекте не все действия или лишнее: " + $stub)
+                Check ($stub -match '(?m)^KitBranch=main\s*$') 'в прогон с комплектом не передана ветка'
+            }
+            $state = Read-GitStateFile $sb
+            Check (-not (@($state.actionsDone) -contains $third)) 'упавшее действие записано выполненным'
+            Check ($state.commit -eq $mixed) 'после зелёного прогона комплекта state.json не на main'
+            Check (@($kit.Output | Where-Object { $_ -match ('не выполнены: ' + $third) }).Count -eq 1) 'не сказано, что упавшее действие не выполнено'
+
+            # Следующая загрузка запускает упавшее снова - прогоном только действий.
+            Reset-FakeState $sb
+            $again = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{ dumps = (New-GitDumps -Extra 'Процедура Д3() КонецПроцедуры') } -Com $com -Answers @(
+                @{ Kind = 'confirm'; Header = 'Загрузить в erp_temp_test из main'; Yes = $true })
+            Check-DeployCommon $again -LocksExpected $false
+            $found = & $stubs
+            Check ($found.Count -eq 3) ("после упавшего действия прогонов {0}, ждали три" -f $found.Count)
+            if ($found.Count -ge 3) {
+                $stub = [System.IO.File]::ReadAllText($found[2].FullName, $utf8)
+                Check ($stub -match '(?m)^Kit=\s*$' -and $stub -match ('actionfile=' + $third)) ("упавшее действие не запущено снова без комплекта: " + $stub)
+            }
         }
     },
     @{

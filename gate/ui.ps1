@@ -402,11 +402,13 @@ function Wait-UiAcknowledge {
 function Confirm-Ui {
     # Да или нет. Возвращает $true, $false или $null (отмена: Esc в ci.exe).
     # DangerYes - «да» опасно (откат): в ci.exe щелчок мышью по нему срабатывает только со второго раза.
-    param([string]$Question, [string]$Yes = 'Да', [string]$No = 'Нет', [switch]$DangerYes)
+    # DefaultNo - Enter в ci.exe выбирает «нет» (выбор, который ничего не меняет).
+    param([string]$Question, [string]$Yes = 'Да', [string]$No = 'Нет', [switch]$DangerYes, [switch]$DefaultNo)
     if ($script:UiChannelDir) {
         # Не $question: это тот же параметр $Question (имена переменных без учёта регистра).
         $uiQuestion = @{ kind = 'confirm'; header = $Question; yes = $Yes; no = $No }
         if ($DangerYes) { $uiQuestion['danger'] = @(0) }
+        if ($DefaultNo) { $uiQuestion['defaultNo'] = $true }
         $answer = Request-UiAnswer -Question $uiQuestion
         if ([bool](Get-UiField $answer 'cancel' $false)) { return $null }
         return [bool](Get-UiField $answer 'yes' $false)
@@ -459,7 +461,10 @@ $script:UiTick = 0
 $script:UiLastMinuteLine = -1
 $script:UiAnimate = $true
 try { $script:UiAnimate = -not [Console]::IsOutputRedirected } catch { $script:UiAnimate = $false }
-$script:UiIdleCaptions = @('конфигуратор работает', 'SQL шуршит', 'сервер 1С занят делом', 'платформа думает', 'ещё немного')
+# Подписи под полосой хода, когда у операции нет своих подробностей. Они показываются у любой долгой операции
+# (конфигуратор, клиент 1С, git), поэтому не называют, кто именно работает: «сервер 1С занят делом» при отправке
+# в GitHub сбивало с толку.
+$script:UiIdleCaptions = @('работа идёт', 'жду, пока закончит', 'процесс жив', 'ещё немного')
 
 function Format-UiDuration {
     param([double]$Seconds)

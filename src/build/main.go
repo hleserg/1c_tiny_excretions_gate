@@ -66,6 +66,8 @@ func main() {
 	packs := loadPackages()
 	vpo := buildProcessing(packs)
 	if check {
+		// Канарейка и исполнитель действий - тоже: их ошибки иначе всплыли бы только при выпуске.
+		vpo = append(append(vpo, buildCanary()...), buildActions()...)
 		if srcOut != "" {
 			for _, e := range vpo {
 				path := filepath.Join(srcOut, filepath.FromSlash(e.Name))
@@ -81,11 +83,12 @@ func main() {
 	}
 	must(os.MkdirAll(outDir, 0o755))
 	canary := buildCanary()
+	actions := buildActions()
 	writeZip(filepath.Join(outDir, "ВыполнитьПослеОбновления_"+stamp+".zip"), vpo)
 	writeZip(filepath.Join(outDir, "Канарейка_"+stamp+".zip"), canary)
 	// Архив гейта - всё для установки: папка ci, установщик и выгрузки обработок (их собирает install.cmd).
 	gate := buildGate()
-	for _, e := range append(append([]entry{}, vpo...), canary...) {
+	for _, e := range append(append(append([]entry{}, vpo...), canary...), actions...) {
 		gate = append(gate, entry{"epf/" + e.Name, e.Data})
 	}
 	writeZip(filepath.Join(outDir, "ci-gate_"+stamp+".zip"), gate)
@@ -250,6 +253,76 @@ func definedNames(text string) map[string]bool {
 			fail("метод %s определён дважды (пакеты пересекаются по именам?)", m[1])
 		}
 		out[name] = true
+	}
+	return out
+}
+
+// Обработчики оповещений. Число параметров обработчика платформа сверяет строго, значения по умолчанию
+// не помогают: «В методе ... количество параметров 2. Ожидаемое количество - 1» - и обработка падает
+// посреди прогона, без человека у экрана. Поэтому до сборки: обработчик определён в модуле, без
+// необязательных параметров; обработчик ошибки - три параметра; оповещение о конце
+// ТекстовыйДокумент.НачатьЧтение - один параметр (дополнительные параметры).
+func notifyHandlerProblems(text string) []string {
+	params := map[string][]string{}
+	defRe := regexp.MustCompile(`(?im)^[ \t]*(?:асинх[ \t]+)?(?:процедура|функция)[ \t]+([^\s(]+)\s*\(([^)]*)\)`)
+	for _, m := range defRe.FindAllStringSubmatch(text, -1) {
+		var list []string
+		for _, p := range strings.Split(m[2], ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				list = append(list, p)
+			}
+		}
+		params[strings.ToLower(m[1])] = list
+	}
+	count := func(name string, want int, role string) []string {
+		list, ok := params[strings.ToLower(name)]
+		if !ok {
+			return []string{fmt.Sprintf("обработчик оповещения %s не определён в модуле", name)}
+		}
+		var out []string
+		for _, p := range list {
+			if strings.Contains(p, "=") {
+				out = append(out, fmt.Sprintf("обработчик оповещения %s: параметр «%s» с значением по умолчанию - платформа сверяет число параметров строго", name, p))
+				break
+			}
+		}
+		if want >= 0 && len(list) != want {
+			out = append(out, fmt.Sprintf("%s %s: параметров %d, платформа передаёт %d", role, name, len(list), want))
+		}
+		return out
+	}
+	var problems []string
+	ctorRe := regexp.MustCompile(`(?i)новый\s+описаниеоповещения\s*\(\s*"([^"]+)"([^;]*)`)
+	for _, m := range ctorRe.FindAllStringSubmatch(text, -1) {
+		problems = append(problems, count(m[1], -1, "")...)
+		// Четвёртый параметр конструктора - обработчик ошибки, он же - вторая строка в вызове.
+		if extra := regexp.MustCompile(`"([^"]+)"`).FindStringSubmatch(m[2]); extra != nil {
+			problems = append(problems, count(extra[1], 3, "обработчик ошибки")...)
+		}
+	}
+	// Оповещение, переданное в НачатьЧтение: ищется ближайшее присваивание той же переменной выше вызова.
+	assignRe := regexp.MustCompile(`(?i)([^\s=]+)\s*=\s*новый\s+описаниеоповещения\s*\(\s*"([^"]+)"`)
+	readRe := regexp.MustCompile(`(?i)\.начатьчтение\(\s*([^\s,)]+)`)
+	for _, r := range readRe.FindAllStringSubmatchIndex(text, -1) {
+		variable := strings.ToLower(text[r[2]:r[3]])
+		handler := ""
+		for _, a := range assignRe.FindAllStringSubmatchIndex(text[:r[0]], -1) {
+			if strings.ToLower(text[a[2]:a[3]]) == variable {
+				handler = text[a[4]:a[5]]
+			}
+		}
+		if handler != "" {
+			problems = append(problems, count(handler, 1, "обработчик конца НачатьЧтение")...)
+		}
+	}
+	// Одна и та же ошибка из разных мест - одной строкой.
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range problems {
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
 	}
 	return out
 }
@@ -481,6 +554,9 @@ func buildProcessing(packs []pack) []entry {
 		}
 	}
 	definedNames(object) // нет ли двойных определений
+	for _, problem := range append(notifyHandlerProblems(form), notifyHandlerProblems(object)...) {
+		fail("модуль обработки: %s", problem)
+	}
 	if regexp.MustCompile(`(?m)^\s*// @@ПАКЕТЫ: [А-ЯЁ]+@@`).MatchString(object + form) {
 		fail("в обработке остались метки @@ПАКЕТЫ")
 	}
@@ -510,10 +586,35 @@ func buildProcessing(packs []pack) []entry {
 // ---------- канарейка ----------
 
 func buildCanary() []entry {
+	return buildPlain("Канарейка", "канарейка", 3)
+}
+
+// Исполнитель действий после обновления. Действия в него вставляет гейт на машине перед сборкой - между
+// метками @@ДЕЙСТВИЯ модуля объекта: они должны быть ровно по одной.
+func buildActions() []entry {
+	files := buildPlain("ДействияПослеОбновления", "действия после обновления", 4)
+	for _, f := range files {
+		if f.Name != "ДействияПослеОбновления/Ext/ObjectModule.bsl" {
+			continue
+		}
+		text := string(f.Data)
+		for _, mark := range []string{"// @@ДЕЙСТВИЯ: НАЧАЛО@@", "// @@ДЕЙСТВИЯ: КОНЕЦ@@"} {
+			if n := strings.Count(text, mark); n != 1 {
+				fail("действия после обновления: метка %q встречается %d раз, нужна одна", mark, n)
+			}
+		}
+		return files
+	}
+	fail("действия после обновления: нет модуля объекта")
+	return nil
+}
+
+// Обработка из epf/<имя> как есть: метки версии - на штамп (ровно marks штук), XML - проверка, модули - обработчики оповещений.
+func buildPlain(name, title string, marks int) []entry {
 	base := filepath.Join(root, "epf")
 	var files []entry
-	walk := []string{"Канарейка.xml"}
-	must(filepath.WalkDir(filepath.Join(base, "Канарейка"), func(path string, d os.DirEntry, err error) error {
+	walk := []string{name + ".xml"}
+	must(filepath.WalkDir(filepath.Join(base, name), func(path string, d os.DirEntry, err error) error {
 		if err == nil && !d.IsDir() {
 			rel, _ := filepath.Rel(base, path)
 			walk = append(walk, filepath.ToSlash(rel))
@@ -529,10 +630,15 @@ func buildCanary() []entry {
 		if strings.HasSuffix(rel, ".xml") {
 			checkXML(rel, data)
 		}
+		if strings.HasSuffix(rel, ".bsl") {
+			for _, problem := range notifyHandlerProblems(text) {
+				fail("%s, %s: %s", title, rel, problem)
+			}
+		}
 		files = append(files, entry{rel, data})
 	}
-	if total != 3 {
-		fail("канарейка: меток версии %d, ожидалось 3", total)
+	if total != marks {
+		fail("%s: меток версии %d, ожидалось %d", title, total, marks)
 	}
 	return files
 }

@@ -19,7 +19,7 @@
 
     .\run.ps1 -Resume last
         Продолжить последний прогон с упавшего шага: шаги до него берутся готовыми, он и всё после - заново.
-        -FromStep checks - с этапа (before, backup, load, checks, canary, dumps, selfcheck, unittests) или с номера шага.
+        -FromStep checks - с этапа (before, backup, load, checks, canary, actions, dumps, selfcheck, unittests) или с номера шага.
 
     .\run.ps1 -SkipChecks
         Без проверок конфигуратором.
@@ -109,7 +109,7 @@ param(
     [Parameter(ParameterSetName = 'Run')]
     [string]$Resume = '',
 
-    # С какого шага продолжать (-Resume): этап (before, backup, load, checks, canary, dumps, selfcheck, unittests) или
+    # С какого шага продолжать (-Resume): этап (before, backup, load, checks, canary, actions, dumps, selfcheck, unittests) или
     # номер шага прогона. Без ключа - с первого упавшего.
     [Parameter(ParameterSetName = 'Run')]
     [string]$FromStep = '',
@@ -118,6 +118,15 @@ param(
     # репозиторий и коммит.
     [Parameter(ParameterSetName = 'Run')]
     [string]$KitSource = '',
+
+    # Ветка, из которой комплект («Загрузить из git»): для истории загрузок (раздел 5.24).
+    [Parameter(ParameterSetName = 'Run')]
+    [string]$KitBranch = '',
+
+    # Папка действий после обновления (файлы <ГГГГММДД>-<NN>-<имя>.bsl, раздел 5.24): новые действия гейт выполняет
+    # в тестовой базе после загрузки и канареечного входа. Без ключа - папка actions комплекта.
+    [Parameter(ParameterSetName = 'Run')]
+    [string]$ActionsDir = '',
 
     # Папка канала интерфейса ci.exe: его задаёт сам ci.exe, руками не нужен.
     [Parameter(ParameterSetName = 'Run')]
@@ -2098,6 +2107,13 @@ function Compare-SelfCheckSnapshots {
     $gone = New-Object System.Collections.Generic.List[string]
     foreach ($key in @($reference.Keys | Sort-Object)) { if (-not $Current.Contains($key)) { $gone.Add($key) } }
     if ($changed.Count -gt 0 -and $DiffPath) { [System.IO.File]::WriteAllLines($DiffPath, $diff.ToArray(), $Utf8Bom) }
+    # ** Хлебников С.Ю. 20261120 Новые и пропавшие снимки - поимённо, рядом с разницей (*.snapshots.keys.txt): разбор
+    # прогона показывает их тем, у кого папки прогона нет. Только сведения, на вердикт не влияют.
+    if ($DiffPath -match '\.diff\.txt$' -and (Test-Path -LiteralPath $ReferenceFile) -and ($added.Count -gt 0 -or $gone.Count -gt 0)) {
+        $keyLines = @($added | ForEach-Object { "+`t" + $_ }) + @($gone | ForEach-Object { "-`t" + $_ })
+        [System.IO.File]::WriteAllLines(($DiffPath -replace '\.diff\.txt$', '.keys.txt'), [string[]]$keyLines, $Utf8Bom)
+    }
+    # ** Хлебников С.Ю. 20261120 конец
     return [pscustomobject]@{
         HasReference = (Test-Path -LiteralPath $ReferenceFile)
         Total        = @($Current.Keys).Count
@@ -2123,6 +2139,20 @@ if ($PSCmdlet.ParameterSetName -eq 'Password') {
     Write-Host 'Расшифровать файл можно только под этой учёткой Windows и только на этой машине.'
     exit 0
 }
+
+# ** Хлебников С.Ю. 20261120 Падения модульных тестов при принятии в эталон - отдельным решением, во всех интерактивных
+# путях (меню и «Оставить и принять» после вердикта): принять остальное (снимки, самопроверку), а падения оставить новыми.
+# $true - падения не принимать (KeepFailures). Падений нет - вопроса нет, $false.
+function Get-AcceptKeepFailures {
+    param([string]$RunPath, [string]$RunName)
+    $unitFile = Join-Path $RunPath 'unittests.txt'
+    if (-not (Test-Path -LiteralPath $unitFile)) { return $false }
+    $unitFailed = @([System.IO.File]::ReadAllLines($unitFile, [System.Text.Encoding]::UTF8) | Where-Object { ([string]$_).TrimStart([char]0xFEFF) -match '^(FAIL|ERROR)\t' }).Count
+    if ($unitFailed -eq 0) { return $false }
+    $withFailures = Confirm-Ui -Question ('В прогоне {0} падают модульные тесты ({1}). Их тоже принять как известные?' -f $RunName, $unitFailed) -Yes 'Да, и падения' -No 'Нет, падения оставить новыми'
+    return ($withFailures -ne $true)
+}
+# ** Хлебников С.Ю. 20261120 конец
 
 function Invoke-AcceptBaseline {
     # Принять замечания прогона как известные: записать их в эталон базы. Зовут ключ -AcceptBaseline
@@ -2563,18 +2593,7 @@ function Invoke-AcceptFromMenu {
     if ($red) { $yesText = 'Принять, хотя прогон красный' }
     $sure = Confirm-Ui -Question ('Принять новое прогона {0} в эталон? Что внутри - report.txt и *.new.txt в папке прогона.' -f $runName) -Yes $yesText -No 'Не принимать'
     if ($sure -ne $true) { Write-Host '  Не принято.'; return $false }
-    # ** Хлебников С.Ю. 20261120 Падения модульных тестов - отдельным решением: принять остальное (снимки, самопроверку),
-    # а падения оставить новыми.
-    $keepFailures = $false
-    $unitFile = Join-Path $Run.Dir.FullName 'unittests.txt'
-    if (Test-Path -LiteralPath $unitFile) {
-        $unitFailed = @([System.IO.File]::ReadAllLines($unitFile, [System.Text.Encoding]::UTF8) | Where-Object { ([string]$_).TrimStart([char]0xFEFF) -match '^(FAIL|ERROR)\t' }).Count
-        if ($unitFailed -gt 0) {
-            $withFailures = Confirm-Ui -Question ('В прогоне {0} падают модульные тесты ({1}). Их тоже принять как известные?' -f $runName, $unitFailed) -Yes 'Да, и падения' -No 'Нет, падения оставить новыми'
-            $keepFailures = ($withFailures -ne $true)
-        }
-    }
-    # ** Хлебников С.Ю. 20261120 конец
+    $keepFailures = Get-AcceptKeepFailures -RunPath $Run.Dir.FullName -RunName $runName
     try {
         Invoke-AcceptBaseline -RunPath $Run.Dir.FullName -KeepFailures:$keepFailures
         Write-Host ('  Принято: новое прогона {0} теперь известное.' -f $runName) -ForegroundColor Green
@@ -2715,20 +2734,20 @@ function Show-RecentRuns {
 # тестовых расширений и вердикт - всегда заново. «До» (самопроверка до загрузки, прежние версии расширений, копия
 # эталона перед загрузкой) - всегда от первого прогона цепочки: снимать их заново с базы, в которой уже стоит
 # комплект, нельзя. Ночной прогон и deploy ничего не продолжают.
-$script:ResumePhases = @('before', 'backup', 'load', 'checks', 'canary', 'dumps', 'selfcheck', 'unittests')
+$script:ResumePhases = @('before', 'backup', 'load', 'checks', 'canary', 'actions', 'dumps', 'selfcheck', 'unittests')
 $script:ResumePhaseTitles = @{
     before = 'Самопроверка до загрузки'; backup = 'Сохранение текущих версий'; load = 'Загрузка комплекта'
-    checks = 'Проверки конфигуратором'; canary = 'Канареечный вход'; dumps = 'Выгрузка расширений и правила обмена'
-    selfcheck = 'Самопроверка после загрузки'; unittests = 'Модульные тесты'
+    checks = 'Проверки конфигуратором'; canary = 'Канареечный вход'; actions = 'Действия после обновления'
+    dumps = 'Выгрузка расширений и правила обмена'; selfcheck = 'Самопроверка после загрузки'; unittests = 'Модульные тесты'
 }
 # Этапы, итог которых зависит от того, что стоит в базе: готовыми их можно взять, только если база с тех пор та же.
-$script:ResumeBasePhases = @('checks', 'canary', 'dumps', 'selfcheck', 'unittests')
+$script:ResumeBasePhases = @('checks', 'canary', 'actions', 'dumps', 'selfcheck', 'unittests')
 # Файлы этапа в папке прогона (маски имён): при продолжении копируются из прежнего прогона вместе с шагами - по ним
 # строится разбор прогона и принимается эталон.
 $script:ResumePhaseFiles = @{
     before = @('selfcheck-before*'); backup = @('backup_*.log')
     load = @('load_*.log', 'update_*.log', 'build_*.log', 'sessions_*.txt', 'epf')
-    checks = @('check*'); canary = @('canary_*'); dumps = @('dump_*.log', 'exchange-rules.*')
+    checks = @('check*'); canary = @('canary_*'); actions = @('actions*'); dumps = @('dump_*.log', 'exchange-rules.*')
     selfcheck = @('selfcheck-after*', 'exchange-compare.txt', 'exchange-set.txt', 'coverage*.txt', 'metrics-slow.txt')
     unittests = @('unittests*')
 }
@@ -2744,6 +2763,8 @@ $script:ResumeRun = $null
 $script:ResumeRequest = $null
 # Комплект продолжения: обновления прежнего прогона (или новые из inbox для тех же имён).
 $script:ResumeKitFound = @()
+# Папка действий после обновления прежнего прогона: продолжение выполняет те же действия.
+$script:ResumeActionsDir = ''
 
 function ConvertTo-ResumeText {
     # Значение настройки строкой, одинаковой при каждом чтении config.psd1: ключи таблиц - по алфавиту,
@@ -2796,6 +2817,10 @@ function Get-PhaseInputs {
             $flags['-SkipSelfCheck'] = [bool]$SkipSelfCheck
         }
         'unittests' { $keys = @('UnitTestExtensions', 'UnitTestEngine', 'RunUnitTests') }
+        'actions' {
+            $keys = @('ActionsRegister', 'HistoryRegister')
+            $flags['действия'] = Get-GateActionsStamp $script:GateActionsDir
+        }
     }
     $inputs = [ordered]@{}
     foreach ($key in $keys) { $inputs[$key] = ConvertTo-ResumeText (Get-Setting $cfg $key $null) }
@@ -3280,6 +3305,7 @@ function Initialize-Resume {
         $script:RunState.metricsBeforeSaved = [bool](Get-UiField $state 'metricsBeforeSaved' $false)
     }
     $script:RunState.accepted = ([bool](Get-UiField $state 'accepted' $false) -or $plan.Record.Accepted)
+    $script:ResumeActionsDir = [string](Get-UiField $state 'actionsDir' '')
     $found = New-Object System.Collections.Generic.List[object]
     foreach ($source in $plan.Sources) {
         $entry = [pscustomobject]@{ Kind = $source.Kind; Path = $source.Path }
@@ -4246,10 +4272,10 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
     $menuSlots = @(
         @('kit', 'Тестовая база', '1'), @('asis', 'Тестовая база', '2'), @('resume', 'Тестовая база', '3'),
         @('gitimport', 'Тестовая база', '4'), @('gitexport', 'Тестовая база', '5'), @('accept', 'Тестовая база', '6'),
-        @('runs', 'Тестовая база', '7'), @('tests', 'Тестовая база', '8'),
+        @('runs', 'Тестовая база', '7'), @('tests', 'Тестовая база', '8'), @('templocks', 'Тестовая база', 'q'),
         @('precheck', 'Рабочая база', '9'), @('applyprep', 'Рабочая база', 'a'), @('prepare', 'Рабочая база', 'b'),
         @('cancelprep', 'Рабочая база', 'c'), @('deploy', 'Рабочая база', 'd'), @('rollback', 'Рабочая база', 'e'),
-        @('basestate', 'Рабочая база', 'f'),
+        @('basestate', 'Рабочая база', 'f'), @('prodlocks', 'Рабочая база', 'r'),
         @('cmpext', 'Сравнить и забрать', 'g'), @('cmpepf', 'Сравнить и забрать', 'h'), @('pullext', 'Сравнить и забрать', 'i'),
         @('pullepf', 'Сравнить и забрать', 'j'), @('gitprod', 'Сравнить и забрать', 'k'),
         @('settings', 'Гейт', 'l'), @('update', 'Гейт', 'm'), @('stats', 'Гейт', 'n'), @('comcheck', 'Гейт', 'o'), @('exit', 'Гейт', 'p'))
@@ -4308,6 +4334,9 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
                 $menu.Add((New-MenuItem 'cancelprep' 'Отменить подготовку рабочей' 'вернуть расширения к применённым версиям'))
             }
             $menu.Add((New-MenuItem 'basestate' 'Показать состояние баз' 'блокировки и сеансы'))
+            # Блокировки руками (deploy.ps1 -ManualLocks): поставить или снять, каждое изменение - выбором человека.
+            $menu.Add((New-MenuItem 'templocks' 'Блокировки тестовой базы' ('{0}: поставить или снять начало сеансов, регламентные задания' -f $script:Base)))
+            $menu.Add((New-MenuItem 'prodlocks' 'Блокировки рабочей базы' ('{0}: поставить или снять начало сеансов, регламентные задания' -f [string](Get-Setting $cfg 'ProdBase' 'рабочая'))))
             $menu.Add((New-MenuItem 'comcheck' 'Проверка внешнего соединения (COM)' ('с {0}: как читаются расширения, только читает' -f $script:Base)))
             $menu.Add((New-MenuItem 'cmpext' 'Сравнить расширения' 'рабочая и temp'))
             $menu.Add((New-MenuItem 'cmpepf' 'Сравнить внешние обработки' 'рабочая и temp'))
@@ -4402,6 +4431,17 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             # Только чтение, только temp: каким способом через внешнее соединение читаются расширения - и обратно в меню.
             try {
                 if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -ComCheck -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') -ComCheck }
+            }
+            catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+            Wait-UiAcknowledge
+            continue
+        }
+        if ($choice -eq 'templocks' -or $choice -eq 'prodlocks') {
+            $locksWhich = 'Temp'
+            if ($choice -eq 'prodlocks') { $locksWhich = 'Prod' }
+            try {
+                if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -ManualLocks -LocksBase $locksWhich -UiChannel $UiChannel }
+                else { & (Join-Path $Root 'deploy.ps1') -ManualLocks -LocksBase $locksWhich }
             }
             catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
             Wait-UiAcknowledge
@@ -4810,6 +4850,302 @@ function Update-GateTools {
         Write-RunLog ("Обработка {0} собрана из {1}, отпечаток {2}" -f $tool.Title, $xml, $hash)
     }
 }
+
+#region Действия после обновления
+
+# Действия после обновления (раздел 5.24): то, что меняет данные и настройки базы после загрузки расширений.
+# Файл действия - actions\<ГГГГММДД>-<NN>-<имя>.bsl: шапка (// @Действие, @Зачем, @Автор, @Задача) и тело
+# процедуры с параметром Журнал (Массив строк). Гейт вставляет действия в обработку «Действия после обновления»
+# (исходники - tools\src), собирает её конфигуратором в начале прогона и запускает после канареечного входа.
+# Выполненные (запись в регистре ActionsRegister) обработка не повторяет; загрузку пишет в HistoryRegister.
+
+$script:GateActionsDir = ''
+$script:GateActions = @()
+$script:GateActionsEpf = ''
+$script:GateActionsProblem = ''
+$script:GateActionsNeeded = $false
+# Папка actions внутри комплекта (так её кладёт «Загрузить из git»).
+$script:KitActionsDir = ''
+
+function Get-GateActions {
+    # Действия из папки по порядку имён: Id - имя файла без .bsl, шапка, тело и Problems - что не так (пусто - годится).
+    param([string]$Dir)
+    $list = New-Object System.Collections.Generic.List[object]
+    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) { return , $list.ToArray() }
+    foreach ($file in @(Get-ChildItem -LiteralPath $Dir -File | Where-Object { $_.Extension -ieq '.bsl' } | Sort-Object Name)) {
+        $id = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+        $problems = New-Object System.Collections.Generic.List[string]
+        if ($id -notmatch '^\d{8}-\d{2}-[0-9A-Za-zА-Яа-яЁё_-]+$') { $problems.Add('имя файла не по образцу <ГГГГММДД>-<NN>-<имя>.bsl') }
+        if ($id.Length -gt 150) { $problems.Add('имя длиннее 150 знаков') }
+        $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF).Replace("`r`n", "`n")
+        $head = @{}
+        foreach ($line in $text.Split("`n")) {
+            $found = [regex]::Match($line, '^\s*//\s*@(Действие|Зачем|Автор|Задача)\s+(\S.*?)\s*$')
+            if ($found.Success -and -not $head.ContainsKey($found.Groups[1].Value)) { $head[$found.Groups[1].Value] = $found.Groups[2].Value }
+        }
+        foreach ($tag in @('Действие', 'Зачем', 'Автор', 'Задача')) { if (-not $head.ContainsKey($tag)) { $problems.Add(('в шапке нет @' + $tag)) } }
+        # Файл - тело одной процедуры: объявления методов и директивы в нём не к месту, транзакцию открывает обработка.
+        if ($text -match '(?im)^\s*(Процедура|Функция|КонецПроцедуры|КонецФункции|Procedure|Function|EndProcedure|EndFunction)(\s|\(|;|$)') {
+            $problems.Add('в файле объявлен метод: файл - тело одной процедуры, без «Процедура ... КонецПроцедуры»')
+        }
+        if ($text -match '(?m)^\s*&') { $problems.Add('в файле директива компиляции (&...)') }
+        if ($text -match '(?i)(НачатьТранзакцию|ЗафиксироватьТранзакцию|ОтменитьТранзакцию|BeginTransaction|CommitTransaction|RollbackTransaction)\s*\(') {
+            $problems.Add('в файле управление транзакцией: каждое действие и так идёт в своей транзакции')
+        }
+        $list.Add([pscustomobject]@{
+                Id = $id; File = $file.FullName; Title = [string]$head['Действие']; Why = [string]$head['Зачем']
+                Author = [string]$head['Автор']; Task = [string]$head['Задача']; Body = $text; Problems = $problems.ToArray()
+            })
+    }
+    return , $list.ToArray()
+}
+
+function Get-GateActionsStamp {
+    # Отпечаток папки действий (имена и содержимое файлов): по нему продолжение видит, что действия поменялись.
+    param([string]$Dir)
+    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) { return 'нет действий' }
+    $parts = @(Get-ChildItem -LiteralPath $Dir -File | Where-Object { $_.Extension -ieq '.bsl' } | Sort-Object Name | ForEach-Object {
+            '{0}={1}' -f $_.Name, (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash })
+    if ($parts.Count -eq 0) { return 'нет действий' }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    return [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes(($parts -join "`n")))).Replace('-', '')
+}
+
+function New-GateActionsSource {
+    # Исходники обработки с действиями: шаблон из tools\src, между метками @@ДЕЙСТВИЯ - список действий, выбор
+    # по номеру и сами действия. Возвращает путь к корневому XML или бросает исключение.
+    param($List, [string]$Target)
+    $source = Resolve-RootPath 'tools\src'
+    $xml = Join-Path $source 'ДействияПослеОбновления.xml'
+    if (-not (Test-Path -LiteralPath $xml)) { throw ('нет исходников обработки «Действия после обновления» ({0}): переустанови гейт («Обновить гейт из GitHub»)' -f $xml) }
+    if (Test-Path -LiteralPath $Target) { Remove-Item -LiteralPath $Target -Recurse -Force }
+    New-Item -ItemType Directory -Path $Target -Force | Out-Null
+    Copy-Item -LiteralPath $xml -Destination $Target -Force
+    Copy-Item -LiteralPath (Join-Path $source 'ДействияПослеОбновления') -Destination $Target -Recurse -Force
+    $module = Join-Path $Target 'ДействияПослеОбновления\Ext\ObjectModule.bsl'
+    $text = [System.IO.File]::ReadAllText($module, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF).Replace("`r`n", "`n")
+    $begin = '// @@ДЕЙСТВИЯ: НАЧАЛО@@'
+    $end = '// @@ДЕЙСТВИЯ: КОНЕЦ@@'
+    $from = $text.IndexOf($begin)
+    $to = $text.IndexOf($end)
+    if ($from -lt 0 -or $to -lt $from) { throw 'в модуле объекта обработки «Действия после обновления» нет меток @@ДЕЙСТВИЯ' }
+    $code = New-Object System.Collections.Generic.List[string]
+    $code.Add($begin)
+    $code.Add(('// Вставлено гейтом {0} в прогоне {1}: действий {2}. Руками не править.' -f $script:GateVersion, $runId, @($List).Count))
+    $code.Add('')
+    $code.Add('Функция СписокДействий()')
+    $code.Add('')
+    $code.Add("`tСписок = Новый Массив;")
+    foreach ($action in $List) { $code.Add(("`tСписок.Добавить(""{0}"");" -f $action.Id)) }
+    $code.Add("`tВозврат Список;")
+    $code.Add('')
+    $code.Add('КонецФункции')
+    $code.Add('')
+    $code.Add('Процедура ВыполнитьДействиеПоНомеру(Номер, Журнал)')
+    $code.Add('')
+    $number = 0
+    foreach ($action in $List) {
+        $number++
+        if ($number -eq 1) { $code.Add(("`tЕсли Номер = {0} Тогда" -f $number)) } else { $code.Add(("`tИначеЕсли Номер = {0} Тогда" -f $number)) }
+        $code.Add(("`t`tДействие{0}(Журнал);" -f $number))
+    }
+    if ($number -gt 0) { $code.Add("`tИначе") }
+    $indent = "`t"
+    if ($number -gt 0) { $indent = "`t`t" }
+    $code.Add(($indent + 'ВызватьИсключение СтрШаблон(НСтр("ru = ''Действия с номером %1 в этой сборке нет''"), Номер);'))
+    if ($number -gt 0) { $code.Add("`tКонецЕсли;") }
+    $code.Add('')
+    $code.Add('КонецПроцедуры')
+    $number = 0
+    foreach ($action in $List) {
+        $number++
+        $code.Add('')
+        $code.Add(('// {0}: {1}' -f $action.Id, $action.Title))
+        $code.Add(('// Файл actions\{0}.bsl, автор: {1}, задача: {2}.' -f $action.Id, $action.Author, $action.Task))
+        $code.Add(('Процедура Действие{0}(Журнал)' -f $number))
+        $code.Add('')
+        foreach ($line in $action.Body.TrimEnd().Split("`n")) {
+            if ($line.Trim()) { $code.Add(("`t" + $line.TrimEnd())) } else { $code.Add('') }
+        }
+        $code.Add('')
+        $code.Add('КонецПроцедуры')
+    }
+    $code.Add($end)
+    $text = $text.Substring(0, $from) + ($code -join "`n") + $text.Substring($to + $end.Length)
+    [System.IO.File]::WriteAllText($module, $text.Replace("`n", "`r`n"), $Utf8Bom)
+    return (Join-Path $Target 'ДействияПослеОбновления.xml')
+}
+
+function Initialize-GateActions {
+    # Какие действия выполнять в этом прогоне и сборка обработки. Нужна ли обработка вообще: есть действия или
+    # прогон грузит расширения, а регистр истории задан. Не собралась при действиях - шаг потом будет красным.
+    param([string]$KitActionsDir)
+    $dir = ''
+    if ($ActionsDir) { $dir = Resolve-RootPath $ActionsDir }
+    elseif ($KitActionsDir) { $dir = $KitActionsDir }
+    elseif ($script:ResumeActionsDir -and (Test-Path -LiteralPath $script:ResumeActionsDir)) { $dir = $script:ResumeActionsDir }
+    if ($dir -and -not (Test-Path -LiteralPath $dir -PathType Container)) { throw ('Нет папки действий после обновления: {0}' -f $dir) }
+    $script:GateActionsDir = $dir
+    if ($null -ne $script:RunState) { $script:RunState['actionsDir'] = $dir }
+    $script:GateActions = Get-GateActions $dir
+    $historyRegister = [string](Get-Setting $cfg 'HistoryRegister' '')
+    $script:GateActionsNeeded = ($script:GateActions.Count -gt 0 -or (($kitItems.Count + $kitProcessings.Count) -gt 0 -and [bool]$historyRegister))
+    if (-not $script:GateActionsNeeded) { return }
+    # Продолжение берёт этап действий готовым из прежнего прогона: собирать обработку незачем.
+    if ($null -ne $script:ResumeRun -and $script:ResumeRun.Reused.ContainsKey('actions')) { return }
+    if ($script:GateActions.Count -gt 0) {
+        Write-Host ("Действия после обновления ({0}): {1}" -f $dir, $script:GateActions.Count)
+        foreach ($action in $script:GateActions) { Write-Host ("  {0}  {1}" -f $action.Id, $action.Title) }
+    }
+    $bad = @($script:GateActions | Where-Object { $_.Problems.Count -gt 0 })
+    if ($bad.Count -gt 0) {
+        $script:GateActionsProblem = 'действия с ошибками в файлах, ни одно не выполнялось: ' + ((@($bad | ForEach-Object { '{0} - {1}' -f $_.Id, ($_.Problems -join '; ') })) -join ' | ')
+        return
+    }
+    if ($script:GateActions.Count -gt 0 -and -not [string](Get-Setting $cfg 'ActionsRegister' '')) {
+        $script:GateActionsProblem = 'не задан ActionsRegister (регистр сведений выполненных действий): действия не выполнялись'
+        return
+    }
+    try {
+        $xml = New-GateActionsSource -List $script:GateActions -Target (Join-Path $RunDir 'actions\src')
+        $epf = Join-Path $RunDir 'actions\ДействияПослеОбновления.epf'
+        $result = Invoke-Designer -Command @('/LoadExternalDataProcessorOrReportFromFiles', ('"{0}"' -f $xml), ('"{0}"' -f $epf)) `
+            -LogName 'actions_build.log' -TimeoutSec $timeoutLoadSec -Title 'Собрать обработку действий после обновления'
+        if ($result.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $epf)) {
+            $why = (@($result.Lines | Where-Object { $_ }) | Select-Object -First 3) -join ' | '
+            throw ('обработка не собралась (код {0}): {1}' -f $result.ExitCode, $why)
+        }
+        $script:GateActionsEpf = $epf
+        Write-RunLog ("Действия после обновления: обработка собрана, {0}, действий {1}" -f $epf, $script:GateActions.Count)
+    }
+    catch { $script:GateActionsProblem = 'обработка «Действия после обновления» не собрана: ' + $_.Exception.Message }
+}
+
+function Get-GateActionsKind {
+    # Вид загрузки для истории.
+    if ($kitItems.Count -eq 0 -and $kitProcessings.Count -eq 0) { return 'действия после обновления' }
+    if ($KitSource -like 'git *') { return 'загрузка из git' }
+    return 'комплект'
+}
+
+function Invoke-GateActionsStep {
+    # Запуск обработки «Действия после обновления» тонким клиентом и разбор её итога: шаг «Действия после
+    # обновления», журнал действий - actions\log.txt, итог обработки - actions.txt.
+    $stepName = 'Действия после обновления'
+    $paramsFile = Join-Path $RunDir 'actions\params.txt'
+    $outFile = Join-Path $RunDir 'actions.txt'
+    $commit = ''
+    if ($KitSource -match '@([0-9a-fA-F]{7,40})\s*$') { $commit = $Matches[1] }
+    $items = @(@($kitItems | ForEach-Object { if ($_.Version) { '{0} {1}' -f $_.Name, $_.Version } else { $_.Name } }) + @($kitProcessings | ForEach-Object { $_.Name })) -join ', '
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add(('done=' + [string](Get-Setting $cfg 'ActionsRegister' '')))
+    $lines.Add(('history=' + [string](Get-Setting $cfg 'HistoryRegister' '')))
+    $lines.Add(('run=' + $runId))
+    $lines.Add(('commit=' + $commit))
+    $lines.Add(('branch=' + $KitBranch))
+    $lines.Add(('gate=' + $script:GateVersion))
+    $lines.Add(('kind=' + (Get-GateActionsKind)))
+    $lines.Add(('items=' + $items))
+    foreach ($action in $script:GateActions) { $lines.Add(('action=' + $action.Id)) }
+    [System.IO.File]::WriteAllLines($paramsFile, [string[]]$lines, $Utf8Bom)
+
+    $timeoutSec = [int](Get-Setting $cfg 'ActionsTimeoutSec' 1800)
+    $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -User $adminUser -Password $adminPassword) + @(
+        '/DisableStartupDialogs', '/DisableStartupMessages',
+        '/Execute', ('"{0}"' -f $script:GateActionsEpf),
+        ('/C"actions;in={0};out={1}"' -f $paramsFile, $outFile))
+    $argLine = $argList -join ' '
+    Write-RunLog ("> 1cv8c.exe {0}" -f (Get-MaskedLine $argLine))
+    Write-Host ("  ...  {0}: клиент запущен в {1}, жду не дольше {2} с" -f $stepName, (Get-Date -Format 'HH:mm:ss'), $timeoutSec) -ForegroundColor DarkGray
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $process = Start-Process -FilePath $v8c -ArgumentList $argLine -PassThru
+    $null = $process.Handle
+    $appeared = $false
+    while ($watch.Elapsed.TotalSeconds -lt $timeoutSec) {
+        if (Test-Path -LiteralPath $outFile) { $appeared = $true; break }
+        if ($process.HasExited) { break }
+        Write-UiProgress -Title $stepName -Elapsed $watch.Elapsed.TotalSeconds -Expected (Get-ExpectedStepSeconds $stepName)
+        Start-Sleep -Milliseconds 250
+    }
+    Complete-UiProgress
+    if (-not $appeared -and (Test-Path -LiteralPath $outFile)) { $appeared = $true }
+    $seconds = [int]$watch.Elapsed.TotalSeconds
+    if (-not $appeared) {
+        $windows = @()
+        if (-not $process.HasExited) {
+            $windows = @(Save-ProcessWindows -ProcessId $process.Id -FilePrefix (Join-Path $RunDir 'actions\client'))
+            try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { }
+        }
+        $stage = 'обработка не открылась (ошибка в коде действий? окна клиента: {0})' -f ($windows -join '; ')
+        if (Test-Path -LiteralPath ($outFile + '.started')) { $stage = 'обработка открылась, но итог не записала: действия могли выполниться частично, смотри регистр выполненных' }
+        if ($process.HasExited -and -not $windows) { $stage = ('клиент закрылся сам, итога нет (код {0})' -f $process.ExitCode) }
+        Add-StatFact -Title $stepName -Seconds $watch.Elapsed.TotalSeconds -Status 'FAIL'
+        Add-StepResult -Name $stepName -Status 'FAIL' -Detail ('за {0} с итога нет: {1}' -f $seconds, $stage) -Seconds $seconds
+        return
+    }
+    if (-not $process.WaitForExit(60000)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
+    $result = @([System.IO.File]::ReadAllLines($outFile, [System.Text.Encoding]::UTF8) | ForEach-Object { $_.TrimStart([char]0xFEFF) })
+    $value = { param([string]$Key) $row = @($result | Where-Object { $_.StartsWith($Key + '=') } | Select-Object -Last 1); if ($row.Count -eq 0) { return '' }; return $row[0].Substring($Key.Length + 1) }
+    $status = & $value 'status'
+    $register = & $value 'done-register'
+    $history = & $value 'history'
+    $done = New-Object System.Collections.Generic.List[string]
+    $already = New-Object System.Collections.Generic.List[string]
+    $notRun = New-Object System.Collections.Generic.List[string]
+    $failed = ''
+    foreach ($row in @($result | Where-Object { $_.StartsWith('action=') })) {
+        $parts = $row.Substring(7).Split([char[]]@('|'), 3)
+        $how = ''
+        if ($parts.Length -gt 1) { $how = $parts[1] }
+        if ($how -eq 'done') { $done.Add($parts[0]) }
+        elseif ($how -eq 'already') { $already.Add($parts[0]) }
+        elseif ($how -eq 'failed') { $text = ''; if ($parts.Length -gt 2) { $text = $parts[2] }; $failed = ('{0}: {1}' -f $parts[0], $text) }
+        else { $notRun.Add($parts[0]) }
+    }
+    $logRows = @($result | Where-Object { $_.StartsWith('log=') } | ForEach-Object { $_.Substring(4).Replace('|', ': ') })
+    $logFile = Join-Path $RunDir 'actions\log.txt'
+    if ($logRows.Count -gt 0) { [System.IO.File]::WriteAllLines($logFile, [string[]]$logRows, $Utf8Bom) }
+
+    $historyText = ''
+    if ($history -eq 'ok') { $historyText = 'загрузка записана в историю' }
+    elseif ($history -eq 'missing') { $historyText = ('регистра истории {0} в базе нет' -f [string](Get-Setting $cfg 'HistoryRegister' '')) }
+    elseif ($history -eq 'notset') { $historyText = 'история загрузок не задана (HistoryRegister)' }
+    elseif ($history -like 'error*') { $historyText = 'загрузку в историю записать не удалось (шаг «История загрузок»)' }
+    $registerText = @{
+        missing = ('регистра {0} в базе нет' -f [string](Get-Setting $cfg 'ActionsRegister' ''))
+        notset = 'не задан ActionsRegister'
+        nodimension = ('в регистре {0} нет измерения Действие' -f [string](Get-Setting $cfg 'ActionsRegister' ''))
+    }
+    $parts = New-Object System.Collections.Generic.List[string]
+    $stepStatus = 'OK'
+    if ($status -eq 'error') {
+        $stepStatus = 'FAIL'
+        $parts.Add(('обработка не выполнила действия: {0}' -f (& $value 'error')))
+    }
+    elseif ($register -and $register -ne 'ok' -and $script:GateActions.Count -gt 0) {
+        $stepStatus = 'FAIL'
+        $why = [string]$registerText[$register]
+        if (-not $why) { $why = $register }
+        $parts.Add(('{0}: действия не выполнялись ({1})' -f $why, $script:GateActions.Count))
+    }
+    else {
+        if ($failed) { $stepStatus = 'FAIL'; $parts.Add(('упало действие {0}' -f $failed)) }
+        if ($done.Count -gt 0) { $parts.Add(('выполнено сейчас: {0}' -f ($done -join ', '))) }
+        if ($already.Count -gt 0) { $parts.Add(('выполнены раньше: {0}' -f $already.Count)) }
+        if ($notRun.Count -gt 0) { $parts.Add(('не выполнялись: {0}' -f ($notRun -join ', '))) }
+        if ($script:GateActions.Count -eq 0) { $parts.Add('действий нет') }
+        elseif ($status -ne 'ok' -and -not $failed) { $stepStatus = 'FAIL'; $parts.Add(('итог обработки: {0}' -f $status)) }
+    }
+    if ($historyText) { $parts.Add($historyText) }
+    if ($logRows.Count -gt 0) { $parts.Add(('журнал действий - actions\log.txt: {0}' -f ((@($logRows | Select-Object -First 3)) -join ' | '))) }
+    Add-StatFact -Title $stepName -Seconds $watch.Elapsed.TotalSeconds -Status $stepStatus
+    Add-StepResult -Name $stepName -Status $stepStatus -Detail ($parts -join '; ') -Log $outFile -Seconds $seconds
+    if ($history -like 'error*') {
+        Add-StepResult -Name 'История загрузок' -Status 'WARN' -Detail ('запись в {0} не удалась: {1}' -f [string](Get-Setting $cfg 'HistoryRegister' ''), $history.Substring(5).TrimStart('|'))
+    }
+}
+
+#endregion
 
 function Start-DesignerBackground {
     # Конфигуратор с командой - без ожидания: процесс идёт параллельно со следующими шагами.
@@ -6033,6 +6369,7 @@ if (-not [string]::IsNullOrWhiteSpace($Kit)) {
     if ($script:MenuItems.Count -eq 0 -and $script:ResumeKitFound.Count -eq 0) {
     $kitPath = Resolve-RootPath $Kit
     $kitFound = @()
+    if (Test-Path -LiteralPath (Join-Path $kitPath 'actions') -PathType Container) { $script:KitActionsDir = Join-Path $kitPath 'actions' }
 
     if (Test-Path -LiteralPath $kitPath -PathType Container) {
         $kitFound = @(Get-KitDirect $kitPath)
@@ -6232,6 +6569,8 @@ $parallelCheckConfig = ([bool](Get-Setting $cfg 'ParallelCheckConfig' $true) -an
 # Обработки гейта собраны не из этой поставки (обновление из GitHub их не собирает) - собрать сейчас, до первого
 # запуска самопроверки и канарейки.
 Update-GateTools
+# Действия после обновления (раздел 5.24): обработка с ними собирается сейчас, пока конфигуратор ничем не занят.
+Initialize-GateActions -KitActionsDir $script:KitActionsDir
 if ($selfCheckOff -like 'нет обработки*' -and (Test-Path -LiteralPath $selfCheckEpf)) {
     $selfCheckOff = ''
     if (-not (Test-Path -LiteralPath $v8c)) { $selfCheckOff = "нет тонкого клиента $v8c" }
@@ -6275,6 +6614,7 @@ else {
         $planSteps.Add("Канареечный вход: $planLabel")
     }
 }
+if ($script:GateActionsNeeded) { $planSteps.Add('Действия после обновления') }
 if ($processingOnly) { Write-RunLog 'План: комплект только из внешних обработок, самопроверки нет' }
 if (-not $processingOnly -and $runExchangeRules) { $planSteps.Add('Правила обмена') }
 if (-not $processingOnly -and ($runSelfCheck -or $SkipSelfCheck)) {
@@ -6987,6 +7327,27 @@ else {
 }
 if ($canaryState) { Set-PhaseState 'canary' $canaryState }
 
+# 5б. Действия после обновления (раздел 5.24): новые действия из комплекта или -ActionsDir и запись загрузки
+# в историю. После канареечного входа: в базу, которая не открывается, действия не пустить.
+$script:StepPhase = 'actions'
+$actionsState = 'done'
+if (Restore-Phase 'actions') { $actionsState = '' }
+elseif (-not $script:GateActionsNeeded) { $actionsState = 'na' }
+elseif (-not $proceed -or $script:StopRun) {
+    Add-StepResult -Name 'Действия после обновления' -Status 'SKIP' -Detail 'пропущено: загрузка не прошла'
+    $actionsState = 'skipped'
+}
+elseif ($script:GateActionsProblem) {
+    $problemStatus = 'FAIL'
+    if ($script:GateActions.Count -eq 0) { $problemStatus = 'WARN' }
+    Add-StepResult -Name 'Действия после обновления' -Status $problemStatus -Detail $script:GateActionsProblem
+}
+elseif (-not (Test-Path -LiteralPath $v8c)) {
+    Add-StepResult -Name 'Действия после обновления' -Status 'FAIL' -Detail "нет тонкого клиента ${v8c}: действия не выполнялись"
+}
+else { Invoke-GateActionsStep }
+if ($actionsState) { Set-PhaseState 'actions' $actionsState }
+
 # 5а. Выгрузка расширений в файлы и проверка правил обмена по ней (без 1С). Идёт до самопроверки «после»:
 # что изменилось в правилах обмена (R3), нужно знать до её итогов. Та же выгрузка - для карты покрытия.
 $script:StepPhase = 'dumps'
@@ -7252,12 +7613,21 @@ if ([string](Get-Setting $cfg 'ProdBase' '') -and (Test-Path -LiteralPath (Join-
     Write-Host 'Снимок temp для обновления рабочей (хеш-суммы расширений и обработок, только чтение)...' -ForegroundColor DarkGray
     try {
         $snapshotProcess = Start-Process -FilePath 'powershell.exe' -ArgumentList ($snapshotArgs -join ' ') -NoNewWindow -PassThru -RedirectStandardOutput $snapshotLog -RedirectStandardError ($snapshotLog + '.err')
-        $snapshotLimit = ([int](Get-Setting $cfg 'ComTimeoutSec' 300) * 4 + 60) * 1000
-        if (-not $snapshotProcess.WaitForExit($snapshotLimit)) { try { $snapshotProcess.Kill() } catch { }; throw 'не уложился в срок' }
+        # Ждём по секунде: остановка из ci.exe (файл stop) снимает процесс снимка и идёт дальше как обычная остановка.
+        $snapshotDeadline = (Get-Date).AddSeconds([int](Get-Setting $cfg 'ComTimeoutSec' 300) * 4 + 60)
+        while (-not $snapshotProcess.WaitForExit(1000)) {
+            try { Test-UiStop }
+            catch { try { $snapshotProcess.Kill() } catch { }; throw }
+            if ((Get-Date) -gt $snapshotDeadline) { try { $snapshotProcess.Kill() } catch { }; throw 'не уложился в срок' }
+        }
         if (-not (Test-Path -LiteralPath $checkedFile)) { throw ('файла снимка нет (код {0}), см. checked-state.log' -f $snapshotProcess.ExitCode) }
         $script:CheckedState = [System.IO.File]::ReadAllText($checkedFile, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
     }
-    catch { $script:CheckedState = [pscustomobject]@{ ok = $false; error = [string]$_.Exception.Message } }
+    catch {
+        # Остановка из ci.exe - не ошибка снимка: дальше её обрабатывают trap и finally прогона.
+        if ([string]$_.Exception.Message -eq 'остановлено из интерфейса ci.exe') { throw }
+        $script:CheckedState = [pscustomobject]@{ ok = $false; error = [string]$_.Exception.Message }
+    }
     if ([bool](Get-UiField $script:CheckedState 'ok' $false)) { Write-RunLog 'Снимок temp для обновления рабочей снят' }
     else { Write-RunLog ('Снимок temp для обновления рабочей не снят: ' + [string](Get-UiField $script:CheckedState 'error' '')) }
 }
@@ -7456,7 +7826,9 @@ elseif ($anyTouched -gt 0) {
     }
     if ($acceptAfterDecision -and $decision -eq 'kept') {
         try {
-            Invoke-AcceptBaseline -RunPath $RunDir
+            $keepFailuresNow = $false
+            if (Test-UiCanAsk) { $keepFailuresNow = Get-AcceptKeepFailures -RunPath $RunDir -RunName $runId }
+            Invoke-AcceptBaseline -RunPath $RunDir -KeepFailures:$keepFailuresNow
             $aftermath.Add('Новое этого прогона принято в эталон.')
             Write-Host 'Новое этого прогона принято в эталон.' -ForegroundColor Green
         }
