@@ -106,13 +106,8 @@ if ($UiChannel) {
     $ProgressPreference = 'SilentlyContinue'
 }
 
-# Блокировки рабочей базы. С начала подготовки рабочей базы (после подтверждения) обе - регламентных заданий
-# и начала сеансов - в конце обязательно снимаются, кто бы их ни поставил: при удачном обновлении, при сбое,
-# при остановке и по Ctrl+C. Тестовую базу это не касается. Исключение - чужая блокировка сеансов с другим кодом:
-# с ней скрипт останавливается до обновления и её не трогает.
-$script:ProdLocksArmed = $false
-$script:KeepForeignSessionLock = $false
-$script:SessionLockCode = ''
+# До входа в подготовку у этого запуска нет собственных блокировок.
+$script:ProdLockState = $null
 
 trap {
     Write-Host ''
@@ -120,13 +115,14 @@ trap {
     if ([string]$_.FullyQualifiedErrorId -ne [string]$_.Exception.Message -and $null -ne $_.InvocationInfo) {
         Write-Host ("  {0}" -f ($_.InvocationInfo.PositionMessage -split "`r?`n")[0]) -ForegroundColor DarkGray
     }
-    if ($script:ProdLocksArmed) {
+    if ($null -ne $script:ProdLockState) {
         try { Clear-ProdLocks } catch { Write-Host ("Блокировки снять не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Yellow }
     }
     exit 1
 }
 
 $Root = $PSScriptRoot
+. (Join-Path $Root 'cluster-target.ps1')
 $Utf8Bom = New-Object System.Text.UTF8Encoding($true)
 $TestBasePattern = 'temp|test|copy|tmp|dev|sandbox|stand|тест|копи|стенд|песочниц'
 $SelfCheckLineRegex = New-Object System.Text.RegularExpressions.Regex('^\d\d:\d\d:\d\d \[(ОК|ОШИБКА|ВНИМАНИЕ|ПРОПУСК|ИНФО)\]\s*(.*)$')
@@ -311,6 +307,9 @@ function Invoke-Designer {
     $argList = @('DESIGNER') + @(Get-ConnectionArgs -BaseName $BaseName -User $user -Password $password) +
         @('/DisableStartupDialogs', '/DisableStartupMessages') + $Command + @('/Out', ('"{0}"' -f $logPath))
     while ($true) {
+        if ($BaseName -ieq $script:ProdBase -and $Command[0] -in @('/LoadCfg', '/LoadConfigFromFiles', '/DeleteCfg', '/UpdateDBCfg')) {
+            $null = Get-BaseInfo $deployLink $BaseName $user $password
+        }
         $result = Invoke-V8 -Exe $script:V8 -Arguments $argList -TimeoutSec $TimeoutSec -Title $Title -NoResultLine
         $lines = @(Read-V8Log $logPath)
         if ($Title) {
@@ -415,6 +414,7 @@ function Connect-ClusterAgent {
     $link = [pscustomobject]@{
         Connector       = $null
         Agent           = $null
+        Server          = $script:Server
         Clusters        = @()
         Errors          = @()
         ClusterUser     = [string](Get-Setting $cfg 'ClusterAdmin' '')
@@ -453,19 +453,24 @@ function Format-ClusterSession {
     return $text
 }
 
+function Get-SessionTarget {
+    param($Link, [string]$BaseName)
+    if ($BaseName -ieq $script:ProdBase) { return (Resolve-ClusterBase $Link $BaseName $script:ProdUser $script:ProdPassword) }
+    if ($BaseName -ieq $script:TempBase) { return (Resolve-ClusterBase $Link $BaseName $script:TempUser $script:TempPassword) }
+    throw ("База {0} отсутствует в текущем профиле." -f $BaseName)
+}
+
 function Get-BaseSessions {
     # Сеансы базы по данным агента: имя базы сравнивается целиком.
     param($Link, [string]$BaseName)
     $list = New-Object System.Collections.Generic.List[object]
-    foreach ($message in @($Link.Errors)) { $list.Add([pscustomobject]@{ Text = $message; IsDesigner = $false; IsError = $true }) }
-    foreach ($cluster in @($Link.Clusters)) {
-        foreach ($session in @($Link.Agent.GetSessions($cluster))) {
-            $sessionBase = ''
-            try { $sessionBase = [string]$session.infoBase.Name } catch { continue }
-            if ($sessionBase -ine $BaseName) { continue }
+    try {
+        $target = Get-SessionTarget $Link $BaseName
+        foreach ($session in @($Link.Agent.GetInfoBaseSessions($target.Cluster, $target.ShortBase))) {
             $list.Add([pscustomobject]@{ Text = (Format-ClusterSession $session); IsDesigner = ([string]$session.AppID -eq 'Designer'); IsError = $false })
         }
     }
+    catch { $list.Add([pscustomobject]@{ Text = $_.Exception.Message; IsDesigner = $false; IsError = $true }) }
     return $list.ToArray()
 }
 
@@ -473,47 +478,26 @@ function Stop-BaseSessions {
     # Завершает сеансы базы. Без -Designers конфигураторы не трогаются, с -Designers - только они.
     param($Link, [string]$BaseName, [switch]$Designers)
     $lines = New-Object System.Collections.Generic.List[string]
-    foreach ($message in @($Link.Errors)) { $lines.Add($message) }
-    if ($null -eq $Link.Agent) { return $lines.ToArray() }
-    foreach ($cluster in @($Link.Clusters)) {
-        foreach ($session in @($Link.Agent.GetSessions($cluster))) {
-            $sessionBase = ''
-            try { $sessionBase = [string]$session.infoBase.Name } catch { continue }
-            if ($sessionBase -ine $BaseName) { continue }
-            $isDesigner = ([string]$session.AppID -eq 'Designer')
-            if ([bool]$Designers -ne $isDesigner) { continue }
-            $description = Format-ClusterSession $session
-            try { $Link.Agent.TerminateSession($cluster, $session); $lines.Add(("{0} - завершён" -f $description)) }
-            catch { $lines.Add(("{0} - не завершился: {1}" -f $description, $_.Exception.Message)) }
-        }
+    $target = Get-SessionTarget $Link $BaseName
+    foreach ($session in @($Link.Agent.GetInfoBaseSessions($target.Cluster, $target.ShortBase))) {
+        $isDesigner = ([string]$session.AppID -eq 'Designer')
+        if ([bool]$Designers -ne $isDesigner) { continue }
+        $description = Format-ClusterSession $session
+        try { $Link.Agent.TerminateSession($target.Cluster, $session); $lines.Add(("{0} - завершён" -f $description)) }
+        catch { $lines.Add(("{0} - не завершился: {1}" -f $description, $_.Exception.Message)) }
     }
     foreach ($line in $lines) { Write-RunLog ('Завершение сеансов: ' + $line) }
     return $lines.ToArray()
 }
 
 function Get-BaseInfo {
-    # Свойства базы в кластере через рабочий процесс: менять их можно только со входом в саму базу.
     param($Link, [string]$BaseName, [string]$User, [string]$Password)
-    if ($null -eq $Link.Agent) { throw (@($Link.Errors) -join '; ') }
-    foreach ($cluster in @($Link.Clusters)) {
-        $processes = @($Link.Agent.GetWorkingProcesses($cluster) | Where-Object { [int]$_.Running -eq 1 })
-        if ($processes.Count -eq 0) { continue }
-        $process = $Link.Connector.ConnectWorkingProcess(("tcp://{0}:{1}" -f $processes[0].HostName, $processes[0].MainPort))
-        $process.AuthenticateAdmin($Link.ClusterUser, $Link.ClusterPassword)
-        $process.AddAuthentication($User, $Password)
-        foreach ($infoBase in @($process.GetInfoBases())) {
-            if ([string]$infoBase.Name -ieq $BaseName) { return [pscustomobject]@{ Process = $process; InfoBase = $infoBase } }
-        }
-    }
-    throw ("в кластере не нашёл базу {0} или нет рабочего процесса" -f $BaseName)
+    return (Get-CurrentClusterBase $Link $BaseName $User $Password)
 }
 
 function Read-BaseInfoAgain {
     param($Target, [string]$BaseName)
-    foreach ($infoBase in @($Target.Process.GetInfoBases())) {
-        if ([string]$infoBase.Name -ieq $BaseName) { return $infoBase }
-    }
-    throw ("база {0} пропала из списка баз кластера" -f $BaseName)
+    return (Read-ClusterBaseAgain $Target $BaseName)
 }
 
 function Wait-ProdWarnLock {
@@ -554,60 +538,38 @@ function Wait-ProdWarnLock {
     if ($answer -eq '2') { throw ("обновление {0} отменено во время предупреждения пользователей: в рабочую ничего не загружено" -f $script:ProdBase) }
     if ($answer -eq 'empty') { Write-Line ("  в {0} сеансов не осталось" -f $script:ProdBase) 'Green' }
     if ($answer -eq 'time') { Write-Line ("  {0}: завершаю оставшиеся сеансы" -f (Get-Date -Format 'HH:mm')) }
-    if ((Get-Date) -lt $lockAt) {
-        try {
-            $target = Get-BaseInfo -Link $script:WarnLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
-            $infoBase = $target.InfoBase
-            $infoBase.DeniedFrom = (Get-Date).AddMinutes(-30)
-            $infoBase.DeniedMessage = ("Идёт обновление расширений, база заблокирована до {0}" -f ([datetime]$script:WarnLockUntil).ToString('HH:mm'))
-            $target.Process.UpdateInfoBase($infoBase)
+    if ($script:ProdLockState.Expected.Count) {
+        $target = Get-BaseInfo -Link $script:WarnLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+        $infoBase = Read-BaseInfoAgain $target $script:ProdBase
+        if (-not (Test-GateSessionLock $script:ProdLockState $infoBase)) {
+            throw 'блокировку начала сеансов изменили во время предупреждения пользователей'
+        }
+        if ((Get-Date) -lt $lockAt) {
+            $until = [datetime]$script:WarnLockUntil
+            $message = "Идёт обновление расширений, база заблокирована до {0}" -f $until.ToString('HH:mm')
+            Set-GateSessionLock $script:ProdLockState $target ((Get-Date).AddMinutes(-30)) $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:ProdBase }
             Write-Line '  блокировка начала сеансов действует с этой минуты' 'Green'
             Write-RunLog 'Начало блокировки сеансов перенесено на сейчас'
-        }
-        catch {
-            Write-Line ("  перенести начало блокировки на сейчас не смог: {0}; жду {1}" -f $_.Exception.Message, $lockAt.ToString('HH:mm')) 'Yellow'
-            while ((Get-Date) -lt $lockAt) { Test-UiStop; Start-Sleep -Seconds 3 }
         }
     }
     foreach ($line in @(Stop-BaseSessions -Link $script:WarnLink -BaseName $script:ProdBase)) { Write-Line ('  ' + $line) }
 }
 
 function Clear-ProdLocks {
-    # Снимает с рабочей базы блокировку регламентных заданий и блокировку начала сеансов - обе, кто бы их
-    # ни поставил (кроме чужой блокировки сеансов с другим кодом, см. KeepForeignSessionLock). Потом читает
-    # свойства базы заново и проверяет. Не получилось - вторая попытка, потом красная строка с тем, что делать руками.
-    if (-not $script:ProdLocksArmed) { return }
-    $script:ProdLocksArmed = $false
+    $state = $script:ProdLockState
+    if ($null -eq $state -or (-not $state.Expected.Count -and -not $state.JobsSet)) { return }
     for ($try = 1; $try -le 2; $try++) {
         try {
             $target = Get-BaseInfo -Link (Connect-ClusterAgent) -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
-            $infoBase = $target.InfoBase
-            $changes = New-Object System.Collections.Generic.List[string]
-            if ([bool]$infoBase.ScheduledJobsDenied) {
-                $infoBase.ScheduledJobsDenied = $false
-                $changes.Add('блокировку регламентных заданий')
-            }
-            if ([bool]$infoBase.SessionsDenied -and -not $script:KeepForeignSessionLock) {
-                $infoBase.SessionsDenied = $false
-                $infoBase.DeniedMessage = ''
-                $infoBase.PermissionCode = ''
-                $changes.Add('блокировку начала сеансов')
-            }
-            if ($changes.Count -gt 0) { $target.Process.UpdateInfoBase($infoBase) }
-            $check = Read-BaseInfoAgain $target $script:ProdBase
-            $left = New-Object System.Collections.Generic.List[string]
-            if ([bool]$check.ScheduledJobsDenied) { $left.Add('регламентных заданий') }
-            if ([bool]$check.SessionsDenied -and -not $script:KeepForeignSessionLock) { $left.Add('начала сеансов') }
-            if ($left.Count -gt 0) { throw ('после записи всё ещё стоит блокировка ' + ($left -join ' и ')) }
-            if ($changes.Count -gt 0) { Write-Line ("Снял с {0}: {1}. Проверил: блокировок нет." -f $script:ProdBase, ($changes -join ' и ')) 'Green' }
-            else { Write-Line ("Блокировок на {0} нет." -f $script:ProdBase) 'Green' }
-            if ($script:KeepForeignSessionLock) { Write-Line ("Чужую блокировку начала сеансов {0} не трогал." -f $script:ProdBase) 'Yellow' }
+            $released = Restore-GateLocks $state $target $true { param($t) Read-BaseInfoAgain $t $script:ProdBase }
+            if ($released) { Write-Line ("Снял с {0}: {1}." -f $script:ProdBase, $released) 'Green' }
             return
         }
         catch {
-            if ($try -lt 2) { Start-Sleep -Seconds 5; continue }
-            Write-Line ("НЕ СНЯЛ блокировки {0}: {1}. Снять руками: консоль кластера - {0} - Свойства - убрать «Блокировка регламентных заданий включена» и «Блокировка начала сеансов включена»." -f $script:ProdBase, $_.Exception.Message) 'Red'
+            if ($try -lt 2 -and ($state.Expected.Count -or $state.JobsSet)) { Start-Sleep -Seconds 5; continue }
+            Write-Line ("НЕ СНЯЛ или не подтвердил снятие блокировок {0}: {1}. Проверь свойства базы в консоли кластера." -f $script:ProdBase, $_.Exception.Message) 'Red'
         }
+        break
     }
 }
 
@@ -642,6 +604,7 @@ $cfg = Read-DeployConfig
 
 # Меню и вопросы (ui.ps1): из ci.exe их рисует ci.exe, без него - консоль. Нужны уже здесь: если в настройках
 # чего-то не хватает, скрипт спрашивает и записывает в config.psd1.
+. (Join-Path $Root 'locks.ps1')
 . (Join-Path $Root 'ui.ps1')
 Initialize-Ui -Channel $UiChannel
 
@@ -1467,6 +1430,7 @@ function Invoke-ProdProcessing {
     # OutDir, без неё обработка не заменяется. File - сам .epf/.erf, TextFile - уже base64 (откат из old.b64).
     # unregepf: снять обработку - по имени объекта и ссылке элемента вместе.
     param([string]$Mode, [string]$OutDir, [string]$File = '', [string]$TextFile = '', [string]$Name, [string]$Ref = '', [string]$Title)
+    $null = Get-BaseInfo $deployLink $script:ProdBase $script:ProdUser $script:ProdPassword
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
     $parts = New-Object System.Collections.Generic.List[string]
     $parts.Add($Mode)
@@ -3303,7 +3267,11 @@ $preparedWhen = ''
 function Read-PreparedState {
     # Подготовленное обновление рабочей или $null, если его нет.
     if (-not (Test-Path -LiteralPath $preparedPath)) { return $null }
-    try { return ([System.IO.File]::ReadAllText($preparedPath, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json) }
+    try {
+        $state = [System.IO.File]::ReadAllText($preparedPath, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+        if (-not $state -or -not $state.PSObject.Properties['base']) { throw 'отсутствует запись о базе' }
+        return $state
+    }
     catch { throw ("подготовленное обновление не читается ({0}): {1}" -f $preparedPath, $_.Exception.Message) }
 }
 
@@ -3354,13 +3322,17 @@ function Save-PreparedState {
         runId      = $runId
         timeText   = (Get-Date).ToString('dd.MM.yyyy HH:mm')
         base       = $script:ProdBase
+        target     = $deployTarget.Identity
         tempBase   = $script:TempBase
         user       = $env:USERNAME
         partial    = $Partial
         gate       = $GateRun
         extensions = $items
     }
-    [System.IO.File]::WriteAllText($preparedPath, (ConvertTo-Json -InputObject $state -Depth 5), $Utf8Bom)
+    $next = $preparedPath + '.tmp'
+    [System.IO.File]::WriteAllText($next, (ConvertTo-Json -InputObject $state -Depth 5), $Utf8Bom)
+    if ([System.IO.File]::Exists($preparedPath)) { [System.IO.File]::Replace($next, $preparedPath, [System.Management.Automation.Language.NullString]::Value) }
+    else { [System.IO.File]::Move($next, $preparedPath) }
     Write-RunLog ("Подготовка записана: {0}" -f $preparedPath)
 }
 
@@ -3406,7 +3378,44 @@ function Undo-PreparedExtensions {
     return $ok
 }
 
+function Assert-DeployRecordTarget {
+    param($Record, [string]$Identity, [string]$Path)
+    if ([string](Get-JsonValue $Record 'base' '') -ine $script:ProdBase) {
+        throw ("Другая база: запись {0} не соответствует ProdBase текущего профиля." -f $Path)
+    }
+    $saved = [string](Get-JsonValue $Record 'target' '')
+    if (-not $saved) {
+        # Запись сделал гейт прежней версии: идентификатора кластера и ИБ в ней нет, сверить можно только имя базы.
+        # Отказ сделал бы недоступным штатный откат всех прежних обновлений, поэтому решает человек; без человека -
+        # отказ, как и был.
+        $sure = $null
+        if (Test-UiCanAsk) {
+            $sure = Confirm-Ui -Question ("В записи {0} нет идентификатора кластера и базы: её сделал гейт прежней версии. Она относится к {1}\{2}?" -f $Path, $script:Server, $script:ProdBase) -Yes 'Да, к этой базе' -No 'Нет, выйти'
+        }
+        if ($sure -ne $true) {
+            throw ("В записи {0} нет идентификатора кластера и ИБ, и подтверждения, что она относится к {1}\{2}, нет. Ничего не менял." -f $Path, $script:Server, $script:ProdBase)
+        }
+        Write-RunLog ("Запись {0} без идентификатора цели: человек подтвердил, что она относится к {1}\{2}" -f $Path, $script:Server, $script:ProdBase)
+        return
+    }
+    if ($saved -cne $Identity) { throw ("Кластер или ИБ текущего профиля не совпадает с целью в {0}." -f $Path) }
+}
+
+$writeRun = (-not $StatusOnly -or $Prepare -or $ApplyPrepared -or $CancelPrepared -or $Rollback)
+$deployGuard = $null
+if ($writeRun) {
+    try { $deployGuard = [System.IO.File]::Open((Join-Path $deployRoot 'deploy.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
+    catch { throw ("Не получил исключительный доступ к каталогу обновлений {0}. Проверь права и другие запуски deploy." -f $deployRoot) }
+}
+try {
 $prepared = Read-PreparedState
+$deployTarget = $null
+if ($writeRun -and (-not $CancelPrepared -or $null -ne $prepared)) {
+    $deployLink = Connect-ClusterAgent
+    $deployTarget = Get-BaseInfo $deployLink $script:ProdBase $script:ProdUser $script:ProdPassword
+    if ($null -ne $prepared) { Assert-DeployRecordTarget $prepared $deployTarget.Identity $preparedPath }
+    if (-not $CancelPrepared) { $null = Get-BaseInfo $deployLink $script:TempBase $script:TempUser $script:TempPassword }
+}
 
 if ($CancelPrepared) {
     if (-not (Test-UiCanAsk)) { throw 'отмена подготовки только из консоли или ci.exe' }
@@ -3602,6 +3611,8 @@ if ($Rollback) {
             -Items @('Откатить', 'Отмена') -Danger @(0)
         if ($action -eq 0) { $target = $record }
     }
+
+    Assert-DeployRecordTarget $target $deployTarget.Identity $target.Dir
 
     # Что вернётся: расширения обновления с резервной копией. Без копии (новые) откатом не удаляются.
     $selected = @()
@@ -4270,30 +4281,21 @@ if (-not $Prepare) {
 }
 # ** Хлебников С.Ю. 20261120 конец
 
-# Отсюда и до конца блокировки рабочей базы снимаются обязательно: в finally в конце скрипта (он выполняется
-# и при exit, и по Ctrl+C) и в trap.
-# Только внешние обработки - монопольный доступ не нужен: блокировки не ставятся и в конце не снимаются
-# (снятие снимает и чужие блокировки), пользователи работают дальше.
+# Только обновлению расширений нужен монопольный доступ. Свои изменения возвращаем через finally.
 $needExclusive = ($selected.Count -gt 0 -and -not $Prepare)
-if ($needExclusive) { $script:ProdLocksArmed = $true }
+if ($needExclusive) { $script:ProdLockState = New-GateLockState }
 try {
 
 if ($needExclusive) {
     Write-Host ''
     Write-Host 'Подготовка рабочей базы:'
     $prepLink = Connect-ClusterAgent
-    $prepTarget = $null
+    $prepTarget = Get-BaseInfo -Link $prepLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
     try {
-        $prepTarget = Get-BaseInfo -Link $prepLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
-        if ([bool]$prepTarget.InfoBase.ScheduledJobsDenied) {
-            Write-Line '  блокировка регламентных заданий уже стоит; в конце обновления сниму её'
-        }
-        else {
-            $prepTarget.InfoBase.ScheduledJobsDenied = $true
-            $prepTarget.Process.UpdateInfoBase($prepTarget.InfoBase)
-            if (-not [bool](Read-BaseInfoAgain $prepTarget $script:ProdBase).ScheduledJobsDenied) { throw 'флажок не записался' }
+        if (Set-GateJobsLock $script:ProdLockState $prepTarget { param($t) Read-BaseInfoAgain $t $script:ProdBase }) {
             Write-Line '  поставил блокировку регламентных заданий на время обновления; в конце сниму' 'Green'
         }
+        else { Write-Line '  блокировка регламентных заданий уже стоит, оставляю её' }
     }
     catch {
         $prepTarget = $null
@@ -4363,14 +4365,18 @@ if ($needExclusive) {
         # сразу (начало на 30 минут назад: часы сервера и этой машины могут расходиться).
         param($Target, $StartAt = $null)
         if ($null -eq $Target) { Write-Line '  блокировку начала сеансов поставить не смог (нет входа в свойства базы): сеансы могут вернуться' 'Yellow'; return }
-        $infoBase = $Target.InfoBase
+        $infoBase = Read-BaseInfoAgain $Target $script:ProdBase
         if ([bool]$infoBase.SessionsDenied) {
             $existing = [string]$infoBase.PermissionCode
-            if ($existing -and $existing -ne $script:UnlockCode) {
-                $script:KeepForeignSessionLock = $true
+            if ($existing -cne $script:UnlockCode) {
                 throw ("в {0} уже стоит чужая блокировка сеансов с другим кодом: впиши его в UnlockCode или сними блокировку" -f $script:ProdBase)
             }
-            Write-Line '  блокировка начала сеансов уже стоит (код тот же); в конце обновления сниму её'
+            $now = Get-Date
+            if (($null -ne $infoBase.DeniedFrom -and [datetime]$infoBase.DeniedFrom -gt $now) -or
+                ($null -ne $infoBase.DeniedTo -and ([datetime]$infoBase.DeniedTo).Year -ge 1900 -and [datetime]$infoBase.DeniedTo -lt $now)) {
+                throw 'в свойствах уже стоит блокировка начала сеансов с другим периодом, оставляю её расписание'
+            }
+            Write-Line '  блокировка начала сеансов уже стоит (код тот же), оставляю её'
             if ($null -ne $StartAt) {
                 Write-Line '  предупреждать не буду: блокировка уже стоит; оставшиеся сеансы завершу перед загрузкой'
                 $script:WarnLockAt = Get-Date
@@ -4381,20 +4387,15 @@ if ($needExclusive) {
         $start = Get-Date
         if ($null -ne $StartAt) { $start = [datetime]$StartAt }
         $until = $start.AddHours($sessionLockHours)
+        $from = $start
         if ($null -eq $StartAt) {
-            $infoBase.DeniedFrom = (Get-Date).AddMinutes(-30)
-            $infoBase.DeniedMessage = ("Идёт обновление расширений, база заблокирована до {0}" -f $until.ToString('HH:mm'))
+            $from = $start.AddMinutes(-30)
+            $message = "Идёт обновление расширений, база заблокирована до {0}" -f $until.ToString('HH:mm')
         }
         else {
-            $infoBase.DeniedFrom = $start
-            $infoBase.DeniedMessage = ("Обновление программы: в {0} база закрывается (не дольше чем до {1}). Сохраните работу и выйдите из программы до {0}." -f $start.ToString('HH:mm'), $until.ToString('HH:mm'))
+            $message = "Обновление программы: в {0} база закрывается (не дольше чем до {1}). Сохраните работу и выйдите из программы до {0}." -f $start.ToString('HH:mm'), $until.ToString('HH:mm')
         }
-        $infoBase.DeniedTo = $until
-        $infoBase.PermissionCode = $script:UnlockCode
-        $infoBase.SessionsDenied = $true
-        $Target.Process.UpdateInfoBase($infoBase)
-        if (-not [bool](Read-BaseInfoAgain $Target $script:ProdBase).SessionsDenied) { throw 'блокировка сеансов не записалась' }
-        $script:SessionLockCode = $script:UnlockCode
+        Set-GateSessionLock $script:ProdLockState $Target $from $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:ProdBase }
         if ($null -eq $StartAt) { Write-Line ("  поставил блокировку начала сеансов до {0}; сниму в конце" -f $until.ToString('HH:mm')) 'Green'; return }
         $script:WarnLockAt = $start
         $script:WarnLockUntil = $until
@@ -5252,6 +5253,7 @@ $record = [ordered]@{
     runId        = $runId
     time         = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
     base         = $script:ProdBase
+    target       = $deployTarget.Identity
     tempBase     = $script:TempBase
     user         = $env:USERNAME
     mode         = $mode
@@ -5338,3 +5340,5 @@ finally {
 }
 
 #endregion
+}
+finally { if ($null -ne $deployGuard) { $deployGuard.Dispose() } }
