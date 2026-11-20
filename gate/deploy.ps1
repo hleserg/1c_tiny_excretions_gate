@@ -108,6 +108,11 @@ if ($UiChannel) {
 
 # До входа в подготовку у этого запуска нет собственных блокировок.
 $script:ProdLockState = $null
+# ** Хлебников С.Ю. 20261120 Простой рабочей (#24): когда базу закрыли для пользователей и когда открыли снова.
+$script:ProdClosedAt = $null
+$script:ProdOpenedAt = $null
+# Блокировка начала сеансов стояла до запуска (код тот же) и оставлена: после обновления база закрыта не нами.
+$script:SessionLockKept = $false
 
 trap {
     Write-Host ''
@@ -177,10 +182,10 @@ function Get-PlainPassword {
 
 function Get-ConnectionArgs {
     # Строка соединения с базой кластера. Код разрешения входа - если в базе стоит блокировка сеансов.
-    param([string]$BaseName, [string]$User, [string]$Password)
+    param([string]$BaseName, [string]$User, [string]$Password, [switch]$NoUnlockCode)
     $list = New-Object System.Collections.Generic.List[string]
     $list.Add(('/S"{0}\{1}"' -f $script:Server, $BaseName))
-    if (-not [string]::IsNullOrEmpty($script:UnlockCode)) { $list.Add(('/UC"{0}"' -f $script:UnlockCode)) }
+    if (-not $NoUnlockCode -and -not [string]::IsNullOrEmpty($script:UnlockCode)) { $list.Add(('/UC"{0}"' -f $script:UnlockCode)) }
     if (-not [string]::IsNullOrEmpty($User)) {
         $list.Add(('/N"{0}"' -f $User))
         if (-not [string]::IsNullOrEmpty($Password)) { $list.Add(('/P"{0}"' -f $Password)) }
@@ -550,9 +555,49 @@ function Wait-ProdWarnLock {
             Set-GateSessionLock $script:ProdLockState $target ((Get-Date).AddMinutes(-30)) $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:ProdBase }
             Write-Line '  блокировка начала сеансов действует с этой минуты' 'Green'
             Write-RunLog 'Начало блокировки сеансов перенесено на сейчас'
+            $script:ProdClosedAt = Get-Date
         }
+        else { $script:ProdClosedAt = $lockAt }
     }
     foreach ($line in @(Stop-BaseSessions -Link $script:WarnLink -BaseName $script:ProdBase)) { Write-Line ('  ' + $line) }
+}
+
+function Test-ProdPlainLogin {
+    # ** Хлебников С.Ю. 20261120 Вход без кода разрешения (#2). «Проверил: блокировок нет» - это флажки в кластере;
+    # здесь - сам вход, каким его увидит пользователь: тонкий клиент с «Канарейкой» без /UC. Только чтение.
+    # Возвращает Status (OK, FAIL, WARN, SKIP) и Text. Исход обновления от него не зависит: расширения уже
+    # обновлены (или откачены), не получился только вход.
+    if ($script:SessionLockKept) {
+        return [pscustomobject]@{ Status = 'SKIP'; Text = 'не проверял: блокировка начала сеансов стояла до обновления и оставлена, без кода в базу не войти' }
+    }
+    if ($plainLoginTimeoutSec -le 0) { return [pscustomobject]@{ Status = 'SKIP'; Text = 'не проверял: PlainLoginTimeoutSec = 0' } }
+    if (-not (Test-Path -LiteralPath $canaryEpf)) { return [pscustomobject]@{ Status = 'WARN'; Text = "не проверял: нет обработки $canaryEpf" } }
+    $plainFile = Join-Path $script:RunDir 'canary-plain.txt'
+    try {
+        $client = Invoke-ProdClient -Epf $canaryEpf -Parameter ("canary;out={0};wait=3" -f $plainFile) -DoneFile $plainFile `
+            -TimeoutSec $plainLoginTimeoutSec -Title 'Вход без кода разрешения' -NoUnlockCode
+    }
+    catch { return [pscustomobject]@{ Status = 'FAIL'; Text = ("клиент не запустился: {0}" -f $_.Exception.Message) } }
+    if ($client.Done) { return [pscustomobject]@{ Status = 'OK'; Text = ("вошёл за {0} с" -f $client.Seconds) } }
+    # Не вошёл. Снятие блокировок - ещё раз (если прошлое не подтвердилось, оно повторится), и что в свойствах сейчас.
+    Clear-ProdLocks
+    $now = 'свойства базы прочитать не смог'
+    try {
+        $target = Get-BaseInfo -Link (Connect-ClusterAgent) -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+        if ([bool](Read-BaseInfoAgain $target $script:ProdBase).SessionsDenied) { $now = 'в свойствах базы блокировка начала сеансов стоит' }
+        else { $now = 'в свойствах базы блокировки начала сеансов нет' }
+    }
+    catch { $now = ('свойства базы прочитать не смог: ' + $_.Exception.Message) }
+    return [pscustomobject]@{ Status = 'FAIL'; Text = ("за {0} с не вошёл; {1}. Войди в {2} обычным ярлыком; не пускает - консоль кластера, свойства базы: снять «Блокировка начала сеансов включена»" -f $client.Seconds, $now, $script:ProdBase) }
+}
+
+function Get-ProdDowntimeText {
+    # Сколько рабочая была закрыта для пользователей этим запуском: от начала блокировки сеансов до её снятия.
+    if ($null -eq $script:ProdClosedAt -or $null -eq $script:ProdOpenedAt) { return '' }
+    $span = [datetime]$script:ProdOpenedAt - [datetime]$script:ProdClosedAt
+    if ($span.TotalSeconds -lt 0) { $span = [timespan]::Zero }
+    return ("Простой {0}: {1} мин {2:00} с (вход закрыт в {3}, открыт в {4})" -f $script:ProdBase, [int][Math]::Floor($span.TotalMinutes), $span.Seconds,
+        ([datetime]$script:ProdClosedAt).ToString('HH:mm:ss'), ([datetime]$script:ProdOpenedAt).ToString('HH:mm:ss'))
 }
 
 function Clear-ProdLocks {
@@ -563,6 +608,13 @@ function Clear-ProdLocks {
             $target = Get-BaseInfo -Link (Connect-ClusterAgent) -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
             $released = Restore-GateLocks $state $target $true { param($t) Read-BaseInfoAgain $t $script:ProdBase }
             if ($released) { Write-Line ("Снял с {0}: {1}." -f $script:ProdBase, $released) 'Green' }
+            # ** Хлебников С.Ю. 20261120 Простой (#24): считается, только если базу закрывал этот запуск и он же открыл.
+            if ($released -and ([string]$released).Contains('начала сеансов') -and $null -ne $script:ProdClosedAt -and $null -eq $script:ProdOpenedAt) {
+                $script:ProdOpenedAt = Get-Date
+                $downtime = Get-ProdDowntimeText
+                Write-Line ('  ' + $downtime)
+                Write-RunLog $downtime
+            }
             return
         }
         catch {
@@ -734,6 +786,9 @@ $timeoutUpdateSec = 60 * [int](Get-Setting $cfg 'TimeoutUpdateMin' 120)
 $canaryEpf = Resolve-RootPath ([string](Get-Setting $cfg 'CanaryEpf' 'tools\Канарейка.epf'))
 $selfCheckEpf = Resolve-RootPath ([string](Get-Setting $cfg 'SelfCheckEpf' 'tools\ВыполнитьПослеОбновления.epf'))
 $canaryTimeoutSec = [int](Get-Setting $cfg 'CanaryTimeoutSec' 300)
+# ** Хлебников С.Ю. 20261120 Вход без кода разрешения после снятия блокировок (#2): сколько ждать, 0 - не проверять.
+$plainLoginTimeoutSec = [int](Get-Setting $cfg 'PlainLoginTimeoutSec' 180)
+if ($plainLoginTimeoutSec -lt 0) { $plainLoginTimeoutSec = 0 }
 $comTimeoutSec = [int](Get-Setting $cfg 'ComTimeoutSec' 300)
 # Сколько ждать один сеанс записи внешней обработки в справочник (regepf, unregepf).
 $processingTimeoutSec = [int](Get-Setting $cfg 'ProcessingTimeoutSec' 600)
@@ -1203,6 +1258,13 @@ function Get-DeployDetailLines {
     $lines.Add('Лёгкий прогон после обновления:')
     if ($light.Count -eq 0) { $lines.Add('  нет данных') }
     foreach ($item in $light) { $lines.Add(("  [{0}] {1}: {2}" -f $item.status, $item.name, $item.text)) }
+    $plainRecord = Get-JsonValue $Record 'plainLogin' $null
+    if ($null -ne $plainRecord) { $lines.Add(("Вход без кода разрешения после снятия блокировок: [{0}] {1}" -f (Get-JsonValue $plainRecord 'status' ''), (Get-JsonValue $plainRecord 'text' ''))) }
+    $downtimeRecord = Get-JsonValue $Record 'downtimeSec' $null
+    if ($null -ne $downtimeRecord) {
+        $lines.Add(("Простой базы: {0} мин {1:00} с (вход закрыт {2}, открыт {3})" -f [int][Math]::Floor([int]$downtimeRecord / 60), ([int]$downtimeRecord % 60),
+                (Get-JsonValue $Record 'closedAt' ''), (Get-JsonValue $Record 'openedAt' '')))
+    }
     $article = [string](Get-JsonValue $Record 'article' '')
     if ($article) { $lines.Add("Отчёт: $article") }
 
@@ -1366,8 +1428,9 @@ function Invoke-ProdClient {
     # Тонкий клиент рабочей базы с внешней обработкой; ждём файл $DoneFile не дольше $TimeoutSec.
     # StartFile - отметка «обработка открылась и поняла параметр запуска»: нет её за StartTimeoutSec - дальше не ждём
     # (вход не удался или сборка обработки этого режима не знает); в ответе Started.
-    param([string]$Epf, [string]$Parameter, [string]$DoneFile, [int]$TimeoutSec, [string]$Title, [string]$StartFile = '', [int]$StartTimeoutSec = 0)
-    $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword) + @(
+    # NoUnlockCode - вход как у пользователя, без кода разрешения (/UC): проверка, что база открыта.
+    param([string]$Epf, [string]$Parameter, [string]$DoneFile, [int]$TimeoutSec, [string]$Title, [string]$StartFile = '', [int]$StartTimeoutSec = 0, [switch]$NoUnlockCode)
+    $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword -NoUnlockCode:$NoUnlockCode) + @(
         '/DisableStartupDialogs', '/DisableStartupMessages', '/Execute', ('"{0}"' -f $Epf), ('/C"{0}"' -f $Parameter))
     $argLine = $argList -join ' '
     Write-RunLog ("> 1cv8c.exe {0}" -f (Get-MaskedLine $argLine))
@@ -1489,7 +1552,7 @@ function Compare-Processings {
             $entry.ProdVersion = $prodItem.Version
             $entry.ProdFile = $prodItem.File
             $entry.Status = 'changed'
-            $entry.Text = ("изменена в temp (рабочая {0}, temp {1})" -f $prodItem.Version, $item.Version)
+            $entry.Text = ("отличается (рабочая {0}, temp {1})" -f $prodItem.Version, $item.Version)
         }
         $list.Add($entry)
     }
@@ -3857,7 +3920,7 @@ else {
         # Что в рабочей поменялось с прошлого раза (для «как есть»): хеш сейчас против хеша при прошлой выгрузке.
         if ($inProd) {
             $savedHash = Get-MirrorHash $prodDir
-            if (-not $savedHash) { $entry.ProdText = 'прежнего состояния рабочей нет: что изменилось в ней, не сравнить' }
+            if (-not $savedHash) { $entry.ProdText = 'менялась ли рабочая помимо гейта, не узнать: снимка после прошлого обновления нет' }
             elseif ($savedHash -eq $prodStates.Items[$name].Hash) { $entry.ProdChanged = 0; $entry.ProdText = 'в рабочей без изменений с прошлого обновления' }
             else { $entry.ProdChanged = 1; $entry.ProdText = 'в рабочей изменено после прошлого обновления (загружали руками?)' }
         }
@@ -4377,6 +4440,7 @@ if ($needExclusive) {
                 throw 'в свойствах уже стоит блокировка начала сеансов с другим периодом, оставляю её расписание'
             }
             Write-Line '  блокировка начала сеансов уже стоит (код тот же), оставляю её'
+            $script:SessionLockKept = $true
             if ($null -ne $StartAt) {
                 Write-Line '  предупреждать не буду: блокировка уже стоит; оставшиеся сеансы завершу перед загрузкой'
                 $script:WarnLockAt = Get-Date
@@ -4396,7 +4460,11 @@ if ($needExclusive) {
             $message = "Обновление программы: в {0} база закрывается (не дольше чем до {1}). Сохраните работу и выйдите из программы до {0}." -f $start.ToString('HH:mm'), $until.ToString('HH:mm')
         }
         Set-GateSessionLock $script:ProdLockState $Target $from $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:ProdBase }
-        if ($null -eq $StartAt) { Write-Line ("  поставил блокировку начала сеансов до {0}; сниму в конце" -f $until.ToString('HH:mm')) 'Green'; return }
+        if ($null -eq $StartAt) {
+            $script:ProdClosedAt = Get-Date
+            Write-Line ("  поставил блокировку начала сеансов до {0}; сниму в конце" -f $until.ToString('HH:mm')) 'Green'
+            return
+        }
         $script:WarnLockAt = $start
         $script:WarnLockUntil = $until
         Write-Line ("  поставил блокировку начала сеансов с {0} до {1}: пользователи видят предупреждение, в {0} их программы закроются сами; сниму в конце" -f $start.ToString('HH:mm'), $until.ToString('HH:mm')) 'Green'
@@ -5011,6 +5079,21 @@ if ($outcome -eq 'updated') {
 
 #endregion
 
+# ** Хлебников С.Ю. 20261120 Блокировки рабочей снимаются здесь, а не в самом конце (#24). Закрытая база нужна до
+# конца обновления конфигурации БД и на время отката - к этой строке и то и другое позади, при любом исходе.
+# Отчёт, статья в базу знаний, выгрузки рабочей в файлы и хеш-суммы пользователям не мешают: идут при открытой
+# базе. В конце скрипта и в trap снятие вызывается ещё раз - повторный вызов ничего не делает.
+Clear-ProdLocks
+# Вход без кода разрешения (#2) - сразу после снятия, до отчёта и статьи: только если базу закрывал этот запуск.
+$plainLogin = $null
+if ($null -ne $script:ProdClosedAt -or $script:SessionLockKept) {
+    $plainLogin = Test-ProdPlainLogin
+    $plainColor = 'Green'
+    if ($plainLogin.Status -eq 'FAIL') { $plainColor = 'Red' } elseif ($plainLogin.Status -ne 'OK') { $plainColor = 'Yellow' }
+    Write-Line ("[{0}] Вход без кода разрешения: {1}" -f $plainLogin.Status, $plainLogin.Text) $plainColor
+}
+# ** Хлебников С.Ю. 20261120 конец
+
 #region Отчёт об изменениях
 
 $reportTitle = "Обновление расширений {0} от {1}" -f $script:ProdBase, (Get-Date -Format 'dd.MM.yyyy HH:mm')
@@ -5040,6 +5123,9 @@ if ($riskAccepted) {
 [void]$html.Append('<h2>Гейт (справочно)</h2><ul>')
 foreach ($line in $ciLines) { [void]$html.Append(('<li>{0}</li>' -f (ConvertTo-Html $line))) }
 [void]$html.Append('</ul>')
+$downtimeReport = Get-ProdDowntimeText
+if ($downtimeReport) { [void]$html.Append(('<p>{0}.</p>' -f (ConvertTo-Html $downtimeReport))) }
+if ($null -ne $plainLogin) { [void]$html.Append(('<p>Вход без кода разрешения после снятия блокировок: [{0}] {1}.</p>' -f $plainLogin.Status, (ConvertTo-Html $plainLogin.Text))) }
 [void]$html.Append('<h2>Лёгкий прогон после обновления</h2>')
 if ($light.Count -eq 0) { [void]$html.Append('<p>Не выполнялся: обновление не прошло.</p>') }
 else {
@@ -5167,9 +5253,16 @@ if ($outcome -eq 'updated' -and (Test-Path -LiteralPath $selfCheckEpf)) {
 
 if ($outcome -eq 'updated') {
     # Выгрузки рабочей базы - заново: следующее сравнение должно видеть новое состояние.
-    if ($mode -ne 'asis') { foreach ($entry in $selected) { $null = Update-Mirror -BaseName $script:ProdBase -Extension $entry.Name } }
-    # Хеш-суммы рабочей после обновления: следующий запуск по ним увидит ручную загрузку («как есть»).
-    if ($selected.Count -gt 0) { Save-MirrorHashes -Names @($selected | ForEach-Object { $_.Name }) }
+    # ** Хлебников С.Ю. 20261120 База уже открыта (#24): сбой выгрузки или чтения хеш-сумм исход обновления не меняет.
+    try {
+        if ($mode -ne 'asis') { foreach ($entry in $selected) { $null = Update-Mirror -BaseName $script:ProdBase -Extension $entry.Name } }
+        # Хеш-суммы рабочей после обновления: следующий запуск по ним увидит ручную загрузку («как есть»).
+        if ($selected.Count -gt 0) { Save-MirrorHashes -Names @($selected | ForEach-Object { $_.Name }) }
+    }
+    catch {
+        Write-Line ("[WARN] Выгрузка {0} после обновления не получилась: {1}. Обновление остаётся; следующее сравнение выгрузит рабочую заново." -f $script:ProdBase, $_.Exception.Message) 'Yellow'
+    }
+    # ** Хлебников С.Ю. 20261120 конец
     # ** Хлебников С.Ю. 20261120 «Обновить все» больше не принимает прогон в эталон молча. Выпуск несмотря на гейт -
     # эталон не трогается: падения останутся новыми, пока их не исправят или не примут вручную. Жёлтый, ещё не
     # принятый - вопрос, по умолчанию «не принимать». Зелёный - как раньше (нового в нём нет).
@@ -5217,6 +5310,9 @@ if ($riskReason) { $summary.Add(('Причина выпуска: ' + $riskReason
 $summary.Add(('Расширения: ' + (@($selected | ForEach-Object { $_.Name }) -join ', ')))
 if ($selectedProcessings.Count -gt 0) { $summary.Add(('Внешние обработки: ' + (@($touchedProcessings | ForEach-Object { $_.ObjName }) -join ', '))) }
 foreach ($item in $light) { $summary.Add(('[{0}] {1}: {2}' -f $item.Status, $item.Name, $item.Text)) }
+$downtimeLine = Get-ProdDowntimeText
+if ($downtimeLine) { $summary.Add($downtimeLine) }
+if ($null -ne $plainLogin) { $summary.Add(('[{0}] Вход без кода разрешения: {1}' -f $plainLogin.Status, $plainLogin.Text)) }
 $summary.Add(('Резервные копии: ' + $beforeDir))
 [System.IO.File]::WriteAllLines((Join-Path $script:RunDir 'summary.txt'), $summary.ToArray(), $Utf8Bom)
 
@@ -5269,6 +5365,13 @@ $record = [ordered]@{
     light        = @(foreach ($item in $light) { [ordered]@{ status = $item.Status; name = $item.Name; text = $item.Text } })
     article      = $articleFile
 }
+# ** Хлебников С.Ю. 20261120 Простой и вход без кода разрешения (#24, #2) - в запись об обновлении.
+if ($null -ne $script:ProdClosedAt -and $null -ne $script:ProdOpenedAt) {
+    $record['closedAt'] = ([datetime]$script:ProdClosedAt).ToString('yyyy-MM-ddTHH:mm:ss')
+    $record['openedAt'] = ([datetime]$script:ProdOpenedAt).ToString('yyyy-MM-ddTHH:mm:ss')
+    $record['downtimeSec'] = [int][Math]::Max(0, ([datetime]$script:ProdOpenedAt - [datetime]$script:ProdClosedAt).TotalSeconds)
+}
+if ($null -ne $plainLogin) { $record['plainLogin'] = [ordered]@{ status = $plainLogin.Status; text = $plainLogin.Text } }
 [System.IO.File]::WriteAllText((Join-Path $script:RunDir 'deploy.json'), (ConvertTo-Json -InputObject $record -Depth 6), $Utf8Bom)
 
 Write-Host ''
@@ -5282,6 +5385,9 @@ if ($statLines.Count -gt 0) {
     foreach ($line in $statLines) { Write-Host $line -ForegroundColor DarkGray }
 }
 Write-Line ("ИТОГ: {0}. Резервные копии: {1}" -f $outcomeNames[$outcome], $beforeDir) $finalColor
+if ($null -ne $plainLogin -and $plainLogin.Status -eq 'FAIL') {
+    Write-Line ("ВХОД В {0} БЕЗ КОДА РАЗРЕШЕНИЯ НЕ ПРОШЁЛ: {1}." -f $script:ProdBase, $plainLogin.Text) 'Red'
+}
 if ($riskAccepted -and $outcome -eq 'updated') {
     Write-Line ("ПРОВЕРИТЬ РАБОТОСПОСОБНОСТЬ: обновлено, хотя {0}." -f ($gateRisks -join '; ')) 'Red'
     if ($riskReason) { Write-Line ("  причина выпуска: {0}" -f $riskReason) 'Red' }

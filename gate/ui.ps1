@@ -459,7 +459,10 @@ $script:UiTick = 0
 $script:UiLastMinuteLine = -1
 $script:UiAnimate = $true
 try { $script:UiAnimate = -not [Console]::IsOutputRedirected } catch { $script:UiAnimate = $false }
-$script:UiIdleCaptions = @('конфигуратор работает', 'SQL шуршит', 'сервер 1С занят делом', 'платформа думает', 'ещё немного')
+# Подписи под полосой хода, когда у операции нет своих подробностей. Они показываются у любой долгой операции
+# (конфигуратор, клиент 1С, git), поэтому не называют, кто именно работает: «сервер 1С занят делом» при отправке
+# в GitHub сбивало с толку.
+$script:UiIdleCaptions = @('работа идёт', 'жду, пока закончит', 'процесс жив', 'ещё немного')
 
 function Format-UiDuration {
     param([double]$Seconds)

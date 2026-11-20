@@ -168,6 +168,121 @@ function New-ContractCatalogLink {
         }
     },
     @{
+        Name = 'deploy-contract-open-early'
+        Text = 'обновление с блокировкой сеансов: блокировки сняты до статьи в базу знаний и выгрузки рабочей, потом вход без кода разрешения; в итоге - простой (#24, #2)'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-ComState -Sessions @(@{ id = 5; base = 'erp_base'; app = '1CV8C'; user = 'Пользователь'; host = 'pc1' })
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить выбранные' },
+                @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
+                $deployRiskAnswer, $deployNameAnswer,
+                @{ Kind = 'one'; Header = 'В erp_base есть сеансы'; Item = 'Поставить блокировку' })
+            Check-DeployCommon $r
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            $clock = { param([string]$Text) [timespan]::ParseExact($Text, 'hh\:mm\:ss\.fff', [System.Globalization.CultureInfo]::InvariantCulture) }
+            $writes = @($r.ComLog | Where-Object { $_ -match 'UpdateInfoBase erp_base ' })
+            $closed = @($writes | Where-Object { $_ -match 'sessionsDenied=1' })
+            Check ($closed.Count -gt 0) 'блокировку начала сеансов не ставили'
+            Check ($writes.Count -gt 0 -and $writes[-1] -match 'scheduledJobsDenied=0 sessionsDenied=0') 'последняя запись свойств рабочей - не снятие блокировок'
+            $article = @(Get-Calls $r @('ENTERPRISE', 'kbarticle'))
+            $plain = @(Get-Calls $r @('ENTERPRISE', 'canary-plain'))
+            $coded = @(Get-Calls $r @('ENTERPRISE', 'canary.txt'))
+            $dumps = @(Get-Calls $r @('/DumpConfigToFiles', 'fake\erp_base', '-Extension Адаптация'))
+            Check ($article.Count -eq 1) ("статей в базу знаний: {0}, ждали одну" -f $article.Count)
+            Check ($plain.Count -eq 1) ("входов без кода разрешения: {0}, ждали один" -f $plain.Count)
+            Check ($coded.Count -eq 1 -and $coded[0].Line.Contains('/UC')) 'канареечный вход при закрытой базе шёл без кода разрешения'
+            if ($plain.Count -eq 1) { Check (-not $plain[0].Line.Contains('/UC')) 'вход «без кода» запущен с ключом /UC' }
+            if ($writes.Count -gt 0 -and $article.Count -eq 1 -and $plain.Count -eq 1 -and $dumps.Count -gt 0) {
+                $opened = & $clock ($writes[-1].Split("`t")[0])
+                Check ($opened -le (& $clock $plain[0].Time)) 'вход без кода разрешения шёл до снятия блокировок'
+                Check ((& $clock $plain[0].Time) -le (& $clock $article[0].Time)) 'статья в базу знаний записана раньше входа без кода разрешения'
+                Check ($opened -le (& $clock $article[0].Time)) 'статья в базу знаний записана при закрытой базе'
+                Check ($opened -le (& $clock $dumps[-1].Time)) 'выгрузка рабочей после обновления шла при закрытой базе'
+            }
+            else { Check ($dumps.Count -gt 0) 'рабочая после обновления в файлы не выгружалась' }
+            Check (@($r.Output | Where-Object { $_ -match 'Простой erp_base: \d+ мин \d\d с' }).Count -gt 0) 'нет строки о простое рабочей'
+            Check (@($r.Output | Where-Object { $_ -match '\[OK\] Вход без кода разрешения: вошёл' }).Count -gt 0) 'нет строки о входе без кода разрешения'
+            $record = Get-DeployRecord $sb
+            Check ($null -ne $record) 'нет deploy.json'
+            if ($null -ne $record) {
+                Check ($record.outcome -eq 'updated') ("итог {0}, ждали updated" -f $record.outcome)
+                Check ($null -ne $record.PSObject.Properties['downtimeSec'] -and $null -ne $record.PSObject.Properties['openedAt']) 'в deploy.json нет простоя'
+                Check ($null -ne $record.PSObject.Properties['plainLogin'] -and $record.plainLogin.status -eq 'OK') 'в deploy.json нет входа без кода разрешения'
+                $summaryText = [System.IO.File]::ReadAllText((Join-Path $record.Dir 'summary.txt'), $utf8)
+                Check ($summaryText.Contains('Простой erp_base') -and $summaryText.Contains('Вход без кода разрешения')) 'в summary.txt нет простоя или входа без кода'
+            }
+        }
+    },
+    @{
+        Name = 'deploy-contract-plain-login-fail'
+        Text = 'после снятия блокировок без кода разрешения войти не удалось: красная строка, обновление остаётся, отката нет, скрипт дошёл до конца (#2)'
+        Run = {
+            param($Name)
+            $config = @{ PlainLoginTimeoutSec = 3 }
+            foreach ($key in $deployConfig.Keys) { $config[$key] = $deployConfig[$key] }
+            $sb = New-Sandbox $Name -Config $config
+            # Первый вход - канареечный, с кодом; второй - без кода: клиент висит, результата нет.
+            $fake = @{ canary = @(@{ status = 'ok' }, @{ noresult = $true }) }
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Fake $fake -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить выбранные' },
+                @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
+                $deployRiskAnswer, $deployNameAnswer)
+            Check-DeployCommon $r
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0: вход без кода исход обновления не меняет" -f $r.ExitCode)
+            Check (@($r.Output | Where-Object { $_ -match '\[FAIL\] Вход без кода разрешения' }).Count -gt 0) 'нет красной строки о входе без кода разрешения'
+            Check (@($r.Output | Where-Object { $_ -match 'ВХОД В erp_base БЕЗ КОДА РАЗРЕШЕНИЯ НЕ ПРОШЁЛ' }).Count -gt 0) 'в итоге нет строки о несостоявшемся входе'
+            Check ((Get-Calls $r @('/LoadCfg', '-Extension Адаптация', 'fake\erp_base')).Count -eq 1) 'после несостоявшегося входа расширение загружали ещё раз (откат?)'
+            $record = Get-DeployRecord $sb
+            Check ($null -ne $record) 'нет deploy.json'
+            if ($null -ne $record) {
+                Check ($record.outcome -eq 'updated') ("итог {0}, ждали updated" -f $record.outcome)
+                Check ($null -ne $record.PSObject.Properties['plainLogin'] -and $record.plainLogin.status -eq 'FAIL') 'в deploy.json вход без кода не отмечен как несостоявшийся'
+                $runLog = Join-Path $record.Dir 'run.log'
+                if (Test-Path -LiteralPath $runLog) {
+                    $plainLines = @([System.IO.File]::ReadAllLines($runLog, $utf8) | Where-Object { $_.Contains('canary-plain') -and $_.Contains('1cv8c.exe') })
+                    Check ($plainLines.Count -eq 1 -and -not $plainLines[0].Contains('/UC')) 'вход «без кода» запущен с ключом /UC или не запущен'
+                }
+                else { Check $false 'нет run.log обновления' }
+            }
+        }
+    },
+    @{
+        Name = 'deploy-contract-plain-login-kept-lock'
+        Text = 'блокировка начала сеансов стояла до обновления (код тот же) и оставлена: вход без кода не проверяется, об этом сказано; блокировка на месте (#2)'
+        Run = {
+            param($Name)
+            $config = @{ UnlockCode = 'fixture-code' }
+            foreach ($key in $deployConfig.Keys) { $config[$key] = $deployConfig[$key] }
+            $sb = New-Sandbox $Name -Config $config
+            $com = New-ComState
+            $prod = $com.bases['erp_base']
+            $prod.sessionsDenied = $true
+            $prod.permissionCode = 'fixture-code'
+            $prod.deniedMessage = 'Служебные работы'
+            $prod.deniedFrom = (Get-Date).AddHours(-1).ToString('s')
+            $prod.deniedTo = (Get-Date).AddDays(1).ToString('s')
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить выбранные' },
+                @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
+                $deployRiskAnswer, $deployNameAnswer)
+            Check-DeployCommon $r -LocksExpected $false
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check ((Get-Calls $r @('ENTERPRISE', 'canary-plain')).Count -eq 0) 'вход без кода запускался при оставленной блокировке'
+            Check (@($r.Output | Where-Object { $_ -match '\[SKIP\] Вход без кода разрешения' }).Count -gt 0) 'не сказано, что вход без кода не проверялся'
+            Check (@($r.Output | Where-Object { $_ -match 'Простой erp_base' }).Count -eq 0) 'посчитан простой, хотя базу закрывал не этот запуск'
+            if ($null -ne $r.ComState) {
+                $after = $r.ComState.bases.erp_base
+                Check ([bool]$after.sessionsDenied -and [string]$after.permissionCode -ceq 'fixture-code') 'блокировку начала сеансов, стоявшую до обновления, сняли или изменили'
+                Check (-not [bool]$after.scheduledJobsDenied) 'в конце осталась блокировка регламентных заданий рабочей'
+            }
+            $record = Get-DeployRecord $sb
+            if ($null -ne $record) { Check ($null -ne $record.PSObject.Properties['plainLogin'] -and $record.plainLogin.status -eq 'SKIP') 'в deploy.json нет отметки, что вход без кода пропущен' }
+            else { Check $false 'нет deploy.json' }
+        }
+    },
+    @{
         Name = 'deploy-contract-existing-locks'
         Text = 'очистка без собственных изменений сохраняет исходные свойства ИБ в fakecom'
         Run = {
