@@ -33,6 +33,7 @@ var (
 	styleDialog        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colAccent).Padding(1, 2)
 	styleDocked        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colAccent).Padding(0, 1)
 	styleDialogTitle   = lipgloss.NewStyle().Bold(true).Foreground(colText)
+	styleDialogGroup   = lipgloss.NewStyle().Bold(true).Foreground(colDim)
 	styleCursor        = lipgloss.NewStyle().Foreground(colAccent).Bold(true)
 	styleSelected      = lipgloss.NewStyle().Foreground(colAccent).Bold(true)
 	styleButton        = lipgloss.NewStyle().Padding(0, 2).Foreground(colText).Background(lipgloss.Color("238"))

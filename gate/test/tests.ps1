@@ -2093,14 +2093,26 @@ $tests = @(
                     if ($null -ne $uiEvent -and [string]$uiEvent.kind -eq 'one' -and ([string]$uiEvent.header).StartsWith('Гейт расширений')) { , @($uiEvent.items | ForEach-Object { [string]$_ }) }
                 })
             Check ($menus.Count -eq 3) ("меню гейта показано {0} раз, ждали 3" -f $menus.Count)
+            $menuHints = @(foreach ($line in @($r.Output | Where-Object { $_.StartsWith('@@ui:') })) {
+                    $uiEvent = $null
+                    try { $uiEvent = $line.Substring(5) | ConvertFrom-Json } catch { $uiEvent = $null }
+                    if ($null -ne $uiEvent -and [string]$uiEvent.kind -eq 'one' -and ([string]$uiEvent.header).StartsWith('Гейт расширений')) {
+                        if (@($uiEvent.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'hints') { , @($uiEvent.hints | ForEach-Object { [string]$_ }) } else { , @() }
+                    }
+                })
+            Check ($menuHints.Count -eq 3) ("пояснений к меню {0}, ждали 3" -f $menuHints.Count)
             # Перед каждым выбранным действием меню просит ci.exe убрать шаги и вердикт прошлого (событие reset);
             # «Выход» - без него. Здесь действий два: подготовка и её отмена.
             $resets = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_ -match '"kind"\s*:\s*"reset"' })
             Check ($resets.Count -eq 2) ("событий reset для ci.exe {0}, ждали 2 (по одному на выбранное действие меню)" -f $resets.Count)
             if ($menus.Count -eq 3) {
                 Check (@($menus[0] | Where-Object { $_.StartsWith('Обновить рабочую подготовленным') }).Count -eq 0) 'до подготовки меню предлагает обновить подготовленным'
-                Check (@($menus[1] | Where-Object { $_.StartsWith('Обновить рабочую подготовленным (Адаптация') }).Count -eq 1) 'после подготовки в меню нет «Обновить рабочую подготовленным»'
-                Check (@($menus[1] | Where-Object { $_.StartsWith('Подготовить заново') }).Count -eq 1) 'после подготовки в меню нет «Подготовить заново»'
+                Check (@($menus[1] | Where-Object { $_ -eq 'Обновить рабочую подготовленным' }).Count -eq 1) 'после подготовки в меню нет «Обновить рабочую подготовленным»'
+                # Подписи пунктов не меняются: что подготовлено и что подготовка будет заново - в пояснениях (hints).
+                Check (@($menus[1] | Where-Object { $_ -eq 'Подготовить обновление рабочей' }).Count -eq 1) 'после подготовки в меню нет «Подготовить обновление рабочей»'
+                Check (@($menuHints[1] | Where-Object { $_.StartsWith('Адаптация') -and $_.Contains('подготовлено') }).Count -eq 1) ('после подготовки в пояснениях нет состава и времени подготовки: ' + (@($menuHints[1] | Where-Object { $_ }) -join ' | '))
+                Check (@($menuHints[1] | Where-Object { $_.StartsWith('заново') }).Count -eq 1) 'после подготовки у «Подготовить обновление рабочей» нет пояснения «заново»'
+                Check (@($menuHints[0] | Where-Object { $_.StartsWith('заново') }).Count -eq 0) 'до подготовки у «Подготовить обновление рабочей» пояснение «заново»'
                 Check (@($menus[2] | Where-Object { $_.StartsWith('Обновить рабочую подготовленным') }).Count -eq 0) 'после отмены подготовки меню предлагает обновить подготовленным'
             }
             Check ((Get-Calls $r @('/UpdateDBCfg')).Count -eq 0) 'подготовка и отмена из меню обновили конфигурацию БД'
@@ -2162,6 +2174,93 @@ $tests = @(
             $stateLine = [array]::IndexOf(@($r.Output), @($r.Output | Where-Object { $_ -match 'СОСТОЯНИЕ БАЗ' } | Select-Object -First 1)[0])
             $waitLine = [array]::IndexOf(@($r.Output), @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Посмотрел') } | Select-Object -First 1)[0])
             Check ($stateLine -ge 0 -and $waitLine -gt $stateLine) 'кнопка «Вернуться в меню» не после вывода состояния'
+        }
+    },
+    @{
+        Name = 'menu-groups'
+        Text = 'меню гейта: пункты по группам (заголовок - у первого пункта группы), у пункта своя клавиша, и она не меняется, когда появляется условный пункт («Прогон с обновлением из inbox»); подписи постоянные, переменное - в пояснениях (hints)'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            # Вопрос меню из вывода скрипта: пункты, заголовки групп и клавиши.
+            $getMenu = {
+                param($Result)
+                foreach ($line in @($Result.Output | Where-Object { $_.StartsWith('@@ui:') })) {
+                    $uiEvent = $null
+                    try { $uiEvent = $line.Substring(5) | ConvertFrom-Json } catch { $uiEvent = $null }
+                    if ($null -ne $uiEvent -and [string]$uiEvent.kind -eq 'one' -and ([string]$uiEvent.header).StartsWith('Гейт расширений')) { return $uiEvent }
+                }
+                return $null
+            }
+            $keyOf = {
+                param($Menu, [string]$Pattern)
+                $labels = @($Menu.items | ForEach-Object { [string]$_ })
+                $keys = @($Menu.keys | ForEach-Object { [string]$_ })
+                for ($i = 0; $i -lt $labels.Count; $i++) { if ($labels[$i] -match $Pattern) { return $keys[$i] } }
+                return ''
+            }
+            $r = Invoke-Script -Sandbox $sb -Answers @(@{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            Check ($r.UnusedAnswers -eq 0) ("тест ждал вопросов, а их не было: {0}" -f $r.UnusedAnswers)
+            Check (@($r.Output | Where-Object { $_ -match '^Остановлено: |ParserError' }).Count -eq 0) ('скрипт упал: ' + ((@($r.Output | Where-Object { $_ -match '^Остановлено: ' }) | Select-Object -First 1) -join ''))
+            $menu = & $getMenu $r
+            Check ($null -ne $menu) 'вопроса меню гейта нет'
+            if ($null -ne $menu) {
+                $labels = @($menu.items | ForEach-Object { [string]$_ })
+                $names = @($menu.PSObject.Properties | ForEach-Object { $_.Name })
+                Check (($names -contains 'sections') -and ($names -contains 'keys')) 'в вопросе меню нет заголовков групп или клавиш'
+                if (($names -contains 'sections') -and ($names -contains 'keys')) {
+                    $sections = @($menu.sections | ForEach-Object { [string]$_ })
+                    $keys = @($menu.keys | ForEach-Object { [string]$_ })
+                    Check ($sections.Count -eq $labels.Count -and $keys.Count -eq $labels.Count) ("пунктов {0}, заголовков {1}, клавиш {2} - должно быть поровну" -f $labels.Count, $sections.Count, $keys.Count)
+                    Check ((@($sections | Where-Object { $_ }) -join ' | ') -eq 'Тестовая база | Рабочая база | Сравнить и забрать | Гейт') ("группы: {0}" -f (@($sections | Where-Object { $_ }) -join ' | '))
+                    Check ($sections.Count -gt 0 -and [bool]$sections[0]) 'у первого пункта меню нет заголовка группы'
+                    Check (@($keys | Sort-Object -Unique).Count -eq $keys.Count) ("клавиши повторяются: {0}" -f ($keys -join ''))
+                    Check (@($keys | Where-Object { $_ -notmatch '^[1-9a-z]$' }).Count -eq 0) ("клавиши не из 1-9, a-z: {0}" -f ($keys -join ' '))
+                    Check ($labels[$labels.Count - 1] -eq 'Выход') ("последний пункт - «{0}», ждали «Выход»" -f $labels[$labels.Count - 1])
+                    Check ((& $keyOf $menu '^Прогон на том, что есть в базе$') -eq '2') ("«Прогон на том, что есть в базе»: клавиша «{0}», ждали «2»" -f (& $keyOf $menu '^Прогон на том, что есть в базе$'))
+                    Check ((& $keyOf $menu '^Обновить рабочую базу$') -eq 'd') ("«Обновить рабочую базу»: клавиша «{0}», ждали «d»" -f (& $keyOf $menu '^Обновить рабочую базу$'))
+                    Check ((& $keyOf $menu '^Откатить рабочую базу$') -eq 'e') ("«Откатить рабочую базу»: клавиша «{0}», ждали «e»" -f (& $keyOf $menu '^Откатить рабочую базу$'))
+                    Check ((& $keyOf $menu '^Настройки гейта$') -eq 'l') ("«Настройки гейта»: клавиша «{0}», ждали «l»" -f (& $keyOf $menu '^Настройки гейта$'))
+                    Check ((& $keyOf $menu '^Прогон с обновлением из inbox') -eq '') 'в пустом inbox есть пункт «Прогон с обновлением из inbox»'
+                    # Подписи постоянные: без чисел, имён баз и версий; переменное и подробности - в пояснениях.
+                    Check (@($labels | Where-Object { $_ -match '\d|\(|:' -and $_ -ne 'Проверка внешнего соединения (COM)' }).Count -eq 0) ("в подписях пунктов есть переменное или пояснение: {0}" -f (@($labels | Where-Object { $_ -match '\d|\(|:' -and $_ -ne 'Проверка внешнего соединения (COM)' }) -join ' | '))
+                    Check ($names -contains 'hints') 'в вопросе меню нет пояснений (hints)'
+                    if ($names -contains 'hints') {
+                        $hints = @($menu.hints | ForEach-Object { [string]$_ })
+                        Check ($hints.Count -eq $labels.Count) ("пунктов {0}, пояснений {1} - должно быть поровну" -f $labels.Count, $hints.Count)
+                        if ($hints.Count -eq $labels.Count) {
+                            Check ($hints[[array]::IndexOf($labels, 'Показать состояние баз')] -eq 'блокировки и сеансы') 'у «Показать состояние баз» не то пояснение'
+                            Check ($hints[[array]::IndexOf($labels, 'Выход')] -eq '') 'у «Выход» есть пояснение'
+                        }
+                    }
+                    # Группа «Рабочая база» идёт раньше «Сравнить и забрать»: проверка перед обновлением - выше сравнения.
+                    $precheckAt = [array]::IndexOf($labels, @($labels | Where-Object { $_ -match '^Проверка рабочей перед обновлением' } | Select-Object -First 1)[0])
+                    $compareAt = [array]::IndexOf($labels, @($labels | Where-Object { $_ -match '^Сравнить расширения' } | Select-Object -First 1)[0])
+                    Check ($precheckAt -ge 0 -and $compareAt -gt $precheckAt) ("порядок: проверка рабочей {0}, сравнение {1}" -f $precheckAt, $compareAt)
+                    if ($precheckAt -ge 0 -and $compareAt -ge 0) {
+                        Check ($sections[$precheckAt] -eq 'Рабочая база') 'группа «Рабочая база» начинается не с проверки перед обновлением'
+                        Check ($sections[$compareAt] -eq 'Сравнить и забрать') 'группа «Сравнить и забрать» начинается не со сравнения расширений'
+                    }
+                }
+            }
+            # В inbox появилось обновление: новый пункт - первым, со своей клавишей «1», остальные клавиши те же.
+            $null = Add-InboxFile $sb $cfeName
+            $k = Invoke-Script -Sandbox $sb -Answers @(@{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
+            Check ($k.Unexpected.Count -eq 0) ("с обновлением в inbox: неожиданные вопросы: " + ($k.Unexpected -join ' | '))
+            $menuKit = & $getMenu $k
+            Check ($null -ne $menuKit) 'с обновлением в inbox: вопроса меню гейта нет'
+            $kitNames = @()
+            if ($null -ne $menuKit) { $kitNames = @($menuKit.PSObject.Properties | ForEach-Object { $_.Name }) }
+            Check (($kitNames -contains 'keys') -and ($kitNames -contains 'hints')) 'с обновлением в inbox: в вопросе меню нет клавиш или пояснений'
+            if (($kitNames -contains 'keys') -and ($kitNames -contains 'hints')) {
+                Check ((& $keyOf $menuKit '^Прогон с обновлением из inbox') -eq '1') ("«Прогон с обновлением из inbox»: клавиша «{0}», ждали «1»" -f (& $keyOf $menuKit '^Прогон с обновлением из inbox'))
+                Check ([string]@($menuKit.items)[0] -eq 'Прогон с обновлением из inbox') ("первый пункт - «{0}»" -f [string]@($menuKit.items)[0])
+                Check ([string]@($menuKit.hints)[0] -eq 'обновлений в inbox: 1') ("пояснение первого пункта - «{0}», ждали «обновлений в inbox: 1»" -f [string]@($menuKit.hints)[0])
+                Check ([string]@($menuKit.sections)[0] -eq 'Тестовая база') 'заголовок группы не у первого показанного пункта'
+                Check ((& $keyOf $menuKit '^Прогон на том, что есть в базе$') -eq '2') 'клавиша «Прогон на том, что есть в базе» сдвинулась, когда появился пункт inbox'
+                Check ((& $keyOf $menuKit '^Обновить рабочую базу$') -eq 'd') 'клавиша «Обновить рабочую базу» сдвинулась, когда появился пункт inbox'
+            }
         }
     },
     @{
@@ -2287,6 +2386,39 @@ $tests = @(
             Check ($r.ExitCode -ne 0) 'deploy не остановился, хотя рабочая закрыта'
             Check (@($r.Output | Where-Object { $_ -match 'блокировка начала сеансов, и код разрешения у неё не тот' }).Count -gt 0) 'нет понятной причины остановки'
             Check (@($r.Output | Where-Object { $_ -match 'ВНЕШНИЕ ОБРАБОТКИ' }).Count -eq 0) 'после закрытой рабочей deploy пошёл выгружать обработки'
+        }
+    },
+    @{
+        Name = 'deploy-unlockcode-hidden'
+        Text = 'значение UnlockCode не попадает ни в вывод, ни в журналы: рабочая закрыта чужой блокировкой - сообщение называет настройку, а не её значение; обычный просмотр состояния - код в ключе /UC закрыт звёздочками'
+        Run = {
+            param($Name)
+            $secretCode = 'Kod-Razblokirovki-9731'
+            $config = @{} + $deployConfig
+            $config['UnlockCode'] = $secretCode
+            $sb = New-Sandbox $Name -Config $config
+            # Всё, что скрипт записал в свою папку: настройки и файлы подставных 1С и COM - не в счёт.
+            $findLeaks = {
+                param([string]$Dir)
+                $found = @(Get-ChildItem -LiteralPath $Dir -Recurse -File | Where-Object { $_.Name -ne 'config.psd1' -and $_.FullName -notmatch '\\(fake|chan|bin|test)\\' -and $_.Length -lt 5MB } | Where-Object { [System.IO.File]::ReadAllText($_.FullName, $utf8).Contains($secretCode) } | ForEach-Object { $_.FullName.Substring($Dir.Length) })
+                return , $found
+            }
+            $com = New-ComState
+            $com['lockedConnect'] = @('erp_base')
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-StatusOnly' -Com $com
+            Check-DeployCommon $r -LocksExpected $false
+            Check (@($r.Output | Where-Object { $_ -match 'код разрешения у неё не тот, что в UnlockCode' }).Count -gt 0) 'нет сообщения о чужой блокировке с именем настройки'
+            $shown = @($r.Output | Where-Object { $_.Contains($secretCode) })
+            Check ($shown.Count -eq 0) ('значение UnlockCode в выводе: ' + (($shown | Select-Object -First 2) -join ' | ').Replace($secretCode, '<код>'))
+            $leaks = & $findLeaks $sb
+            Check ($leaks.Count -eq 0) ('значение UnlockCode в файлах: ' + ($leaks -join ', '))
+            # Рабочая открыта: «Показать состояние баз» идёт до конца, кода по-прежнему нигде нет.
+            $s = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-BaseState' -Com (New-ComState)
+            Check-DeployCommon $s -LocksExpected $false
+            $shown = @($s.Output | Where-Object { $_.Contains($secretCode) })
+            Check ($shown.Count -eq 0) ('состояние баз: значение UnlockCode в выводе: ' + (($shown | Select-Object -First 2) -join ' | ').Replace($secretCode, '<код>'))
+            $leaks = & $findLeaks $sb
+            Check ($leaks.Count -eq 0) ('состояние баз: значение UnlockCode в файлах: ' + ($leaks -join ', '))
         }
     },
     @{
@@ -2905,6 +3037,14 @@ $tests = @(
                 $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = $dumps } -Com $com -Answers ($gitBootstrapAnswers + @(@{ Kind = 'confirm'; Header = 'Выгрузить и типовую'; Yes = $true }))
                 Check-DeployCommon $first -LocksExpected $false
                 Check ($first.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($first.Unexpected -join ' | '))
+                # Итог каждой долгой операции - строкой под её «начато» и событием step для колонки шагов ci.exe.
+                Check (@($first.Output | Where-Object { $_ -match '^\s+готово за \d+:\d\d$' }).Count -gt 0) 'у долгих операций нет строки итога «готово за ...»'
+                $stepEvents = @($first.Output | Where-Object { $_.StartsWith('@@ui:') -and $_ -match '"kind"\s*:\s*"step"' })
+                Check (@($stepEvents | Where-Object { $_ -match 'git add' -and $_ -match '"status"\s*:\s*"OK"' }).Count -eq 1) ('события step с итогом git add для колонки шагов: ' + @($stepEvents | Where-Object { $_ -match 'git add' }).Count)
+                # Будущие шаги видны заранее: план операций (ops) - выгрузки расширений, потом весь путь типовой.
+                $opsPlans = @($first.Output | Where-Object { $_.StartsWith('@@ui:') -and $_ -match '"kind"\s*:\s*"plan"' -and $_ -match '"ops"\s*:\s*true' })
+                Check (@($opsPlans | Where-Object { $_ -match 'Типовая: git push' -and $_ -match 'Типовая: git add' -and $_ -match 'Выгрузить типовую' }).Count -eq 1) ('планов операций типовой для колонки шагов: ' + @($opsPlans | Where-Object { $_ -match 'git push' }).Count)
+                Check (@($opsPlans | Where-Object { $_ -match 'Выгрузить .+ из erp_temp_test' -and $_ -notmatch 'git push' }).Count -eq 1) ('планов выгрузки расширений для колонки шагов: ' + @($opsPlans | Where-Object { $_ -notmatch 'git push' }).Count)
                 $tree = @(& $gitExe --git-dir=$bare ls-tree -r --name-only main 2>&1 | ForEach-Object { [string]$_ })
                 foreach ($path in @('README.md', 'Configuration.xml', 'Catalogs/Items.xml', 'CommonModules/Common/Ext/Module.bsl')) { Check ($tree -contains $path) ("в репозитории типовой нет {0}: {1}" -f $path, ($tree -join ' ')) }
                 Check ($tree -notcontains 'ConfigDumpInfo.xml') 'ConfigDumpInfo.xml попал в репозиторий типовой'
@@ -2981,6 +3121,60 @@ $tests = @(
                 Check ($commits -eq '1') ("коммитов в хранилище {0}, ждали 1" -f $commits)
                 $stateFile = Join-Path $sb 'git\typical\typical.json'
                 Check (Test-Path -LiteralPath $stateFile) 'после повтора нет typical.json'
+            }
+            finally {
+                Remove-Item -Path 'env:CI_FAKE_GIT_EXE' -ErrorAction SilentlyContinue
+                Remove-Item -Path 'env:CI_FAKE_GIT_REMOTE' -ErrorAction SilentlyContinue
+            }
+        }
+    },
+    @{
+        Name = 'git-typical-noversion'
+        Text = 'типовая в git: в typical.json коммит без версии (до 20.11.2026 версия читалась пустой - свойства COM 1С) - версия коммита из его Configuration.xml; та же, что в temp, - дописывается, без вопроса и без выгрузки; другая - вопрос и выгрузка'
+        Run = {
+            param($Name)
+            $gitCommand = Get-Command git -ErrorAction SilentlyContinue
+            if ($null -eq $gitCommand) { Write-Host '       пропущен: нет git в PATH'; return }
+            $gitExe = $gitCommand.Source
+            $sb = New-GitSandbox $Name -Extra @{ TypicalRepo = 'owner/typical'; TypicalMinFreeGB = 1 }
+            $bare = Join-Path $sb 'typical-remote.git'
+            $null = & $gitExe init --bare --quiet $bare 2>&1
+            $env:CI_FAKE_GIT_EXE = $gitExe
+            $env:CI_FAKE_GIT_REMOTE = $bare
+            try {
+                $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
+                $com.bases.erp_temp_test['config'] = @{ name = 'ERP'; synonym = 'ERP завода'; version = '2.5.22.149' }
+                $dumps = New-GitDumps
+                $dumps['@config'] = @{ 'Configuration.xml' = '<MetaDataObject><Configuration><Properties><Name>ERP</Name><Version>2.5.22.149</Version></Properties></Configuration></MetaDataObject>'; 'Catalogs/Items.xml' = '<Items/>' }
+                $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = $dumps } -Com $com -Answers ($gitBootstrapAnswers + @(@{ Kind = 'confirm'; Header = 'Выгрузить и типовую'; Yes = $true }))
+                Check-DeployCommon $first -LocksExpected $false
+                $sha = ([string](& $gitExe --git-dir=$bare rev-parse main 2>&1)).Trim()
+                $stateFile = Join-Path $sb 'git\typical\typical.json'
+                $blank = { [System.IO.File]::WriteAllText($stateFile, (ConvertTo-Json -InputObject ([ordered]@{ repo = 'owner/typical'; name = ''; version = ''; commit = $sha; time = '2026-11-20 02:10:00' })), $utf8) }
+                # Та же версия в temp: дописать, не выгружать.
+                & $blank
+                Reset-FakeState $sb
+                $same = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = $dumps } -Com $com
+                Check-DeployCommon $same -LocksExpected $false
+                Check ($same.Unexpected.Count -eq 0) ("коммит без версии, та же версия - а вопросы: " + ($same.Unexpected -join ' | '))
+                Check (@($same.Output | Where-Object { $_ -match 'без версии, в нём та же версия - дописал' }).Count -eq 1) 'не сказано, что версия дописана'
+                $sameDumps = Get-Calls $same @('/DumpConfigToFiles')
+                Check (@($sameDumps | Where-Object { -not $_.Line.Contains('-Extension') }).Count -eq 0) 'коммит без версии, та же версия: типовая выгружалась заново'
+                $state = [System.IO.File]::ReadAllText($stateFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check ($state.version -eq '2.5.22.149' -and $state.name -eq 'ERP' -and $state.commit -eq $sha) ("typical.json после дописывания: версия «{0}», имя «{1}», коммит «{2}»" -f $state.version, $state.name, $state.commit)
+                # temp обновили после того запуска: версию не приписывать, а выгрузить.
+                & $blank
+                $com.bases.erp_temp_test['config']['version'] = '2.5.23.10'
+                $dumps['@config']['Configuration.xml'] = '<MetaDataObject><Configuration><Properties><Name>ERP</Name><Version>2.5.23.10</Version></Properties></Configuration></MetaDataObject>'
+                Reset-FakeState $sb
+                $next = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = $dumps } -Com $com -Answers @(@{ Kind = 'confirm'; Header = 'Выгрузить и типовую'; Yes = $true })
+                Check-DeployCommon $next -LocksExpected $false
+                Check ($next.Unexpected.Count -eq 0) ("коммит без версии, другая версия - неожиданные вопросы: " + ($next.Unexpected -join ' | '))
+                Check (@($next.Output | Where-Object { $_ -match 'без версии; версия в нём - 2\.5\.22\.149, .* - 2\.5\.23\.10: выгружаю как новую' }).Count -eq 1) 'не сказано, что версия в коммите другая'
+                $nextDumps = Get-Calls $next @('/DumpConfigToFiles')
+                Check (@($nextDumps | Where-Object { -not $_.Line.Contains('-Extension') }).Count -eq 1) 'коммит без версии, другая версия: типовая не выгружалась'
+                $state = [System.IO.File]::ReadAllText($stateFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check ($state.version -eq '2.5.23.10' -and $state.commit -ne $sha) ("typical.json после выгрузки новой: версия «{0}», коммит «{1}»" -f $state.version, $state.commit)
             }
             finally {
                 Remove-Item -Path 'env:CI_FAKE_GIT_EXE' -ErrorAction SilentlyContinue

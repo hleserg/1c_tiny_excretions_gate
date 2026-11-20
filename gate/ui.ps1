@@ -4,11 +4,14 @@
 #
 # Канал интерфейса ci.exe (ключ -UiChannel <папка>). Скрипт запущен из ci.exe, его вывод читает ci.exe.
 # Всё, что надо показать особо, скрипт пишет строками «@@ui:{json}»: ход шага (progress, progress-end),
-# заголовок в рамке (title), вопрос (one, many, confirm, text, view) с номером id. Ответ ci.exe кладёт
+# заголовок в рамке (title), вопрос (one, many, confirm, text, view) с номером id; у вопроса one могут быть
+# заголовки групп (sections), свои клавиши пунктов (keys) и пояснения серым (hints), по одному на пункт. Ответ ci.exe кладёт
 # в папку канала файлом a-<id>.json: {"cancel":..,"index":..,"indexes":[..],"yes":..,"text":".."}.
 # Если вопрос ждёт события (закроют конфигуратор, уйдут сеансы) и оно случилось, скрипт пишет
 # {"kind":"cancel","id":..} и идёт дальше. Файл stop в папке канала - просьба остановиться: скрипт
 # останавливается через свою обычную обработку ошибки (trap, finally), со снятием блокировок.
+# {"kind":"step","title":..,"status":"OK|WARN|FAIL","elapsed":..} - долгая операция кончилась: ci.exe ставит её в
+# колонку шагов с итогом и временем, если у действия нет своего плана шагов.
 # {"kind":"close","restart":..} - просьба к ci.exe закрыться, когда скрипт кончится без ошибки, а с restart - и
 # сразу открыться заново (после обновления гейта: в папке уже новый ci.exe).
 
@@ -39,9 +42,14 @@ function Send-UiEvent {
 function Send-UiPlan {
     # План прогона для ci.exe: шаги по порядку. Parallel - шаги, которые идут параллельно остальным (проверка
     # конфигурации в фоне): их итог может прийти раньше их места в плане, и шаги перед ними при этом не пропущены.
-    param([string[]]$StepNames, [string[]]$Parallel = @())
+    # Operations - план долгих операций действия без вердикта (выгрузка в git, типовая): шаги - заголовки операций,
+    # их итог и время приходят событием step (Write-UiOperationResult), узла «Вердикт» нет, сделанное до этого плана
+    # остаётся в колонке. Такой план можно прислать ещё раз - когда стало известно, что будет дальше.
+    param([string[]]$StepNames, [string[]]$Parallel = @(), [switch]$Operations)
     if (-not $script:UiChannelDir) { return }
-    Send-UiEvent @{ kind = 'plan'; steps = @($StepNames); parallel = @($Parallel | Where-Object { $_ }) }
+    $plan = @{ kind = 'plan'; steps = @($StepNames); parallel = @($Parallel | Where-Object { $_ }) }
+    if ($Operations) { $plan['ops'] = $true }
+    Send-UiEvent $plan
 }
 
 function Send-UiReset {
@@ -51,6 +59,28 @@ function Send-UiReset {
     if (-not $script:UiChannelDir) { return }
     $script:UiSubPlanSent = ''
     Send-UiEvent @{ kind = 'reset' }
+}
+
+function Write-UiOperationResult {
+    # Итог долгой операции - строкой под её «... начато в»: готово или нет, за сколько и что за ошибка. В ci.exe она
+    # же встаёт в колонку шагов с итогом и временем, если у действия нет своего плана шагов (выгрузка в git, типовая,
+    # сравнения): событие step. Status: OK, FAIL или WARN (кончилась не нулём, но вызывающему это можно).
+    param([string]$Title, [string]$Status = 'OK', [double]$Seconds = 0, [string]$Problem = '')
+    if (-not $Title) { return }
+    $whole = [int][Math]::Floor($Seconds)
+    $time = '{0}:{1:00}' -f [int][Math]::Floor($whole / 60), ($whole % 60)
+    if ($whole -ge 3600) { $time = '{0}:{1:00}:{2:00}' -f [int][Math]::Floor($whole / 3600), [int][Math]::Floor(($whole % 3600) / 60), ($whole % 60) }
+    $detail = ''
+    if ($Problem) {
+        $detail = [regex]::Replace($Problem, '\s+', ' ').Trim()
+        if ($null -ne (Get-Command Get-MaskedLine -ErrorAction SilentlyContinue)) { $detail = Get-MaskedLine $detail }
+        if ($detail.Length -gt 300) { $detail = $detail.Substring(0, 300) + '...' }
+        $detail = ': ' + $detail
+    }
+    if ($Status -eq 'OK') { Write-Host ('       готово за {0}' -f $time) -ForegroundColor DarkGreen }
+    elseif ($Status -eq 'WARN') { Write-Host ('       кончилось за {0}{1}' -f $time, $detail) -ForegroundColor DarkYellow }
+    else { Write-Host ('       не вышло за {0}{1}' -f $time, $detail) -ForegroundColor Red }
+    if ($script:UiChannelDir) { Send-UiEvent @{ kind = 'step'; title = $Title; status = $Status; elapsed = $whole } }
 }
 
 function Send-UiClose {
@@ -240,10 +270,22 @@ function Get-UiKeyIndex {
 function Select-UiOne {
     # Один пункт из списка. Возвращает номер пункта (с нуля) или -1, если выбор отменили (Esc, 0).
     # Danger - номера опасных пунктов (откат рабочей): в ci.exe они в красной рамке с ▲!, в консоли - красные, с «!!!».
-    param([string]$Header, [string[]]$Items, [string[]]$Notes = @(), [int[]]$Danger = @())
+    # Sections - заголовки групп, по одному на пункт: непустой - с этого пункта начинается группа (строка-заголовок
+    # перед ним, выбрать её нельзя). Keys - своя клавиша у каждого пункта (из 1-9, a-z) вместо порядковой: клавиша
+    # пункта не зависит от того, какие пункты показаны сейчас (меню гейта). Hints - пояснение пункта: переменное
+    # (какой прогон, какая версия) и подробности серым рядом с подписью, сама подпись при этом не меняется; пустое -
+    # нет. Все три действуют, только если их столько же, сколько пунктов.
+    param([string]$Header, [string[]]$Items, [string[]]$Notes = @(), [int[]]$Danger = @(), [string[]]$Sections = @(), [string[]]$Keys = @(), [string[]]$Hints = @())
     if ($Items.Count -eq 0) { return -1 }
+    $hasSections = ($Sections.Count -eq $Items.Count)
+    $hasKeys = ($Keys.Count -eq $Items.Count)
+    $hasHints = ($Hints.Count -eq $Items.Count)
     if ($script:UiChannelDir) {
-        $answer = Request-UiAnswer -Question @{ kind = 'one'; header = $Header; items = @($Items); notes = @($Notes | Where-Object { $_ }); danger = @($Danger) }
+        $question = @{ kind = 'one'; header = $Header; items = @($Items); notes = @($Notes | Where-Object { $_ }); danger = @($Danger) }
+        if ($hasSections) { $question['sections'] = @($Sections) }
+        if ($hasKeys) { $question['keys'] = @($Keys) }
+        if ($hasHints) { $question['hints'] = @($Hints) }
+        $answer = Request-UiAnswer -Question $question
         if ([bool](Get-UiField $answer 'cancel' $false)) { return -1 }
         $index = [int](Get-UiField $answer 'index' -1)
         if ($index -ge 0 -and $index -lt $Items.Count) { return $index }
@@ -254,9 +296,16 @@ function Select-UiOne {
     Write-Host ('  ' + $Header)
     foreach ($note in $Notes) { if ($note) { Write-Host ('  ' + $note) -ForegroundColor DarkGray } }
     $shown = [Math]::Min($Items.Count, $script:UiKeys.Count)
+    if ($hasKeys) { $shown = $Items.Count }
     for ($i = 0; $i -lt $shown; $i++) {
-        if ($Danger -contains $i) { Write-Host ("    {0} - {1}" -f $script:UiKeys[$i], $shownItems[$i]) -ForegroundColor Red }
-        else { Write-Host ("    {0} - {1}" -f $script:UiKeys[$i], $shownItems[$i]) }
+        if ($hasSections -and $Sections[$i]) { Write-Host ('  ' + $Sections[$i].ToUpper()) -ForegroundColor Cyan }
+        $itemKey = $script:UiKeys[$i]
+        if ($hasKeys) { $itemKey = $Keys[$i] }
+        $itemHint = ''
+        if ($hasHints -and $Hints[$i]) { $itemHint = '  ' + $Hints[$i] }
+        if ($Danger -contains $i) { Write-Host -NoNewline ("    {0} - {1}" -f $itemKey, $shownItems[$i]) -ForegroundColor Red }
+        else { Write-Host -NoNewline ("    {0} - {1}" -f $itemKey, $shownItems[$i]) }
+        Write-Host $itemHint -ForegroundColor DarkGray
     }
     Write-Host '    0 - отмена'
     Write-Host -NoNewline '  Выбор: '
@@ -264,6 +313,13 @@ function Select-UiOne {
         $keyInfo = [Console]::ReadKey($true)
         if ([string]$keyInfo.KeyChar -eq '0') { Write-Host '0'; return -1 }
         $index = Get-UiKeyIndex $keyInfo
+        if ($hasKeys) {
+            # Свои клавиши: нажатая клавиша - в её букву (в любой раскладке), буква - в пункт.
+            if ($index -lt 0) { continue }
+            $index = [array]::IndexOf($Keys, $script:UiKeys[$index])
+            if ($index -ge 0) { Write-Host $Keys[$index]; return $index }
+            continue
+        }
         if ($index -ge 0 -and $index -lt $shown) { Write-Host $script:UiKeys[$index]; return $index }
     }
 }
