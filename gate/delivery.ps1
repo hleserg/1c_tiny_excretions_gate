@@ -48,7 +48,7 @@ function Get-DeliverySetup {
         Root = $root; Inbox = $inbox; Tech = $tech
         Merge = (Resolve-RootPath ([string](Get-Setting $cfg 'DeliveryMergeExe' 'merge1c.exe')))
         AutoMerge = [bool](Get-Setting $cfg 'DeliveryAutoMerge' $false)
-        Python = [string](Get-Setting $cfg 'DeliveryPython' 'python')
+        Python = [string](Get-Setting $cfg 'DeliveryPython' '')
         MergeCheckedPath = [string](Get-Setting $cfg 'DeliveryMergeChecked' 'ci/merge_checked.py')
         MergeCheckedBlob = ([string](Get-Setting $cfg 'DeliveryMergeCheckedBlob' '')).ToLowerInvariant()
         Workflow = [string](Get-Setting $cfg 'DeliveryCiWorkflow' '.github/workflows/erp-static.yml')
@@ -834,12 +834,25 @@ function Invoke-DeliveryMergeCheck {
     return $write
 }
 
+function Get-DeliveryPython {
+    param([string]$Configured)
+    # «python» оставался в config.psd1 от прежней поставки. Полный путь, заданный площадкой, сохраняет приоритет.
+    if ($Configured -and $Configured -notin @('python', 'python.exe')) { return $Configured }
+    $runtime = Join-Path $PSScriptRoot 'runtime'
+    $version = [System.IO.File]::ReadAllText((Join-Path $runtime 'python-version.txt')).Trim()
+    if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'повреждён файл версии комплектного Python' }
+    $exe = Join-Path $runtime ("python-{0}\python.exe" -f $version)
+    if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw ("нет {0}: переустанови комплект гейта" -f $exe) }
+    return $exe
+}
+
 function Invoke-MergeCheckedScript {
     # python -I merge_checked.py ...: токен - переменной окружения процесса (не в командной строке и не в журнале).
     param($D, $Setup, [string]$Script, [string[]]$Arguments)
     $info = New-Object System.Diagnostics.ProcessStartInfo
-    $info.FileName = $D.Python
-    $info.Arguments = (@('-I', ('"{0}"' -f $Script)) + $Arguments) -join ' '
+    try { $info.FileName = Get-DeliveryPython $D.Python }
+    catch { return [pscustomobject]@{ Ok = $false; Error = ('Комплектный Python: ' + $_.Exception.Message); Data = $null } }
+    $info.Arguments = (@('-I', '-X', 'utf8', ('"{0}"' -f $Script)) + $Arguments) -join ' '
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true
@@ -847,10 +860,9 @@ function Invoke-MergeCheckedScript {
     $info.StandardOutputEncoding = [System.Text.Encoding]::UTF8
     $info.StandardErrorEncoding = [System.Text.Encoding]::UTF8
     $info.EnvironmentVariables['MERGE_CHECKED_TOKEN'] = [string]$Setup.Gh.Token
-    $info.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
-    Write-RunLog ("> {0} {1}" -f $D.Python, $info.Arguments)
+    Write-RunLog ("> {0} {1}" -f $info.FileName, $info.Arguments)
     try { $process = [System.Diagnostics.Process]::Start($info) }
-    catch { return [pscustomobject]@{ Ok = $false; Error = ("не запустился {0}: {1} (DeliveryPython)" -f $D.Python, $_.Exception.Message); Data = $null } }
+    catch { return [pscustomobject]@{ Ok = $false; Error = ("не запустился {0}: {1} (DeliveryPython)" -f $info.FileName, $_.Exception.Message); Data = $null } }
     $outTask = $process.StandardOutput.ReadToEndAsync()
     $errTask = $process.StandardError.ReadToEndAsync()
     if (-not $process.WaitForExit(300000)) { try { $process.Kill() } catch { }; return [pscustomobject]@{ Ok = $false; Error = 'merge_checked.py не ответил за 5 минут'; Data = $null } }

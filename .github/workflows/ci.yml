@@ -74,6 +74,13 @@ jobs:
           Pop-Location
           Remove-Item dist/*.exe
 
+      - name: Приёмка из установленного ZIP без системного Python
+        shell: powershell
+        run: |
+          $bundle = @(Get-ChildItem dist/ci-gate_*.zip -File)
+          if ($bundle.Count -ne 1) { throw 'ожидается один комплект гейта' }
+          & ./gate/test/portable-python.ps1 -Bundle $bundle[0].FullName
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist

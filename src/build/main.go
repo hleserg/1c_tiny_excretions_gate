@@ -94,6 +94,9 @@ func main() {
 	writeZip(filepath.Join(outDir, "Канарейка_"+stamp+".zip"), canary)
 	// Архив гейта - всё для установки: папка ci, установщик и выгрузки обработок (их собирает install.cmd).
 	gate := buildGate()
+	pythonFiles, err := embeddedPython()
+	must(err)
+	gate = append(gate, pythonFiles...)
 	for _, e := range append(append(append([]entry{}, vpo...), canary...), actions...) {
 		gate = append(gate, entry{"epf/" + e.Name, e.Data})
 	}
