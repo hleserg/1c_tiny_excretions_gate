@@ -126,6 +126,10 @@ param(
     [Parameter(ParameterSetName = 'Accept', Mandatory = $true)]
     [string]$AcceptBaseline,
 
+    # С -AcceptBaseline: падения модульных тестов не принимать - в эталон тестов идут только прошедшие.
+    [Parameter(ParameterSetName = 'Accept')]
+    [switch]$KeepFailures,
+
     [Parameter(ParameterSetName = 'Password', Mandatory = $true)]
     [string]$SavePassword
 )
@@ -2123,7 +2127,9 @@ if ($PSCmdlet.ParameterSetName -eq 'Password') {
 function Invoke-AcceptBaseline {
     # Принять замечания прогона как известные: записать их в эталон базы. Зовут ключ -AcceptBaseline
     # и пункт меню «Принять новое последнего прогона в эталон». Ошибка - исключением.
-    param([string]$RunPath)
+    # ** Хлебников С.Ю. 20261120 KeepFailures - частичное принятие: в эталон тестов из прогона идут только OK,
+    # у падений, пропусков и пропавших тестов остаётся прежняя запись (новое падение остаётся новым).
+    param([string]$RunPath, [switch]$KeepFailures)
     $acceptDir = $RunPath
     $verdictFile = Join-Path $acceptDir 'verdict.json'
     if (-not (Test-Path -LiteralPath $verdictFile)) { throw "Не нашёл verdict.json в $acceptDir" }
@@ -2143,11 +2149,39 @@ function Invoke-AcceptBaseline {
     if ($logFiles.Count -eq 0 -and -not (Test-Path -LiteralPath $acceptSelfCheck) -and -not (Test-Path -LiteralPath $acceptUnit)) {
         throw "В $acceptDir нет ни логов проверок (check*.log), ни записей самопроверки (selfcheck-after.norm.txt), ни результатов модульных тестов (unittests.txt): принимать нечего."
     }
+    $acceptScope = 'full'
     if (Test-Path -LiteralPath $acceptUnit) {
-        # Результаты модульных тестов того прогона: его падения становятся известными.
-        Copy-Item -LiteralPath $acceptUnit -Destination (Join-Path $baselineTarget 'unittests.txt') -Force
-        Write-Host 'Принято как известное: результаты модульных тестов'
+        $unitTarget = Join-Path $baselineTarget 'unittests.txt'
+        if ($KeepFailures) {
+            # Только прошедшие: строки эталона по ключу, OK прогона их заменяют или добавляются.
+            $acceptScope = 'partial'
+            $kept = [ordered]@{}
+            if (Test-Path -LiteralPath $unitTarget) {
+                foreach ($line in [System.IO.File]::ReadAllLines($unitTarget, [System.Text.Encoding]::UTF8)) {
+                    $clean = ([string]$line).TrimStart([char]0xFEFF)
+                    $parts = $clean.Split("`t")
+                    if ($parts.Length -ge 2) { $kept[$parts[1]] = $clean }
+                }
+            }
+            $takenOk = 0
+            $leftFailed = 0
+            foreach ($line in [System.IO.File]::ReadAllLines($acceptUnit, [System.Text.Encoding]::UTF8)) {
+                $clean = ([string]$line).TrimStart([char]0xFEFF)
+                $parts = $clean.Split("`t")
+                if ($parts.Length -lt 2) { continue }
+                if ($parts[0] -eq 'OK') { $kept[$parts[1]] = $clean; $takenOk++ }
+                elseif ($parts[0] -eq 'FAIL' -or $parts[0] -eq 'ERROR') { $leftFailed++ }
+            }
+            [System.IO.File]::WriteAllLines($unitTarget, [string[]]@($kept.Values), $Utf8Bom)
+            Write-Host ("Принято как известное: прошедшие модульные тесты ({0}); падения ({1}) не приняты - останутся новыми" -f $takenOk, $leftFailed)
+        }
+        else {
+            # Результаты модульных тестов того прогона: его падения становятся известными.
+            Copy-Item -LiteralPath $acceptUnit -Destination $unitTarget -Force
+            Write-Host 'Принято как известное: результаты модульных тестов'
+        }
     }
+    # ** Хлебников С.Ю. 20261120 конец
     foreach ($file in $logFiles) {
         $acceptLines = @(Read-V8Log $file.FullName)
         if (Test-DesignerBusy $acceptLines) {
@@ -2202,12 +2236,12 @@ function Invoke-AcceptBaseline {
         }
     }
     # Отметка в папке прогона: в списке прогонов он виден как принятый, второй раз его не предлагают.
-    [System.IO.File]::WriteAllLines((Join-Path $acceptDir 'accepted.txt'), [string[]]@(('time={0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))), $Utf8Bom)
+    [System.IO.File]::WriteAllLines((Join-Path $acceptDir 'accepted.txt'), [string[]]@(('time={0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')), ('scope={0}' -f $acceptScope)), $Utf8Bom)
     Write-Host "Эталон базы «$($acceptMeta.baseKey)» обновлён: $baselineTarget"
 }
 
 if ($PSCmdlet.ParameterSetName -eq 'Accept') {
-    Invoke-AcceptBaseline -RunPath (Resolve-RootPath $AcceptBaseline)
+    Invoke-AcceptBaseline -RunPath (Resolve-RootPath $AcceptBaseline) -KeepFailures:$KeepFailures
     exit 0
 }
 
@@ -2529,8 +2563,20 @@ function Invoke-AcceptFromMenu {
     if ($red) { $yesText = 'Принять, хотя прогон красный' }
     $sure = Confirm-Ui -Question ('Принять новое прогона {0} в эталон? Что внутри - report.txt и *.new.txt в папке прогона.' -f $runName) -Yes $yesText -No 'Не принимать'
     if ($sure -ne $true) { Write-Host '  Не принято.'; return $false }
+    # ** Хлебников С.Ю. 20261120 Падения модульных тестов - отдельным решением: принять остальное (снимки, самопроверку),
+    # а падения оставить новыми.
+    $keepFailures = $false
+    $unitFile = Join-Path $Run.Dir.FullName 'unittests.txt'
+    if (Test-Path -LiteralPath $unitFile) {
+        $unitFailed = @([System.IO.File]::ReadAllLines($unitFile, [System.Text.Encoding]::UTF8) | Where-Object { ([string]$_).TrimStart([char]0xFEFF) -match '^(FAIL|ERROR)\t' }).Count
+        if ($unitFailed -gt 0) {
+            $withFailures = Confirm-Ui -Question ('В прогоне {0} падают модульные тесты ({1}). Их тоже принять как известные?' -f $runName, $unitFailed) -Yes 'Да, и падения' -No 'Нет, падения оставить новыми'
+            $keepFailures = ($withFailures -ne $true)
+        }
+    }
+    # ** Хлебников С.Ю. 20261120 конец
     try {
-        Invoke-AcceptBaseline -RunPath $Run.Dir.FullName
+        Invoke-AcceptBaseline -RunPath $Run.Dir.FullName -KeepFailures:$keepFailures
         Write-Host ('  Принято: новое прогона {0} теперь известное.' -f $runName) -ForegroundColor Green
         return $true
     }
@@ -3874,12 +3920,23 @@ function Invoke-UtStep {
     $comparison = Compare-UtResults -Current $results -BaselineFile $unitBaselineFile
     $passed = @($results | Where-Object { $_.Status -eq 'OK' }).Count
     $skippedCount = @($results | Where-Object { $_.Status -eq 'SKIP' }).Count
+    # ** Хлебников С.Ю. 20261120 Пустой и неполный отчёт - красный выше (сверка с запланированными). Здесь - тесты,
+    # что были в эталоне, а в каталоге их больше нет (Gone): жёлтый, эталон их не теряет.
+    $goneCount = 0
+    if (-not $Filter) { $goneCount = @($comparison.Gone).Count }
+    $changedCount = @($comparison.ReasonChanged).Count
+    # ** Хлебников С.Ю. 20261120 конец
     $detail = 'тестов {0}: прошло {1}, упало {2}' -f $results.Count, $passed, $failed.Count
-    if ($failed.Count -gt 0) { $detail += (' (новых {0}, известных {1})' -f @($comparison.NewFailed).Count, @($comparison.KnownFailed).Count) }
+    if ($failed.Count -gt 0) {
+        $newErrors = @($comparison.NewFailed | Where-Object { $_.Status -eq 'ERROR' }).Count
+        $newFails = @($comparison.NewFailed).Count - $newErrors
+        $detail += (' (новых {0}: ERROR - ошибка выполнения {1}, FAIL - не прошло утверждение {2}; известных {3})' -f @($comparison.NewFailed).Count, $newErrors, $newFails, @($comparison.KnownFailed).Count)
+    }
+    if ($changedCount -gt 0) { $detail += (', известных падает по-другому {0} (unittests.changed.txt)' -f $changedCount) }
     if ($skippedCount -gt 0) { $detail += (', пропущено {0}' -f $skippedCount) }
     if ($disabled.Count -gt 0 -and -not $Filter) { $detail += (', выключено {0}' -f $disabled.Count) }
     if (@($comparison.Fixed).Count -gt 0) { $detail += (', починились {0}' -f @($comparison.Fixed).Count) }
-    if (@($comparison.Gone).Count -gt 0 -and -not $Filter) { $detail += (', пропало из эталона {0}' -f @($comparison.Gone).Count) }
+    if ($goneCount -gt 0) { $detail += (', пропало из эталона {0}: эталон не сдвинут, принять - вручную' -f $goneCount) }
     if (-not $comparison.HasBaseline) { $detail += '; эталона тестов не было' }
     if ($problems -gt 0) { $detail += ('; замечаний к описаниям тестов {0} (unittests-*.catalog.txt)' -f $problems) }
     if ($session.State -eq 'junit') { $detail += '; кода возврата YAxUnit нет (движок упал после отчёта, см. unittests\yaxunit.log) - итог по junit.xml' }
@@ -3892,16 +3949,24 @@ function Invoke-UtStep {
         $sample = (@($comparison.NewFailed | Select-Object -First 3 | ForEach-Object {
                     $message = [string]$_.Message
                     if ($message.Length -gt 160) { $message = $message.Substring(0, 160) + '...' }
-                    '{0}: {1}' -f $_.Key, $message
+                    '{0} ({1}): {2}' -f $_.Key, (Get-UtStatusTitle $_.Status), $message
                 }) -join ' | ')
         $detail += ('. Новые падения в unittests.new.txt: {0}' -f $sample)
     }
-    elseif ($problems -gt 0) { $status = 'WARN' }
-    # Эталон двигается сам, когда новых падений нет (как у самопроверки); прогон одного теста эталон не трогает.
+    elseif ($problems -gt 0 -or $goneCount -gt 0 -or $changedCount -gt 0) { $status = 'WARN' }
+    if ($changedCount -gt 0) {
+        $changedLines = @($comparison.ReasonChanged | ForEach-Object { ("{0}`t{1}`tбыло: {2} {3}`tстало: {4} {5}" -f $_.Result.Status, $_.Result.Key, $_.BeforeStatus, $_.BeforeMessage, $_.Result.Status, (([string]$_.Result.Message) -replace '\s+', ' ')) })
+        [System.IO.File]::WriteAllLines((Join-Path $RunDir 'unittests.changed.txt'), [string[]]$changedLines, $Utf8Bom)
+    }
+    # ** Хлебников С.Ю. 20261120 Эталон двигается сам, когда новых падений нет, - но только по подтверждённым OK
+    # (Merge-UtBaseline): у падений, пропусков и пропавших тестов остаётся прежняя запись, и следующий прогон снова
+    # их покажет. Прогон одного теста эталон не трогает. Целиком - только принятием.
     if ($status -ne 'FAIL' -and -not $Filter) {
         New-Item -ItemType Directory -Path $baselineDir -Force | Out-Null
-        Copy-Item -LiteralPath $resultFile -Destination $unitBaselineFile -Force
+        $mergedLines = Merge-UtBaseline -Current $results -BaselineFile $unitBaselineFile
+        [System.IO.File]::WriteAllLines($unitBaselineFile, [string[]]$mergedLines, $Utf8Bom)
     }
+    # ** Хлебников С.Ю. 20261120 конец
     Add-StepResult -Name $StepName -Status $status -Detail $detail -Log $session.Junit -Seconds $session.Seconds
 }
 
@@ -6485,7 +6550,7 @@ elseif ($kitItems.Count -gt 0) {
     $extensionsBefore = Get-ExtensionNamesBefore (Join-Path $RunDir 'selfcheck-before\try1\info.txt')
 
     New-Item -ItemType Directory -Path $referenceSnapshotDir -Force | Out-Null
-    foreach ($file in @($selfCheckReferenceFile, $selfCheckReferenceInfoFile, $selfCheckLastFile, $selfCheckSnapshotsFile, $selfCheckExchangeFile, $coverageReferenceFile, $exchangeRulesStateFile, $exchangeRulesFindingsFile)) {
+    foreach ($file in @($selfCheckReferenceFile, $selfCheckReferenceInfoFile, $selfCheckLastFile, $selfCheckSnapshotsFile, $selfCheckExchangeFile, $coverageReferenceFile, $exchangeRulesStateFile, $exchangeRulesFindingsFile, $unitBaselineFile)) {
         if (Test-Path -LiteralPath $file) { Copy-Item -LiteralPath $file -Destination $referenceSnapshotDir -Force }
     }
 
@@ -7331,8 +7396,8 @@ elseif ($anyTouched -gt 0) {
             if ($outcome.Done) {
                 $decision = 'rolledBack'
                 $aftermath.Add('Откат выполнен: комплект возвращён к состоянию до загрузки.')
-                # Эталон самопроверки и отпечаток возвращаются к тем, что были перед загрузкой.
-                foreach ($name in @('selfcheck.norm.txt', 'selfcheck.info.txt', 'selfcheck.last.txt', 'selfcheck.snapshots.txt', 'coverage.txt')) {
+                # Эталон самопроверки, отпечаток и эталон модульных тестов возвращаются к тем, что были перед загрузкой.
+                foreach ($name in @('selfcheck.norm.txt', 'selfcheck.info.txt', 'selfcheck.last.txt', 'selfcheck.snapshots.txt', 'coverage.txt', 'unittests.txt')) {
                     $savedFile = Join-Path $referenceSnapshotDir $name
                     $currentFile = Join-Path $baselineDir $name
                     if (Test-Path -LiteralPath $savedFile) { Copy-Item -LiteralPath $savedFile -Destination $currentFile -Force }
