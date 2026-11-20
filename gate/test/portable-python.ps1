@@ -36,6 +36,26 @@ print(json.dumps({"ok": bool(sys.flags.isolated), "exe": sys.executable, "arg": 
             throw ("не прошла проверка запуска из поставки: {0}" -f $result.Error)
         }
     }
+    # Повторно ставим эту же версию с файлом, открытым без разрешения записи.
+    $inUse = [IO.File]::Open($expected, 'Open', 'Read', 'Read')
+    try {
+        & (Join-Path $kit 'install.ps1') -Target $target -Unattended
+        if ($LASTEXITCODE) { throw 'не удалось повторное обновление с занятым python.exe' }
+    } finally { $inUse.Dispose() }
+
+    # Новый каталог с неверной версией Python не должен стать активным.
+    $versionFile = Join-Path $kit 'ci/runtime/python-version.txt'
+    $current = [IO.File]::ReadAllText($versionFile).Trim()
+    $kitRuntime = Split-Path -Parent $versionFile
+    $invalid = '0.0.1'
+    Copy-Item -LiteralPath (Join-Path $kitRuntime ('python-' + $current)) -Destination (Join-Path $kitRuntime ('python-' + $invalid)) -Recurse
+    [IO.File]::WriteAllText($versionFile, $invalid)
+    $rejected = $false
+    try { & (Join-Path $kit 'install.ps1') -Target $target -Unattended }
+    catch { if ($_.Exception.Message -notlike '*Не запустился комплектный Python*') { throw }; $rejected = $true }
+    if (-not $rejected -or (Test-Path -LiteralPath (Join-Path $target ('runtime/python-' + $invalid)))) { throw 'неполный runtime принят' }
+    if ((Get-DeliveryPython '') -cne $expected) { throw 'после ошибки изменился действующий Python' }
+    Write-Host 'Занятый python.exe сохранился при обновлении, неисправная следующая версия отвергнута.'
     # Исполняем текст, который оператор копирует из журнала. Скрипт пробы только печатает свои аргументы.
     $savedPath = $env:Path
     Push-Location $work
