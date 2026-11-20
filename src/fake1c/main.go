@@ -317,7 +317,9 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 			}
 		}
 	}
-	if hasArg(args, "/DeleteCfg") && logDir != "" {
+	// Удаление расширения очищает склад только у файловой базы (техническая база приёмки): у серверной склад
+	// остаётся, как раньше, - на нём держатся тесты, которые правят выгрузку «в базе» после прогона.
+	if hasArg(args, "/DeleteCfg") && logDir != "" && isFileBase(args) {
 		if ext := valueAfter(args, "-Extension"); ext != "" {
 			_ = os.RemoveAll(extStore(args, ext))
 		}
@@ -832,6 +834,15 @@ func extStore(args []string, ext string) string {
 		}
 	}
 	return filepath.Join(logDir, "ext", ext)
+}
+
+func isFileBase(args []string) bool {
+	for _, a := range args {
+		if len(a) > 2 && (strings.HasPrefix(a, "/F") || strings.HasPrefix(a, "/f")) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasArg(args []string, key string) bool {
