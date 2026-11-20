@@ -168,6 +168,106 @@ function New-ContractCatalogLink {
         }
     },
     @{
+        Name = 'deploy-manual-locks-prod-set'
+        Text = 'блокировки рабочей руками: поставить блокировку начала сеансов (на час, с подтверждением) и регламентных; сеансы не завершаются, в журнале - что сделано'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-ComState -Sessions @(@{ id = 5; base = 'erp_base'; app = '1CV8C'; user = 'Пользователь'; host = 'pc1' })
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ManualLocks -LocksBase Prod' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Блокировки erp_base: что сделать'; Item = '^Поставить блокировку начала сеансов' },
+                @{ Kind = 'one'; Header = 'до какого времени'; Item = '^на час' },
+                @{ Kind = 'confirm'; Header = 'Закрыть вход в erp_base'; Yes = $true },
+                @{ Kind = 'one'; Header = 'Блокировки erp_base: что сделать'; Item = '^Поставить блокировку регламентных' },
+                @{ Kind = 'confirm'; Header = 'Запретить регламентные задания erp_base'; Yes = $true },
+                @{ Kind = 'one'; Header = 'Блокировки erp_base: что сделать'; Item = '^Готово' })
+            Check-DeployCommon $r -LocksExpected $false
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check ($null -ne $r.ComState) 'нет состояния подставного кластера'
+            if ($null -ne $r.ComState) {
+                $prod = $r.ComState.bases.erp_base
+                Check ([bool]$prod.sessionsDenied) 'блокировка начала сеансов рабочей не поставлена'
+                Check ([string]$prod.permissionCode -ceq '0') ("код разрешения «{0}», ждали UnlockCode" -f $prod.permissionCode)
+                Check ([string]$prod.deniedMessage -match '^Технические работы, вход в программу закрыт до ') ("сообщение блокировки: {0}" -f $prod.deniedMessage)
+                Check ([bool]$prod.scheduledJobsDenied) 'блокировка регламентных заданий рабочей не поставлена'
+                $until = [datetime]::MinValue
+                try { $until = [datetime]$prod.deniedTo } catch { }
+                Check ($until -gt (Get-Date).AddMinutes(50) -and $until -lt (Get-Date).AddMinutes(70)) ("конец блокировки {0}, ждали через час" -f $prod.deniedTo)
+                Check (-not [bool]$r.ComState.bases.erp_temp_test.sessionsDenied -and -not [bool]$r.ComState.bases.erp_temp_test.scheduledJobsDenied) 'тронута тестовая база'
+            }
+            Check (@($r.ComLog | Where-Object { $_ -match '\tTerminateSession ' }).Count -eq 0) 'блокировки руками завершали сеансы'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase erp_base ' }).Count -eq 2) 'свойства рабочей записаны не два раза'
+            $log = Join-Path $sb 'deploy\locks\run.log'
+            Check ((Test-Path -LiteralPath $log) -and ([System.IO.File]::ReadAllText($log, $utf8) -match 'поставил блокировку начала сеансов до .*поставил блокировку регламентных заданий')) 'в deploy\locks\run.log нет сделанного'
+            $runDirs = @(Get-ChildItem -LiteralPath (Join-Path $sb 'deploy') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8}-\d{6}$' })
+            Check ($runDirs.Count -eq 0) 'блокировки руками создали папку запуска обновления'
+        }
+    },
+    @{
+        Name = 'deploy-manual-locks-prod-clear'
+        Text = 'блокировки рабочей руками: снять чужую блокировку начала сеансов (код другой - предупреждение) и запрет регламентных, с подтверждением; отказ ничего не меняет'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-ComState -ProdJobsDenied $true
+            $com.bases.erp_base.sessionsDenied = $true
+            $com.bases.erp_base.permissionCode = 'чужой'
+            $com.bases.erp_base.deniedMessage = 'Регламентные работы'
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ManualLocks -LocksBase Prod' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Блокировки erp_base: что сделать'; Item = '^Снять блокировку регламентных' },
+                @{ Kind = 'confirm'; Header = 'Снять запрет регламентных заданий erp_base'; Yes = $false },
+                @{ Kind = 'one'; Header = 'Блокировки erp_base: что сделать'; Item = '^Снять блокировку начала сеансов' },
+                @{ Kind = 'confirm'; Header = 'Открыть вход в erp_base'; Yes = $true },
+                @{ Kind = 'one'; Header = 'Блокировки erp_base: что сделать'; Item = '^Снять блокировку регламентных' },
+                @{ Kind = 'confirm'; Header = 'Снять запрет регламентных заданий erp_base'; Yes = $true },
+                @{ Kind = 'one'; Header = 'Блокировки erp_base: что сделать'; Item = '^Готово' })
+            Check-DeployCommon $r
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            Check (@($r.Output | Where-Object { $_ -match 'её ставил не гейт' }).Count -gt 0) 'нет предупреждения о чужой блокировке'
+            Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase erp_base ' }).Count -eq 2) 'отказ в подтверждении всё равно записал свойства (или снятие не записано)'
+        }
+    },
+    @{
+        Name = 'deploy-manual-locks-temp'
+        Text = 'блокировки тестовой базы руками: без подтверждений, рабочая не трогается'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ManualLocks -LocksBase Temp' -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Блокировки erp_temp_test: что сделать'; Item = '^Поставить блокировку регламентных' },
+                @{ Kind = 'one'; Header = 'Блокировки erp_temp_test: что сделать'; Item = '^Готово' })
+            Check-DeployCommon $r
+            Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            if ($null -ne $r.ComState) { Check ([bool]$r.ComState.bases.erp_temp_test.scheduledJobsDenied) 'запрет регламентных заданий тестовой базы не поставлен' }
+            Check (@($r.ComLog | Where-Object { $_ -match '\tUpdateInfoBase erp_base ' }).Count -eq 0) 'тронута рабочая база'
+        }
+    },
+    @{
+        Name = 'menu-manual-locks'
+        Text = 'меню гейта: «Блокировки тестовой базы» (q) и «Блокировки рабочей базы» (r) запускают блокировки руками для своей базы'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $r = Invoke-Script -Sandbox $sb -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Блокировки рабочей базы$' },
+                @{ Kind = 'one'; Header = 'Блокировки erp_base: что сделать'; Item = '^Готово' },
+                @{ Kind = 'one'; Header = 'Посмотрел'; Item = '^Вернуться в меню' },
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            Check ($r.UnusedAnswers -eq 0) ("тест ждал вопросов, а их не было: {0}" -f $r.UnusedAnswers)
+            Check (@($r.Output | Where-Object { $_ -match '^Остановлено: |ParserError|Не получилось: ' }).Count -eq 0) ('скрипт упал: ' + ((@($r.Output | Where-Object { $_ -match '^Остановлено: |Не получилось: ' }) | Select-Object -First 1)))
+            Check (@($r.Output | Where-Object { $_ -match 'БЛОКИРОВКИ erp_base' }).Count -gt 0) 'пункт меню не открыл блокировки рабочей'
+            $menuLine = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Гейт расширений') } | Select-Object -First 1)
+            if ($menuLine.Count -gt 0) {
+                $menu = $menuLine[0].Substring(5) | ConvertFrom-Json
+                $labels = @($menu.items | ForEach-Object { [string]$_ }); $keys = @($menu.keys | ForEach-Object { [string]$_ })
+                Check ($keys[[array]::IndexOf($labels, 'Блокировки тестовой базы')] -eq 'q') 'у «Блокировки тестовой базы» клавиша не q'
+                Check ($keys[[array]::IndexOf($labels, 'Блокировки рабочей базы')] -eq 'r') 'у «Блокировки рабочей базы» клавиша не r'
+            }
+            else { Check $false 'нет вопроса меню' }
+        }
+    },
+    @{
         Name = 'gate-report-names'
         Text = 'разбор прогона называет поимённо то, что в итоге шагов стоит числом: новые и пропавшие снимки, пропущенные модульные тесты с причиной, известные ошибки, которых не было в прошлом прогоне'
         Run = {

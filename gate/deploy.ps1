@@ -73,6 +73,11 @@ param(
     [switch]$PullProcessings,
     # Показать состояние баз (блокировка начала сеансов, её даты и сообщение, блокировка регламентных, сеансы) и выйти.
     [switch]$BaseState,
+    # Поставить или снять руками блокировку начала сеансов и блокировку регламентных заданий базы LocksBase
+    # (Temp - тестовая, Prod - рабочая). Только с человеком: каждое изменение - его выбором, на рабочей - с подтверждением.
+    [switch]$ManualLocks,
+    [ValidateSet('Temp', 'Prod')]
+    [string]$LocksBase = 'Prod',
     # Сравнить temp и рабочую и показать разницу: расширения (по выгрузкам в файлы) или внешние обработки. Только чтение.
     [switch]$CompareExtensions,
     [switch]$CompareProcessings,
@@ -933,11 +938,12 @@ Initialize-Stats -Dir (Resolve-RootPath ([string](Get-Setting $cfg 'StatsDir' 's
 $deployRoot = Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))
 $mirrorRoot = Join-Path $deployRoot 'mirror'
 $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
-$viewOnly = ($BaseState -or $CompareExtensions -or $CompareProcessings -or $ProdPreCheck -or $ComCheck -or $GitExport -or $GitImport -or $GitProd -or $GitTypical)
+$viewOnly = ($BaseState -or $ManualLocks -or $CompareExtensions -or $CompareProcessings -or $ProdPreCheck -or $ComCheck -or $GitExport -or $GitImport -or $GitProd -or $GitTypical)
 if ($viewOnly) {
     # Показать состояние или сравнить - не запуск обновления: своей папки запуска нет (в истории обновлений его не видно),
     # журнал - в deploy\state\run.log, каждый раз заново.
     $viewName = 'state'
+    if ($ManualLocks) { $viewName = 'locks' }
     if ($CompareExtensions) { $viewName = 'compare-ext' } elseif ($CompareProcessings) { $viewName = 'compare-epf' } elseif ($ProdPreCheck) { $viewName = 'precheck' } elseif ($ComCheck) { $viewName = 'comcheck' } elseif ($GitExport -or $GitImport -or $GitProd -or $GitTypical) { $viewName = 'git' }
     $script:RunDir = Join-Path $deployRoot $viewName
     New-Item -ItemType Directory -Path $script:RunDir -Force | Out-Null
@@ -1932,6 +1938,105 @@ if ($BaseState) {
     $stateLink = Connect-ClusterAgent
     Show-BaseState -Link $stateLink -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
     Show-BaseState -Link $stateLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+    exit 0
+}
+
+function Get-NextClockTime {
+    # Ближайшие часы:минуты не раньше чем через 10 минут: «до 02:00» днём - это ближайшая ночь.
+    param([int]$Hour)
+    $at = (Get-Date).Date.AddHours($Hour)
+    if ($at -le (Get-Date).AddMinutes(10)) { $at = $at.AddDays(1) }
+    return $at
+}
+
+function Invoke-ManualLocks {
+    # Блокировки базы руками: показать, что стоит, и по выбору человека поставить или снять блокировку начала сеансов
+    # и блокировку регламентных заданий. Сеансы не завершаются. Каждое изменение - запись свойств базы в кластере и
+    # проверка повторным чтением; в журнале deploy\locks\run.log - кто что поменял.
+    param([string]$Which)
+    $baseName = $script:TempBase; $user = $script:TempUser; $password = $script:TempPassword
+    if ($Which -eq 'Prod') { $baseName = $script:ProdBase; $user = $script:ProdUser; $password = $script:ProdPassword }
+    $isProd = ($Which -eq 'Prod')
+    if (-not (Test-UiCanAsk)) { throw 'блокировки руками - только с человеком у экрана: запусти из меню гейта' }
+    # Пока идёт обновление рабочей (deploy.lock занят), блокировки руками не трогаются: обновление ведёт их само.
+    $guard = $null
+    try { $guard = [System.IO.File]::Open((Join-Path $deployRoot 'deploy.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
+    catch { throw 'идёт обновление рабочей (deploy.lock занят другим запуском): блокировки руками не трогаю, дождись его конца' }
+    try {
+        Write-Line ("БЛОКИРОВКИ {0}" -f $baseName) 'Cyan'
+        Write-RunLog ("Блокировки руками: {0}, пользователь Windows {1}" -f $baseName, [Environment]::UserName)
+        while ($true) {
+            $link = Connect-ClusterAgent
+            Show-BaseState -Link $link -BaseName $baseName -User $user -Password $password
+            $target = Get-BaseInfo -Link $link -BaseName $baseName -User $user -Password $password
+            $info = Read-BaseInfoAgain $target $baseName
+            $sessionsOn = [bool]$info.SessionsDenied
+            $jobsOn = [bool]$info.ScheduledJobsDenied
+            $keys = @('1', '2', '0')
+            $labels = @('Поставить блокировку начала сеансов', 'Поставить блокировку регламентных заданий', 'Готово, выйти')
+            if ($sessionsOn) { $labels[0] = 'Снять блокировку начала сеансов' }
+            if ($jobsOn) { $labels[1] = 'Снять блокировку регламентных заданий' }
+            $answer = Read-UiChoice -Header ("Блокировки {0}: что сделать?" -f $baseName) -Keys $keys -Labels $labels -CancelKey '0' -DefaultKey '0' `
+                -Notes @('Сеансы, которые уже открыты, не завершаются.')
+            if ($answer -ne '1' -and $answer -ne '2') { break }
+            $done = ''
+            if ($answer -eq '1' -and -not $sessionsOn) {
+                $until1 = (Get-Date).AddHours(1); $until3 = (Get-Date).AddHours(3)
+                $night = Get-NextClockTime 2; $morning = Get-NextClockTime 8
+                $period = Read-UiChoice -Header ("Блокировка начала сеансов {0}: до какого времени?" -f $baseName) -Keys @('1', '2', '3', '4', '0') -Labels @(
+                    ('на час, до {0}' -f $until1.ToString('HH:mm')), ('на 3 часа, до {0}' -f $until3.ToString('HH:mm')),
+                    ('до {0}' -f $night.ToString('dd.MM HH:mm')), ('до {0}' -f $morning.ToString('dd.MM HH:mm')), 'Не ставить') -CancelKey '0' -DefaultKey '0'
+                $until = $null
+                switch ($period) { '1' { $until = $until1 } '2' { $until = $until3 } '3' { $until = $night } '4' { $until = $morning } }
+                if ($null -eq $until) { continue }
+                $code = $script:UnlockCode
+                if ([string]::IsNullOrEmpty($code)) { $code = '123'; Write-Line '  UnlockCode пустой: код разрешения входа - 123 (как у обновления рабочей)' 'Yellow' }
+                if ($isProd -and -not (Confirm-Ui -Question ("Закрыть вход в {0} до {1}? Новые сеансы не откроются (кроме входа с кодом разрешения), открытые останутся." -f $baseName, $until.ToString('dd.MM HH:mm')) -Yes 'Да, закрыть вход' -No 'Нет' -DefaultNo)) { continue }
+                $from = (Get-Date).AddMinutes(-30)
+                $info.DeniedFrom = $from.AddTicks(-($from.Ticks % [timespan]::TicksPerSecond))
+                $info.DeniedTo = $until.AddTicks(-($until.Ticks % [timespan]::TicksPerSecond))
+                $info.PermissionCode = $code
+                $info.DeniedMessage = ('Технические работы, вход в программу закрыт до {0}' -f $until.ToString('dd.MM HH:mm'))
+                $info.SessionsDenied = $true
+                $null = $target.Process.UpdateInfoBase($info)
+                $check = Read-BaseInfoAgain $target $baseName
+                if (-not [bool]$check.SessionsDenied -or [string]$check.PermissionCode -cne $code) { throw 'запись блокировки начала сеансов не подтвердилась: проверь в консоли кластера' }
+                $done = ('поставил блокировку начала сеансов до {0}' -f $until.ToString('dd.MM HH:mm'))
+            }
+            elseif ($answer -eq '1') {
+                if ([string]$info.PermissionCode -cne [string]$script:UnlockCode) {
+                    Write-Line '  код разрешения у этой блокировки не тот, что UnlockCode: её ставил не гейт (консоль кластера, админ)' 'Yellow'
+                }
+                if ($isProd -and -not (Confirm-Ui -Question ("Открыть вход в {0}? Блокировка начала сеансов будет снята." -f $baseName) -Yes 'Да, открыть вход' -No 'Нет' -DefaultNo)) { continue }
+                $info.SessionsDenied = $false
+                $null = $target.Process.UpdateInfoBase($info)
+                if ([bool](Read-BaseInfoAgain $target $baseName).SessionsDenied) { throw 'снятие блокировки начала сеансов не подтвердилось: проверь в консоли кластера' }
+                $done = 'снял блокировку начала сеансов'
+            }
+            elseif (-not $jobsOn) {
+                if ($isProd -and -not (Confirm-Ui -Question ("Запретить регламентные задания {0}? Обмены и прочие задания не запустятся, пока запрет не снимут." -f $baseName) -Yes 'Да, запретить' -No 'Нет' -DefaultNo)) { continue }
+                $info.ScheduledJobsDenied = $true
+                $null = $target.Process.UpdateInfoBase($info)
+                if (-not [bool](Read-BaseInfoAgain $target $baseName).ScheduledJobsDenied) { throw 'запрет регламентных заданий не подтвердился: проверь в консоли кластера' }
+                $done = 'поставил блокировку регламентных заданий'
+            }
+            else {
+                if ($isProd -and -not (Confirm-Ui -Question ("Снять запрет регламентных заданий {0}? Задания начнут запускаться по расписанию." -f $baseName) -Yes 'Да, снять' -No 'Нет' -DefaultNo)) { continue }
+                $info.ScheduledJobsDenied = $false
+                $null = $target.Process.UpdateInfoBase($info)
+                if ([bool](Read-BaseInfoAgain $target $baseName).ScheduledJobsDenied) { throw 'снятие запрета регламентных заданий не подтвердилось: проверь в консоли кластера' }
+                $done = 'снял блокировку регламентных заданий'
+            }
+            Write-Line ("  {0}: {1}" -f $baseName, $done) 'Green'
+            Write-RunLog ("{0}: {1}" -f $baseName, $done)
+            Write-Host ''
+        }
+    }
+    finally { if ($null -ne $guard) { $guard.Dispose() } }
+}
+
+if ($ManualLocks) {
+    Invoke-ManualLocks $LocksBase
     exit 0
 }
 

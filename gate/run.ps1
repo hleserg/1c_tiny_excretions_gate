@@ -4256,10 +4256,10 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
     $menuSlots = @(
         @('kit', 'Тестовая база', '1'), @('asis', 'Тестовая база', '2'), @('resume', 'Тестовая база', '3'),
         @('gitimport', 'Тестовая база', '4'), @('gitexport', 'Тестовая база', '5'), @('accept', 'Тестовая база', '6'),
-        @('runs', 'Тестовая база', '7'), @('tests', 'Тестовая база', '8'),
+        @('runs', 'Тестовая база', '7'), @('tests', 'Тестовая база', '8'), @('templocks', 'Тестовая база', 'q'),
         @('precheck', 'Рабочая база', '9'), @('applyprep', 'Рабочая база', 'a'), @('prepare', 'Рабочая база', 'b'),
         @('cancelprep', 'Рабочая база', 'c'), @('deploy', 'Рабочая база', 'd'), @('rollback', 'Рабочая база', 'e'),
-        @('basestate', 'Рабочая база', 'f'),
+        @('basestate', 'Рабочая база', 'f'), @('prodlocks', 'Рабочая база', 'r'),
         @('cmpext', 'Сравнить и забрать', 'g'), @('cmpepf', 'Сравнить и забрать', 'h'), @('pullext', 'Сравнить и забрать', 'i'),
         @('pullepf', 'Сравнить и забрать', 'j'), @('gitprod', 'Сравнить и забрать', 'k'),
         @('settings', 'Гейт', 'l'), @('update', 'Гейт', 'm'), @('stats', 'Гейт', 'n'), @('comcheck', 'Гейт', 'o'), @('exit', 'Гейт', 'p'))
@@ -4318,6 +4318,9 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
                 $menu.Add((New-MenuItem 'cancelprep' 'Отменить подготовку рабочей' 'вернуть расширения к применённым версиям'))
             }
             $menu.Add((New-MenuItem 'basestate' 'Показать состояние баз' 'блокировки и сеансы'))
+            # Блокировки руками (deploy.ps1 -ManualLocks): поставить или снять, каждое изменение - выбором человека.
+            $menu.Add((New-MenuItem 'templocks' 'Блокировки тестовой базы' ('{0}: поставить или снять начало сеансов, регламентные задания' -f $script:Base)))
+            $menu.Add((New-MenuItem 'prodlocks' 'Блокировки рабочей базы' ('{0}: поставить или снять начало сеансов, регламентные задания' -f [string](Get-Setting $cfg 'ProdBase' 'рабочая'))))
             $menu.Add((New-MenuItem 'comcheck' 'Проверка внешнего соединения (COM)' ('с {0}: как читаются расширения, только читает' -f $script:Base)))
             $menu.Add((New-MenuItem 'cmpext' 'Сравнить расширения' 'рабочая и temp'))
             $menu.Add((New-MenuItem 'cmpepf' 'Сравнить внешние обработки' 'рабочая и temp'))
@@ -4412,6 +4415,17 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             # Только чтение, только temp: каким способом через внешнее соединение читаются расширения - и обратно в меню.
             try {
                 if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -ComCheck -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') -ComCheck }
+            }
+            catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
+            Wait-UiAcknowledge
+            continue
+        }
+        if ($choice -eq 'templocks' -or $choice -eq 'prodlocks') {
+            $locksWhich = 'Temp'
+            if ($choice -eq 'prodlocks') { $locksWhich = 'Prod' }
+            try {
+                if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -ManualLocks -LocksBase $locksWhich -UiChannel $UiChannel }
+                else { & (Join-Path $Root 'deploy.ps1') -ManualLocks -LocksBase $locksWhich }
             }
             catch { Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red }
             Wait-UiAcknowledge
