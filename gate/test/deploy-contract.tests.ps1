@@ -233,10 +233,10 @@ function New-ContractCatalogLink {
             $closed = @($writes | Where-Object { $_ -match 'sessionsDenied=1' })
             Check ($closed.Count -gt 0) 'блокировку начала сеансов не ставили'
             Check ($writes.Count -gt 0 -and $writes[-1] -match 'scheduledJobsDenied=0 sessionsDenied=0') 'последняя запись свойств рабочей - не снятие блокировок'
-            $article = @(Get-Calls $r @('ENTERPRISE', 'kbarticle'))
-            $plain = @(Get-Calls $r @('ENTERPRISE', 'canary-plain'))
-            $coded = @(Get-Calls $r @('ENTERPRISE', 'canary.txt'))
-            $dumps = @(Get-Calls $r @('/DumpConfigToFiles', 'fake\erp_base', '-Extension Адаптация'))
+            $article = Get-Calls $r @('ENTERPRISE', 'kbarticle')
+            $plain = Get-Calls $r @('ENTERPRISE', 'canary-plain')
+            $coded = Get-Calls $r @('ENTERPRISE', 'canary.txt')
+            $dumps = Get-Calls $r @('/DumpConfigToFiles', 'fake\erp_base', '-Extension Адаптация')
             Check ($article.Count -eq 1) ("статей в базу знаний: {0}, ждали одну" -f $article.Count)
             Check ($plain.Count -eq 1) ("входов без кода разрешения: {0}, ждали один" -f $plain.Count)
             Check ($coded.Count -eq 1 -and $coded[0].Line.Contains('/UC')) 'канареечный вход при закрытой базе шёл без кода разрешения'
