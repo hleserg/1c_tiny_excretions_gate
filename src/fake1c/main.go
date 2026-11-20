@@ -20,7 +20,7 @@
 // (ext\<имя>); выгрузка этого расширения (/DumpConfigToFiles) отдаёт потом её файлы - как настоящая база. Расширения
 // из списка absent до загрузки «нет в базе»: их выгрузка - код 1 и «не найдено».
 //
-// Приёмка поставок (техническая база, файловая /F): у файловой базы свой склад расширений (ext@<база>\<имя>).
+// Приёмка поставок (техническая база: файловая, создана CREATEINFOBASE): у неё свой склад расширений (ext@<база>\<имя>).
 // /LoadCfg <файл> -Extension <имя> с файлом-архивом zip (подставной .cfe - архив выгрузки в файлы) кладёт его выгрузку
 // в склад, /DeleteCfg -Extension <имя> - убирает. /DumpExternalDataProcessorOrReportToFiles с архивом zip (подставной
 // .epf/.erf - архив выгрузки: <Имя>.xml и <Имя>/...) отдаёт его под именем корня; в архиве есть PROTECTED - код 1,
@@ -202,6 +202,13 @@ func main() {
 	} else if len(args) > 0 && strings.EqualFold(args[0], "ENTERPRISE") {
 		mode = "ENTERPRISE"
 		code = client(sc, args, state)
+	} else if len(args) > 1 && strings.EqualFold(args[0], "CREATEINFOBASE") {
+		// Файловая база, созданная так (техническая база приёмки), получает свой склад расширений - метка в её папке.
+		mode = "CREATEINFOBASE"
+		if path := createdFileBase(args[1]); path != "" {
+			_ = os.MkdirAll(path, 0o755)
+			_ = os.WriteFile(filepath.Join(path, createdMarker), []byte("fake1c"), 0o644)
+		}
 	}
 	// Гейт может держать два процесса 1С сразу (проверка конфигурации параллельно с остальными шагами):
 	// счётчики дописываются к тому, что лежит в файле сейчас, а не перезаписывают его прежней копией.
@@ -327,8 +334,8 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 			}
 		}
 	}
-	// Удаление расширения очищает склад только у файловой базы (техническая база приёмки): у серверной склад
-	// остаётся, как раньше, - на нём держатся тесты, которые правят выгрузку «в базе» после прогона.
+	// Удаление расширения очищает склад только у базы, созданной подставной 1С (техническая база приёмки): у остальных
+	// склад остаётся, как раньше, - на нём держатся тесты, которые правят выгрузку «в базе» после прогона.
 	if hasArg(args, "/DeleteCfg") && logDir != "" && isFileBase(args) {
 		if ext := valueAfter(args, "-Extension"); ext != "" {
 			_ = os.RemoveAll(extStore(args, ext))
@@ -941,23 +948,43 @@ func processingRun(mode string, r processing, dir string, p map[string]string) {
 	writeUTF8(dir+"result.txt", strings.Join(lines, "\n"))
 }
 
-// extStore - склад выгрузок расширения базы: у серверной - ext\<имя> (как раньше), у файловой - ext@<папка базы>\<имя>.
-func extStore(args []string, ext string) string {
+// createdMarker - метка файловой базы, созданной подставной 1С (CREATEINFOBASE): у неё свой склад расширений.
+const createdMarker = "fake1c-created.txt"
+
+// createdFileBase - путь из File="<путь>" (или File=<путь>) команды CREATEINFOBASE.
+func createdFileBase(arg string) string {
+	if !strings.HasPrefix(strings.ToLower(arg), "file=") {
+		return ""
+	}
+	value := strings.TrimSpace(arg[5:])
+	value = strings.TrimSuffix(value, ";")
+	return strings.Trim(value, "\"")
+}
+
+// fileBasePath - папка файловой базы из /F"<путь>", если она создана подставной 1С; иначе пусто.
+func fileBasePath(args []string) string {
 	for _, a := range args {
 		if len(a) > 2 && (strings.HasPrefix(a, "/F") || strings.HasPrefix(a, "/f")) {
-			return filepath.Join(logDir, "ext@"+filepath.Base(strings.Trim(a[2:], "\"")), ext)
+			path := strings.Trim(a[2:], "\"")
+			if _, err := os.Stat(filepath.Join(path, createdMarker)); err == nil {
+				return path
+			}
 		}
+	}
+	return ""
+}
+
+// extStore - склад выгрузок расширения базы: ext\<имя>, как раньше (и у файловой базы тестов гейта); у файловой базы,
+// созданной CREATEINFOBASE (техническая база приёмки), - свой: ext@<папка базы>\<имя>, чтобы не смешивать с temp.
+func extStore(args []string, ext string) string {
+	if path := fileBasePath(args); path != "" {
+		return filepath.Join(logDir, "ext@"+filepath.Base(path), ext)
 	}
 	return filepath.Join(logDir, "ext", ext)
 }
 
 func isFileBase(args []string) bool {
-	for _, a := range args {
-		if len(a) > 2 && (strings.HasPrefix(a, "/F") || strings.HasPrefix(a, "/f")) {
-			return true
-		}
-	}
-	return false
+	return fileBasePath(args) != ""
 }
 
 func hasArg(args []string, key string) bool {
