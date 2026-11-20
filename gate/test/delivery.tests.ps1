@@ -179,8 +179,9 @@ function Get-DeliveryStates {
 function Get-DPulls {
     param([string]$Sandbox)
     $file = Join-Path $Sandbox 'fake-github\pulls.txt'
-    if (-not (Test-Path -LiteralPath $file)) { return @() }
-    return @([System.IO.File]::ReadAllLines($file, $utf8) | Where-Object { $_ })
+    # Запятая: один PR - всё равно массив (.Count под StrictMode).
+    if (-not (Test-Path -LiteralPath $file)) { return , @() }
+    return , @([System.IO.File]::ReadAllLines($file, $utf8) | Where-Object { $_ })
 }
 
 function Get-DMainText {
@@ -448,7 +449,8 @@ function Check-DeliveryCommon {
             Check ($null -ne $module -and $module.Contains('Окр(Цена * Количество, 2)') -and $module.Contains('Функция Наценка')) 'в main не наше решение по процедуре или нет новой функции'
             $print = Get-DMainText $gh 'processings/Печать/Печать/Ext/ObjectModule.bsl'
             Check ($null -ne $print -and $print.Contains('НоваяПроцедура')) 'обработка не в выбранной карточке'
-            $report = [System.IO.File]::ReadAllText((Join-Path $sb ('deliveries\{0}eport.md' -f $state.id)), $utf8)
+            $report = [System.IO.File]::ReadAllText((Join-Path $sb ('deliveries\{0}
+eport.md' -f $state.id)), $utf8)
             foreach ($word in @('Доработки_v9.cfe', 'Печать.epf', 'ОтчётПродаж.erf', 'Закрытая.epf', $closedSha, 'Решено человеком', 'Регистрация в справочнике', 'Сборка в технической базе', 'Цепочка', $refMain)) {
                 Check ($report.Contains($word)) ("в отчёте нет «{0}»" -f $word)
             }
