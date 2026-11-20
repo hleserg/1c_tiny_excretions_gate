@@ -949,6 +949,45 @@ if ((Test-Path -LiteralPath $unitNewPath) -or (Test-Path -LiteralPath $unitChang
     $report.Add('')
 }
 # ** Хлебников С.Ю. 20261120 конец
+# ** Хлебников С.Ю. 20261120 Поимённо то, что в итоге шагов стоит числом: разбор читают и там, где папки прогона нет
+# (итог прогона в GitHub). Всё ниже - сведения, на вердикт и на «КОРОТКО» не влияет.
+# 1. Пропущенные модульные тесты с причиной: по ним видно, каких данных в базе нет.
+$unitSkipped = @(Read-TextLines (Join-Path $RunDir 'unittests.txt') | ForEach-Object { ([string]$_).TrimStart([char]0xFEFF) } | Where-Object { $_.StartsWith("SKIP`t") })
+if ($unitSkipped.Count -gt 0) {
+    $report.Add(('== Модульные тесты: пропущено {0}' -f $unitSkipped.Count))
+    foreach ($unitLine in $unitSkipped) {
+        $unitParts = $unitLine.Split("`t")
+        $unitReason = ''
+        if ($unitParts.Length -ge 3) { $unitReason = $unitParts[2] }
+        if (-not $unitReason) { $unitReason = 'причина не записана' }
+        $report.Add(('   {0}: {1}' -f $unitParts[1], $unitReason))
+    }
+    $report.Add('')
+}
+# 2. Известные ошибки самопроверки, которых не было в прошлом прогоне: эталон «до» мог сняться уже новым пакетом,
+# и первые запуски новых проверок сразу стали известными - что в них упало, по числу не узнать.
+$knownErrorsNow = @($afterRecords | Where-Object { $_.StartsWith('[ОШИБКА]') -and $newSelfCheck -notcontains $_ })
+$previousRun = @($script:EarlierRuns | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'selfcheck-after.norm.txt') } | Select-Object -Last 1)
+if ($knownErrorsNow.Count -gt 0 -and $previousRun.Count -gt 0) {
+    $previousRecords = @(Read-RecordSet (Join-Path $previousRun[0].FullName 'selfcheck-after.norm.txt'))
+    $knownFirst = @($knownErrorsNow | Where-Object { $previousRecords -notcontains $_ })
+    if ($knownFirst.Count -gt 0) {
+        $report.Add(('== Самопроверка: известные ошибки, которых не было в прошлом прогоне ({0}): {1} из {2} известных' -f $previousRun[0].Name, $knownFirst.Count, $knownErrorsNow.Count))
+        foreach ($knownLine in $knownFirst) { $report.Add(('   ' + $knownLine)) }
+        $report.Add('')
+    }
+}
+# 3. Новые и пропавшие снимки самопроверки - ключами (объект для снимка база выбирает заново, он может смениться сам).
+$snapshotKeyLines = @(Read-RecordSet (Join-Path $RunDir 'selfcheck-after.snapshots.keys.txt'))
+if ($snapshotKeyLines.Count -gt 0) {
+    $snapshotAdded = @($snapshotKeyLines | Where-Object { $_.StartsWith("+`t") } | ForEach-Object { $_.Substring(2) })
+    $snapshotGone = @($snapshotKeyLines | Where-Object { $_.StartsWith("-`t") } | ForEach-Object { $_.Substring(2) })
+    $report.Add(('== Снимки самопроверки: новых {0}, пропало {1}' -f $snapshotAdded.Count, $snapshotGone.Count))
+    foreach ($snapshotName in $snapshotAdded) { $report.Add(('   новый: ' + $snapshotName)) }
+    foreach ($snapshotName in $snapshotGone) { $report.Add(('   пропал: ' + $snapshotName)) }
+    $report.Add('')
+}
+# ** Хлебников С.Ю. 20261120 конец
 $report.Add('Подробности: summary.txt, *.new.txt, selfcheck-after.journal.txt в папке прогона. Разбор строится только по файлам прогона, без 1С.')
 
 $reportPath = Join-Path $RunDir 'report.txt'

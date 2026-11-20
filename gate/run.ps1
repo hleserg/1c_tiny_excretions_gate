@@ -2098,6 +2098,13 @@ function Compare-SelfCheckSnapshots {
     $gone = New-Object System.Collections.Generic.List[string]
     foreach ($key in @($reference.Keys | Sort-Object)) { if (-not $Current.Contains($key)) { $gone.Add($key) } }
     if ($changed.Count -gt 0 -and $DiffPath) { [System.IO.File]::WriteAllLines($DiffPath, $diff.ToArray(), $Utf8Bom) }
+    # ** Хлебников С.Ю. 20261120 Новые и пропавшие снимки - поимённо, рядом с разницей (*.snapshots.keys.txt): разбор
+    # прогона показывает их тем, у кого папки прогона нет. Только сведения, на вердикт не влияют.
+    if ($DiffPath -match '\.diff\.txt$' -and (Test-Path -LiteralPath $ReferenceFile) -and ($added.Count -gt 0 -or $gone.Count -gt 0)) {
+        $keyLines = @($added | ForEach-Object { "+`t" + $_ }) + @($gone | ForEach-Object { "-`t" + $_ })
+        [System.IO.File]::WriteAllLines(($DiffPath -replace '\.diff\.txt$', '.keys.txt'), [string[]]$keyLines, $Utf8Bom)
+    }
+    # ** Хлебников С.Ю. 20261120 конец
     return [pscustomobject]@{
         HasReference = (Test-Path -LiteralPath $ReferenceFile)
         Total        = @($Current.Keys).Count

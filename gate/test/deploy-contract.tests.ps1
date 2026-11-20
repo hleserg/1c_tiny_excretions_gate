@@ -168,6 +168,53 @@ function New-ContractCatalogLink {
         }
     },
     @{
+        Name = 'gate-report-names'
+        Text = 'разбор прогона называет поимённо то, что в итоге шагов стоит числом: новые и пропавшие снимки, пропущенные модульные тесты с причиной, известные ошибки, которых не было в прошлом прогоне'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb $cfeName
+            $tasks = {
+                param([string]$Key)
+                @(
+                    @{ key = 'Окружение'; title = 'Окружение и расширения'; step = 'Окружение'; lines = @('[ОК] Обработка запущена под полными правами') },
+                    @{ key = 'Обмены'; title = 'Обмены'; step = 'Обмены'; lines = @('[ОК] Бухгалтерия: документ выгружается'); snapshots = @{ $Key = 'Сумма=100' } }
+                )
+            }
+            $oldKey = 'обмен|Бухгалтерия|Документ.Старый|11111111-2222-3333-4444-555555555555'
+            $newKey = 'обмен|Бухгалтерия|Документ.Новый|99999999-8888-7777-6666-555555555555'
+            $fake = @{ selfcheck = @(@{ tasks = (& $tasks $oldKey) }, @{ tasks = (& $tasks $newKey); fingerprint = 'после' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $r
+            if (-not $r.RunDir) { Check $false 'нет папки прогона'; return }
+            $keysFile = Join-Path $r.RunDir 'selfcheck-after.snapshots.keys.txt'
+            Check (Test-Path -LiteralPath $keysFile) 'нет selfcheck-after.snapshots.keys.txt'
+            $reportText = [System.IO.File]::ReadAllText((Join-Path $r.RunDir 'report.txt'), $utf8)
+            Check ($reportText.Contains('== Снимки самопроверки: новых 1, пропало 1')) 'в разборе нет раздела о новых и пропавших снимках'
+            Check ($reportText.Contains('новый: ' + $newKey) -and $reportText.Contains('пропал: ' + $oldKey)) 'в разборе нет ключей нового и пропавшего снимка'
+            # Следующий прогон - из файлов: известная ошибка, которой в прошлом прогоне не было, и пропущенный тест.
+            $next = Join-Path (Split-Path -Parent $r.RunDir) '99991231-235959'
+            New-Item -ItemType Directory -Path $next -Force | Out-Null
+            Copy-Item -LiteralPath (Join-Path $r.RunDir 'verdict.json') -Destination $next
+            $normFile = Join-Path $r.RunDir 'selfcheck-after.norm.txt'
+            if (-not (Test-Path -LiteralPath $normFile)) { Check $false 'в папке прогона нет selfcheck-after.norm.txt'; return }
+            $knownOld = @([System.IO.File]::ReadAllLines($normFile, $utf8) | ForEach-Object { $_.TrimStart([char]0xFEFF) } | Where-Object { $_ })
+            $firstSeen = '[ОШИБКА] ПроверкиДокументов :: Шаг прерван исключением: метод не обнаружен'
+            $brandNew = '[ОШИБКА] Обмены :: Бухгалтерия: документ не выгружается'
+            [System.IO.File]::WriteAllLines((Join-Path $next 'selfcheck-after.norm.txt'), [string[]](@($knownOld) + @($firstSeen, $brandNew)), $utf8Bom)
+            [System.IO.File]::WriteAllLines((Join-Path $next 'selfcheck-after.new.txt'), [string[]]@($brandNew), $utf8Bom)
+            [System.IO.File]::WriteAllLines((Join-Path $next 'unittests.txt'), [string[]]@("OK`tОМ_Пример.Сложение`t", "SKIP`tОМ_Пример.Остатки`tНет документа с остатком на складе"), $utf8Bom)
+            $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $sb 'report.ps1') -RunDir $next -Quiet
+            $nextReport = Join-Path $next 'report.txt'
+            if (-not (Test-Path -LiteralPath $nextReport)) { Check $false 'разбор второго прогона не записал report.txt'; return }
+            $nextText = [System.IO.File]::ReadAllText($nextReport, $utf8)
+            Check ($nextText.Contains('== Модульные тесты: пропущено 1') -and $nextText.Contains('ОМ_Пример.Остатки: Нет документа с остатком на складе')) 'в разборе нет пропущенного теста с причиной'
+            Check ($nextText.Contains(('не было в прошлом прогоне ({0}): 1 из 1 известных' -f (Split-Path -Leaf $r.RunDir)))) 'в разборе нет раздела об известных ошибках, которых не было в прошлом прогоне'
+            Check ($nextText.Contains('   ' + $firstSeen)) 'в разборе нет текста известной ошибки, которой не было в прошлом прогоне'
+            Check (-not $nextText.Contains('   ' + $brandNew)) 'новая ошибка попала в раздел известных'
+        }
+    },
+    @{
         Name = 'deploy-contract-open-early'
         Text = 'обновление с блокировкой сеансов: блокировки сняты до статьи в базу знаний и выгрузки рабочей, потом вход без кода разрешения; в итоге - простой (#24, #2)'
         Run = {
