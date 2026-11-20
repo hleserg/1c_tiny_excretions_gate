@@ -223,7 +223,7 @@ function Check-DeliveryCommon {
 @(
     @{
         Name = 'delivery-cfe-first'
-        Text = 'Приёмка: первый CFE без истории. Правка temp (новый реквизит) - штатно PR и слиянием по CI; реквизит сохранён, замена процедуры - один вопрос с разницей, новая функция принята; кандидат - PR, CI, merge_checked по точному SHA, загрузка этого SHA, GREEN. Тот же файл под другим именем - повторная подача без PR; поставка из «Входящих» прямой загрузкой не берётся.'
+        Text = 'Приёмка: первый CFE без истории. Правка temp (новый реквизит) - штатно PR и слиянием по CI; реквизит сохранён, замена процедуры - один вопрос с разницей, новая функция принята; кандидат - PR, CI, merge_checked по точному SHA, загрузка этого SHA, GREEN. Тот же файл под другим именем - повторная подача без PR; поставка из «Входящих» прямой загрузкой не берётся. Следующая поставка с другими процедурами - без вопросов: изменение подрядчика принято, отклонённое не вернулось, наш реквизит цел. Старый файл с другим номером версии - нового нет, без PR и загрузки.'
         Run = {
             param($Name)
             $com = New-ComState
@@ -292,6 +292,34 @@ function Check-DeliveryCommon {
             Check ((Get-DPulls $sb).Count -eq 3) 'повторная подача создала PR'
             Check ((Get-DStubs $sb).Count -eq 1) 'повторная подача запустила гейт'
             Check (@($again.Output | Where-Object { $_ -match 'повторная подача' }).Count -gt 0) 'не сказано о повторной подаче'
+            # Следующая поставка того же расширения - другие процедуры: Скидку подрядчик поменял (у нас она как в его
+            # прошлой поставке) - берётся без вопроса; Пересчитать - та же, что отклонили, - молча остаётся наше;
+            # реквизита Склад у подрядчика нет, но он его и не поставлял - не удаление.
+            Reset-FakeState $sb
+            $null = New-DZip -Path (Join-Path $inbox 'erp_Доработки_v8.cfe') -Files (New-DExtFiles -Version '1.0.0.8' -Module (New-DModule -Digits '0' -Discount 'Сумма * 0.05' -Extra 'Сумма * 0.1'))
+            $next = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{ dumps = (New-DDumps -Ext (Get-DMainExt $gh)) } -Com $null
+            Check-DeliveryCommon $next
+            $second = @(Get-DeliveryStates $sb | Where-Object { $_.id -ne $state.id })
+            Check ($second.Count -eq 1 -and [string]$second[0].verdict -eq 'GREEN') ("вторая поставка: " + (@($second | ForEach-Object { '{0} {1} {2}' -f $_.status, $_.verdict, $_.note }) -join '; '))
+            $module = Get-DMainText $gh 'extensions/Доработки/Documents/Заказ/Ext/ObjectModule.bsl'
+            Check ($null -ne $module -and $module.Contains('Возврат Сумма * 0.05;')) 'изменение подрядчика (Скидка) не принято'
+            Check ($null -ne $module -and $module.Contains('Количество, 2)') -and -not $module.Contains('Количество, 0)')) 'отклонённая раньше замена вернулась'
+            $doc = Get-DMainText $gh 'extensions/Доработки/Documents/Заказ.xml'
+            Check ($null -ne $doc -and $doc.Contains('<Name>Склад</Name>')) 'наш реквизит удалён: подрядчик его не поставлял'
+            Check ((Get-DPulls $sb).Count -eq 4) 'второй поставке нужен ровно один новый PR'
+            # Старый файл под новым именем и со старым номером версии: всё в нём уже в истории - нового нет, PR и
+            # загрузки нет. Номер версии доказательством не считается.
+            Reset-FakeState $sb
+            $null = New-DZip -Path (Join-Path $inbox 'Доработки_от_подрядчика_ещё_раз.cfe') -Files (New-DExtFiles -Version '1.0.0.6' -Module (New-DModule -Digits '0' -Extra 'Сумма * 0.1'))
+            $stubsBefore = (Get-DStubs $sb).Count
+            $old = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{ dumps = (New-DDumps -Ext (Get-DMainExt $gh)) } -Com $null
+            Check-DeliveryCommon $old
+            $third = @(Get-DeliveryStates $sb | Where-Object { $_.id -ne $state.id -and $_.id -ne $second[0].id })
+            Check ($third.Count -eq 1 -and [string]$third[0].verdict -eq 'UNCHANGED' -and [string]$third[0].status -eq 'done') ("старый файл: " + (@($third | ForEach-Object { '{0} {1} {2}' -f $_.status, $_.verdict, $_.note }) -join '; '))
+            Check ((Get-DPulls $sb).Count -eq 4) 'старый файл открыл PR'
+            Check ((Get-DStubs $sb).Count -eq $stubsBefore) 'старый файл запустил гейт'
+            $module = Get-DMainText $gh 'extensions/Доработки/Documents/Заказ/Ext/ObjectModule.bsl'
+            Check ($null -ne $module -and $module.Contains('Возврат Сумма * 0.05;')) 'старый файл откатил принятое изменение'
         }
     },
     @{
