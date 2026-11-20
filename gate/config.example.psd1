@@ -195,10 +195,10 @@
     DeliveryDir = 'deliveries'
     DeliveryTechBase = 'deliveries\tech-stand'
     # Слияние PR самим гейтом через ci/merge_checked.py репозитория расширений - только если хеш файла в main равен
-    # закреплённому (DeliveryMergeCheckedBlob, git hash-object): изменённый CI сначала смотрит человек. Нужен Python 3.9+.
+    # закреплённому (DeliveryMergeCheckedBlob, git hash-object): изменённый CI сначала смотрит человек. Python для приёмки входит в комплект.
     DeliveryAutoMerge = $false
     # DeliveryMergeCheckedBlob = 'хеш блоба git'
-    DeliveryPython = 'python'
+    DeliveryPython = ''  # пусто или прежнее 'python' - из комплекта; свой интерпретатор - полным путём
     DeliveryCiWaitMin = 30
 
     # Статистика длительностей шагов (stats.ps1): папка журнала и за сколько дней брать записи для прогноза.

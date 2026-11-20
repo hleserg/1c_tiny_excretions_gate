@@ -117,7 +117,7 @@ $catalog = @(
     @('Приёмка поставок', 'DeliveryTechBase', 'str', 'техническая файловая база для разбора поставок (основная конфигурация temp, без данных)', '''deliveries\tech-stand'''),
     @('Приёмка поставок', 'DeliveryAutoMerge', 'bool', 'гейт сам сливает PR после зелёного CI через merge_checked.py (только с закреплённым хешем)', '$false'),
     @('Приёмка поставок', 'DeliveryMergeCheckedBlob', 'str', 'git-хеш доверенного ci/merge_checked.py в main репозитория расширений; другой - автослияния нет', ''''''),
-    @('Приёмка поставок', 'DeliveryPython', 'str', 'Python 3.9+ для merge_checked.py', '''python'''),
+    @('Приёмка поставок', 'DeliveryPython', 'str', 'интерпретатор для merge_checked.py: пусто - из комплекта, свой - полным путём', ''''''),
     @('Приёмка поставок', 'DeliveryCiWaitMin', 'int', 'сколько ждать CI PR за один проход, минут', '30'),
     @('Модульные тесты', 'UnitTestExtensions', 'list', 'тестовые расширения YAxUnit: грузятся из файлов UnitTestsDir\<имя> только в temp, в рабочую не уходят', '@()'),
     @('Модульные тесты', 'RunUnitTests', 'bool', 'шаг «Модульные тесты» в прогоне гейта', '$true'),

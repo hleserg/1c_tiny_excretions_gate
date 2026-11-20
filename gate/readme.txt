@@ -2372,7 +2372,7 @@ binaries/manifest.json; что у него внутри, не видно: про
 
 Настройки («Настройки - Приёмка поставок»): DeliveryInboxDir (Входящие), DeliveryDir (deliveries),
 DeliveryTechBase (deliveries\tech-stand), DeliveryMergeExe (merge1c.exe), DeliveryAutoMerge ($false -
-сливает человек), DeliveryPython (python, 3.9+), DeliveryMergeChecked (ci/merge_checked.py),
+сливает человек), DeliveryPython (пусто или python - из комплекта, свой интерпретатор - полным путём), DeliveryMergeChecked (ci/merge_checked.py),
 DeliveryMergeCheckedBlob, DeliveryCiWorkflow (.github/workflows/erp-static.yml), DeliveryCiWaitMin
 (30), DeliverySettleSec (15), DeliveryHistoryCommits (300). Токен для merge_checked.py - тот же
 GitHubTokenPassFile, передаётся переменной окружения процесса MERGE_CHECKED_TOKEN.
@@ -3618,3 +3618,7 @@ ComTimeoutSec (300 с), не ответило - «сравнить не удал
                  целиком с проверкой SHA-256; совпадающее с main правкой temp не считается; открытый PR
                  выгрузки temp продолжается. Обработка «Выполнить после обновления»: запись в карточку по
                  ссылке, назначение и публикация сохраняются, одноимённые карточки не отключаются.
+20261120.235700  Приёмка поставок запускает Python из каталога гейта. Интерпретатор Windows x64 включён в ZIP,
+                 установка и обновление работают в доступной пользователю папке. Старое DeliveryPython = 'python'
+                 тоже выбирает комплектный интерпретатор. На машине гейта скачивание Python не требуется.
+                 Для автономной сборки задать GATE_PYTHON_ZIP с официальным embeddable ZIP той же версии.
