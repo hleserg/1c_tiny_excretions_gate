@@ -494,7 +494,7 @@ function Save-GhFiles {
 
 #endregion
 
-#region Pull request, проверки, история (приёмка поставок, раздел 5.25)
+#region Pull request, проверки, история (приёмка поставок, раздел 5.26)
 
 # Подставной GitHub: pulls\<номер>.closed - PR закрыт без слияния; ci.txt - строки «<head>\t<status>\t<conclusion>»,
 # ci-default.txt - то же для всех остальных head («completed\tsuccess», «in_progress\t», «completed\tfailure»);

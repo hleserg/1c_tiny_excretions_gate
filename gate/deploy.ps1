@@ -44,7 +44,7 @@
     «Выполнить после обновления» в режиме regepf; прежняя версия сохраняется до записи - это откат.
 
     .\deploy.ps1 -Delivery [-DeliveryUnattended] [-DeliveryId <номер>]
-        Приёмка поставок подрядчика (раздел 5.25): файлы .cfe, .epf, .erf или папка комплекта из «Входящих» -
+        Приёмка поставок подрядчика (раздел 5.26): файлы .cfe, .epf, .erf или папка комплекта из «Входящих» -
         реестр (оригинал, SHA-256), разбор в технической базе, объединение с main, pull request и CI, слияние
         проверенного SHA, загрузка в temp под блокировкой и прогон гейта. Рабочую базу не трогает.
 
@@ -106,7 +106,7 @@ param(
     [switch]$GitUnattended,
     # С -GitImport: грузить только этот коммит main (полный SHA); main уже другой - не грузить.
     [string]$GitCommit = '',
-    # Приёмка поставок подрядчика (раздел 5.25): «Входящие» -> разбор в технической базе -> объединение с git ->
+    # Приёмка поставок подрядчика (раздел 5.26): «Входящие» -> разбор в технической базе -> объединение с git ->
     # pull request и CI -> загрузка проверенного SHA в temp -> гейт. DeliveryUnattended - без человека: решения
     # ждут, остальное идёт само. DeliveryId - только эта поставка.
     [switch]$Delivery,
@@ -2816,7 +2816,7 @@ function Get-GitManifestRefs {
 }
 
 function Get-GitBinaries {
-    # binaries/manifest.json коммита (раздел 5.25): обработки, принятые файлом целиком (защищённые, непрозрачные) -
+    # binaries/manifest.json коммита (раздел 5.26): обработки, принятые файлом целиком (защищённые, непрозрачные) -
     # папка -> запись (folder, objectName, file, sha256, ref). Файл - binaries/<папка>/<файл>, ставится только с этим sha256.
     param($Setup, [hashtable]$Files)
     $list = @{}
@@ -3154,7 +3154,7 @@ function Invoke-GitImport {
     # manifest.json правкой temp не считается: версия и хеш обработки меняются от самой загрузки из git. В ветку с
     # правками он идёт, если правки есть.
     $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes -Ignore (@('processings/manifest.json') + @($skippedPaths))
-    # Совпадающее с main - не правка temp, а недогруженная прежняя загрузка (раздел 5.25: обрыв после первого объекта).
+    # Совпадающее с main - не правка temp, а недогруженная прежняя загрузка (раздел 5.26: обрыв после первого объекта).
     $sameAsHead = @()
     if ($drift.Count -gt 0 -and $known -and $known -ne $head.Sha) {
         $sameAsHead = @($drift | Where-Object { Test-GitSameAsHead $_ $headFiles })
@@ -3214,7 +3214,7 @@ function Invoke-GitImport {
         if ((Get-GitFolderPrint $headFiles $prefix) -ne (Get-GitFolderPrint $localShas $prefix)) { $toLoad.Add([pscustomobject]@{ Kind = 'extension'; Name = $name; Prefix = $prefix; Ref = ''; Binary = $null }) }
     }
     # Элемент справочника каждой папки - из manifest.json main: запись идёт в него (regepf с ref=), а не в первый
-    # элемент с тем же именем объекта. Обработки, принятые файлом целиком, - из binaries/ (раздел 5.25).
+    # элемент с тем же именем объекта. Обработки, принятые файлом целиком, - из binaries/ (раздел 5.26).
     $manifestRefs = Get-GitManifestRefs -Setup $Setup -Files $headFiles
     $binaries = Get-GitBinaries -Setup $Setup -Files $headFiles
     foreach ($name in @($headTracked.Processings)) {
@@ -3764,7 +3764,7 @@ function Set-GitLoaded {
 }
 
 if ($Delivery) {
-    # Приёмка поставок (раздел 5.25): свой файл, подключается точкой - пользуется функциями git этого скрипта.
+    # Приёмка поставок (раздел 5.26): свой файл, подключается точкой - пользуется функциями git этого скрипта.
     if (-not $DeliveryUnattended -and -not (Test-UiCanAsk)) { throw 'приёмку поставок с вопросами - из консоли или ci.exe; без человека - deploy.ps1 -Delivery -DeliveryUnattended' }
     . (Join-Path $Root 'github.ps1')
     . (Join-Path $Root 'delivery.ps1')

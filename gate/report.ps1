@@ -822,6 +822,15 @@ if ($kitProcessings.Count -gt 0) {
 }
 
 # Шаги, которые шли заметно дольше прежних прогонов.
+# ** Хлебников С.Ю. 20261120 Самопроверка «до загрузки», взятая из эталона (не запускалась, секунды), и полная
+# (десятки минут) - разные замеры: в одной медиане полная выглядела бы «дольше обычного» из-за нагрузки на сервер.
+function Get-ReportStepTimeKey {
+    param($Step)
+    $name = [string](Get-JsonProperty $Step 'name' '')
+    if ([string](Get-JsonProperty $Step 'detail' '') -like 'не запускалась*') { return ($name + ' (из эталона)') }
+    return $name
+}
+# ** Хлебников С.Ю. 20261120 конец
 $history = @{}
 foreach ($dir in $script:EarlierRuns) {
     $verdictPath = Join-Path $dir.FullName 'verdict.json'
@@ -832,14 +841,14 @@ foreach ($dir in $script:EarlierRuns) {
         if ([string](Get-JsonProperty $step 'from' '')) { continue }
         $seconds = [int](Get-JsonProperty $step 'seconds' 0)
         if ([string](Get-JsonProperty $step 'status' '') -ne 'OK' -or $seconds -le 0) { continue }
-        $name = [string](Get-JsonProperty $step 'name' '')
+        $name = Get-ReportStepTimeKey $step # ** Хлебников С.Ю. 20261120
         if (-not $history.ContainsKey($name)) { $history[$name] = New-Object System.Collections.Generic.List[int] }
         $history[$name].Add($seconds)
     }
 }
 $slow = New-Object System.Collections.Generic.List[string]
 foreach ($step in $steps) {
-    $name = [string](Get-JsonProperty $step 'name' '')
+    $name = Get-ReportStepTimeKey $step # ** Хлебников С.Ю. 20261120
     $seconds = [int](Get-JsonProperty $step 'seconds' 0)
     if ([string](Get-JsonProperty $step 'from' '')) { continue }
     if (-not $history.ContainsKey($name) -or $seconds -le 120) { continue }

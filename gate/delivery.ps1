@@ -1,6 +1,6 @@
 ﻿#requires -Version 5.1
 <#
-Приёмка поставок подрядчика (раздел 5.25 руководства). Подключается точкой из deploy.ps1 (-Delivery): пользуется его
+Приёмка поставок подрядчика (раздел 5.26 руководства). Подключается точкой из deploy.ps1 (-Delivery): пользуется его
 функциями temp и git (Get-TempSnapshot, Compare-GitSnapshot, New-GitTempBranch, Invoke-GitImport), конфигуратором
 (Invoke-V8), агентом кластера и блокировками (locks.ps1).
 

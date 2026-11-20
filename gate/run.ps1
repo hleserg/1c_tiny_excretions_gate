@@ -100,6 +100,14 @@ param(
     [ValidateSet('Run', 'Take', 'Load')]
     [string]$Tests = '',
 
+    # ** Хлебников С.Ю. 20261120 Служебный запуск: только одна группа заданий самопроверки (шаг очереди, как в заголовке
+    # шага журнала), без комплекта, подготовки базы и эталона - замер группы (раздел 5.25). Сравнить два таких
+    # запуска - selfcheck-compare.cmd.
+    [string]$SelfCheckGroup = '',
+
+    # ** Хлебников С.Ю. 20261120 Сколько исполнителей самопроверки (1 или 2) - вместо SelfCheckWorkers из config.psd1.
+    [int]$SelfCheckWorkers = 0,
+
     # Один тест «Модуль.Метод» для -Tests Run.
     [Parameter(ParameterSetName = 'Run')]
     [string]$TestFilter = '',
@@ -2365,7 +2373,7 @@ foreach ($unitName in $unitTestExtensions) {
 # Обновления в inbox - каждое расширение (файл .cfe, каталог выгрузки, архив .zip) и каждая внешняя обработка
 # (файл .epf или .erf, каталог выгрузки обработки). Обработки гейт пока только показывает.
 $inboxDir = Resolve-RootPath ([string](Get-Setting $cfg 'InboxDir' 'inbox'))
-# «Входящие» приёмки поставок и её реестр (раздел 5.25): оттуда - только через git (deploy.ps1 -Delivery), прямой
+# «Входящие» приёмки поставок и её реестр (раздел 5.26): оттуда - только через git (deploy.ps1 -Delivery), прямой
 # загрузкой в temp ни меню, ни -Kit, ни продолжение прогона их не берут.
 $deliveryInboxDir = Resolve-RootPath ([string](Get-Setting $cfg 'DeliveryInboxDir' 'Входящие'))
 $deliveryStoreDir = Resolve-RootPath ([string](Get-Setting $cfg 'DeliveryDir' 'deliveries'))
@@ -2475,7 +2483,7 @@ function Add-InboxItems {
     # Обход inbox. Каталог выгрузки - одно обновление, внутрь него поиск не заходит.
     param([string]$Dir, [int]$Depth, $Items)
     foreach ($child in @(Get-ChildItem -LiteralPath $Dir | Sort-Object Name)) {
-        # «Входящие» приёмки поставок внутри inbox - не обновления для прямой загрузки (раздел 5.25).
+        # «Входящие» приёмки поставок внутри inbox - не обновления для прямой загрузки (раздел 5.26).
         if (Test-DeliveryPath $child.FullName) { continue }
         $relative = $child.FullName.Substring($inboxDir.TrimEnd('\').Length + 1)
         if (-not $child.PSIsContainer) {
@@ -4302,7 +4310,7 @@ function Show-UtMenu {
 #endregion
 
 # Итоги прежних прогонов, которые не ушли в GitHub (прогон оборвался, не было связи), - до всего остального.
-if (-not $Tests) { Invoke-RunPublish -Pending }
+if (-not ($Tests -or $SelfCheckGroup)) { Invoke-RunPublish -Pending } # ** Хлебников С.Ю. 20261120 служебные запуски не публикуются
 
 # Меню - при запуске без ключей (ключ -UiChannel от ci.exe не в счёт).
 $menuKeys = @($PSBoundParameters.Keys | Where-Object { $_ -ne 'UiChannel' })
@@ -4341,7 +4349,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         if ($gitRepo -and (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1'))) {
             $menu.Add((New-MenuItem 'gitimport' 'Загрузить из git' ('в {0} из {1}' -f $script:Base, $gitRepo)))
             $menu.Add((New-MenuItem 'gitexport' 'Выгрузить temp в git' ('правки {0} - веткой и pull request' -f $script:Base)))
-            # Приёмка поставок подрядчика (раздел 5.25): «Входящие» -> git -> CI -> temp -> гейт.
+            # Приёмка поставок подрядчика (раздел 5.26): «Входящие» -> git -> CI -> temp -> гейт.
             $deliveryWaiting = 0
             if (Test-Path -LiteralPath $deliveryInboxDir) { $deliveryWaiting = @(Get-ChildItem -LiteralPath $deliveryInboxDir -ErrorAction SilentlyContinue).Count }
             $deliveryOpen = 0
@@ -4506,7 +4514,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             continue
         }
         if ($choice -eq 'delivery') {
-            # Приёмка поставок (deploy.ps1 -Delivery, раздел 5.25): вопросы - только решения по поставке. Потом - в меню.
+            # Приёмка поставок (deploy.ps1 -Delivery, раздел 5.26): вопросы - только решения по поставке. Потом - в меню.
             $deliveryArgs = @{ Delivery = $true }
             if ($UiChannel) { $deliveryArgs['UiChannel'] = $UiChannel }
             try { & (Join-Path $Root 'deploy.ps1') @deliveryArgs }
@@ -4623,8 +4631,8 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
 }
 # Продолжение ключом -Resume: план - как в меню, этап - -FromStep или первый упавший.
 if ($Resume) {
-    if ($Kit -or $Tests -or $SkipChecks -or $SkipCanary -or $SkipSelfCheck -or $FreshBefore) {
-        throw 'С -Resume нельзя -Kit, -Tests, -SkipChecks, -SkipCanary, -SkipSelfCheck и -FreshBefore: продолжение берёт комплект и шаги прежнего прогона.'
+    if ($Kit -or $Tests -or $SelfCheckGroup -or $SkipChecks -or $SkipCanary -or $SkipSelfCheck -or $FreshBefore) {
+        throw 'С -Resume нельзя -Kit, -Tests, -SelfCheckGroup, -SkipChecks, -SkipCanary, -SkipSelfCheck и -FreshBefore: продолжение берёт комплект и шаги прежнего прогона.'
     }
     $resumeDir = ''
     if ($Resume -ieq 'last') { $resumeDir = Get-ResumeTargetDir }
@@ -4657,17 +4665,19 @@ $timeoutCheckSec = 60 * [int](Get-Setting $cfg 'TimeoutCheckMin' 120)
 $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
 $runsRoot = Resolve-RootPath ([string](Get-Setting $cfg 'RunsDir' 'runs'))
 # Имя прогона - время до секунды. Два прогона в одну секунду (продолжение сразу за прогоном) - второй ждёт следующую.
-while (-not $Tests -and (Test-Path -LiteralPath (Join-Path $runsRoot $runId))) { Start-Sleep -Milliseconds 300; $runId = Get-Date -Format 'yyyyMMdd-HHmmss' }
+while (-not $Tests -and -not $SelfCheckGroup -and (Test-Path -LiteralPath (Join-Path $runsRoot $runId))) { Start-Sleep -Milliseconds 300; $runId = Get-Date -Format 'yyyyMMdd-HHmmss' }
 $RunDir = Join-Path $runsRoot $runId
 # Служебные запуски для тестов (-Tests) - в tests-runs: в список прогонов гейта и в эталон они не попадают.
 if ($Tests) { $RunDir = Join-Path (Resolve-RootPath 'tests-runs') ('{0}-{1}' -f $runId, $Tests.ToLowerInvariant()) }
+# ** Хлебников С.Ю. 20261120 Замеры одной группы самопроверки (-SelfCheckGroup) - в selfcheck-runs: имя папки - время запуска.
+if ($SelfCheckGroup) { $RunDir = Join-Path (Resolve-RootPath 'selfcheck-runs') $runId }
 New-Item -ItemType Directory -Path $RunDir -Force | Out-Null
 $script:RunLogPath = Join-Path $RunDir 'run.log'
 $script:Steps = New-Object System.Collections.Generic.List[object]
 # Сведения для продолжения прогона с упавшего шага: шаги по ходу (steps.jsonl), этапы и комплект (resume.json).
 $kitItems = @()
 $kitProcessings = @()
-if (-not $Tests) {
+if (-not ($Tests -or $SelfCheckGroup)) {
     $script:StepsLogPath = Join-Path $RunDir 'steps.jsonl'
     $script:RunState = [ordered]@{
         version = 1; runId = $runId; baseKey = $baseKey; gateVersion = $script:GateVersion
@@ -4708,6 +4718,15 @@ $selfCheckRestarts = [int](Get-Setting $cfg 'SelfCheckRestarts' 2)
 if (($selfCheckSkipDocs + $selfCheckNotOlder + $RunDir + $selfCheckEpf) -match '[;"]') {
     throw 'В SelfCheckSkipDocs, SelfCheckNotOlder, пути к обработке самопроверки и пути к папке прогонов не должно быть точки с запятой и кавычек.'
 }
+# ** Хлебников С.Ю. 20261120 Два исполнителя самопроверки (раздел 5.25): SelfCheckWorkers = 2 и группа, которую они
+# делят, - SelfCheckSplitGroup (шаг очереди, как в заголовке шага журнала). По умолчанию один исполнитель.
+# Имена переменных - не как у ключей запуска -SelfCheckWorkers и -SelfCheckGroup: в PowerShell регистр не различается.
+$selfCheckWorkerCount = [int](Get-Setting $cfg 'SelfCheckWorkers' 1)
+if ($SelfCheckWorkers -gt 0) { $selfCheckWorkerCount = $SelfCheckWorkers }
+$selfCheckSplit = ([string](Get-Setting $cfg 'SelfCheckSplitGroup' '')).Trim()
+if ($selfCheckWorkerCount -lt 1 -or $selfCheckWorkerCount -gt 2) { throw "SelfCheckWorkers: допустимо 1 или 2, а стоит $selfCheckWorkerCount." }
+if (($selfCheckSplit + $SelfCheckGroup) -match '[;"]') { throw 'В SelfCheckSplitGroup и -SelfCheckGroup не должно быть точки с запятой и кавычек.' }
+# ** Хлебников С.Ю. 20261120 конец
 
 # Эталон самопроверки базы: записи последнего состояния, в котором не было ничего нового.
 # В selfcheck.last.txt - отпечаток состояния базы после последней самопроверки гейта.
@@ -5231,13 +5250,19 @@ function Complete-BackgroundCheck {
     $phaseBefore = $script:StepPhase
     $script:StepPhase = 'checks'
     $background = $script:BackgroundCheck
+    # ** Хлебников С.Ю. 20261120 Сколько основной ход простоял, дожидаясь параллельной проверки: это время прогона,
+    # которое она не спрятала за другими шагами (разбор времени прогона, timeline.ps1).
+    $waitWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-RunLog ("  {0}: жду её перед вердиктом, она идёт уже {1} с" -f $background.Title, [int]$background.Watch.Elapsed.TotalSeconds)
+    # ** Хлебников С.Ю. 20261120 конец
     $finished = Wait-UiProcess -Process $background.Process -Watch $background.Watch -TimeoutSec $background.TimeoutSec -Title $background.Title -Expected $background.Expected
     $exitCode = $null
     if ($finished) { $background.Process.WaitForExit(); $exitCode = $background.Process.ExitCode }
     else { try { Stop-Process -Id $background.Process.Id -Force -ErrorAction Stop } catch { } }
     $background.Watch.Stop()
+    $waitWatch.Stop()
     $seconds = [int]$background.Watch.Elapsed.TotalSeconds
-    Write-RunLog ("  {0}: код={1} таймаут={2} секунд={3}" -f $background.Title, $exitCode, (-not $finished), $seconds)
+    Write-RunLog ("  {0}: код={1} таймаут={2} секунд={3} ждали={4}" -f $background.Title, $exitCode, (-not $finished), $seconds, [int]$waitWatch.Elapsed.TotalSeconds)
     $script:BackgroundCheck = $null
     $result = [pscustomobject]@{ ExitCode = $exitCode; TimedOut = (-not $finished); Seconds = $seconds; Log = $background.Log; Lines = @(Read-V8Log $background.Log) }
     if ($finished -and $exitCode -ne 0 -and $exitCode -ne 101 -and (Test-DesignerBusy $result.Lines)) {
@@ -5445,16 +5470,134 @@ function Save-SelfCheckReference {
 function Save-SelfCheckLastState {
     # Отпечаток состояния базы после самопроверки гейта. Пока он не изменился, состояние «до загрузки»
     # заново не снимается. Пустой (ненадёжный) отпечаток стирает прежний: тогда «до» снимается каждый раз.
-    param([string]$Fingerprint)
+    # ** Хлебников С.Ю. 20261120 Рядом с отпечатком - его состав (строки «part:» из info.txt обработки): по нему
+    # следующий прогон пишет, что именно изменилось, если «до загрузки» придётся снимать заново.
+    param([string]$Fingerprint, [string[]]$Parts = @())
     if (-not (Test-Path -LiteralPath $baselineDir)) { New-Item -ItemType Directory -Path $baselineDir -Force | Out-Null }
     if ($Fingerprint) {
-        $lastState = @(("fingerprint={0}" -f $Fingerprint), ("run={0}" -f $runId))
-        [System.IO.File]::WriteAllLines($selfCheckLastFile, [string[]]$lastState, $Utf8Bom)
+        $lastState = New-Object System.Collections.Generic.List[string]
+        $lastState.Add(("fingerprint={0}" -f $Fingerprint))
+        $lastState.Add(("run={0}" -f $runId))
+        foreach ($part in @($Parts | Where-Object { $_ })) { $lastState.Add(('part:' + $part)) }
+        [System.IO.File]::WriteAllLines($selfCheckLastFile, $lastState.ToArray(), $Utf8Bom)
     }
     elseif (Test-Path -LiteralPath $selfCheckLastFile) {
         Remove-Item -LiteralPath $selfCheckLastFile -Force
     }
 }
+
+# ** Хлебников С.Ю. 20261120 Состав отпечатка самопроверки: строки info.txt, из которых обработка его считает.
+# selfchecksrc - хеш кода обработки (обработка прежней версии его не пишет, у неё в отпечатке номер сборки selfcheck).
+$SelfCheckFingerprintKeys = @('selfcheck', 'selfchecksrc', 'config', 'params', 'docsboundary', 'pack', 'ext')
+
+function Get-SelfCheckFingerprintParts {
+    # Строки состава отпечатка из info.txt сеанса, в порядке файла. Файла нет - пустой массив.
+    param([string]$InfoFile)
+    $parts = New-Object System.Collections.Generic.List[string]
+    if (-not $InfoFile -or -not (Test-Path -LiteralPath $InfoFile)) { return $parts.ToArray() }
+    $lines = @()
+    try { $lines = @([System.IO.File]::ReadAllLines($InfoFile, [System.Text.Encoding]::UTF8)) } catch { return $parts.ToArray() }
+    foreach ($line in $lines) {
+        if ($null -eq $line) { continue }
+        $clean = $line.TrimStart([char]0xFEFF)
+        $position = $clean.IndexOf('=')
+        if ($position -le 0) { continue }
+        if ($SelfCheckFingerprintKeys -contains $clean.Substring(0, $position)) { $parts.Add($clean) }
+    }
+    return $parts.ToArray()
+}
+
+function Read-SelfCheckLastParts {
+    # Состав отпечатка прошлой самопроверки гейта из selfcheck.last.txt (строки «part:»). Гейт прежней версии
+    # состав не писал - пустой массив.
+    $parts = New-Object System.Collections.Generic.List[string]
+    if (-not (Test-Path -LiteralPath $selfCheckLastFile)) { return $parts.ToArray() }
+    $lines = @()
+    try { $lines = @([System.IO.File]::ReadAllLines($selfCheckLastFile, [System.Text.Encoding]::UTF8)) } catch { return $parts.ToArray() }
+    foreach ($line in $lines) {
+        if ($null -eq $line) { continue }
+        $clean = $line.TrimStart([char]0xFEFF)
+        if ($clean.StartsWith('part:', [System.StringComparison]::Ordinal)) { $parts.Add($clean.Substring(5)) }
+    }
+    return $parts.ToArray()
+}
+
+function Get-SelfCheckFingerprintChanges {
+    # Что изменилось в составе отпечатка между прошлой самопроверкой гейта и этой: по строке на изменение.
+    param([string[]]$Old, [string[]]$New)
+    $tables = @{ old = @{}; new = @{} }
+    $extensions = @{ old = [ordered]@{}; new = [ordered]@{} }
+    foreach ($side in @('old', 'new')) {
+        $lines = $Old
+        if ($side -eq 'new') { $lines = $New }
+        foreach ($line in @($lines)) {
+            if ($null -eq $line) { continue }
+            $position = $line.IndexOf('=')
+            if ($position -le 0) { continue }
+            $key = $line.Substring(0, $position)
+            $value = $line.Substring($position + 1)
+            if ($key -eq 'ext') { $extensions[$side][$value.Split('|')[0]] = $value.Split('|') }
+            else { $tables[$side][$key] = $value }
+        }
+    }
+    $changes = New-Object System.Collections.Generic.List[string]
+    $oldBuild = [string](Get-Setting $tables.old 'selfcheck' '')
+    $newBuild = [string](Get-Setting $tables.new 'selfcheck' '')
+    $oldSource = [string](Get-Setting $tables.old 'selfchecksrc' '')
+    $newSource = [string](Get-Setting $tables.new 'selfchecksrc' '')
+    if ($oldSource -and $newSource) {
+        if ($oldSource -ne $newSource) { $changes.Add(("изменился код обработки самопроверки (сборка {0} -> {1})" -f $oldBuild, $newBuild)) }
+    }
+    elseif ($newSource) {
+        $changes.Add(("отпечаток теперь считается по коду обработки, а не по номеру сборки (сборка {0} -> {1}): после такого обновления гейта «до загрузки» снимается один раз" -f $oldBuild, $newBuild))
+    }
+    elseif ($oldSource) {
+        $changes.Add(("у обработки самопроверки нет хеша исходников (собрана не сборщиком гейта?), в отпечатке номер сборки {0}" -f $newBuild))
+    }
+    elseif ($oldBuild -ne $newBuild) {
+        $changes.Add(("другая сборка обработки самопроверки: {0} -> {1}" -f $oldBuild, $newBuild))
+    }
+    $named = [ordered]@{ config = 'конфигурация'; params = 'параметры самопроверки'; docsboundary = 'граница даты документов'; pack = 'пакет сценариев' }
+    foreach ($key in @($named.Keys)) {
+        $was = [string](Get-Setting $tables.old $key '')
+        $now = [string](Get-Setting $tables.new $key '')
+        if ($was -ne $now) { $changes.Add(("{0}: {1} -> {2}" -f $named[$key], $was, $now)) }
+    }
+    foreach ($name in @($extensions.new.Keys)) {
+        if (-not $extensions.old.Contains($name)) { $changes.Add(("расширение {0}: появилось" -f $name)); continue }
+        $was = [string[]]$extensions.old[$name]
+        $now = [string[]]$extensions.new[$name]
+        $what = New-Object System.Collections.Generic.List[string]
+        if ($was.Count -gt 1 -and $now.Count -gt 1 -and $was[1] -ne $now[1]) { $what.Add(("версия {0} -> {1}" -f $was[1], $now[1])) }
+        if ($was.Count -gt 2 -and $now.Count -gt 2 -and $was[2] -ne $now[2]) { $what.Add(("{0} -> {1}" -f $was[2], $now[2])) }
+        if ($what.Count -eq 0 -and ($was -join '|') -ne ($now -join '|')) { $what.Add('загружено заново без смены версии (другая хеш-сумма)') }
+        if ($what.Count -gt 0) { $changes.Add(("расширение {0}: {1}" -f $name, ($what.ToArray() -join ', '))) }
+    }
+    foreach ($name in @($extensions.old.Keys)) {
+        if (-not $extensions.new.Contains($name)) { $changes.Add(("расширение {0}: удалено" -f $name)) }
+    }
+    return $changes.ToArray()
+}
+
+function Get-SelfCheckBeforeReason {
+    # Почему самопроверка «до загрузки» выполнялась полностью, а не взята из эталона: условие и, если отпечаток
+    # другой, изменившиеся части. Known - отпечаток прошлой самопроверки, который передавался обработке.
+    param([string]$Known, [string]$Fingerprint, [string[]]$Parts)
+    if ($FreshBefore) { return 'задан ключ -FreshBefore' }
+    if (-not (Test-Path -LiteralPath $selfCheckReferenceFile)) { return 'эталона самопроверки ещё нет' }
+    if (-not (Test-Path -LiteralPath $selfCheckLastFile)) {
+        return 'нет отпечатка прошлой самопроверки гейта (прошлый прогон откатил комплект, отпечаток был ненадёжным или самопроверки ещё не было)'
+    }
+    if (-not $Known) { return 'отпечаток прошлой самопроверки в selfcheck.last.txt не похож на отпечаток' }
+    if (-not $Fingerprint) { return 'отпечаток этого прогона ненадёжный: обработка не получила хеш-сумму расширения' }
+    if ($Fingerprint -eq $Known) { return 'отпечаток тот же, но обработка выполнила самопроверку' }
+    $oldParts = @(Read-SelfCheckLastParts)
+    if ($oldParts.Count -eq 0) { return 'отпечаток другой; что в нём изменилось, не узнать: прошлый гейт записал отпечаток без состава' }
+    $changes = @(Get-SelfCheckFingerprintChanges -Old $oldParts -New $Parts)
+    if ($changes.Count -eq 0) { return 'отпечаток другой, а записанный состав тот же' }
+    return ($changes -join '; ')
+}
+# ** Хлебников С.Ю. 20261120 конец
 
 function Get-SelfCheckScreenText {
     # Шапка экрана хода в окне 1С: что это за сеанс самопроверки и зачем он запущен - по имени шага прогона.
@@ -5483,12 +5626,12 @@ function Get-SelfCheckScreenText {
     return [pscustomobject]@{ Caption = (& $clean $caption); Why = (& $clean $why) }
 }
 
-function Invoke-SelfCheckSession {
-    # Один сеанс обработки «Выполнить после обновления» в режиме автозапуска.
-    # Чем кончился: result - обработка записала итог; exited - клиент закрылся без итога;
-    # nostart - обработка не открылась; stalled - новых частей журнала нет дольше SelfCheckStallMin;
-    # timeout - сеанс идёт дольше SelfCheckTimeoutMin.
-    param([string]$OutDir, [string]$Known, [int]$StartFrom, [string]$Title, [string]$ExchangeSetFile = '')
+function Start-SelfCheckSession {
+    # Запускает один сеанс обработки «Выполнить после обновления» в режиме автозапуска, не дожидаясь его.
+    # ** Хлебников С.Ю. 20261120 Запуск, опрос и итог сеанса - тремя функциями (Start-, Update-, Complete-SelfCheckSession):
+    # два исполнителя (Invoke-SelfCheckLanes) опрашивают два сеанса по очереди. Один сеанс - Invoke-SelfCheckSession.
+    # Extra - дополнительные части параметра запуска (only=, split=, worker=). Lane - номер исполнителя (0 - один).
+    param([string]$OutDir, [string]$Known, [int]$StartFrom, [string]$Title, [string]$ExchangeSetFile = '', [string[]]$Extra = @(), [int]$Lane = 0)
 
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
@@ -5512,12 +5655,15 @@ function Invoke-SelfCheckSession {
     if ($StartFrom -gt 0) { $launch.Add(("start={0}" -f $StartFrom)) }
     # Шапка экрана в окне 1С: что за сеанс и зачем (части caption= и why=; обработка, которая их не знает, пропускает).
     $screenText = Get-SelfCheckScreenText -Title $Title -StartFrom $StartFrom
-    if ($screenText.Caption) { $launch.Add(("caption={0}" -f $screenText.Caption)) }
+    $caption = $screenText.Caption
+    if ($caption -and $Lane -gt 0) { $caption = ('{0}, исполнитель {1}' -f $caption, $Lane) }
+    if ($caption) { $launch.Add(("caption={0}" -f $caption)) }
     if ($screenText.Why) { $launch.Add(("why={0}" -f $screenText.Why)) }
     # Шаг «Обмены»: режим, лимиты очереди узла и набор объектов прогона «до» (тот же набор для «после»).
     if ($exchangeMode -eq 'Light') { $launch.Add('exchmode=light') }
     $launch.Add(("exchq={0}/{1}" -f $exchangeQueuePerType, $exchangeQueueTotal))
     if ($ExchangeSetFile) { $launch.Add(("exch={0}" -f $ExchangeSetFile)) }
+    foreach ($part in @($Extra | Where-Object { $_ })) { $launch.Add($part) }
 
     $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -User $adminUser -Password $adminPassword) + @(
         '/DisableStartupDialogs',
@@ -5528,68 +5674,77 @@ function Invoke-SelfCheckSession {
     $argLine = $argList -join ' '
     Write-RunLog ("> 1cv8c.exe {0}" -f ([regex]::Replace([regex]::Replace($argLine, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"')))
 
-    $resultFile = Join-Path $OutDir 'result.txt'
-    $startedFile = Join-Path $OutDir 'started.txt'
-
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $idle = [System.Diagnostics.Stopwatch]::StartNew()
     $process = Start-Process -FilePath $v8c -ArgumentList $argLine -PassThru
     $null = $process.Handle
 
-    $state = ''
-    $started = $false
-    $pieceCount = -1
-    $progressShown = $false
-    while ($true) {
-        if (Test-Path -LiteralPath $resultFile) { $state = 'result'; break }
-        if ($process.HasExited) {
-            # Итог мог записаться в последний момент.
-            Start-Sleep -Seconds 2
-            if (Test-Path -LiteralPath $resultFile) { $state = 'result' } else { $state = 'exited' }
-            break
-        }
-        if (-not $started) {
-            if (Test-Path -LiteralPath $startedFile) { $started = $true; $idle.Restart() }
-            elseif ($watch.Elapsed.TotalSeconds -ge $selfCheckStartTimeoutSec) { $state = 'nostart'; break }
-        }
-        else {
-            $countNow = @(Get-SelfCheckPieceFiles $OutDir).Count
-            if ($countNow -ne $pieceCount) { $pieceCount = $countNow; $idle.Restart() }
-            elseif ($idle.Elapsed.TotalSeconds -ge $selfCheckStallSec) { $state = 'stalled'; break }
-            if ($watch.Elapsed.TotalSeconds -ge $selfCheckTimeoutSec) { $state = 'timeout'; break }
-        }
-
-        # Ход: какое задание из скольких - по последней части журнала; полоса настоящая.
-        $progress = 'клиент запускается'
-        if ($started) { $progress = 'обработка открылась, готовит задания' }
-        $done = -1
-        $total = 0
-        $files = @(Get-SelfCheckPieceFiles $OutDir)
-        if ($files.Count -gt 0) {
-            try {
-                $lastPiece = Read-SelfCheckPiece $files[$files.Count - 1].FullName
-                if ($lastPiece.Header.ContainsKey('n')) {
-                    $done = [int]$lastPiece.Header['n']
-                    $total = [int]$lastPiece.Header['total']
-                    $progress = "задание {0} из {1}: {2}" -f ($done + 1), $total, $lastPiece.Header['title']
-                }
-                if ($lastPiece.Blocks.Count -gt 0) {
-                    try { Add-SelfCheckKnownCounts -State $knownState -Files $files -Finished $false; Write-SelfCheckKnownFile -State $knownState -Path $knownFile } catch { }
-                    Send-UiSubPlan -Title $Title -Current ([string]$lastPiece.Header['step']) -Task ([string]$lastPiece.Header['title']) -Blocks $lastPiece.Blocks -Known $knownState.ByStep
-                }
-            }
-            catch { }
-        }
-        # 3 секунды до следующей проверки файлов - анимация строки хода.
-        for ($frame = 0; $frame -lt 12; $frame++) {
-            Write-UiProgress -Title $Title -Elapsed $watch.Elapsed.TotalSeconds -Expected (Get-ExpectedStepSeconds $Title) -Done $done -Total $total -Detail $progress
-            $progressShown = $true
-            if ($process.HasExited -or (Test-Path -LiteralPath $resultFile)) { break }
-            Start-Sleep -Milliseconds 250
-        }
+    return [pscustomobject]@{
+        OutDir = $OutDir; Title = $Title; StartFrom = $StartFrom; Lane = $Lane
+        Process = $process; Watch = $watch; Idle = $idle
+        ResultFile = (Join-Path $OutDir 'result.txt'); StartedFile = (Join-Path $OutDir 'started.txt')
+        KnownState = $knownState; KnownFile = $knownFile
+        State = ''; Started = $false; PieceCount = -1; Waiting = $false
+        Progress = 'клиент запускается'; Done = -1; Total = 0; Header = @{}; Blocks = @()
     }
-    if ($progressShown) { Complete-UiProgress }
+}
 
+function Update-SelfCheckSession {
+    # Один опрос сеанса: чем он кончился - в State (пусто - идёт), ход - в Progress, Done, Total, заголовок последней
+    # части журнала - в Header. Waiting - сеанс ждёт сигнала гейта (второй исполнитель до старта, первый - пока
+    # второй не закончил): так он не считается зависшим.
+    param($Session)
+    if ($Session.State) { return }
+    $OutDir = $Session.OutDir
+    $Title = $Session.Title
+    if (Test-Path -LiteralPath $Session.ResultFile) { $Session.State = 'result'; return }
+    if ($Session.Process.HasExited) {
+        # Итог мог записаться в последний момент.
+        Start-Sleep -Seconds 2
+        if (Test-Path -LiteralPath $Session.ResultFile) { $Session.State = 'result' } else { $Session.State = 'exited' }
+        return
+    }
+    if (-not $Session.Started) {
+        if (Test-Path -LiteralPath $Session.StartedFile) { $Session.Started = $true; $Session.Idle.Restart() }
+        elseif ($Session.Watch.Elapsed.TotalSeconds -ge $selfCheckStartTimeoutSec) { $Session.State = 'nostart'; return }
+    }
+    else {
+        $countNow = @(Get-SelfCheckPieceFiles $OutDir).Count
+        if ($countNow -ne $Session.PieceCount -or $Session.Waiting) { $Session.PieceCount = $countNow; $Session.Idle.Restart() }
+        elseif ($Session.Idle.Elapsed.TotalSeconds -ge $selfCheckStallSec) { $Session.State = 'stalled'; return }
+        if ($Session.Watch.Elapsed.TotalSeconds -ge $selfCheckTimeoutSec) { $Session.State = 'timeout'; return }
+    }
+
+    # Ход: какое задание из скольких - по последней части журнала; полоса настоящая.
+    $Session.Progress = 'клиент запускается'
+    if ($Session.Started) { $Session.Progress = 'обработка открылась, готовит задания' }
+    $files = @(Get-SelfCheckPieceFiles $OutDir)
+    if ($files.Count -gt 0) {
+        try {
+            $lastPiece = Read-SelfCheckPiece $files[$files.Count - 1].FullName
+            $Session.Header = $lastPiece.Header
+            if ($lastPiece.Header.ContainsKey('n')) {
+                $Session.Done = [int]$lastPiece.Header['n']
+                $Session.Total = [int]$lastPiece.Header['total']
+                $Session.Progress = "задание {0} из {1}: {2}" -f ($Session.Done + 1), $Session.Total, $lastPiece.Header['title']
+            }
+            if ($lastPiece.Blocks.Count -gt 0) {
+                $Session.Blocks = $lastPiece.Blocks
+                try { Add-SelfCheckKnownCounts -State $Session.KnownState -Files $files -Finished $false; Write-SelfCheckKnownFile -State $Session.KnownState -Path $Session.KnownFile } catch { }
+                if ($Session.Lane -le 1) { Send-UiSubPlan -Title $Title -Current ([string]$lastPiece.Header['step']) -Task ([string]$lastPiece.Header['title']) -Blocks $lastPiece.Blocks -Known $Session.KnownState.ByStep }
+            }
+        }
+        catch { }
+    }
+}
+
+function Complete-SelfCheckSession {
+    # Сеанс кончился (State не пустой): закрыть клиент, снять окна, если он не дописал итог, прочитать последнюю
+    # целую часть журнала. Ответ - тот же, что у Invoke-SelfCheckSession.
+    param($Session)
+    $state = $Session.State
+    $process = $Session.Process
+    $OutDir = $Session.OutDir
     $windows = @()
     if ($state -eq 'result') {
         # После записи итога обработка закрывает 1С сама.
@@ -5603,7 +5758,7 @@ function Invoke-SelfCheckSession {
         try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { }
         [System.IO.File]::WriteAllLines((Join-Path $OutDir 'client_windows.txt'), [string[]]$windows, $Utf8Bom)
     }
-    $watch.Stop()
+    $Session.Watch.Stop()
     # Сеанс на сервере закрывается не мгновенно: следующий шаг не должен на него наткнуться.
     Start-Sleep -Seconds 5
 
@@ -5626,22 +5781,24 @@ function Invoke-SelfCheckSession {
         break
     }
 
-    Write-RunLog ("  самопроверка: сеанс кончился как {0}, секунд {1}, частей журнала {2}, последнее задание {3}" -f $state, [int]$watch.Elapsed.TotalSeconds, $files.Count, $lastN)
+    $who = 'самопроверка'
+    if ($Session.Lane -gt 0) { $who = 'самопроверка (исполнитель {0})' -f $Session.Lane }
+    Write-RunLog ("  {0}: сеанс кончился как {1}, секунд {2}, частей журнала {3}, последнее задание {4}" -f $who, $state, [int]$Session.Watch.Elapsed.TotalSeconds, $files.Count, $lastN)
     # Статистика: целый прогон самопроверки - OK, продолжение после остановки - PART (в прогноз не идёт),
-    # «база та же, не запускалась» - SKIP. Размер - число заданий.
+    # «база та же, не запускалась» - SKIP. Размер - число заданий. Исполнитель из двух - PART: это часть самопроверки.
     $statStatus = 'FAIL'
     if ($state -eq 'result') {
         $statStatus = 'OK'
-        if ($StartFrom -gt 0) { $statStatus = 'PART' }
-        if ([string](Get-Setting (Read-KeyValueFile $resultFile) 'status' '') -ne 'done') { $statStatus = 'SKIP' }
+        if ($Session.StartFrom -gt 0 -or $Session.Lane -gt 0) { $statStatus = 'PART' }
+        if ([string](Get-Setting (Read-KeyValueFile $Session.ResultFile) 'status' '') -ne 'done') { $statStatus = 'SKIP' }
     }
-    Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status $statStatus -Size $total
+    Add-StatFact -Title $Session.Title -Seconds $Session.Watch.Elapsed.TotalSeconds -Status $statStatus -Size $total
 
     return [pscustomobject]@{
         State      = $state
         Dir        = $OutDir
-        Seconds    = [int]$watch.Elapsed.TotalSeconds
-        Result     = (Read-KeyValueFile $resultFile)
+        Seconds    = [int]$Session.Watch.Elapsed.TotalSeconds
+        Result     = (Read-KeyValueFile $Session.ResultFile)
         Info       = (Read-KeyValueFile (Join-Path $OutDir 'info.txt'))
         Windows    = $windows
         LastN      = $lastN
@@ -5649,14 +5806,288 @@ function Invoke-SelfCheckSession {
         LastTitle  = $lastTitle
         Total      = $total
         PieceCount = $files.Count
+        Lane       = $Session.Lane
     }
 }
+
+function Invoke-SelfCheckSession {
+    # Один сеанс обработки «Выполнить после обновления» в режиме автозапуска.
+    # Чем кончился: result - обработка записала итог; exited - клиент закрылся без итога;
+    # nostart - обработка не открылась; stalled - новых частей журнала нет дольше SelfCheckStallMin;
+    # timeout - сеанс идёт дольше SelfCheckTimeoutMin.
+    param([string]$OutDir, [string]$Known, [int]$StartFrom, [string]$Title, [string]$ExchangeSetFile = '', [string[]]$Extra = @())
+
+    $session = Start-SelfCheckSession -OutDir $OutDir -Known $Known -StartFrom $StartFrom -Title $Title -ExchangeSetFile $ExchangeSetFile -Extra $Extra
+    $progressShown = $false
+    while ($true) {
+        Update-SelfCheckSession $session
+        if ($session.State) { break }
+        # 3 секунды до следующей проверки файлов - анимация строки хода.
+        for ($frame = 0; $frame -lt 12; $frame++) {
+            Write-UiProgress -Title $Title -Elapsed $session.Watch.Elapsed.TotalSeconds -Expected (Get-ExpectedStepSeconds $Title) -Done $session.Done -Total $session.Total -Detail $session.Progress
+            $progressShown = $true
+            if ($session.Process.HasExited -or (Test-Path -LiteralPath $session.ResultFile)) { break }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    if ($progressShown) { Complete-UiProgress }
+    return (Complete-SelfCheckSession $session)
+}
+
+# ** Хлебников С.Ю. 20261120 Два исполнителя самопроверки (раздел 5.25).
+# Группу заданий (SelfCheckSplitGroup) делят два сеанса обработки: первый выполняет всё остальное и половину
+# группы, второй - другую половину. Сигналы - файл par.txt в папке сеанса: go=1 - второму начинать (первый дошёл
+# до группы), done2=1 - первому идти дальше (второй закончил), stop=1 - второму не начинать. Второй сеанс
+# запускается, только когда первый записал список заданий (plan.txt): обработка прежней версии деления не знает,
+# и второй сеанс выполнил бы всю самопроверку одновременно с первым. Итог сводится по ключам заданий
+# (Get-SelfCheckLaneProblems): каждое задание списка - ровно один раз и у своего исполнителя.
+
+function New-SelfCheckLane {
+    param([int]$Number, [string[]]$Extra, [string]$Known)
+    return [pscustomobject]@{
+        Number = $Number; Extra = $Extra; Known = $Known; Attempt = 0; StartFrom = 0; Current = $null
+        Sessions = (New-Object System.Collections.Generic.List[object]); Finished = $false; State = ''
+        Signals = (New-Object System.Collections.Generic.List[string]); Problems = (New-Object System.Collections.Generic.List[string])
+    }
+}
+
+function Write-SelfCheckLaneSignal {
+    # Сигнал исполнителю: строка в par.txt папки его сеанса. Сигналы копятся: перезапущенный сеанс получает их сразу.
+    param($Lane, [string]$Signal = '')
+    if ($Signal -and -not $Lane.Signals.Contains($Signal)) { $Lane.Signals.Add($Signal) }
+    if ($null -eq $Lane.Current -or $Lane.Signals.Count -eq 0) { return }
+    $path = Join-Path $Lane.Current.OutDir 'par.txt'
+    # Файл пишется на месте, а не заменой: удалить файл, который сеанс сейчас читает, Windows не даст. Открыт без
+    # права записи - повтор. Короткий файл пишется целиком; недописанное сеанс прочтёт как «сигнала нет» и перечитает.
+    for ($try = 1; $try -le 20; $try++) {
+        try { [System.IO.File]::WriteAllLines($path, $Lane.Signals.ToArray(), $Utf8Bom); return }
+        catch { Start-Sleep -Milliseconds 250 }
+    }
+    Write-RunLog ("Самопроверка: сигнал исполнителю {0} не записался в {1}" -f $Lane.Number, $path)
+}
+
+function Start-SelfCheckLane {
+    # Очередной сеанс исполнителя: папка w<номер>-try<попытка>, сигналы - до запуска клиента.
+    param($Lane, [string]$BaseDir, [string]$Title, [string]$ExchangeSetFile)
+    $Lane.Attempt++
+    $dir = Join-Path $BaseDir ("w{0}-try{1}" -f $Lane.Number, $Lane.Attempt)
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    if ($Lane.Signals.Count -gt 0) { [System.IO.File]::WriteAllLines((Join-Path $dir 'par.txt'), $Lane.Signals.ToArray(), $Utf8Bom) }
+    $known = ''
+    if ($Lane.Attempt -eq 1) { $known = $Lane.Known }
+    $Lane.Current = Start-SelfCheckSession -OutDir $dir -Known $known -StartFrom $Lane.StartFrom -Title $Title -ExchangeSetFile $ExchangeSetFile -Extra $Lane.Extra -Lane $Lane.Number
+}
+
+function Invoke-SelfCheckLanes {
+    # Самопроверка двумя исполнителями. Ответ: Sessions - сеансы первого, потом второго (как у одного исполнителя),
+    # Problems, State (как у Invoke-SelfCheck), Lanes - исполнители для сверки заданий.
+    param([string]$BaseDir, [string]$Known, [string]$Title, [string]$ExchangeSetFile, [string]$Group, [string[]]$Extra)
+    $first = New-SelfCheckLane -Number 1 -Extra (@($Extra) + @(("split={0}" -f $Group), 'worker=1')) -Known $Known
+    $second = New-SelfCheckLane -Number 2 -Extra (@($Extra) + @(("split={0}" -f $Group), 'worker=2')) -Known ''
+    $lanes = @($first, $second)
+    Write-RunLog ("Самопроверка: два исполнителя, группу «{0}» делят пополам" -f $Group)
+    Start-SelfCheckLane -Lane $first -BaseDir $BaseDir -Title $Title -ExchangeSetFile $ExchangeSetFile
+    $go = $false
+    $secondStarted = $false
+    $progressShown = $false
+    while ($true) {
+        # Второй - только когда первый записал список заданий: значит, обработка умеет делить группу.
+        if (-not $secondStarted -and -not $second.Finished -and $null -ne $first.Current -and (Test-Path -LiteralPath (Join-Path $first.Current.OutDir 'plan.txt'))) {
+            Start-SelfCheckLane -Lane $second -BaseDir $BaseDir -Title $Title -ExchangeSetFile $ExchangeSetFile
+            $secondStarted = $true
+        }
+        foreach ($lane in $lanes) {
+            if ($lane.Finished -or $null -eq $lane.Current) { continue }
+            $session = $lane.Current
+            if ($lane.Number -eq 2) { $session.Waiting = (-not $go) }
+            else { $session.Waiting = ([string](Get-Setting $session.Header 'wait' '') -eq '1' -and -not $second.Finished) }
+            Update-SelfCheckSession $session
+            if ($lane.Number -eq 1 -and -not $go -and ([string](Get-Setting $session.Header 'group' '') -eq '1' -or [string](Get-Setting $session.Header 'wait' '') -eq '1')) {
+                $go = $true
+                Write-RunLog ("Самопроверка: первый исполнитель дошёл до группы «{0}», второму - начинать" -f $Group)
+                Write-SelfCheckLaneSignal -Lane $second -Signal 'go=1'
+            }
+            if (-not $session.State) { continue }
+
+            $ended = Complete-SelfCheckSession $session
+            $lane.Sessions.Add($ended)
+            $lane.Current = $null
+            if ($ended.State -eq 'result') {
+                $lane.Finished = $true
+                $lane.State = [string](Get-Setting $ended.Result 'status' 'failed')
+            }
+            elseif ($ended.State -eq 'nostart') {
+                $lane.Finished = $true
+                $lane.State = 'nostart'
+                $lane.Problems.Add(("исполнитель {0}: обработка не открылась за {1} с" -f $lane.Number, $selfCheckStartTimeoutSec))
+            }
+            else {
+                # Сеанс оборвался: как у одного исполнителя - перезапуск со следующего задания.
+                $place = 'до первого задания'
+                if ($ended.LastN -ge 0) { $place = "на задании {0} из {1}: {2}" -f ($ended.LastN + 1), $ended.Total, $ended.LastTitle }
+                $what = 'клиент 1С закрылся без итога'
+                if ($ended.State -eq 'stalled') { $what = "нет движения {0} мин, клиент остановлен" -f [int]($selfCheckStallSec / 60) }
+                if ($ended.State -eq 'timeout') { $what = "сеанс идёт дольше {0} мин, клиент остановлен" -f [int]($selfCheckTimeoutSec / 60) }
+                $problem = "исполнитель {0}, сеанс {1}: {2} {3}" -f $lane.Number, $lane.Attempt, $what, $place
+                if ($ended.Windows.Count -gt 0) { $problem += ("; окна клиента: {0}" -f ($ended.Windows -join '; ')) }
+                $lane.Problems.Add($problem)
+                if ($ended.State -eq 'timeout' -or $ended.LastN -lt 0 -or $lane.Attempt -gt $selfCheckRestarts) {
+                    $lane.Finished = $true
+                    $lane.State = 'incomplete'
+                }
+                else {
+                    $lane.StartFrom = $ended.LastN + 1
+                    Write-Host ("       исполнитель {0}: {1} {2}. Перезапускаю со следующего задания" -f $lane.Number, $what, $place) -ForegroundColor Yellow
+                    Start-SelfCheckLane -Lane $lane -BaseDir $BaseDir -Title $Title -ExchangeSetFile $ExchangeSetFile
+                }
+            }
+            if ($lane.Number -eq 2 -and $lane.Finished) {
+                Write-RunLog ("Самопроверка: второй исполнитель закончил ({0}), первому - идти дальше" -f $lane.State)
+                Write-SelfCheckLaneSignal -Lane $first -Signal 'done2=1'
+            }
+            if ($lane.Number -eq 1 -and $lane.Finished -and -not $second.Finished) {
+                if (-not $secondStarted) {
+                    # Первый кончил раньше, чем второй запустился: база та же, отказ, обработка прежней версии (списка
+                    # нет, группу она не делит) или группу делить не стали - тогда у второго нет заданий. Если они
+                    # всё же есть, сверка заданий покажет их невыполненными.
+                    $second.Finished = $true
+                    $second.State = 'notneeded'
+                }
+                elseif (-not $go) {
+                    Write-SelfCheckLaneSignal -Lane $second -Signal 'stop=1'
+                }
+            }
+        }
+        if ($first.Finished -and $second.Finished) { break }
+        # 3 секунды до следующей проверки - строка хода по первому исполнителю, второй - в пояснении.
+        $shown = $first.Current
+        if ($null -eq $shown) { $shown = $second.Current }
+        $detail = ''
+        if ($null -ne $first.Current) { $detail = 'исп. 1: ' + $first.Current.Progress }
+        if ($null -ne $second.Current) {
+            $secondText = $second.Current.Progress
+            if (-not $go) { $secondText = 'ждёт, пока первый дойдёт до группы' }
+            $detail = ($detail + '; исп. 2: ' + $secondText).TrimStart(';', ' ')
+        }
+        for ($frame = 0; $frame -lt 12; $frame++) {
+            if ($null -eq $shown) { break }
+            Write-UiProgress -Title $Title -Elapsed $shown.Watch.Elapsed.TotalSeconds -Expected (Get-ExpectedStepSeconds $Title) -Done $shown.Done -Total $shown.Total -Detail $detail
+            $progressShown = $true
+            if ($shown.Process.HasExited -or (Test-Path -LiteralPath $shown.ResultFile)) { break }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    if ($progressShown) { Complete-UiProgress }
+
+    $sessions = New-Object System.Collections.Generic.List[object]
+    $problems = New-Object System.Collections.Generic.List[string]
+    foreach ($lane in $lanes) {
+        foreach ($item in $lane.Sessions) { $sessions.Add($item) }
+        foreach ($item in $lane.Problems) { $problems.Add($item) }
+    }
+    $state = $first.State
+    if ($state -eq 'done' -and @('done', 'stopped', 'notneeded') -notcontains $second.State) { $state = 'incomplete' }
+    return [pscustomobject]@{ Sessions = $sessions; Problems = $problems; State = $state; Lanes = $lanes }
+}
+
+function Read-SelfCheckPlan {
+    # plan.txt исполнителя: «номер<TAB>исполнитель<TAB>ключ задания». Нет файла - $null.
+    param([string]$Dir)
+    $path = Join-Path $Dir 'plan.txt'
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($line in [System.IO.File]::ReadAllLines($path, [System.Text.Encoding]::UTF8)) {
+        if ($null -eq $line) { continue }
+        $fields = $line.TrimStart([char]0xFEFF).Split("`t")
+        if ($fields.Count -lt 3) { continue }
+        $rows.Add([pscustomobject]@{ N = $fields[0]; Lane = [int]$fields[1]; Key = ($fields[2..($fields.Count - 1)] -join "`t") })
+    }
+    return $rows.ToArray()
+}
+
+function Get-SelfCheckLaneProblems {
+    # Сверка заданий двух исполнителей с их списком: каждое задание - ровно один раз и у своего исполнителя.
+    # Ожидание второго - не задание. Строки сверки - в selfcheck-<Label>.lanes.txt. Ответ - проблемы для итога шага.
+    param($Lanes, [string]$Label)
+    $problems = New-Object System.Collections.Generic.List[string]
+    $first = $Lanes[0]
+    if ($first.Sessions.Count -eq 0) { return $problems.ToArray() }
+    $plan = Read-SelfCheckPlan $first.Sessions[0].Dir
+    if ($null -eq $plan) {
+        # Обработка прежней версии деления не знает: второй не запускался, первый выполнил всё - как один исполнитель.
+        if ($Lanes[1].Sessions.Count -eq 0) {
+            Write-RunLog 'Самопроверка: обработка не записала список заданий (plan.txt) - группу не делит, шла одним исполнителем'
+            return $problems.ToArray()
+        }
+        $problems.Add('первый исполнитель не записал список заданий (plan.txt): задания исполнителей не сверить')
+        return $problems.ToArray()
+    }
+    $planText = (@($plan | ForEach-Object { '{0}|{1}' -f $_.Lane, $_.Key }) -join "`n")
+    foreach ($lane in $Lanes) {
+        foreach ($session in $lane.Sessions) {
+            if ($lane.Number -eq 1 -and $session -eq $first.Sessions[0]) { continue }
+            $other = Read-SelfCheckPlan $session.Dir
+            if ($null -eq $other) { continue }
+            $otherText = (@($other | ForEach-Object { '{0}|{1}' -f $_.Lane, $_.Key }) -join "`n")
+            if ($otherText -ne $planText) { $problems.Add(("у исполнителя {0} (сеанс {1}) другой список заданий, чем у первого: исполнители видят базу по-разному" -f $lane.Number, (Split-Path -Leaf $session.Dir))) }
+        }
+    }
+    $expected = @{}
+    $done = @{}
+    foreach ($row in $plan) {
+        $id = '{0}|{1}' -f $row.Lane, $row.Key
+        if (-not $expected.ContainsKey($id)) { $expected[$id] = 0 }
+        $expected[$id]++
+    }
+    foreach ($lane in $Lanes) {
+        foreach ($session in $lane.Sessions) {
+            foreach ($file in @(Get-SelfCheckPieceFiles $session.Dir)) {
+                $piece = $null
+                try { $piece = Read-SelfCheckPiece $file.FullName } catch { continue }
+                if (-not $piece.Header.ContainsKey('n')) { continue }
+                $key = [string](Get-Setting $piece.Header 'key' '')
+                if ([string](Get-Setting $piece.Header 'wait' '') -eq '1' -or $key.StartsWith('Ожидание/')) { continue }
+                $id = '{0}|{1}' -f $lane.Number, $key
+                if (-not $done.ContainsKey($id)) { $done[$id] = 0 }
+                $done[$id]++
+            }
+        }
+    }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $missing = New-Object System.Collections.Generic.List[string]
+    $extra = New-Object System.Collections.Generic.List[string]
+    foreach ($id in @(@($expected.Keys) + @($done.Keys) | Sort-Object -Unique)) {
+        $want = 0
+        if ($expected.ContainsKey($id)) { $want = $expected[$id] }
+        $got = 0
+        if ($done.ContainsKey($id)) { $got = $done[$id] }
+        $laneNumber = $id.Substring(0, $id.IndexOf('|'))
+        $taskKey = $id.Substring($id.IndexOf('|') + 1)
+        $lines.Add(("{0}`t{1}`t{2}`t{3}" -f $laneNumber, $taskKey, $want, $got))
+        if ($got -lt $want) { $missing.Add(("{0} (исполнитель {1})" -f $taskKey, $laneNumber)) }
+        if ($got -gt $want) { $extra.Add(("{0} (исполнитель {1}, раз {2})" -f $taskKey, $laneNumber, $got)) }
+    }
+    [System.IO.File]::WriteAllLines((Join-Path $RunDir ("selfcheck-{0}.lanes.txt" -f $Label)), $lines.ToArray(), $Utf8Bom)
+    if ($missing.Count -gt 0) {
+        $shown = @($missing | Select-Object -First 10) -join '; '
+        if ($missing.Count -gt 10) { $shown += ('; и ещё {0}' -f ($missing.Count - 10)) }
+        $problems.Add(("не выполнены задания из списка ({0}): {1}; всё - selfcheck-{2}.lanes.txt" -f $missing.Count, $shown, $Label))
+    }
+    if ($extra.Count -gt 0) {
+        $problems.Add(("задания сверх списка или повторно ({0}): {1}" -f $extra.Count, (@($extra | Select-Object -First 10) -join '; ')))
+    }
+    Write-RunLog ("Самопроверка: сверка заданий исполнителей - по списку {0}, не выполнено {1}, лишних {2}" -f $plan.Count, $missing.Count, $extra.Count)
+    return $problems.ToArray()
+}
+# ** Хлебников С.Ю. 20261120 конец
 
 function Invoke-SelfCheck {
     # Самопроверка базы целиком: сеансы обработки с перезапуском после зависшего задания, сборка журнала
     # и записей для сравнения. Итог: done - выполнена; same - база не менялась, не запускалась;
     # incomplete - выполнена не до конца; nostart, refused, failed - не выполнялась.
-    param([string]$Label, [string]$Known, [string]$Title, [string]$ExchangeSetFile = '')
+    # ** Хлебников С.Ю. 20261120 OnlyGroup - только одна группа заданий (служебный запуск -SelfCheckGroup); Workers -
+    # исполнителей (0 - из настроек). Два исполнителя делят SelfCheckSplitGroup, в служебном запуске - саму группу.
+    param([string]$Label, [string]$Known, [string]$Title, [string]$ExchangeSetFile = '', [string]$OnlyGroup = '', [int]$Workers = 0)
 
     $baseDir = Join-Path $RunDir ("selfcheck-{0}" -f $Label)
     $sessions = New-Object System.Collections.Generic.List[object]
@@ -5665,14 +6096,32 @@ function Invoke-SelfCheck {
     $state = ''
     $startFrom = 0
     $attempt = 0
+    # ** Хлебников С.Ю. 20261120 Одна группа и два исполнителя
+    $extraParts = @()
+    if ($OnlyGroup) { $extraParts += ("only={0}" -f $OnlyGroup) }
+    $workerCount = $Workers
+    if ($workerCount -le 0) { $workerCount = $selfCheckWorkerCount }
+    $splitGroup = $selfCheckSplit
+    if ($OnlyGroup) { $splitGroup = $OnlyGroup }
+    $laneRun = $null
+    # ** Хлебников С.Ю. 20261120 конец
 
     Write-Host ("  ...  {0}: начато в {1}; сеанс не дольше {2} мин, без движения не дольше {3} мин" -f $Title, (Get-Date -Format 'HH:mm:ss'), [int]($selfCheckTimeoutSec / 60), [int]($selfCheckStallSec / 60)) -ForegroundColor DarkGray
 
-    while ($true) {
+    # ** Хлебников С.Ю. 20261120 Два исполнителя - свой цикл сеансов (Invoke-SelfCheckLanes), сборка журнала та же.
+    if ($workerCount -ge 2 -and $splitGroup) {
+        $laneRun = Invoke-SelfCheckLanes -BaseDir $baseDir -Known $Known -Title $Title -ExchangeSetFile $ExchangeSetFile -Group $splitGroup -Extra $extraParts
+        foreach ($item in $laneRun.Sessions) { $sessions.Add($item) }
+        foreach ($item in $laneRun.Problems) { $problems.Add($item) }
+        $state = $laneRun.State
+    }
+    # ** Хлебников С.Ю. 20261120 конец
+
+    while ($null -eq $laneRun) {
         $attempt++
         $knownNow = ''
         if ($attempt -eq 1) { $knownNow = $Known }
-        $session = Invoke-SelfCheckSession -OutDir (Join-Path $baseDir ("try{0}" -f $attempt)) -Known $knownNow -StartFrom $startFrom -Title $Title -ExchangeSetFile $ExchangeSetFile
+        $session = Invoke-SelfCheckSession -OutDir (Join-Path $baseDir ("try{0}" -f $attempt)) -Known $knownNow -StartFrom $startFrom -Title $Title -ExchangeSetFile $ExchangeSetFile -Extra $extraParts
         $sessions.Add($session)
 
         if ($session.State -eq 'result') {
@@ -5698,6 +6147,14 @@ function Invoke-SelfCheck {
 
     # Обработка открылась, но не дошла ни до одного задания: это не «неполный прогон», а «не выполнялась».
     if ($state -eq 'incomplete' -and $sessions.Count -eq 1 -and $sessions[0].LastN -lt 0) { $state = 'failed' }
+    # ** Хлебников С.Ю. 20261120 Два исполнителя: каждое задание списка - ровно один раз, иначе прогон неполный.
+    if ($null -ne $laneRun -and $sessions.Count -gt 0 -and ($state -eq 'done' -or $state -eq 'incomplete')) {
+        $laneProblems = @(Get-SelfCheckLaneProblems -Lanes $laneRun.Lanes -Label $Label)
+        foreach ($item in $laneProblems) { $problems.Add($item) }
+        if ($laneProblems.Count -gt 0 -and $state -eq 'done') { $state = 'incomplete' }
+    }
+    if ($state -eq 'nostart' -and $sessions.Count -eq 0) { $state = 'failed' }
+    # ** Хлебников С.Ю. 20261120 конец
 
     # Журнал и записи собираются из частей всех сеансов. Строки части относятся к заданию,
     # которое объявила предыдущая часть.
@@ -5709,7 +6166,8 @@ function Invoke-SelfCheck {
     $number = 0
     foreach ($session in $sessions) {
         $number++
-        if ($sessions.Count -gt 1) { $journal.Add(("##### сеанс {0} #####" -f $number)) }
+        if ($sessions.Count -gt 1 -and $session.Lane -gt 0) { $journal.Add(("##### исполнитель {0}, сеанс {1} #####" -f $session.Lane, $number)) }
+        elseif ($sessions.Count -gt 1) { $journal.Add(("##### сеанс {0} #####" -f $number)) }
         $key = '(начало)'
         foreach ($file in @(Get-SelfCheckPieceFiles $session.Dir)) {
             $piece = $null
@@ -5774,6 +6232,8 @@ function Invoke-SelfCheck {
     $firstInfo = $sessions[0].Info
     $candidate = [string](Get-Setting $firstInfo 'fingerprint' '')
     if ($candidate -match '^[0-9a-f]{64}$' -and [string](Get-Setting $firstInfo 'fingerprintreliable' '0') -eq '1') { $fingerprint = $candidate }
+    # ** Хлебников С.Ю. 20261120 Из чего отпечаток посчитан - для Save-SelfCheckLastState и Get-SelfCheckBeforeReason.
+    $fingerprintParts = @(Get-SelfCheckFingerprintParts (Join-Path $sessions[0].Dir 'info.txt'))
 
     $lastSession = $sessions[$sessions.Count - 1]
     $watch.Stop()
@@ -5782,6 +6242,7 @@ function Invoke-SelfCheck {
         Records     = $records.ToArray()
         Problems    = $problems.ToArray()
         Fingerprint = $fingerprint
+        FingerprintParts = $fingerprintParts
         Seconds     = [int]$watch.Elapsed.TotalSeconds
         Journal     = $journalPath
         Snapshots   = $snapshots
@@ -6378,7 +6839,7 @@ function New-KitProcessing {
     }
     $what = 'внешняя обработка'
     if ($isReport) { $what = 'внешний отчёт' }
-    # <путь>.gate.json (кладёт «Загрузить из git», раздел 5.25): в какой элемент справочника писать и какой sha256
+    # <путь>.gate.json (кладёт «Загрузить из git», раздел 5.26): в какой элемент справочника писать и какой sha256
     # должен быть у файла. Без него - как раньше: элемент с тем же именем объекта.
     $targetRef = ''
     $expectSha = ''
@@ -6606,6 +7067,51 @@ if ($Tests) {
     if ($serviceFailed -gt 0) { exit 1 }
     exit 0
 }
+
+# ** Хлебников С.Ю. 20261120 Служебный запуск одной группы самопроверки (-SelfCheckGroup, раздел 5.25): замер группы
+# одним или двумя исполнителями (-SelfCheckWorkers) на свободной тестовой базе. Без комплекта, подготовки базы,
+# проверок и вердикта гейта; эталон и отпечаток самопроверки не меняются. Итог - group-run.txt в папке запуска,
+# сравнить два запуска - selfcheck-compare.cmd <папка> <папка>.
+if ($SelfCheckGroup) {
+    if ($Kit -or $script:MenuItems.Count -gt 0) { throw 'С -SelfCheckGroup комплект не грузится: замер идёт на базе как есть.' }
+    # Обработка самопроверки - из этой поставки, как перед прогоном.
+    Update-GateTools
+    if ($selfCheckOff -like 'нет обработки*' -and (Test-Path -LiteralPath $selfCheckEpf)) {
+        $selfCheckOff = ''
+        if (-not (Test-Path -LiteralPath $v8c)) { $selfCheckOff = "нет тонкого клиента $v8c" }
+    }
+    if ($selfCheckOff) { throw ('самопроверка не запустится: ' + $selfCheckOff) }
+    $groupTitle = 'Самопроверка группы'
+    Write-RunLog ("Служебный запуск: группа самопроверки «{0}», исполнителей {1}" -f $SelfCheckGroup, $selfCheckWorkerCount)
+    $groupRun = Invoke-SelfCheck -Label 'group' -Known '' -Title $groupTitle -OnlyGroup $SelfCheckGroup -Workers $selfCheckWorkerCount
+    $groupCount = @{}
+    foreach ($kind in @('ОШИБКА', 'ВНИМАНИЕ', 'ПРОПУСК', 'ОК')) {
+        $groupCount[$kind] = @($groupRun.Records | Where-Object { $_.StartsWith('[' + $kind + ']') }).Count
+    }
+    $groupSource = ''
+    foreach ($part in @($groupRun.FingerprintParts)) { if ([string]$part -like 'selfchecksrc=*') { $groupSource = ([string]$part).Substring(13) } }
+    $groupLines = New-Object System.Collections.Generic.List[string]
+    foreach ($pair in @(
+            @('group', $SelfCheckGroup), @('workers', $selfCheckWorkerCount), @('state', $groupRun.State), @('seconds', $groupRun.Seconds),
+            @('records', @($groupRun.Records).Count), @('errors', $groupCount['ОШИБКА']), @('warnings', $groupCount['ВНИМАНИЕ']),
+            @('skipped', $groupCount['ПРОПУСК']), @('ok', $groupCount['ОК']), @('sessions', $groupRun.Sessions), @('base', $baseKey),
+            @('gate', $script:GateVersion), @('selfchecksrc', $groupSource), @('started', $runId))) {
+        $groupLines.Add(('{0}={1}' -f $pair[0], $pair[1]))
+    }
+    foreach ($problem in @($groupRun.Problems)) { $groupLines.Add(('problem=' + $problem)) }
+    [System.IO.File]::WriteAllLines((Join-Path $RunDir 'group-run.txt'), $groupLines.ToArray(), $Utf8Bom)
+    $groupStatus = 'OK'
+    if ($groupRun.State -ne 'done' -or @($groupRun.Problems).Count -gt 0) { $groupStatus = 'WARN' }
+    if (@('nostart', 'refused', 'failed') -contains $groupRun.State) { $groupStatus = 'FAIL' }
+    $groupDetail = 'исполнителей {0}, {1} с; записей {2}: ошибок {3}, внимание {4}, пропусков {5}; итог - group-run.txt' -f $selfCheckWorkerCount, $groupRun.Seconds, @($groupRun.Records).Count, $groupCount['ОШИБКА'], $groupCount['ВНИМАНИЕ'], $groupCount['ПРОПУСК']
+    if (@($groupRun.Problems).Count -gt 0) { $groupDetail += ('. Неполный: ' + (@($groupRun.Problems) -join ' | ')) }
+    if ($groupStatus -eq 'FAIL') { $groupDetail = Get-SelfCheckFailure $groupRun }
+    Add-StepResult -Name ('Самопроверка группы «{0}»' -f $SelfCheckGroup) -Status $groupStatus -Detail $groupDetail -Log $groupRun.Journal -Seconds $groupRun.Seconds
+    Write-Host ("Папка запуска: {0}" -f $RunDir)
+    if ($groupStatus -eq 'FAIL') { exit 1 }
+    exit 0
+}
+# ** Хлебников С.Ю. 20261120 конец
 
 #endregion
 
@@ -6919,11 +7425,16 @@ elseif ($kitItems.Count -gt 0 -and -not $selfCheckOff) {
         Add-StepResult -Name $stepName -Status 'OK' -Detail $detail -Seconds $before.Seconds
     }
     elseif ($before.State -eq 'done' -or $before.State -eq 'incomplete') {
+        # ** Хлебников С.Ю. 20261120 Почему «до» снималась полностью - до записи нового отпечатка: сравнивается с прошлым.
+        $fullReason = Get-SelfCheckBeforeReason -Known $known -Fingerprint $before.Fingerprint -Parts $before.FingerprintParts
+        Write-RunLog ('Самопроверка до загрузки выполнялась полностью: ' + $fullReason)
+        # ** Хлебников С.Ю. 20261120 конец
         Save-SelfCheckReference -Records $before.Records -Label 'before' -Fingerprint $before.Fingerprint -Snapshots $before.Snapshots -Exchange $before.Exchange
-        Save-SelfCheckLastState -Fingerprint $before.Fingerprint
+        Save-SelfCheckLastState -Fingerprint $before.Fingerprint -Parts $before.FingerprintParts
         $beforeMetrics = $before.Metrics
         if ($before.Exchange.Count -gt 0) { $exchangeBeforeFile = Join-Path $RunDir 'selfcheck-before.exchange.txt' }
         $detail = "состояние до загрузки снято и стало эталоном самопроверки: записей {0}, из них ошибок {1}; {2} мин" -f $before.Records.Count, $errorsBefore, $minutes
+        $detail += ('; снималось заново, потому что ' + $fullReason) # ** Хлебников С.Ю. 20261120
         if ($before.Problems.Count -gt 0) {
             $detail += ('. Прогон неполный: ' + ($before.Problems -join ' | '))
             Add-StepResult -Name $stepName -Status 'WARN' -Detail $detail -Log $before.Journal -Seconds $before.Seconds
@@ -7119,7 +7630,7 @@ foreach ($proc in $kitProcessings) {
         $proc.File = $builtFile
     }
 
-    # Файл целиком (раздел 5.25): ставится только с тем sha256, что записан в git.
+    # Файл целиком (раздел 5.26): ставится только с тем sha256, что записан в git.
     if ($null -ne $proc.PSObject.Properties['ExpectSha256'] -and $proc.ExpectSha256) {
         $sha = [System.Security.Cryptography.SHA256]::Create()
         try { $actualSha = -join @($sha.ComputeHash([System.IO.File]::ReadAllBytes($proc.File)) | ForEach-Object { $_.ToString('x2') }) } finally { $sha.Dispose() }
@@ -7172,7 +7683,7 @@ foreach ($proc in $kitProcessings) {
         $proceed = $false
         continue
     }
-    # Что поменяла запись в карточке (команды, назначение, публикация) - отдельно, для отчёта приёмки (раздел 5.25).
+    # Что поменяла запись в карточке (команды, назначение, публикация) - отдельно, для отчёта приёмки (раздел 5.26).
     $registration = @()
     foreach ($pair in @(@('commandsold', 'команды были'), @('commandsnew', 'команды стали'), @('targetsold', 'назначение было'), @('targetsnew', 'назначение стало'), @('publication', 'публикация'), @('targetskept', 'назначение сохранено'))) {
         $value = [string](Get-Setting $values $pair[0] '')
@@ -7512,7 +8023,7 @@ else {
         Add-StepResult -Name $afterName -Status 'FAIL' -Detail (Get-SelfCheckFailure $after) -Log $after.Journal -Seconds $after.Seconds
     }
     else {
-        Save-SelfCheckLastState -Fingerprint $after.Fingerprint
+        Save-SelfCheckLastState -Fingerprint $after.Fingerprint -Parts $after.FingerprintParts
 
         if (Test-Path -LiteralPath $selfCheckReferenceFile) {
             New-Item -ItemType Directory -Path $referenceCopyDir -Force | Out-Null
@@ -7720,6 +8231,7 @@ if ([string](Get-Setting $cfg 'ProdBase' '') -and (Test-Path -LiteralPath (Join-
 # ** Хлебников С.Ю. 20261120 конец
 
 # Итог пишется сразу: вопрос про комплект может ждать ответа сколько угодно.
+Write-RunLog ('Вердикт: ' + [string]$verdict) # ** Хлебников С.Ю. 20261120 отметка времени вердикта для разбора времени (timeline.ps1)
 Write-RunSummary -KitDecision '' -Aftermath @()
 
 function Invoke-RunReport {

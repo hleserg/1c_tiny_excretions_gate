@@ -149,6 +149,28 @@ function Test-UiCanAsk {
     return $canAsk
 }
 
+# ** Хлебников С.Ю. 20261120 Вопрос оператору и время до ответа - в журнал прогона, если у скрипта он есть (Write-RunLog
+# в run.ps1 и deploy.ps1), и в ci.exe, и в консоли: разбор времени (timeline.ps1) отделяет ожидание человека от работы
+# гейта. Polled - вопрос снят без ответа (дождались сами, Poll).
+function Start-UiAskLog {
+    param([string]$Header)
+    $askState = [pscustomobject]@{ Watch = [System.Diagnostics.Stopwatch]::StartNew(); Logged = $false }
+    if ($null -ne (Get-Command -Name 'Write-RunLog' -CommandType Function -ErrorAction SilentlyContinue)) {
+        try { Write-RunLog ('Вопрос оператору: ' + $Header); $askState.Logged = $true } catch { $askState.Logged = $false }
+    }
+    return $askState
+}
+
+function Stop-UiAskLog {
+    param($State, [switch]$Polled)
+    if ($null -eq $State -or -not $State.Logged) { return }
+    $State.Logged = $false
+    $askText = 'Ответ оператора через {0} с'
+    if ($Polled) { $askText = 'Вопрос снят без ответа через {0} с' }
+    try { Write-RunLog ($askText -f [int]$State.Watch.Elapsed.TotalSeconds) } catch { }
+}
+# ** Хлебников С.Ю. 20261120 конец
+
 function Request-UiAnswer {
     # Вопрос в ci.exe и ожидание ответа. Poll - проверка раз в 3 секунды: вернула непустое - вопрос снимается,
     # ответ - объект с полем polled.
@@ -159,6 +181,7 @@ function Request-UiAnswer {
     $Question['poll'] = ($null -ne $Poll)
     $answerFile = Join-Path $script:UiChannelDir ("a-{0}.json" -f $id)
     if (Test-Path -LiteralPath $answerFile) { Remove-Item -LiteralPath $answerFile -Force }
+    $askLog = Start-UiAskLog ([string]$Question['header']) # ** Хлебников С.Ю. 20261120 ожидание человека - в журнал прогона
     Send-UiEvent $Question
     $nextPoll = (Get-Date).AddSeconds(3)
     while ($true) {
@@ -166,6 +189,7 @@ function Request-UiAnswer {
             Start-Sleep -Milliseconds 50
             $text = [System.IO.File]::ReadAllText($answerFile, [System.Text.Encoding]::UTF8)
             Remove-Item -LiteralPath $answerFile -Force -ErrorAction SilentlyContinue
+            Stop-UiAskLog $askLog # ** Хлебников С.Ю. 20261120
             return ($text | ConvertFrom-Json)
         }
         Test-UiStop
@@ -175,6 +199,7 @@ function Request-UiAnswer {
             try { $polled = [string](& $Poll) } catch { $polled = '' }
             if ($polled) {
                 Send-UiEvent @{ kind = 'cancel'; id = $id }
+                Stop-UiAskLog $askLog -Polled # ** Хлебников С.Ю. 20261120
                 return [pscustomobject]@{ polled = $polled }
             }
         }
@@ -207,21 +232,25 @@ function Read-UiChoice {
     foreach ($note in $Notes) { if ($note) { Write-Host ('  ' + $note) -ForegroundColor DarkGray } }
     for ($i = 0; $i -lt $Keys.Count; $i++) { Write-Host ("  {0} - {1}" -f $Keys[$i], $Labels[$i]) }
     Write-Host -NoNewline ('  Что сделать ({0}): ' -f ($Keys -join ', '))
-    $nextCheck = (Get-Date).AddSeconds(3)
-    while ($true) {
-        if ([Console]::KeyAvailable) {
-            $typed = [string]([Console]::ReadKey($true)).KeyChar
-            if ($Keys -contains $typed) { Write-Host $typed; return $typed }
-            continue
+    $askLog = Start-UiAskLog $Header # ** Хлебников С.Ю. 20261120 ожидание человека - в журнал прогона
+    try {
+        $nextCheck = (Get-Date).AddSeconds(3)
+        while ($true) {
+            if ([Console]::KeyAvailable) {
+                $typed = [string]([Console]::ReadKey($true)).KeyChar
+                if ($Keys -contains $typed) { Write-Host $typed; return $typed }
+                continue
+            }
+            if ($null -ne $Poll -and (Get-Date) -ge $nextCheck) {
+                $nextCheck = (Get-Date).AddSeconds(3)
+                $polled = ''
+                try { $polled = [string](& $Poll) } catch { $polled = '' }
+                if ($polled) { Write-Host ''; return $polled }
+            }
+            Start-Sleep -Milliseconds 200
         }
-        if ($null -ne $Poll -and (Get-Date) -ge $nextCheck) {
-            $nextCheck = (Get-Date).AddSeconds(3)
-            $polled = ''
-            try { $polled = [string](& $Poll) } catch { $polled = '' }
-            if ($polled) { Write-Host ''; return $polled }
-        }
-        Start-Sleep -Milliseconds 200
     }
+    finally { Stop-UiAskLog $askLog }
 }
 
 function Read-UiText {
@@ -233,16 +262,20 @@ function Read-UiText {
         if ([bool](Get-UiField $answer 'cancel' $false)) { if ($CancelAsNull) { return $null } else { return '' } }
         return [string](Get-UiField $answer 'text' '')
     }
-    if ($Secret) {
-        $secure = Read-Host ('  ' + $Prompt) -AsSecureString
-        return (New-Object System.Management.Automation.PSCredential('user', $secure)).GetNetworkCredential().Password
+    $askLog = Start-UiAskLog $Prompt # ** Хлебников С.Ю. 20261120 ожидание человека - в журнал прогона
+    try {
+        if ($Secret) {
+            $secure = Read-Host ('  ' + $Prompt) -AsSecureString
+            return (New-Object System.Management.Automation.PSCredential('user', $secure)).GetNetworkCredential().Password
+        }
+        $shownPrompt = $Prompt
+        if ($Default) { $shownPrompt = "{0} [Enter - оставить «{1}», - - очистить]" -f $Prompt, $Default }
+        $typed = [string](Read-Host ('  ' + $shownPrompt))
+        if ($Default -and $typed -eq '') { return $Default }
+        if ($Default -and $typed -eq '-') { return '' }
+        return $typed
     }
-    $shownPrompt = $Prompt
-    if ($Default) { $shownPrompt = "{0} [Enter - оставить «{1}», - - очистить]" -f $Prompt, $Default }
-    $typed = [string](Read-Host ('  ' + $shownPrompt))
-    if ($Default -and $typed -eq '') { return $Default }
-    if ($Default -and $typed -eq '-') { return '' }
-    return $typed
+    finally { Stop-UiAskLog $askLog }
 }
 
 function Show-UiTitle {
@@ -309,19 +342,23 @@ function Select-UiOne {
     }
     Write-Host '    0 - отмена'
     Write-Host -NoNewline '  Выбор: '
-    while ($true) {
-        $keyInfo = [Console]::ReadKey($true)
-        if ([string]$keyInfo.KeyChar -eq '0') { Write-Host '0'; return -1 }
-        $index = Get-UiKeyIndex $keyInfo
-        if ($hasKeys) {
-            # Свои клавиши: нажатая клавиша - в её букву (в любой раскладке), буква - в пункт.
-            if ($index -lt 0) { continue }
-            $index = [array]::IndexOf($Keys, $script:UiKeys[$index])
-            if ($index -ge 0) { Write-Host $Keys[$index]; return $index }
-            continue
+    $askLog = Start-UiAskLog $Header # ** Хлебников С.Ю. 20261120 ожидание человека - в журнал прогона
+    try {
+        while ($true) {
+            $keyInfo = [Console]::ReadKey($true)
+            if ([string]$keyInfo.KeyChar -eq '0') { Write-Host '0'; return -1 }
+            $index = Get-UiKeyIndex $keyInfo
+            if ($hasKeys) {
+                # Свои клавиши: нажатая клавиша - в её букву (в любой раскладке), буква - в пункт.
+                if ($index -lt 0) { continue }
+                $index = [array]::IndexOf($Keys, $script:UiKeys[$index])
+                if ($index -ge 0) { Write-Host $Keys[$index]; return $index }
+                continue
+            }
+            if ($index -ge 0 -and $index -lt $shown) { Write-Host $script:UiKeys[$index]; return $index }
         }
-        if ($index -ge 0 -and $index -lt $shown) { Write-Host $script:UiKeys[$index]; return $index }
     }
+    finally { Stop-UiAskLog $askLog }
 }
 
 function Select-UiMany {
@@ -348,40 +385,44 @@ function Select-UiMany {
     $shown = [Math]::Min($Items.Count, $script:UiKeys.Count)
     $marks = New-Object 'System.Collections.Generic.HashSet[int]'
     foreach ($index in $Preselected) { if ($index -ge 0 -and $index -lt $shown) { $null = $marks.Add($index) } }
-    while ($true) {
-        Write-Host ''
-        Write-Host ('  ' + $Header)
-        foreach ($note in $Notes) { if ($note) { Write-Host ('  ' + $note) -ForegroundColor DarkGray } }
-        if ($AllowEmpty) { Write-Host '  Клавиша ставит и снимает отметку, Enter - дальше (можно без отметок), 0 - отмена:' }
-        else { Write-Host '  Клавиша ставит и снимает отметку, Enter - старт, 0 - отмена:' }
-        for ($i = 0; $i -lt $shown; $i++) {
-            $box = '[ ]'
-            if ($marks.Contains($i)) { $box = '[x]' }
-            Write-Host ("    {0} {1} {2}" -f $script:UiKeys[$i], $box, $Items[$i])
-        }
-        $key = [Console]::ReadKey($true)
-        if ($key.Key -eq [ConsoleKey]::Enter) {
-            if ($marks.Count -gt 0) { return [int[]]@($marks | Sort-Object) }
-            if ($AllowEmpty) { return , ([int[]]@()) }
-            Write-Host '  Ничего не отмечено.' -ForegroundColor Yellow
-            continue
-        }
-        if ([string]$key.KeyChar -eq '0') { return $null }
-        $index = Get-UiKeyIndex $key
-        if ($index -lt 0 -or $index -ge $shown) { continue }
-        if ($marks.Contains($index)) { $null = $marks.Remove($index); continue }
-        if ($Groups.Count -eq $Items.Count -and $Groups[$index]) {
-            $mine = @($Groups[$index] -split '\|' | Where-Object { $_ })
-            foreach ($other in @($marks)) {
-                $theirs = @($Groups[$other] -split '\|' | Where-Object { $_ })
-                if (@($mine | Where-Object { $theirs -contains $_ }).Count -gt 0) {
-                    $null = $marks.Remove($other)
-                    Write-Host ("  снято: {0} - у расширения одно обновление" -f $Items[$other]) -ForegroundColor DarkYellow
+    $askLog = Start-UiAskLog $Header # ** Хлебников С.Ю. 20261120 ожидание человека - в журнал прогона
+    try {
+        while ($true) {
+            Write-Host ''
+            Write-Host ('  ' + $Header)
+            foreach ($note in $Notes) { if ($note) { Write-Host ('  ' + $note) -ForegroundColor DarkGray } }
+            if ($AllowEmpty) { Write-Host '  Клавиша ставит и снимает отметку, Enter - дальше (можно без отметок), 0 - отмена:' }
+            else { Write-Host '  Клавиша ставит и снимает отметку, Enter - старт, 0 - отмена:' }
+            for ($i = 0; $i -lt $shown; $i++) {
+                $box = '[ ]'
+                if ($marks.Contains($i)) { $box = '[x]' }
+                Write-Host ("    {0} {1} {2}" -f $script:UiKeys[$i], $box, $Items[$i])
+            }
+            $key = [Console]::ReadKey($true)
+            if ($key.Key -eq [ConsoleKey]::Enter) {
+                if ($marks.Count -gt 0) { return [int[]]@($marks | Sort-Object) }
+                if ($AllowEmpty) { return , ([int[]]@()) }
+                Write-Host '  Ничего не отмечено.' -ForegroundColor Yellow
+                continue
+            }
+            if ([string]$key.KeyChar -eq '0') { return $null }
+            $index = Get-UiKeyIndex $key
+            if ($index -lt 0 -or $index -ge $shown) { continue }
+            if ($marks.Contains($index)) { $null = $marks.Remove($index); continue }
+            if ($Groups.Count -eq $Items.Count -and $Groups[$index]) {
+                $mine = @($Groups[$index] -split '\|' | Where-Object { $_ })
+                foreach ($other in @($marks)) {
+                    $theirs = @($Groups[$other] -split '\|' | Where-Object { $_ })
+                    if (@($mine | Where-Object { $theirs -contains $_ }).Count -gt 0) {
+                        $null = $marks.Remove($other)
+                        Write-Host ("  снято: {0} - у расширения одно обновление" -f $Items[$other]) -ForegroundColor DarkYellow
+                    }
                 }
             }
+            $null = $marks.Add($index)
         }
-        $null = $marks.Add($index)
     }
+    finally { Stop-UiAskLog $askLog }
 }
 
 function Wait-UiAcknowledge {
@@ -418,11 +459,15 @@ function Confirm-Ui {
     Write-Host ("    1 - {0}" -f $Yes)
     Write-Host ("    2 - {0}" -f $No)
     Write-Host -NoNewline '  Выбор: '
-    while ($true) {
-        $typed = [string]([Console]::ReadKey($true)).KeyChar
-        if ($typed -eq '1') { Write-Host '1'; return $true }
-        if ($typed -eq '2') { Write-Host '2'; return $false }
+    $askLog = Start-UiAskLog $Question # ** Хлебников С.Ю. 20261120 ожидание человека - в журнал прогона
+    try {
+        while ($true) {
+            $typed = [string]([Console]::ReadKey($true)).KeyChar
+            if ($typed -eq '1') { Write-Host '1'; return $true }
+            if ($typed -eq '2') { Write-Host '2'; return $false }
+        }
     }
+    finally { Stop-UiAskLog $askLog }
 }
 
 function Show-UiPager {
