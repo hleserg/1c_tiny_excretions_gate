@@ -1882,7 +1882,7 @@ $tests = @(
             Check (-not (Test-Path -LiteralPath (Join-Path $runDir 'accepted.txt'))) 'жёлтый принят в эталон, хотя ответили «не принимать»'
             # Вопрос про эталон - после снятия блокировок рабочей, и Enter в нём - «не принимать».
             $text = @($r.Output) -join "`n"
-            $locksAt = $text.IndexOf('Проверил: блокировок нет')
+            $locksAt = $text.IndexOf('Снял с erp_base')
             if ($locksAt -lt 0) { $locksAt = $text.IndexOf('Блокировок на erp_base нет') }
             $questionLine = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Принять новое прогона 20261117-090000') } | Select-Object -First 1)
             Check ($questionLine.Count -eq 1 -and $locksAt -ge 0 -and $text.IndexOf($questionLine[0]) -gt $locksAt) 'вопрос про эталон задан до снятия блокировок рабочей'
