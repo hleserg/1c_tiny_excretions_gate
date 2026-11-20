@@ -2718,6 +2718,19 @@ $tests = @(
             $newKeys = (@($comparison.NewFailed | ForEach-Object { $_.Key }) -join ',')
             Check ($newKeys -eq 'ОМ_Пример.Вычитание [Сервер]') ("новые падения: " + $newKeys)
             Check (@($comparison.KnownFailed).Count -eq 1 -and @($comparison.Gone) -contains 'ОМ_Пропал.Тест [Сервер]') 'известное падение или пропавший тест не опознаны'
+            # Причина падения известного теста: ERROR «модуль не компилируется» против эталонного FAIL «старое» - по-другому.
+            Check (@($comparison.ReasonChanged).Count -eq 1) ("известных, что падают по-другому: {0}, ждали 1" -f @($comparison.ReasonChanged).Count)
+            # Номер строки, GUID, длительность - не меняют причину; код ошибки меняет.
+            Check ((ConvertTo-UtReasonKey 'FAIL' '{ОбщийМодуль.А.Модуль(12,3)}: строка 5: HTTP 403 за 2 с') -eq (ConvertTo-UtReasonKey 'FAIL' '{ОбщийМодуль.А.Модуль(80,1)}: строка 9: HTTP 403 за 15 с')) 'смена номера строки или длительности поменяла причину'
+            Check ((ConvertTo-UtReasonKey 'FAIL' 'HTTP 403') -ne (ConvertTo-UtReasonKey 'FAIL' 'HTTP 503')) 'смена кода ошибки не поменяла причину'
+            Check ((ConvertTo-UtReasonKey 'FAIL' 'нет таблицы') -ne (ConvertTo-UtReasonKey 'ERROR' 'нет таблицы')) 'FAIL и ERROR с одним текстом - одна причина'
+            Check ((Get-UtStatusTitle 'ERROR') -eq 'ERROR - ошибка выполнения' -and (Get-UtStatusTitle 'FAIL') -eq 'FAIL - не прошло утверждение') 'подписи ERROR/FAIL не те'
+            # Эталон без полного принятия: OK из прогона, у падений и пропавших - прежние записи, новое падение не заносится.
+            $merged = @(Merge-UtBaseline -Current $results -BaselineFile $baselineFile)
+            Check (@($merged | Where-Object { $_ -match '^OK\tОМ_Пример\.Сложение' }).Count -eq 1) 'прошедший тест не в эталоне'
+            Check (@($merged | Where-Object { $_ -match '^FAIL\tОМ_Сломан \[Сервер\] набор\tстарое$' }).Count -eq 1) 'известное падение не сохранило прежнюю запись'
+            Check (@($merged | Where-Object { $_ -match 'ОМ_Пропал\.Тест' }).Count -eq 1) 'пропавший тест выпал из эталона'
+            Check (@($merged | Where-Object { $_ -match '^FAIL\tОМ_Пример\.Вычитание \[Сервер\]\t' }).Count -eq 0) 'новое падение попало в эталон'
         }
     },
     @{
@@ -2819,6 +2832,7 @@ $tests = @(
             $accept = Invoke-Script -Sandbox $sb -Answers @(
                 @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Принять новое последнего прогона в эталон' },
                 @{ Kind = 'confirm'; Header = 'Принять новое прогона'; Yes = $true },
+                @{ Kind = 'confirm'; Header = 'падают модульные тесты'; Yes = $true },
                 @{ Kind = 'one'; Header = 'Посмотрел'; Item = '^Вернуться в меню' },
                 @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
             Check-Common $accept
@@ -2827,6 +2841,57 @@ $tests = @(
             Check-Common $known; Check-Verdict $known 'GREEN' 0
             $step = Get-Step $known 'Модульные тесты'
             Check ($null -ne $step -and [string]$step.detail -match 'известных 1') ("после принятия: {0}" -f $(if ($null -ne $step) { $step.detail } else { 'шага нет' }))
+        }
+    },
+    @{
+        Name = 'gate-unittests-accept-keep-failures'
+        Text = 'модульные тесты: принять в эталон «кроме падений» - падение остаётся новым (красный), accepted.txt scope=partial'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $unitConfig
+            $null = Add-UnitTestSource -Dir (Join-Path $sb 'tests')
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ absent = @('Тесты'); unittests = @($unitAllOk) }
+            Check-Verdict $r 'GREEN' 0
+            $red = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ unittests = @($unitMinusFails) }
+            Check-Verdict $red 'RED' 1
+            $accept = Invoke-Script -Sandbox $sb -Answers @(
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Принять новое последнего прогона в эталон' },
+                @{ Kind = 'confirm'; Header = 'Принять новое прогона'; Yes = $true },
+                @{ Kind = 'confirm'; Header = 'падают модульные тесты'; Yes = $false },
+                @{ Kind = 'one'; Header = 'Посмотрел'; Item = '^Вернуться в меню' },
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })
+            Check-Common $accept
+            Check (@($accept.Output | Where-Object { $_ -match 'падения \(1\) не приняты' }).Count -eq 1) 'нет строки о непринятых падениях'
+            if ($red.RunDir) {
+                $acceptedFile = Join-Path $red.RunDir 'accepted.txt'
+                Check ((Test-Path -LiteralPath $acceptedFile) -and [System.IO.File]::ReadAllText($acceptedFile, $utf8).Contains('scope=partial')) 'accepted.txt без scope=partial'
+                $runReport = Join-Path $red.RunDir 'report.txt'
+                if (Test-Path -LiteralPath $runReport) { Check ([System.IO.File]::ReadAllText($runReport, $utf8).Contains('FAIL - не прошло утверждение')) 'в report.txt нет подписи вида падения' }
+            }
+            $again = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ unittests = @($unitMinusFails) }
+            Check-Common $again; Check-Verdict $again 'RED' 1
+            Check-Step $again 'Модульные тесты' 'FAIL'
+        }
+    },
+    @{
+        Name = 'gate-unittests-gone-empty'
+        Text = 'модульные тесты: тест пропал из отчёта и пустой отчёт - красный (сверка с запланированными), эталон тестов не теряет записи'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $unitConfig
+            $null = Add-UnitTestSource -Dir (Join-Path $sb 'tests')
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ absent = @('Тесты'); unittests = @($unitAllOk) }
+            Check-Verdict $r 'GREEN' 0
+            $baselineFile = Join-Path $sb 'baseline\erp_temp_test\unittests.txt'
+            $onlyOne = @{ cases = @(@{ module = 'ОМ_Пример'; method = 'Сложение'; name = 'Сложение двух чисел'; status = 'ok' }) }
+            $gone = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ unittests = @($onlyOne) }
+            Check-Common $gone
+            Check-Step $gone 'Модульные тесты' 'FAIL'
+            Check ([System.IO.File]::ReadAllText($baselineFile, $utf8).Contains('ОМ_Пример.Вычитание')) 'пропавший из отчёта тест выпал из эталона'
+            $empty = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ unittests = @(@{ cases = @() }) }
+            Check-Common $empty
+            Check-Step $empty 'Модульные тесты' 'FAIL'
+            Check ([System.IO.File]::ReadAllText($baselineFile, $utf8).Contains('ОМ_Пример.Сложение')) 'после пустого отчёта эталон тестов потерял записи'
         }
     },
     @{

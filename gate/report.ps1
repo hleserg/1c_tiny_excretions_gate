@@ -900,10 +900,55 @@ $report.Add('')
 foreach ($line in $exchangeTop) { $report.Add($line) }
 if ($exchangeTop.Count -gt 0) { $report.Add('') }
 $report.Add('КОРОТКО')
+# ** Хлебников С.Ю. 20261120 Постоянные строки сверху: итог шагов и решения - отдельно от вердикта проверки.
+$stepCounts = @{ FAIL = 0; WARN = 0; SKIP = 0 }
+foreach ($step in $steps) {
+    $stepStatus = [string](Get-JsonProperty $step 'status' '')
+    if ($stepCounts.ContainsKey($stepStatus)) { $stepCounts[$stepStatus]++ }
+}
+$report.Add(('  Шаги: упало {0}, жёлтых {1}, пропущено {2}' -f $stepCounts['FAIL'], $stepCounts['WARN'], $stepCounts['SKIP']))
+$decisionParts = New-Object System.Collections.Generic.List[string]
+if ($kitDecision -and $decisionText.ContainsKey($kitDecision)) { $decisionParts.Add(('комплект ' + $decisionText[$kitDecision])) }
+$acceptedPath = Join-Path $RunDir 'accepted.txt'
+if (Test-Path -LiteralPath $acceptedPath) {
+    $acceptedText = [System.IO.File]::ReadAllText($acceptedPath, [System.Text.Encoding]::UTF8)
+    if ($acceptedText -match 'scope=partial') { $decisionParts.Add('принят в эталон, кроме падений модульных тестов') } else { $decisionParts.Add('принят в эталон') }
+}
+else { $decisionParts.Add('в эталон не принят') }
+if (Test-Path -LiteralPath (Join-Path $RunDir 'released.txt')) {
+    $releasedAll = [System.IO.File]::ReadAllText((Join-Path $RunDir 'released.txt'), [System.Text.Encoding]::UTF8)
+    if ($releasedAll -match 'riskAccepted=1') { $decisionParts.Add('выпущен в рабочую с отклонением') } else { $decisionParts.Add('выпущен в рабочую') }
+}
+else { $decisionParts.Add('решение о выпуске не принято') }
+$report.Add(('  Решение: ' + ($decisionParts -join '; ')))
+# ** Хлебников С.Ю. 20261120 конец
 if ($summary.Count -eq 0) { $report.Add('  Нового ничего нет.') }
 foreach ($line in $summary) { $report.Add(('  ' + $line)) }
 $report.Add('')
 foreach ($line in $body) { $report.Add($line) }
+# ** Хлебников С.Ю. 20261120 Модульные тесты: вид падения буквально (ERROR - ошибка выполнения, FAIL - не прошло
+# утверждение), без догадок о стадии; известные, что падают по-другому, - отдельно.
+$unitNewPath = Join-Path $RunDir 'unittests.new.txt'
+$unitChangedPath = Join-Path $RunDir 'unittests.changed.txt'
+if ((Test-Path -LiteralPath $unitNewPath) -or (Test-Path -LiteralPath $unitChangedPath)) {
+    $report.Add('== Модульные тесты: падения')
+    foreach ($unitLine in @(Read-TextLines $unitNewPath | Where-Object { $_ })) {
+        $unitParts = ([string]$unitLine).TrimStart([char]0xFEFF).Split("`t")
+        if ($unitParts.Length -lt 2) { continue }
+        $unitTitle = $unitParts[0]
+        if ($unitTitle -eq 'ERROR') { $unitTitle = 'ERROR - ошибка выполнения' } elseif ($unitTitle -eq 'FAIL') { $unitTitle = 'FAIL - не прошло утверждение' }
+        $unitMessage = ''
+        if ($unitParts.Length -ge 3) { $unitMessage = $unitParts[2] }
+        $report.Add(('   новое, {0}: {1}: {2}' -f $unitTitle, $unitParts[1], $unitMessage))
+    }
+    foreach ($unitLine in @(Read-TextLines $unitChangedPath | Where-Object { $_ })) {
+        $unitParts = ([string]$unitLine).TrimStart([char]0xFEFF).Split("`t")
+        if ($unitParts.Length -lt 4) { continue }
+        $report.Add(('   известный, падает по-другому: {0}; {1}; {2}' -f $unitParts[1], $unitParts[2], $unitParts[3]))
+    }
+    $report.Add('')
+}
+# ** Хлебников С.Ю. 20261120 конец
 $report.Add('Подробности: summary.txt, *.new.txt, selfcheck-after.journal.txt в папке прогона. Разбор строится только по файлам прогона, без 1С.')
 
 $reportPath = Join-Path $RunDir 'report.txt'
