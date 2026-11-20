@@ -671,8 +671,11 @@ function Save-ProdLockFile {
         }
         $processStart = ''
         try { $processStart = (Get-Process -Id $PID).StartTime.ToString('yyyy-MM-ddTHH:mm:ss') } catch { $processStart = '' }
+        # Цель - кластер и ИБ (как в журнале обновления): то же имя базы на другом кластере - не наша.
+        $identity = ''
+        if ($null -ne $deployTarget) { $identity = [string]$deployTarget.Identity }
         $record = [ordered]@{
-            base = $script:ProdBase; pid = $PID; processStart = $processStart; marker = $state.Marker; jobsSet = [bool]$state.JobsSet
+            base = $script:ProdBase; target = $identity; pid = $PID; processStart = $processStart; marker = $state.Marker; jobsSet = [bool]$state.JobsSet
             before = (ConvertTo-LockJson $state.Before); expected = @(foreach ($one in $state.Expected) { ConvertTo-LockJson $one })
         }
         Save-DeployJournalFile -Path $lockFile -Record $record
@@ -684,6 +687,8 @@ function Resolve-InterruptedLocks {
     # locks.json запусков, чей процесс уже не живёт: что из блокировок рабочей до сих пор их, и - по вопросу - снять
     # только своё (Restore-GateLocks возвращает запрет сеансов к параметрам до запуска). Чужое и изменённое не трогается.
     # Возвращает, у скольких запусков нашлись свои блокировки (снятые или оставленные).
+    # ReadOnly (-StatusOnly: без deploy.lock) - только показать, ничего не снимать.
+    param([switch]$ReadOnly)
     if (-not (Test-Path -LiteralPath $deployRoot)) { return 0 }
     $found = 0
     foreach ($dir in @(Get-ChildItem -LiteralPath $deployRoot -Directory | Where-Object { $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name)) {
@@ -708,6 +713,13 @@ function Resolve-InterruptedLocks {
         $state.Before = ConvertFrom-LockJson (Get-JsonValue $record 'before' $null)
         $state.Expected = @(foreach ($one in @(Get-JsonValue $record 'expected' @())) { ConvertFrom-LockJson $one })
         $target = Get-BaseInfo -Link (Connect-ClusterAgent) -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+        $savedTarget = [string](Get-JsonValue $record 'target' '')
+        if (-not $savedTarget -or $savedTarget -cne [string]$target.Identity) {
+            # Сверять нечего: другая цель или цель не записана. Файл остаётся - он про ту базу, где ставились блокировки.
+            Write-Line ("  locks.json прерванного обновления {0}: кластер или ИБ не совпадает с текущим профилем {1}\{2} - не сверяю и не снимаю. Блокировки той базы - консоль кластера." -f $dir.Name, $script:Server, $script:ProdBase) 'Yellow'
+            Write-RunLog ("locks.json {0}: цель «{1}» не совпала с текущей" -f $dir.Name, $savedTarget)
+            continue
+        }
         $now = Read-BaseInfoAgain $target $script:ProdBase
         $own = New-Object System.Collections.Generic.List[string]
         $foreign = New-Object System.Collections.Generic.List[string]
@@ -726,11 +738,12 @@ function Resolve-InterruptedLocks {
         if ($own.Count -eq 0) {
             foreach ($line in $foreign) { Write-Line ('  ' + $line) 'Yellow' }
             Write-Line ("  блокировок прерванного обновления {0} на {1} нет" -f $dir.Name, $script:ProdBase) 'Green'
-            Remove-Item -LiteralPath $lockFile -Force
+            if (-not $ReadOnly) { Remove-Item -LiteralPath $lockFile -Force }
             continue
         }
-        $found++
         Show-UiTitle -Text ("Прерванное обновление {0} оставило на {1} блокировки" -f $dir.Name, $script:ProdBase) -Kind 'bad' -More (@($own.ToArray()) + @($foreign.ToArray()))
+        if ($ReadOnly) { Write-Line '  только просмотр: не снимаю. Снять - обычным запуском обновления рабочей.' 'Yellow'; continue }
+        $found++
         if (-not (Test-UiCanAsk)) { Write-Line '  не снимаю: спросить некого. Снять - консоль кластера или deploy в меню гейта.' 'Yellow'; continue }
         $release = Confirm-Ui -Question ("Снять блокировки {0}, оставленные прерванным обновлением {1}: {2}?" -f $script:ProdBase, $dir.Name, ($own -join '; ')) -Yes 'Да, снять' -No 'Нет, оставить' -DefaultNo
         if ($release -ne $true) { Write-Line '  оставил как есть. Снять потом - этим же вопросом при следующем запуске или в консоли кластера.' 'Yellow'; continue }
@@ -3750,7 +3763,7 @@ function Resolve-InterruptedDeploys {
 # ** Хлебников С.Ю. 20261120 конец
 
 if (-not $Prepare -and -not $CancelPrepared) {
-    $lockedBefore = Resolve-InterruptedLocks
+    $lockedBefore = Resolve-InterruptedLocks -ReadOnly:(-not $writeRun)
     $interrupted = Resolve-InterruptedDeploys
     if (($interrupted -gt 0 -or $lockedBefore -gt 0) -and -not $Rollback) {
         Write-Line 'Сначала - разобраться с прерванным обновлением (см. выше). Выход, ничего не менял.' 'Yellow'

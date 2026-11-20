@@ -480,6 +480,9 @@ function New-ComState {
     }
 }
 
+# Идентификатор цели erp_base подставного кластера (кластер, имя, ИБ, СУБД) - как его пишет deploy в deploy.json.
+$script:ProdTargetId = '[["fake",1541,""],"erp_base","","[\"MSSQLServer\",\"fixture-db\",\"erp_base\"]"]'
+
 function New-InterruptedLockCom {
     # Рабочая после обрыва deploy: стоит блокировка начала сеансов с кодом по умолчанию и запрет регламентных.
     param([string]$Message)
@@ -492,10 +495,10 @@ function New-InterruptedLockCom {
 
 function Write-InterruptedLockFile {
     # locks.json запуска 20261117-230000, чей процесс уже не живёт: до него запрета не было.
-    param([string]$Sandbox, [string]$Marker, [bool]$JobsSet)
+    param([string]$Sandbox, [string]$Marker, [bool]$JobsSet, [string]$Target = $script:ProdTargetId)
     $dir = Join-Path $Sandbox 'deploy\20261117-230000'
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
-    $record = @{ base = 'erp_base'; pid = 999999; processStart = '2026-11-17T23:00:00'; marker = $Marker; jobsSet = $JobsSet
+    $record = @{ base = 'erp_base'; target = $Target; pid = 999999; processStart = '2026-11-17T23:00:00'; marker = $Marker; jobsSet = $JobsSet
         before = @{ SessionsDenied = $false; PermissionCode = ''; DeniedMessage = ''; DeniedFrom = $null; DeniedTo = $null }
         expected = @(@{ SessionsDenied = $true; PermissionCode = '0'; DeniedMessage = ('Обновление [{0}]' -f $Marker); DeniedFrom = '2026-11-17T22:30:00.0000000'; DeniedTo = '2026-11-18T01:00:00.0000000' }) }
     [System.IO.File]::WriteAllText((Join-Path $dir 'locks.json'), (ConvertTo-Json -InputObject $record -Depth 6), $utf8)
@@ -2087,6 +2090,38 @@ $tests = @(
             Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\20261117-230000\locks.json')) 'locks.json убран, хотя блокировки оставлены'
             $text = @($r.Output) -join "`n"
             Check ($text.Contains('не та, что ставил прерванный запуск')) 'не сказано, что блокировка сеансов чужая'
+        }
+    },
+    @{
+        Name = 'deploy-interrupted-locks-other-target'
+        Text = 'locks.json записан для другого кластера с тем же именем базы: не сверяет и не снимает, файл остаётся'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-InterruptedLockCom -Message 'Обновление [abc123]'
+            Write-InterruptedLockFile $sb -Marker 'abc123' -JobsSet $true -Target 'другой-кластер|erp_base'
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Cancel = $true })
+            Check (@($r.Questions | Where-Object { $_.Contains('прерванным обновлением') }).Count -eq 0) 'спросил про блокировки чужой цели'
+            $prod = $r.ComState.bases.erp_base
+            Check ([bool]$prod.sessionsDenied -and [bool]$prod.scheduledJobsDenied) 'блокировки сняты по записи другой цели'
+            Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\20261117-230000\locks.json')) 'locks.json другой цели убран'
+        }
+    },
+    @{
+        Name = 'deploy-interrupted-locks-status-only'
+        Text = '-StatusOnly при оставшихся своих блокировках: показывает, но не спрашивает и не снимает'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-InterruptedLockCom -Message 'Обновление [abc123]'
+            Write-InterruptedLockFile $sb -Marker 'abc123' -JobsSet $true
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-StatusOnly' -Com $com
+            Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            $prod = $r.ComState.bases.erp_base
+            Check ([bool]$prod.sessionsDenied -and [bool]$prod.scheduledJobsDenied) 'просмотр снял блокировки'
+            Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\20261117-230000\locks.json')) 'просмотр убрал locks.json'
+            Check ((@($r.Output) -join "`n").Contains('только просмотр: не снимаю')) 'просмотр не показал оставшиеся блокировки'
         }
     },
     @{
