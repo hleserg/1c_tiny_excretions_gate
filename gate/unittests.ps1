@@ -461,6 +461,19 @@ function Format-UtResultLine {
 function Read-UtResultFile {
     # Файл результатов (эталон) -> ключ -> статус. $null - файла нет.
     param([string]$Path)
+    $full = Read-UtResultRecords $Path
+    if ($null -eq $full) { return $null }
+    $map = @{}
+    foreach ($key in @($full.Keys)) { $map[$key] = $full[$key].Status }
+    return $map
+}
+
+# ** Хлебников С.Ю. 20261120 Эталон тестов целиком (статус, сообщение, исходная строка) и причина падения для
+# сравнения: вид (FAIL/ERROR) и текст, где закрыто только то, что меняется само (номер строки, GUID, ссылка,
+# дата, время, путь, длительность). Остальные числа - коды ошибок, счётчики - сравниваются как есть.
+function Read-UtResultRecords {
+    # Файл результатов -> ключ -> @{ Status; Message; HasMessage; Line }. $null - файла нет.
+    param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
     $map = @{}
     foreach ($line in [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)) {
@@ -468,33 +481,95 @@ function Read-UtResultFile {
         if (-not $clean) { continue }
         $parts = $clean.Split("`t")
         if ($parts.Length -lt 2) { continue }
-        $map[$parts[1]] = $parts[0]
+        $message = ''
+        if ($parts.Length -ge 3) { $message = ($parts[2..($parts.Length - 1)] -join "`t") }
+        $map[$parts[1]] = [pscustomobject]@{ Status = $parts[0]; Message = $message; HasMessage = ($parts.Length -ge 3); Line = $clean }
     }
     return $map
 }
 
+function ConvertTo-UtReasonKey {
+    # Причина падения для сравнения: «СТАТУС|текст с закрытыми изменчивыми фрагментами».
+    param([string]$Status, [string]$Message)
+    # Обрезка - как в Format-UtResultLine: в эталоне сообщение уже обрезано до 400 знаков.
+    $text = ([string]$Message) -replace '\s+', ' '
+    if ($text.Length -gt 400) { $text = $text.Substring(0, 400) + '...' }
+    $text = $text -replace '\{[^{}]*\(\d+(?:,\s*\d+)?\)\}', '{#}'
+    $text = $text -replace '(?i)(строк[аеиу]?|line)\s*:?\s*\d+', '$1 #'
+    $text = $text -replace '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', '<guid>'
+    $text = $text -replace 'e1cib/\S+', '<ссылка>'
+    $text = $text -replace '\b\d{4}-\d{2}-\d{2}(?:[T ]\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?', '<дата>'
+    $text = $text -replace '\b\d{1,2}\.\d{1,2}\.\d{2,4}(?: \d{1,2}:\d{2}(?::\d{2})?)?', '<дата>'
+    $text = $text -replace '\b\d{1,2}:\d{2}:\d{2}\b', '<время>'
+    $text = $text -replace '(?:[A-Za-z]:\\|\\\\)[^\s"''«»|]+', '<путь>'
+    $text = $text -replace '(?i)\b\d+(?:[.,]\d+)?\s*(?:мс|ms|сек|с|s)\b', '<длит>'
+    return ('{0}|{1}' -f $Status, $text.Trim())
+}
+
+function Get-UtStatusTitle {
+    # Подпись вида падения - буквально, без догадок о стадии теста.
+    param([string]$Status)
+    if ($Status -eq 'ERROR') { return 'ERROR - ошибка выполнения' }
+    if ($Status -eq 'FAIL') { return 'FAIL - не прошло утверждение' }
+    return $Status
+}
+
+function Merge-UtBaseline {
+    # Эталон после прогона без полного принятия: из прогона берутся только OK (и новые OK), у FAIL, ERROR, SKIP
+    # и пропавших остаётся прежняя запись эталона, новое падение не заносится. Строки - для файла эталона.
+    param([object[]]$Current, [string]$BaselineFile)
+    $baseline = Read-UtResultRecords $BaselineFile
+    if ($null -eq $baseline) { $baseline = @{} }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $done = @{}
+    foreach ($result in $Current) {
+        $key = [string]$result.Key
+        if ($done.ContainsKey($key)) { continue }
+        $done[$key] = $true
+        if ($result.Status -eq 'OK') { $lines.Add((Format-UtResultLine $result)) }
+        elseif ($baseline.ContainsKey($key)) { $lines.Add([string]$baseline[$key].Line) }
+    }
+    foreach ($key in @($baseline.Keys | Sort-Object)) {
+        if (-not $done.ContainsKey($key)) { $lines.Add([string]$baseline[$key].Line) }
+    }
+    return , $lines.ToArray()
+}
+# ** Хлебников С.Ю. 20261120 конец
+
 function Compare-UtResults {
     # Результаты прогона против эталона. Новое падение - тест падает, а в эталоне он проходил, пропускался или его не было.
+    # ** Хлебников С.Ю. 20261120 ReasonChanged - известный тест падает по-другому (вид или текст причины, см.
+    # ConvertTo-UtReasonKey); ReasonUnknown - у записи эталона нет сообщения, сравнить причину нельзя.
     param([object[]]$Current, [string]$BaselineFile)
-    $baseline = Read-UtResultFile $BaselineFile
+    $baseline = Read-UtResultRecords $BaselineFile
     $newFailed = New-Object System.Collections.Generic.List[object]
     $knownFailed = New-Object System.Collections.Generic.List[object]
+    $reasonChanged = New-Object System.Collections.Generic.List[object]
+    $reasonUnknown = 0
     $fixed = New-Object System.Collections.Generic.List[string]
     $added = New-Object System.Collections.Generic.List[string]
     $present = @{}
     foreach ($result in $Current) {
         $present[$result.Key] = $true
-        $before = ''
+        $before = $null
         if ($null -ne $baseline -and $baseline.ContainsKey($result.Key)) { $before = $baseline[$result.Key] } elseif ($null -ne $baseline) { $added.Add($result.Key) }
         if (Test-UtFailed $result.Status) {
-            if ($before -and (Test-UtFailed $before)) { $knownFailed.Add($result) } else { $newFailed.Add($result) }
+            if ($null -ne $before -and (Test-UtFailed $before.Status)) {
+                $knownFailed.Add($result)
+                if (-not $before.HasMessage) { $reasonUnknown++ }
+                elseif ((ConvertTo-UtReasonKey $result.Status $result.Message) -ne (ConvertTo-UtReasonKey $before.Status $before.Message)) {
+                    $reasonChanged.Add([pscustomobject]@{ Result = $result; BeforeStatus = $before.Status; BeforeMessage = $before.Message })
+                }
+            }
+            else { $newFailed.Add($result) }
         }
-        elseif ($result.Status -eq 'OK' -and $before -and (Test-UtFailed $before)) { $fixed.Add($result.Key) }
+        elseif ($result.Status -eq 'OK' -and $null -ne $before -and (Test-UtFailed $before.Status)) { $fixed.Add($result.Key) }
     }
     $gone = New-Object System.Collections.Generic.List[string]
     if ($null -ne $baseline) { foreach ($key in $baseline.Keys) { if (-not $present.ContainsKey($key)) { $gone.Add($key) } } }
     return [pscustomobject]@{
         HasBaseline = ($null -ne $baseline); NewFailed = $newFailed.ToArray(); KnownFailed = $knownFailed.ToArray()
+        ReasonChanged = $reasonChanged.ToArray(); ReasonUnknown = $reasonUnknown
         Fixed = $fixed.ToArray(); Added = $added.ToArray(); Gone = $gone.ToArray()
     }
 }
