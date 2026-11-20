@@ -494,7 +494,8 @@ function ConvertTo-UtReasonKey {
     # Обрезка - как в Format-UtResultLine: в эталоне сообщение уже обрезано до 400 знаков.
     $text = ([string]$Message) -replace '\s+', ' '
     if ($text.Length -gt 400) { $text = $text.Substring(0, 400) + '...' }
-    $text = $text -replace '\{[^{}]*\(\d+(?:,\s*\d+)?\)\}', '{#}'
+    # Только координаты {Модуль(строка,колонка)}: имя модуля остаётся - другой модуль значит другую причину.
+    $text = $text -replace '(\{[^{}()]*)\(\d+(?:,\s*\d+)?\)\}', '$1(#)}'
     $text = $text -replace '(?i)(строк[аеиу]?|line)\s*:?\s*\d+', '$1 #'
     $text = $text -replace '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', '<guid>'
     $text = $text -replace 'e1cib/\S+', '<ссылка>'

@@ -184,7 +184,7 @@ func (d *dialog) windowEnd(offset int) int {
 }
 
 func newDialog(ev uiEvent, width, height int) *dialog {
-	d := &dialog{ev: ev, marks: map[int]bool{}, yes: true, armed: -1}
+	d := &dialog{ev: ev, marks: map[int]bool{}, yes: !ev.DefaultNo, armed: -1}
 	for _, i := range ev.Preselected {
 		if i >= 0 && i < len(ev.Items) && len(d.clashing(i)) == 0 {
 			d.marks[i] = true

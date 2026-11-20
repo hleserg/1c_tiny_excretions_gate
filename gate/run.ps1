@@ -2124,6 +2124,20 @@ if ($PSCmdlet.ParameterSetName -eq 'Password') {
     exit 0
 }
 
+# ** Хлебников С.Ю. 20261120 Падения модульных тестов при принятии в эталон - отдельным решением, во всех интерактивных
+# путях (меню и «Оставить и принять» после вердикта): принять остальное (снимки, самопроверку), а падения оставить новыми.
+# $true - падения не принимать (KeepFailures). Падений нет - вопроса нет, $false.
+function Get-AcceptKeepFailures {
+    param([string]$RunPath, [string]$RunName)
+    $unitFile = Join-Path $RunPath 'unittests.txt'
+    if (-not (Test-Path -LiteralPath $unitFile)) { return $false }
+    $unitFailed = @([System.IO.File]::ReadAllLines($unitFile, [System.Text.Encoding]::UTF8) | Where-Object { ([string]$_).TrimStart([char]0xFEFF) -match '^(FAIL|ERROR)\t' }).Count
+    if ($unitFailed -eq 0) { return $false }
+    $withFailures = Confirm-Ui -Question ('В прогоне {0} падают модульные тесты ({1}). Их тоже принять как известные?' -f $RunName, $unitFailed) -Yes 'Да, и падения' -No 'Нет, падения оставить новыми'
+    return ($withFailures -ne $true)
+}
+# ** Хлебников С.Ю. 20261120 конец
+
 function Invoke-AcceptBaseline {
     # Принять замечания прогона как известные: записать их в эталон базы. Зовут ключ -AcceptBaseline
     # и пункт меню «Принять новое последнего прогона в эталон». Ошибка - исключением.
@@ -2563,18 +2577,7 @@ function Invoke-AcceptFromMenu {
     if ($red) { $yesText = 'Принять, хотя прогон красный' }
     $sure = Confirm-Ui -Question ('Принять новое прогона {0} в эталон? Что внутри - report.txt и *.new.txt в папке прогона.' -f $runName) -Yes $yesText -No 'Не принимать'
     if ($sure -ne $true) { Write-Host '  Не принято.'; return $false }
-    # ** Хлебников С.Ю. 20261120 Падения модульных тестов - отдельным решением: принять остальное (снимки, самопроверку),
-    # а падения оставить новыми.
-    $keepFailures = $false
-    $unitFile = Join-Path $Run.Dir.FullName 'unittests.txt'
-    if (Test-Path -LiteralPath $unitFile) {
-        $unitFailed = @([System.IO.File]::ReadAllLines($unitFile, [System.Text.Encoding]::UTF8) | Where-Object { ([string]$_).TrimStart([char]0xFEFF) -match '^(FAIL|ERROR)\t' }).Count
-        if ($unitFailed -gt 0) {
-            $withFailures = Confirm-Ui -Question ('В прогоне {0} падают модульные тесты ({1}). Их тоже принять как известные?' -f $runName, $unitFailed) -Yes 'Да, и падения' -No 'Нет, падения оставить новыми'
-            $keepFailures = ($withFailures -ne $true)
-        }
-    }
-    # ** Хлебников С.Ю. 20261120 конец
+    $keepFailures = Get-AcceptKeepFailures -RunPath $Run.Dir.FullName -RunName $runName
     try {
         Invoke-AcceptBaseline -RunPath $Run.Dir.FullName -KeepFailures:$keepFailures
         Write-Host ('  Принято: новое прогона {0} теперь известное.' -f $runName) -ForegroundColor Green
@@ -7252,12 +7255,21 @@ if ([string](Get-Setting $cfg 'ProdBase' '') -and (Test-Path -LiteralPath (Join-
     Write-Host 'Снимок temp для обновления рабочей (хеш-суммы расширений и обработок, только чтение)...' -ForegroundColor DarkGray
     try {
         $snapshotProcess = Start-Process -FilePath 'powershell.exe' -ArgumentList ($snapshotArgs -join ' ') -NoNewWindow -PassThru -RedirectStandardOutput $snapshotLog -RedirectStandardError ($snapshotLog + '.err')
-        $snapshotLimit = ([int](Get-Setting $cfg 'ComTimeoutSec' 300) * 4 + 60) * 1000
-        if (-not $snapshotProcess.WaitForExit($snapshotLimit)) { try { $snapshotProcess.Kill() } catch { }; throw 'не уложился в срок' }
+        # Ждём по секунде: остановка из ci.exe (файл stop) снимает процесс снимка и идёт дальше как обычная остановка.
+        $snapshotDeadline = (Get-Date).AddSeconds([int](Get-Setting $cfg 'ComTimeoutSec' 300) * 4 + 60)
+        while (-not $snapshotProcess.WaitForExit(1000)) {
+            try { Test-UiStop }
+            catch { try { $snapshotProcess.Kill() } catch { }; throw }
+            if ((Get-Date) -gt $snapshotDeadline) { try { $snapshotProcess.Kill() } catch { }; throw 'не уложился в срок' }
+        }
         if (-not (Test-Path -LiteralPath $checkedFile)) { throw ('файла снимка нет (код {0}), см. checked-state.log' -f $snapshotProcess.ExitCode) }
         $script:CheckedState = [System.IO.File]::ReadAllText($checkedFile, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
     }
-    catch { $script:CheckedState = [pscustomobject]@{ ok = $false; error = [string]$_.Exception.Message } }
+    catch {
+        # Остановка из ci.exe - не ошибка снимка: дальше её обрабатывают trap и finally прогона.
+        if ([string]$_.Exception.Message -eq 'остановлено из интерфейса ci.exe') { throw }
+        $script:CheckedState = [pscustomobject]@{ ok = $false; error = [string]$_.Exception.Message }
+    }
     if ([bool](Get-UiField $script:CheckedState 'ok' $false)) { Write-RunLog 'Снимок temp для обновления рабочей снят' }
     else { Write-RunLog ('Снимок temp для обновления рабочей не снят: ' + [string](Get-UiField $script:CheckedState 'error' '')) }
 }
@@ -7456,7 +7468,9 @@ elseif ($anyTouched -gt 0) {
     }
     if ($acceptAfterDecision -and $decision -eq 'kept') {
         try {
-            Invoke-AcceptBaseline -RunPath $RunDir
+            $keepFailuresNow = $false
+            if (Test-UiCanAsk) { $keepFailuresNow = Get-AcceptKeepFailures -RunPath $RunDir -RunName $runId }
+            Invoke-AcceptBaseline -RunPath $RunDir -KeepFailures:$keepFailuresNow
             $aftermath.Add('Новое этого прогона принято в эталон.')
             Write-Host 'Новое этого прогона принято в эталон.' -ForegroundColor Green
         }
