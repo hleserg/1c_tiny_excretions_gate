@@ -66,6 +66,8 @@ func main() {
 	packs := loadPackages()
 	vpo := buildProcessing(packs)
 	if check {
+		// Канарейка и исполнитель действий - тоже: их ошибки иначе всплыли бы только при выпуске.
+		vpo = append(append(vpo, buildCanary()...), buildActions()...)
 		if srcOut != "" {
 			for _, e := range vpo {
 				path := filepath.Join(srcOut, filepath.FromSlash(e.Name))
@@ -81,11 +83,12 @@ func main() {
 	}
 	must(os.MkdirAll(outDir, 0o755))
 	canary := buildCanary()
+	actions := buildActions()
 	writeZip(filepath.Join(outDir, "ВыполнитьПослеОбновления_"+stamp+".zip"), vpo)
 	writeZip(filepath.Join(outDir, "Канарейка_"+stamp+".zip"), canary)
 	// Архив гейта - всё для установки: папка ci, установщик и выгрузки обработок (их собирает install.cmd).
 	gate := buildGate()
-	for _, e := range append(append([]entry{}, vpo...), canary...) {
+	for _, e := range append(append(append([]entry{}, vpo...), canary...), actions...) {
 		gate = append(gate, entry{"epf/" + e.Name, e.Data})
 	}
 	writeZip(filepath.Join(outDir, "ci-gate_"+stamp+".zip"), gate)
@@ -583,10 +586,35 @@ func buildProcessing(packs []pack) []entry {
 // ---------- канарейка ----------
 
 func buildCanary() []entry {
+	return buildPlain("Канарейка", "канарейка", 3)
+}
+
+// Исполнитель действий после обновления. Действия в него вставляет гейт на машине перед сборкой - между
+// метками @@ДЕЙСТВИЯ модуля объекта: они должны быть ровно по одной.
+func buildActions() []entry {
+	files := buildPlain("ДействияПослеОбновления", "действия после обновления", 4)
+	for _, f := range files {
+		if f.Name != "ДействияПослеОбновления/Ext/ObjectModule.bsl" {
+			continue
+		}
+		text := string(f.Data)
+		for _, mark := range []string{"// @@ДЕЙСТВИЯ: НАЧАЛО@@", "// @@ДЕЙСТВИЯ: КОНЕЦ@@"} {
+			if n := strings.Count(text, mark); n != 1 {
+				fail("действия после обновления: метка %q встречается %d раз, нужна одна", mark, n)
+			}
+		}
+		return files
+	}
+	fail("действия после обновления: нет модуля объекта")
+	return nil
+}
+
+// Обработка из epf/<имя> как есть: метки версии - на штамп (ровно marks штук), XML - проверка, модули - обработчики оповещений.
+func buildPlain(name, title string, marks int) []entry {
 	base := filepath.Join(root, "epf")
 	var files []entry
-	walk := []string{"Канарейка.xml"}
-	must(filepath.WalkDir(filepath.Join(base, "Канарейка"), func(path string, d os.DirEntry, err error) error {
+	walk := []string{name + ".xml"}
+	must(filepath.WalkDir(filepath.Join(base, name), func(path string, d os.DirEntry, err error) error {
 		if err == nil && !d.IsDir() {
 			rel, _ := filepath.Rel(base, path)
 			walk = append(walk, filepath.ToSlash(rel))
@@ -604,13 +632,13 @@ func buildCanary() []entry {
 		}
 		if strings.HasSuffix(rel, ".bsl") {
 			for _, problem := range notifyHandlerProblems(text) {
-				fail("канарейка, %s: %s", rel, problem)
+				fail("%s, %s: %s", title, rel, problem)
 			}
 		}
 		files = append(files, entry{rel, data})
 	}
-	if total != 3 {
-		fail("канарейка: меток версии %d, ожидалось 3", total)
+	if total != marks {
+		fail("%s: меток версии %d, ожидалось %d", title, total, marks)
 	}
 	return files
 }

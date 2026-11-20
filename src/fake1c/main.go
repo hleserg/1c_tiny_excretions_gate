@@ -10,7 +10,8 @@
 // файл обработки, /DumpExternalDataProcessorOrReportToFiles - корневой XML и модуль объекта, если код возврата 0.
 //
 // Тонкий клиент (ENTERPRISE): режим - первое слово /C. canary, selfcheck (с start= - с этого задания), regepf, unregepf, kbarticle,
-// precheck (проверка перед обновлением: started.txt, precheck.txt, result.txt)
+// precheck (проверка перед обновлением: started.txt, precheck.txt, result.txt), actions (действия после обновления:
+// читает файл параметров in, пишет out.started и out - как обработка «Действия после обновления»)
 // отвечают файлами так же, как настоящие обработки. Список ответов режима - по вызовам: первый вызов
 // берёт первый элемент, следующие - следующие, последний повторяется. RunUnitTests=<файл настроек> - как YAxUnit:
 // лог, отчёт jUnit и файл кода возврата из настроек; тесты - из сценария unittests.
@@ -117,8 +118,25 @@ type precheck struct {
 	NoResult bool     `json:"noresult"`
 }
 
+// actionsRun - ответ режима actions. По умолчанию все действия из файла параметров выполнены сейчас, регистры есть.
+// Already - выполнены раньше; Fail - на каком действии упасть (Error - текст); Register - done-register (ok, missing,
+// notset, nodimension); History - history; Log - строки журнала каждого выполненного действия; Mismatch - обработка
+// собрана с другим списком; NoStart - форма не открылась; NoResult - отметка есть, итога нет.
+type actionsRun struct {
+	Already  []string `json:"already"`
+	Fail     string   `json:"fail"`
+	Error    string   `json:"error"`
+	Register string   `json:"register"`
+	History  string   `json:"history"`
+	Log      []string `json:"log"`
+	Mismatch bool     `json:"mismatch"`
+	NoStart  bool     `json:"nostart"`
+	NoResult bool     `json:"noresult"`
+}
+
 type scenario struct {
 	Designer  []designerRule `json:"designer"`
+	Actions   []actionsRun   `json:"actions"`
 	Canary    []canary       `json:"canary"`
 	Selfcheck []selfcheck    `json:"selfcheck"`
 	Regepf    []processing   `json:"regepf"`
@@ -421,6 +439,9 @@ func client(sc scenario, args []string, state map[string]int) int {
 			u = unitRun{Cases: []unitCase{{Module: "ОМ_Пример", Method: "Тест", Status: "ok"}}}
 		}
 		unitRun1(u, p["config"])
+	case "actions":
+		a, _ := pick(sc.Actions, state, "actions")
+		actionsRun1(a, p["in"], p["out"])
 	case "precheck":
 		c, ok := pick(sc.Precheck, state, "precheck")
 		if !ok {
@@ -599,6 +620,76 @@ func selfcheckRun(s selfcheck, dir, known string, start int) {
 	}
 	writeUTF8(dir+"result.txt", fmt.Sprintf("status=%s\nversion=20261117.999999\nfingerprint=%s\npieces=%d\nwriteerrors=0\nok=%d\nerrors=%d\nwarnings=%d\nskipped=%d",
 		status, fingerprint, pieces, ok, errs, warns, skips))
+}
+
+// actionsRun1 - как обработка «Действия после обновления»: отметка запуска, действия по порядку из файла параметров,
+// первое упавшее останавливает остальные, итог.
+func actionsRun1(a actionsRun, in, out string) {
+	if a.NoStart || out == "" {
+		return
+	}
+	writeUTF8(out+".started", "started=1")
+	if a.NoResult {
+		time.Sleep(time.Hour)
+	}
+	data, err := os.ReadFile(in)
+	if err != nil {
+		writeUTF8(out, "status=error\nerror=не прочитал файл параметров: "+err.Error())
+		return
+	}
+	var ids []string
+	for _, line := range strings.Split(strings.ReplaceAll(string(trimBOM(data)), "\r\n", "\n"), "\n") {
+		if strings.HasPrefix(line, "action=") {
+			ids = append(ids, strings.TrimPrefix(line, "action="))
+		}
+	}
+	lines := []string{"actions=20261117.999999"}
+	if a.Mismatch {
+		writeUTF8(out, strings.Join(append(lines, "error=обработка собрана с другим списком действий: старое", "status=error"), "\n"))
+		return
+	}
+	register := a.Register
+	if register == "" {
+		register = "ok"
+	}
+	lines = append(lines, "done-register="+register)
+	status := "ok"
+	for _, id := range ids {
+		switch {
+		case status != "ok" || register != "ok":
+			status = "failed"
+			lines = append(lines, "action="+id+"|notrun")
+		case id == a.Fail:
+			status = "failed"
+			text := a.Error
+			if text == "" {
+				text = "{ВнешняяОбработка.ДействияПослеОбновления.МодульОбъекта(10)}: Деление на 0"
+			}
+			lines = append(lines, "action="+id+"|failed|"+text)
+		case contains(a.Already, id):
+			lines = append(lines, "action="+id+"|already")
+		default:
+			for _, l := range a.Log {
+				lines = append(lines, "log="+id+"|"+l)
+			}
+			lines = append(lines, "action="+id+"|done|12")
+		}
+	}
+	history := a.History
+	if history == "" {
+		history = "ok"
+	}
+	lines = append(lines, "history="+history, "status="+status)
+	writeUTF8(out, strings.Join(lines, "\n"))
+}
+
+func contains(list []string, value string) bool {
+	for _, item := range list {
+		if item == value {
+			return true
+		}
+	}
+	return false
 }
 
 // precheckRun - как режим precheck обработки «Выполнить после обновления»: отметка запуска, журнал двух шагов, итог.

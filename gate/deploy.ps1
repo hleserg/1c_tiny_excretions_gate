@@ -2567,19 +2567,22 @@ function Get-GitSetup {
 }
 
 function Read-GitState {
-    # commit - чему соответствует temp; pending* - pull request с правками temp, ещё не слитый в main.
+    # commit - чему соответствует temp; pending* - pull request с правками temp, ещё не слитый в main; actionsDone -
+    # действия после обновления (actions/*.bsl), которые прогоны гейта выполнили в temp или нашли выполненными.
     param($Setup)
-    $state = [ordered]@{ repo = $Setup.Repo; commit = ''; how = ''; run = ''; time = ''; pendingBranch = ''; pendingNumber = 0; pendingUrl = ''; pendingCommit = '' }
+    $state = [ordered]@{ repo = $Setup.Repo; commit = ''; how = ''; run = ''; time = ''; pendingBranch = ''; pendingNumber = 0; pendingUrl = ''; pendingCommit = ''; actionsDone = @() }
     if (Test-Path -LiteralPath $Setup.StatePath) {
         try {
             $read = [System.IO.File]::ReadAllText($Setup.StatePath, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
             foreach ($name in @($state.Keys)) { if ($null -ne $read.PSObject.Properties[$name]) { $state[$name] = $read.$name } }
+            $state['actionsDone'] = @(@($state['actionsDone']) | ForEach-Object { [string]$_ } | Where-Object { $_ })
         }
         catch { Write-RunLog ("git: state.json не прочитан: {0}" -f $_.Exception.Message) }
     }
     if ([string]$state['repo'] -ne $Setup.Repo) {
         foreach ($name in @('commit', 'how', 'run', 'pendingBranch', 'pendingUrl', 'pendingCommit')) { $state[$name] = '' }
         $state['pendingNumber'] = 0
+        $state['actionsDone'] = @()
         $state['repo'] = $Setup.Repo
     }
     return $state
@@ -3065,13 +3068,20 @@ function Invoke-GitImport {
     }
     foreach ($name in @($tracked.Extensions | Where-Object { @($headTracked.Extensions) -notcontains $_ })) { Write-Line ("  в {0} больше нет расширения {1}: из {2} не убираю" -f $Setup.Branch, $name, $script:TempBase) 'Yellow' }
     foreach ($name in @($tracked.Processings | Where-Object { @($headTracked.Processings) -notcontains $_ })) { Write-Line ("  в {0} больше нет обработки {1}: из {2} не убираю" -f $Setup.Branch, $name, $script:TempBase) 'Yellow' }
-    if ($toLoad.Count -eq 0) {
+    # Действия после обновления (раздел 5.24) - actions/*.bsl в main. В прогон идут все: выполненные обработка
+    # пропускает по регистру. Прогон только ради действий - если есть файлы, которых нет среди выполненных в temp.
+    $actionFiles = @(@($headFiles.Keys) | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^actions/[^/]+\.bsl$' } | Sort-Object)
+    $doneIds = @($State['actionsDone'])
+    $newActions = @($actionFiles | ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_) } | Where-Object { $doneIds -notcontains $_ })
+    if ($toLoad.Count -eq 0 -and $newActions.Count -eq 0) {
         Write-Line ("{0} уже совпадает с {1} (коммит {2}): загружать нечего." -f $script:TempBase, $Setup.Branch, (Get-GitShort $head.Sha)) 'Green'
         Set-GitLoaded -Setup $Setup -State $State -Commit $head.Sha -Run ''
         Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note ('temp уже на ' + $Setup.Branch)
         return 0
     }
-    $what = @($toLoad | ForEach-Object { if ($_.Kind -eq 'extension') { 'расширение ' + $_.Name } else { 'обработка ' + $_.Name } }) -join ', '
+    $whatList = @($toLoad | ForEach-Object { if ($_.Kind -eq 'extension') { 'расширение ' + $_.Name } else { 'обработка ' + $_.Name } })
+    if ($newActions.Count -gt 0) { $whatList += ('действия после обновления ({0}): {1}' -f $newActions.Count, ($newActions -join ', ')) }
+    $what = $whatList -join ', '
     # Что изменит загрузка - на экран до вопроса: файлы main против того, что в temp сейчас. Вопрос после ответа с
     # экрана уходит, а по выводу должно быть видно, что и почему грузилось.
     $incoming = New-Object System.Collections.Generic.List[object]
@@ -3085,6 +3095,7 @@ function Invoke-GitImport {
             if (([string]$path).StartsWith($entry.Prefix, [System.StringComparison]::Ordinal) -and -not $headFiles.ContainsKey($path)) { $incoming.Add([pscustomobject]@{ Path = [string]$path; Kind = 'delete' }) }
         }
     }
+    foreach ($id in $newActions) { $incoming.Add([pscustomobject]@{ Path = ('actions/{0}.bsl' -f $id); Kind = 'add' }) }
     Write-Line ("Загрузка изменит в {0} ({1}, коммит {2}, против того, что в базе сейчас):" -f $script:TempBase, $Setup.Branch, (Get-GitShort $head.Sha)) 'Cyan'
     foreach ($line in (Get-GitChangeLines $incoming)) { Write-Line ('  ' + $line) }
     foreach ($line in (Get-GitFileLines $incoming)) { Write-Line ('    ' + $line) }
@@ -3094,11 +3105,15 @@ function Invoke-GitImport {
         if (-not $answer) { Write-Line ("Отмена: {0} не трогаю." -f $script:TempBase); return 0 }
     }
 
-    # Комплект: выгрузки изменившихся папок из main, каждая - своей папкой (гейт сам видит, что в ней).
+    # Комплект: выгрузки изменившихся папок из main, каждая - своей папкой (гейт сам видит, что в ней), и действия -
+    # папкой actions. Только действия - комплекта нет, прогон с -ActionsDir.
     $kitName = 'kit-{0}-{1}' -f (Get-GitShort $head.Sha), (Get-Date -Format 'yyyyMMdd-HHmmss')
+    if ($toLoad.Count -eq 0) { $kitName = 'actions-{0}-{1}' -f (Get-GitShort $head.Sha), (Get-Date -Format 'yyyyMMdd-HHmmss') }
     $source = Join-Path $Setup.Root ($kitName + '-src')
     $kitDir = Join-Path $Setup.Root $kitName
-    $count = Save-GhFiles -Gh $Setup.Gh -Commit $head.Sha -Prefixes @($toLoad | ForEach-Object { $_.Prefix }) -Target $source -Expected $headFiles
+    $prefixes = @($toLoad | ForEach-Object { $_.Prefix })
+    if ($actionFiles.Count -gt 0) { $prefixes += 'actions/' }
+    $count = Save-GhFiles -Gh $Setup.Gh -Commit $head.Sha -Prefixes $prefixes -Target $source -Expected $headFiles
     Write-RunLog ("git: из {0} скачано файлов {1} в {2}" -f (Get-GitShort $head.Sha), $count, $source)
     New-Item -ItemType Directory -Path $kitDir -Force | Out-Null
     foreach ($entry in $toLoad) {
@@ -3110,20 +3125,33 @@ function Invoke-GitImport {
         }
         Move-Item -LiteralPath (Join-Path (Join-Path $source $folder) $entry.Name) -Destination $target
     }
+    $actionsDir = ''
+    if ($actionFiles.Count -gt 0) {
+        $actionsDir = Join-Path $kitDir 'actions'
+        New-Item -ItemType Directory -Path $actionsDir -Force | Out-Null
+        foreach ($path in $actionFiles) { Move-Item -LiteralPath (Join-Path (Join-Path $source 'actions') ($path.Substring(8))) -Destination $actionsDir }
+    }
     Remove-Item -LiteralPath $source -Recurse -Force
 
     # Прогон гейта - отдельным процессом (у run.ps1 свои trap и exit). Start-Process без перенаправления: процесс
     # пишет прямо в ту же консоль или в тот же канал ci.exe, вопросы задаёт сам. «& powershell.exe» внутри функции
     # забрал бы весь вывод в её результат - хода прогона не было бы видно.
     $quote = { param([string]$Text) '"' + $Text.Replace('"', '\"') + '"' }
-    $runArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (& $quote (Join-Path $Root 'run.ps1')), '-Kit', (& $quote $kitDir), '-KitSource', (& $quote ("git {0}@{1}" -f $Setup.Repo, [string]$head.Sha)))
+    $runArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (& $quote (Join-Path $Root 'run.ps1')))
+    if ($toLoad.Count -gt 0) { $runArgs += @('-Kit', (& $quote $kitDir)) }
+    else { $runArgs += @('-ActionsDir', (& $quote $actionsDir)) }
+    $runArgs += @('-KitSource', (& $quote ("git {0}@{1}" -f $Setup.Repo, [string]$head.Sha)), '-KitBranch', (& $quote $Setup.Branch))
     if ($Config) { $runArgs += @('-Config', (& $quote $Config)) }
     if ($UiChannel) { $runArgs += @('-UiChannel', (& $quote $UiChannel)) }
     # Без человека - как ночной прогон: вопросов нет, комплект остаётся (temp идёт за main, красное видно в итоге).
-    if ($Unattended) { $runArgs += @('-OnNotGreen', 'Keep', '-OnSessions', 'Continue') }
+    if ($Unattended) {
+        if ($toLoad.Count -gt 0) { $runArgs += @('-OnNotGreen', 'Keep') }
+        $runArgs += @('-OnSessions', 'Continue')
+    }
     $before = @{}
     if (Test-Path -LiteralPath $runsRoot) { foreach ($dir in @(Get-ChildItem -LiteralPath $runsRoot -Directory)) { $before[$dir.Name] = $true } }
-    Write-Line ("Прогон гейта с комплектом из git: {0}" -f $kitDir) 'Cyan'
+    if ($toLoad.Count -gt 0) { Write-Line ("Прогон гейта с комплектом из git: {0}" -f $kitDir) 'Cyan' }
+    else { Write-Line ("Прогон гейта с действиями после обновления из git: {0}" -f $actionsDir) 'Cyan' }
     $process = Start-Process -FilePath 'powershell.exe' -ArgumentList ($runArgs -join ' ') -NoNewWindow -PassThru
     $null = $process.Handle
     $process.WaitForExit()
@@ -3136,6 +3164,29 @@ function Invoke-GitImport {
         return $runCode
     }
     Save-GitImportResult -Setup $Setup -Ran $true -Run $fresh[0].Name -Code $runCode -Note ('загрузка из git, коммит ' + (Get-GitShort $head.Sha))
+    # Выполненные действия - в состояние при любом исходе: откат комплекта данных не возвращает, а выполненное
+    # обработка всё равно не повторит. Упавшее и невыполненное - нет: следующая загрузка запустит их снова.
+    $actionsResult = Join-Path $fresh[0].FullName 'actions.txt'
+    $failedActions = @()
+    if (Test-Path -LiteralPath $actionsResult) {
+        $rows = @([System.IO.File]::ReadAllLines($actionsResult, [System.Text.Encoding]::UTF8) | ForEach-Object { $_.TrimStart([char]0xFEFF) } | Where-Object { $_.StartsWith('action=') })
+        $doneNow = @($rows | ForEach-Object { $parts = $_.Substring(7).Split([char[]]@('|'), 3); if ($parts.Length -gt 1 -and ($parts[1] -eq 'done' -or $parts[1] -eq 'already')) { $parts[0] } })
+        $failedActions = @($rows | ForEach-Object { $parts = $_.Substring(7).Split([char[]]@('|'), 3); if ($parts.Length -lt 2 -or ($parts[1] -ne 'done' -and $parts[1] -ne 'already')) { $parts[0] } })
+        $knownDone = @($State['actionsDone'])
+        $added = @($doneNow | Where-Object { $knownDone -notcontains $_ })
+        if ($added.Count -gt 0) {
+            $State['actionsDone'] = @(@($knownDone + $added) | Sort-Object -Unique)
+            Save-GitState $Setup $State
+        }
+    }
+    if ($newActions.Count -gt 0 -and -not (Test-Path -LiteralPath $actionsResult)) { $failedActions = $newActions }
+    if ($failedActions.Count -gt 0) { Write-Line ("Действия после обновления не выполнены: {0} - следующая загрузка из git запустит их снова." -f ($failedActions -join ', ')) 'Yellow' }
+    if ($toLoad.Count -eq 0) {
+        # Только действия: расширения и обработки temp и так на main.
+        Set-GitLoaded -Setup $Setup -State $State -Commit $head.Sha -Run $fresh[0].Name
+        if ($failedActions.Count -eq 0) { Write-Line ("{0} на {1}, коммит {2}: действия после обновления выполнены (прогон {3})." -f $script:TempBase, $Setup.Branch, (Get-GitShort $head.Sha), $fresh[0].Name) 'Green' }
+        return $runCode
+    }
     $verdictFile = Join-Path $fresh[0].FullName 'verdict.json'
     if (-not (Test-Path -LiteralPath $verdictFile)) { Write-Line ("Прогон {0} без итога: состояние git не меняю, temp смотреть по прогону." -f $fresh[0].Name) 'Yellow'; return $runCode }
     $result = [System.IO.File]::ReadAllText($verdictFile, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json

@@ -65,6 +65,32 @@ function New-ContractCatalogLink {
     return [pscustomobject]@{ Agent = $agent; Connector = $connector; Clusters = $clusters; Errors = @(); ClusterUser = ''; ClusterPassword = '' }
 }
 
+function New-ActionsTemplate {
+    # Шаблон обработки «Действия после обновления» в tools\src песочницы: как в поставке, с метками @@ДЕЙСТВИЯ.
+    param([string]$Sandbox)
+    $src = Join-Path $Sandbox 'tools\src'
+    New-Item -ItemType Directory -Path (Join-Path $src 'ДействияПослеОбновления\Ext') -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $src 'ДействияПослеОбновления.xml'), '<MetaDataObject/>', $utf8Bom)
+    $module = "// Шаблон`r`n#Область Действия`r`n// @@ДЕЙСТВИЯ: НАЧАЛО@@`r`n// В исходниках поставки действий нет.`r`n// @@ДЕЙСТВИЯ: КОНЕЦ@@`r`n#КонецОбласти`r`n"
+    [System.IO.File]::WriteAllText((Join-Path $src 'ДействияПослеОбновления\Ext\ObjectModule.bsl'), $module, $utf8Bom)
+}
+
+function New-ActionText {
+    # Файл действия с полной шапкой.
+    param([string]$Title, [string]$Body)
+    return ("// @Действие {0}`n// @Зачем проверка гейта`n// @Автор Тест`n// @Задача тест`n{1}" -f $Title, $Body)
+}
+
+function New-ActionsKit {
+    # Папка комплекта в песочнице: actions\<имя>.bsl и, если нужно, файл расширения. Возвращает путь к папке.
+    param([string]$Sandbox, [string]$Name, [hashtable]$Actions, [switch]$Cfe)
+    $dir = Join-Path $Sandbox $Name
+    New-Item -ItemType Directory -Path (Join-Path $dir 'actions') -Force | Out-Null
+    if ($Cfe) { [System.IO.File]::WriteAllText((Join-Path $dir $cfeName), 'fake', $utf8Bom) }
+    foreach ($key in $Actions.Keys) { [System.IO.File]::WriteAllText((Join-Path $dir ('actions\' + $key + '.bsl')), $Actions[$key], $utf8Bom) }
+    return $dir
+}
+
 @(
     @{
         Name = 'deploy-contract-prepared-profile'
@@ -267,6 +293,159 @@ function New-ContractCatalogLink {
                 Check ($keys[[array]::IndexOf($labels, 'Блокировки рабочей базы')] -eq 'r') 'у «Блокировки рабочей базы» клавиша не r'
             }
             else { Check $false 'нет вопроса меню' }
+        }
+    },
+    @{
+        Name = 'gate-actions-kit'
+        Text = 'действия после обновления из папки actions комплекта: обработка собрана с ними, выполнены после канарейки по порядку имён, в итоге - что выполнено и что записано в историю'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ ActionsRegister = 'ВыполненныеДействия'; HistoryRegister = 'ИсторияЗагрузок' }
+            New-ActionsTemplate $sb
+            $kit = New-ActionsKit $sb 'kit' -Cfe -Actions @{
+                '20261121-02-второе' = (New-ActionText 'Второе' "Журнал.Добавить(""второе сделано"");")
+                '20261121-01-первое' = (New-ActionText 'Первое' "Значение = 1;")
+            }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $kit) -Fake @{ actions = @(@{ log = @('второе сделано') }) }
+            Check-Common $r
+            Check-Step $r 'Действия после обновления' 'OK'
+            $step = Get-Step $r 'Действия после обновления'
+            if ($null -ne $step) {
+                Check ([string]$step.detail -match 'выполнено сейчас: 20261121-01-первое, 20261121-02-второе') ("в итоге шага не то: {0}" -f $step.detail)
+                Check ([string]$step.detail -match 'загрузка записана в историю') ("нет строки об истории: {0}" -f $step.detail)
+                Check ([string]$step.detail -match 'журнал действий - actions\\log\.txt') ("нет строки о журнале действий: {0}" -f $step.detail)
+            }
+            $build = Get-Calls $r @('/LoadExternalDataProcessorOrReportFromFiles', 'ДействияПослеОбновления.xml')
+            Check ($build.Count -eq 1) ("обработку действий собирали {0} раз, ждали один" -f $build.Count)
+            $client = Get-Calls $r @('ENTERPRISE', 'actions;in=')
+            $canary = Get-Calls $r @('ENTERPRISE', 'canary;')
+            Check ($client.Count -eq 1) ("клиент с действиями запускался {0} раз, ждали один" -f $client.Count)
+            if ($client.Count -eq 1 -and $canary.Count -gt 0) {
+                Check ([array]::IndexOf(@($r.Calls), $client[0]) -gt [array]::IndexOf(@($r.Calls), $canary[0])) 'действия выполнялись раньше канареечного входа'
+            }
+            if ($r.RunDir) {
+                $module = Join-Path $r.RunDir 'actions\src\ДействияПослеОбновления\Ext\ObjectModule.bsl'
+                Check (Test-Path -LiteralPath $module) 'нет собранного модуля объекта с действиями'
+                if (Test-Path -LiteralPath $module) {
+                    $text = [System.IO.File]::ReadAllText($module, $utf8)
+                    Check ($text.IndexOf('Список.Добавить("20261121-01-первое");') -ge 0 -and $text.IndexOf('Список.Добавить("20261121-01-первое");') -lt $text.IndexOf('Список.Добавить("20261121-02-второе");')) 'порядок действий в обработке - не по именам'
+                    Check ($text.Contains("Процедура Действие2(Журнал)") -and $text.Contains("`tЖурнал.Добавить(""второе сделано"");")) 'тело действия не вставлено процедурой'
+                    Check ($text.Contains('Если Номер = 1 Тогда') -and $text.Contains('Действие1(Журнал);')) 'нет выбора действия по номеру'
+                    Check (-not $text.Contains('В исходниках поставки действий нет')) 'заглушка шаблона осталась в собранном модуле'
+                }
+                $params = Join-Path $r.RunDir 'actions\params.txt'
+                if (Test-Path -LiteralPath $params) {
+                    $lines = @([System.IO.File]::ReadAllLines($params, $utf8) | ForEach-Object { $_.TrimStart([char]0xFEFF) })
+                    Check ($lines -contains 'done=ВыполненныеДействия' -and $lines -contains 'history=ИсторияЗагрузок') 'в параметрах нет имён регистров'
+                    Check ($lines -contains 'kind=комплект') 'вид загрузки в параметрах не «комплект»'
+                    Check ((@($lines | Where-Object { $_.StartsWith('action=') }) -join ',') -eq 'action=20261121-01-первое,action=20261121-02-второе') 'список действий в параметрах не тот'
+                }
+                else { Check $false 'нет файла параметров действий' }
+            }
+        }
+    },
+    @{
+        Name = 'gate-actions-fail'
+        Text = 'действие упало: шаг красный, в итоге - какое и почему, следующие не выполнялись, вердикт красный'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ ActionsRegister = 'ВыполненныеДействия' }
+            New-ActionsTemplate $sb
+            $kit = New-ActionsKit $sb 'kit' -Cfe -Actions @{
+                '20261121-01-первое' = (New-ActionText 'Первое' 'Значение = 1;')
+                '20261121-02-второе' = (New-ActionText 'Второе' 'Значение = 1 / 0;')
+                '20261121-03-третье' = (New-ActionText 'Третье' 'Значение = 3;')
+            }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $kit) -Fake @{ actions = @(@{ fail = '20261121-02-второе' }) }
+            Check-Common $r; Check-Verdict $r 'RED' 1
+            Check-Step $r 'Действия после обновления' 'FAIL'
+            $step = Get-Step $r 'Действия после обновления'
+            if ($null -ne $step) {
+                Check ([string]$step.detail -match 'упало действие 20261121-02-второе: .*Деление на 0') ("нет текста упавшего действия: {0}" -f $step.detail)
+                Check ([string]$step.detail -match 'выполнено сейчас: 20261121-01-первое') ("нет выполненного до падения: {0}" -f $step.detail)
+                Check ([string]$step.detail -match 'не выполнялись: 20261121-03-третье') ("нет невыполненного после падения: {0}" -f $step.detail)
+            }
+        }
+    },
+    @{
+        Name = 'gate-actions-bad-file'
+        Text = 'ошибки в файлах действий (нет поля шапки, объявлен метод, транзакция): шаг красный, обработка не собирается, ни одно действие не выполняется'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ ActionsRegister = 'ВыполненныеДействия' }
+            New-ActionsTemplate $sb
+            $noTask = "// @Действие Без задачи`n// @Зачем проверить шапку`n// @Автор Тест`nЗначение = 1;"
+            $kit = New-ActionsKit $sb 'kit' -Cfe -Actions @{
+                '20261121-01-без-задачи' = $noTask
+                '20261121-02-метод' = (New-ActionText 'Метод' "Процедура Своя()`nКонецПроцедуры")
+                '20261121-03-транзакция' = (New-ActionText 'Транзакция' 'НачатьТранзакцию();')
+            }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $kit)
+            Check-Common $r
+            Check-Step $r 'Действия после обновления' 'FAIL'
+            $step = Get-Step $r 'Действия после обновления'
+            if ($null -ne $step) {
+                Check ([string]$step.detail -match '20261121-01-без-задачи - в шапке нет @Задача') ("нет ошибки шапки: {0}" -f $step.detail)
+                Check ([string]$step.detail -match '20261121-02-метод - в файле объявлен метод') ("нет ошибки метода: {0}" -f $step.detail)
+                Check ([string]$step.detail -match '20261121-03-транзакция - в файле управление транзакцией') ("нет ошибки транзакции: {0}" -f $step.detail)
+            }
+            Check ((Get-Calls $r @('/LoadExternalDataProcessorOrReportFromFiles', 'ДействияПослеОбновления.xml')).Count -eq 0) 'обработку с ошибочными действиями собирали'
+            Check ((Get-Calls $r @('ENTERPRISE', 'actions;in=')).Count -eq 0) 'ошибочные действия запускали'
+        }
+    },
+    @{
+        Name = 'gate-actions-only'
+        Text = 'только действия (-ActionsDir, без комплекта): прогон на том, что есть в базе, с действиями после канарейки; вид загрузки - действия'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ ActionsRegister = 'ВыполненныеДействия'; HistoryRegister = 'ИсторияЗагрузок' }
+            New-ActionsTemplate $sb
+            $kit = New-ActionsKit $sb 'only' -Actions @{ '20261121-01-первое' = (New-ActionText 'Первое' 'Значение = 1;') }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-ActionsDir "{0}" -OnNotGreen Keep' -f (Join-Path $kit 'actions')) -Fake @{ actions = @(@{ already = @('20261121-01-первое') }) }
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            Check-Step $r 'Действия после обновления' 'OK'
+            $step = Get-Step $r 'Действия после обновления'
+            if ($null -ne $step) { Check ([string]$step.detail -match 'выполнены раньше: 1') ("нет «выполнены раньше»: {0}" -f $step.detail) }
+            Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0) 'без комплекта что-то загружали'
+            if ($r.RunDir -and (Test-Path -LiteralPath (Join-Path $r.RunDir 'actions\params.txt'))) {
+                Check (@([System.IO.File]::ReadAllLines((Join-Path $r.RunDir 'actions\params.txt'), $utf8)) -contains 'kind=действия после обновления') 'вид загрузки не «действия после обновления»'
+            }
+        }
+    },
+    @{
+        Name = 'gate-actions-no-register'
+        Text = 'регистра выполненных действий в базе нет: действия не выполняются, шаг красный и называет регистр'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ ActionsRegister = 'ВыполненныеДействия' }
+            New-ActionsTemplate $sb
+            $kit = New-ActionsKit $sb 'kit' -Cfe -Actions @{ '20261121-01-первое' = (New-ActionText 'Первое' 'Значение = 1;') }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $kit) -Fake @{ actions = @(@{ register = 'missing'; history = 'notset' }) }
+            Check-Common $r
+            Check-Step $r 'Действия после обновления' 'FAIL'
+            $step = Get-Step $r 'Действия после обновления'
+            if ($null -ne $step) { Check ([string]$step.detail -match 'регистра ВыполненныеДействия в базе нет: действия не выполнялись \(1\)') ("нет текста про регистр: {0}" -f $step.detail) }
+        }
+    },
+    @{
+        Name = 'gate-actions-history-only'
+        Text = 'комплект без действий и с регистром истории: обработка запускается только ради истории; без HistoryRegister шага нет'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ HistoryRegister = 'ИсторияЗагрузок' }
+            New-ActionsTemplate $sb
+            $file = Add-InboxFile $sb $cfeName
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file)
+            Check-Common $r
+            Check-Step $r 'Действия после обновления' 'OK'
+            $step = Get-Step $r 'Действия после обновления'
+            if ($null -ne $step) { Check ([string]$step.detail -match 'действий нет; загрузка записана в историю') ("итог шага: {0}" -f $step.detail) }
+            $plain = New-Sandbox ($Name + '-off')
+            $file = Add-InboxFile $plain $cfeName
+            $s = Invoke-Script -Sandbox $plain -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file)
+            Check-Common $s
+            Check ($null -eq (Get-Step $s 'Действия после обновления')) 'без действий и HistoryRegister появился шаг действий'
+            Check ((Get-Calls $s @('ENTERPRISE', 'actions;in=')).Count -eq 0) 'без действий и HistoryRegister запускалась обработка действий'
         }
     },
     @{

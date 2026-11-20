@@ -556,15 +556,31 @@ $gitBootstrapAnswers = @(
 
 # Заглушка run.ps1 для «Загрузить из git»: записывает, с каким комплектом её позвали, и итог прогона - всё загрузилось.
 $gitRunStub = @'
-param([string]$Kit = '', [string]$KitSource = '', [string]$Config = '', [string]$UiChannel = '', [string]$OnNotGreen = '', [string]$OnSessions = '')
+param([string]$Kit = '', [string]$KitSource = '', [string]$KitBranch = '', [string]$ActionsDir = '', [string]$Config = '', [string]$UiChannel = '', [string]$OnNotGreen = '', [string]$OnSessions = '')
 $dir = Join-Path $PSScriptRoot ('runs\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 New-Item -ItemType Directory -Path $dir -Force | Out-Null
-$lines = @(('Kit=' + $Kit), ('KitSource=' + $KitSource), ('OnNotGreen=' + $OnNotGreen), ('OnSessions=' + $OnSessions))
+$lines = @(('Kit=' + $Kit), ('KitSource=' + $KitSource), ('KitBranch=' + $KitBranch), ('ActionsDir=' + $ActionsDir), ('OnNotGreen=' + $OnNotGreen), ('OnSessions=' + $OnSessions))
 $items = @()
 if ($Kit) {
     foreach ($sub in @(Get-ChildItem -LiteralPath $Kit -Directory | Sort-Object Name)) { $lines += ('dir=' + $sub.Name) }
     foreach ($file in @(Get-ChildItem -LiteralPath $Kit -Recurse -File)) { $lines += ('file=' + $file.FullName.Substring($Kit.TrimEnd('\').Length + 1).Replace('\', '/')) }
-    $items = @(Get-ChildItem -LiteralPath $Kit -Directory | ForEach-Object { @{ name = $_.Name; loadTried = $true; touched = $true } })
+    $items = @(Get-ChildItem -LiteralPath $Kit -Directory | Where-Object { $_.Name -ne 'actions' } | ForEach-Object { @{ name = $_.Name; loadTried = $true; touched = $true } })
+}
+# Действия после обновления: как обработка гейта - каждое выполнено, кроме тех, где в тексте «УПАДИ».
+$actions = $ActionsDir
+if (-not $actions -and $Kit -and (Test-Path -LiteralPath (Join-Path $Kit 'actions'))) { $actions = Join-Path $Kit 'actions' }
+if ($actions) {
+    $result = @('actions=00000000.000000', 'done-register=ok')
+    $status = 'ok'
+    foreach ($file in @(Get-ChildItem -LiteralPath $actions -Filter '*.bsl' -File | Sort-Object Name)) {
+        $id = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+        $lines += ('actionfile=' + $id)
+        if ($status -ne 'ok') { $result += ('action=' + $id + '|notrun'); continue }
+        if ([System.IO.File]::ReadAllText($file.FullName) -match 'УПАДИ') { $result += ('action=' + $id + '|failed|Деление на 0'); $status = 'failed' }
+        else { $result += ('action=' + $id + '|done|5') }
+    }
+    $result += ('status=' + $status)
+    [System.IO.File]::WriteAllLines((Join-Path $dir 'actions.txt'), [string[]]$result, (New-Object System.Text.UTF8Encoding($true)))
 }
 [System.IO.File]::WriteAllLines((Join-Path $dir 'stub.txt'), [string[]]$lines, (New-Object System.Text.UTF8Encoding($true)))
 $verdict = @{ verdict = 'GREEN'; kitDecision = ''; kitItems = $items; kitProcessings = @() }
@@ -3512,6 +3528,96 @@ $tests = @(
             }
             Check ((Read-GitStateFile $sb).commit -eq $merged) 'после прогона state.json не на main'
             Check (@($load.Output | Where-Object { $_ -match 'теперь на main' }).Count -eq 1) 'не сказано, что temp на main'
+        }
+    },
+    @{
+        Name = 'git-import-actions'
+        Text = '«Загрузить из git» и действия после обновления (actions/*.bsl в main): только новые действия - прогон без комплекта с -ActionsDir и -KitBranch, выполненные - в state.json, повтор - «загружать нечего»; с правкой расширения - действия папкой actions в комплекте, все; упавшее не записано выполненным и запускается следующей загрузкой'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
+            $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha (Read-GitStateFile $sb).pendingCommit
+            $head = (Get-GhHead -Gh $gh -Branch 'main').Sha
+            if (-not $head) { Check $false 'в тестовом репозитории отсутствует принятый снимок'; return }
+            $action = { param([string]$Title, [string]$Body) $utf8.GetBytes(("// @Действие {0}`r`n// @Зачем для теста`r`n// @Автор Тест`r`n// @Задача 1`r`n{1}`r`n" -f $Title, $Body)) }
+            $first = '20261120-01-Первое'
+            $second = '20261120-02-Второе'
+            $third = '20261121-01-Падает'
+            $withActions = New-GhCommit -Gh $gh -Parent $head -Changes @(
+                [pscustomobject]@{ Path = ('actions/{0}.bsl' -f $first); Bytes = (& $action 'Первое' 'Журнал.Добавить("1");') },
+                [pscustomobject]@{ Path = ('actions/{0}.bsl' -f $second); Bytes = (& $action 'Второе' 'Журнал.Добавить("2");') },
+                [pscustomobject]@{ Path = 'actions/README.md'; Bytes = $utf8.GetBytes('Действия после обновления') }) -Message 'действия'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $withActions
+            [System.IO.File]::WriteAllText((Join-Path $sb 'run.ps1'), $gitRunStub, $utf8Bom)
+            $stubs = { @(Get-ChildItem -LiteralPath (Join-Path $sb 'runs') -Recurse -Filter 'stub.txt' -ErrorAction SilentlyContinue | Sort-Object { $_.Directory.Name }) }
+
+            # Только действия: расширения temp на main, прогон без комплекта.
+            Reset-FakeState $sb
+            $only = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers @(
+                @{ Kind = 'confirm'; Header = 'Загрузить в erp_temp_test из main'; Yes = $true })
+            Check-DeployCommon $only -LocksExpected $false
+            Check ($only.ExitCode -eq 0) ("код {0}, ждали 0: {1}" -f $only.ExitCode, (($only.Output | Select-Object -Last 3) -join ' | '))
+            Check (@($only.Questions | Where-Object { $_ -match 'действия после обновления \(2\)' }).Count -eq 1) ('в вопросе не сказано, что загрузятся два новых действия: ' + ($only.Questions -join ' | '))
+            Check (@($only.Output | Where-Object { $_.Contains(('+ actions/{0}.bsl' -f $first)) }).Count -eq 1) 'новое действие не названо в том, что изменит загрузка'
+            $found = & $stubs
+            Check ($found.Count -eq 1) ("прогонов {0}, ждали один" -f $found.Count)
+            if ($found.Count -ge 1) {
+                $stub = [System.IO.File]::ReadAllText($found[0].FullName, $utf8)
+                Check ($stub -match '(?m)^Kit=\s*$' -and $stub -match '(?m)^ActionsDir=.*actions-') ("прогон только действий не без комплекта: " + $stub)
+                Check ($stub -match '(?m)^KitBranch=main\s*$' -and $stub -match ('KitSource=git owner/ext@' + $withActions.Substring(0, 7))) ("в прогон не переданы ветка и коммит: " + $stub)
+                Check ($stub -match ('actionfile=' + $first) -and $stub -match ('actionfile=' + $second)) ("в папке действий не оба действия: " + $stub)
+            }
+            $state = Read-GitStateFile $sb
+            Check ((@($state.actionsDone) -contains $first) -and (@($state.actionsDone) -contains $second)) ('state.json: выполненные действия не записаны: ' + (@($state.actionsDone) -join ', '))
+            Check ($state.commit -eq $withActions) 'после прогона действий state.json не на main'
+            Check (@($only.Output | Where-Object { $_ -match 'действия после обновления выполнены' }).Count -eq 1) 'не сказано, что действия выполнены'
+
+            # Повтор: всё выполнено - прогона нет.
+            Reset-FakeState $sb
+            $same = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{ dumps = (New-GitDumps) } -Com $com
+            Check-DeployCommon $same -LocksExpected $false
+            Check ($same.Unexpected.Count -eq 0) ("при повторе вопросы: " + ($same.Unexpected -join ' | '))
+            Check (@($same.Output | Where-Object { $_ -match 'загружать нечего' }).Count -eq 1) 'при выполненных действиях не сказано «загружать нечего»'
+            Check ((& $stubs).Count -eq 1) 'выполненные действия запускались снова'
+
+            # Правка расширения и новое действие, которое падает: комплект с папкой actions, в ней все действия.
+            $mixed = New-GhCommit -Gh $gh -Parent $withActions -Changes @(
+                [pscustomobject]@{ Path = 'extensions/Доработки/CommonModules/Д/Ext/Module.bsl'; Bytes = $utf8.GetBytes('Процедура Д3() КонецПроцедуры') },
+                [pscustomobject]@{ Path = ('actions/{0}.bsl' -f $third); Bytes = (& $action 'Падает' 'ВызватьИсключение "УПАДИ";') }) -Message 'расширение и действие'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $mixed
+            Reset-FakeState $sb
+            $kit = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers @(
+                @{ Kind = 'confirm'; Header = 'Загрузить в erp_temp_test из main'; Yes = $true })
+            Check-DeployCommon $kit -LocksExpected $false
+            $found = & $stubs
+            Check ($found.Count -eq 2) ("прогонов {0}, ждали два" -f $found.Count)
+            if ($found.Count -ge 2) {
+                $stub = [System.IO.File]::ReadAllText($found[1].FullName, $utf8)
+                Check ($stub -match '(?m)^Kit=.*kit-' -and $stub -match '(?m)^ActionsDir=\s*$') ("с правкой расширения не комплект: " + $stub)
+                Check ($stub -match 'dir=Доработки' -and $stub -match 'dir=actions' -and $stub -notmatch 'dir=Адаптация') ("в комплекте не то: " + $stub)
+                Check ($stub -match ('actionfile=' + $first) -and $stub -match ('actionfile=' + $third) -and $stub -notmatch 'actionfile=README') ("в комплекте не все действия или лишнее: " + $stub)
+                Check ($stub -match '(?m)^KitBranch=main\s*$') 'в прогон с комплектом не передана ветка'
+            }
+            $state = Read-GitStateFile $sb
+            Check (-not (@($state.actionsDone) -contains $third)) 'упавшее действие записано выполненным'
+            Check ($state.commit -eq $mixed) 'после зелёного прогона комплекта state.json не на main'
+            Check (@($kit.Output | Where-Object { $_ -match ('не выполнены: ' + $third) }).Count -eq 1) 'не сказано, что упавшее действие не выполнено'
+
+            # Следующая загрузка запускает упавшее снова - прогоном только действий.
+            Reset-FakeState $sb
+            $again = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{ dumps = (New-GitDumps -Extra 'Процедура Д3() КонецПроцедуры') } -Com $com -Answers @(
+                @{ Kind = 'confirm'; Header = 'Загрузить в erp_temp_test из main'; Yes = $true })
+            Check-DeployCommon $again -LocksExpected $false
+            $found = & $stubs
+            Check ($found.Count -eq 3) ("после упавшего действия прогонов {0}, ждали три" -f $found.Count)
+            if ($found.Count -ge 3) {
+                $stub = [System.IO.File]::ReadAllText($found[2].FullName, $utf8)
+                Check ($stub -match '(?m)^Kit=\s*$' -and $stub -match ('actionfile=' + $third)) ("упавшее действие не запущено снова без комплекта: " + $stub)
+            }
         }
     },
     @{
