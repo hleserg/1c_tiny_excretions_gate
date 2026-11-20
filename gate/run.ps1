@@ -7196,6 +7196,7 @@ function Write-RunSummary {
         preparation = @($script:PrepLines)
         gateVersion = $script:GateVersion
         resume      = $resumeInfo
+        checkedState = $script:CheckedState
     }
     [System.IO.File]::WriteAllText((Join-Path $RunDir 'verdict.json'), ($summary | ConvertTo-Json -Depth 6), $Utf8Bom)
 
@@ -7225,6 +7226,30 @@ function Write-RunSummary {
     [System.IO.File]::WriteAllLines((Join-Path $RunDir 'summary.txt'), $text.ToArray(), $Utf8Bom)
     Save-RunState
 }
+
+# ** Хлебников С.Ю. 20261120 Снимок «что проверено» (#27): хеш-суммы расширений и обработок temp сразу после проверок,
+# до вопроса про комплект - по нему обновление рабочей сверяет, что выпускает то, что проверено. Только если
+# рабочая настроена (ProdBase); отдельным процессом deploy.ps1 -SnapshotTemp (внешнее соединение, только чтение).
+# Не снялся - в verdict.json так и записано, на вердикт не влияет.
+$script:CheckedState = $null
+if ([string](Get-Setting $cfg 'ProdBase' '') -and (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1'))) {
+    $checkedFile = Join-Path $RunDir 'checked-state.json'
+    $snapshotLog = Join-Path $RunDir 'checked-state.log'
+    $snapshotArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f (Join-Path $Root 'deploy.ps1')), '-SnapshotTemp', ('"{0}"' -f $checkedFile))
+    if ($Config) { $snapshotArgs += @('-Config', ('"{0}"' -f $Config)) }
+    Write-Host 'Снимок temp для обновления рабочей (хеш-суммы расширений и обработок, только чтение)...' -ForegroundColor DarkGray
+    try {
+        $snapshotProcess = Start-Process -FilePath 'powershell.exe' -ArgumentList ($snapshotArgs -join ' ') -NoNewWindow -PassThru -RedirectStandardOutput $snapshotLog -RedirectStandardError ($snapshotLog + '.err')
+        $snapshotLimit = ([int](Get-Setting $cfg 'ComTimeoutSec' 300) * 4 + 60) * 1000
+        if (-not $snapshotProcess.WaitForExit($snapshotLimit)) { try { $snapshotProcess.Kill() } catch { }; throw 'не уложился в срок' }
+        if (-not (Test-Path -LiteralPath $checkedFile)) { throw ('файла снимка нет (код {0}), см. checked-state.log' -f $snapshotProcess.ExitCode) }
+        $script:CheckedState = [System.IO.File]::ReadAllText($checkedFile, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+    }
+    catch { $script:CheckedState = [pscustomobject]@{ ok = $false; error = [string]$_.Exception.Message } }
+    if ([bool](Get-UiField $script:CheckedState 'ok' $false)) { Write-RunLog 'Снимок temp для обновления рабочей снят' }
+    else { Write-RunLog ('Снимок temp для обновления рабочей не снят: ' + [string](Get-UiField $script:CheckedState 'error' '')) }
+}
+# ** Хлебников С.Ю. 20261120 конец
 
 # Итог пишется сразу: вопрос про комплект может ждать ответа сколько угодно.
 Write-RunSummary -KitDecision '' -Aftermath @()
