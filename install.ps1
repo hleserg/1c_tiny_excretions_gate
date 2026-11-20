@@ -82,6 +82,58 @@ function Find-Platform {
     return @($found | Sort-Object Version -Descending)[0].Bin
 }
 
+function Test-GatePythonFiles {
+    param([string]$SourceDir, [string]$InstalledDir)
+    foreach ($file in Get-ChildItem -LiteralPath $SourceDir -Recurse -File) {
+        $relative = $file.FullName.Substring($SourceDir.Length + 1)
+        $copy = Join-Path $InstalledDir $relative
+        if (-not (Test-Path -LiteralPath $copy -PathType Leaf)) { return $false }
+        if ((Get-FileHash -LiteralPath $copy).Hash -ne (Get-FileHash -LiteralPath $file.FullName).Hash) { return $false }
+    }
+    return $true
+}
+
+function Install-GatePythonRuntime {
+    # Каталог версии становится виден целиком. Маркер переключается последним, прежний Python может продолжать работу.
+    param([string]$Package, [string]$Destination)
+    $marker = 'python-version.txt'
+    $version = [IO.File]::ReadAllText((Join-Path $Package $marker)).Trim()
+    if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Некорректная версия Python в комплекте' }
+    $folder = 'python-' + $version
+    $src = Join-Path $Package $folder
+    if (-not (Test-Path -LiteralPath (Join-Path $src 'python.exe') -PathType Leaf)) { throw 'Нет python.exe в комплекте гейта' }
+    $null = New-Item -ItemType Directory -Path $Destination -Force
+    $lock = [IO.File]::Open((Join-Path $Destination '.python-install.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+    $stage = Join-Path $Destination ('.python-' + [guid]::NewGuid())
+    $pending = $stage + '.txt'
+    $backup = $stage + '.bak'
+    try {
+        $final = Join-Path $Destination $folder
+        if (Test-Path -LiteralPath $final) {
+            if (-not (Test-GatePythonFiles $src $final)) {
+                throw ("Файлы уже установленного Python {0} отличаются от комплекта. Прежняя папка сохранена. Для восстановления установите комплект в другую доступную папку." -f $version)
+            }
+        } else {
+            Copy-Item -LiteralPath $src -Destination $stage -Recurse -ErrorAction Stop
+            if (-not (Test-GatePythonFiles $src $stage)) { throw 'Не все файлы Python скопированы' }
+            $exe = Join-Path $stage 'python.exe'
+            $actual = & $exe -I -X utf8 -c 'import argparse, json, ssl, sys, urllib.request; print(sys.version.split()[0])'
+            if ($LASTEXITCODE -ne 0 -or [string]$actual -cne $version) { throw ("Не запустился комплектный Python {0}" -f $version) }
+            [IO.Directory]::Move($stage, $final)
+        }
+        $active = Join-Path $Destination $marker
+        if ((Test-Path -LiteralPath $active) -and [IO.File]::ReadAllText($active).Trim() -ceq $version) { return }
+        [IO.File]::WriteAllText($pending, $version)
+        if (Test-Path -LiteralPath $active) { [IO.File]::Replace($pending, $active, $backup) }
+        else { [IO.File]::Move($pending, $active) }
+    } finally {
+        $lock.Dispose()
+        foreach ($item in @($stage, $pending, $backup)) {
+            if (Test-Path -LiteralPath $item) { Remove-Item -LiteralPath $item -Recurse -Force }
+        }
+    }
+}
+
 Write-Host 'Установка гейта расширений 1С' -ForegroundColor Cyan
 Write-Host ''
 
@@ -89,8 +141,10 @@ Write-Host ''
 if (-not $Target) { $Target = Read-Answer 'Папка установки' 'C:\ci' }
 $Target = [System.IO.Path]::GetFullPath($Target)
 New-Item -ItemType Directory -Path $Target -Force | Out-Null
+$runtimeSource = Join-Path $source 'runtime'
+if (Test-Path -LiteralPath $runtimeSource) { Install-GatePythonRuntime $runtimeSource (Join-Path $Target 'runtime') }
 # Своё: не затирается никогда. Остальное в папке установки - файлы гейта, их заменяет новая версия.
-$keep = @('config.psd1', 'config.psd1.bak', 'runs', 'baseline', 'stats', 'inbox', 'secrets', 'deploy', 'kit', 'nightly', 'state', 'out', 'tests-runs')
+$keep = @('runtime', 'config.psd1', 'config.psd1.bak', 'runs', 'baseline', 'stats', 'inbox', 'secrets', 'deploy', 'kit', 'nightly', 'state', 'out', 'tests-runs')
 # Файлы тестовых расширений (tests\<имя>) из поставки заменяют прежние целиком: удалённый в поставке модуль не должен
 # остаться. Прежняя папка (могла быть забрана из temp и ещё не отправлена) - в tests\.old\<имя>_<время>.
 $kitTests = Join-Path $source 'tests'

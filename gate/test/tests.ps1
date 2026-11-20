@@ -1810,7 +1810,7 @@ $tests = @(
         Text = 'ночной прогон: run.ps1 «как есть» без вопросов, итог в nightly\last.json, утром он в меню гейта'
         Run = {
             param($Name)
-            $sb = New-Sandbox $Name
+            $sb = New-Sandbox $Name -Config @{ NightlyDeniedFrom = 0; NightlyDeniedTo = 0 }
             $r = Invoke-Script -Sandbox $sb -Script 'nightly.ps1'
             Check (-not $r.TimedOut) 'ночной прогон не уложился'
             Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
@@ -1826,6 +1826,20 @@ $tests = @(
             $menu = Invoke-Script -Sandbox $sb -Answers @(@{ Kind = 'one'; Header = '^Гейт расширений'; Item = '^Выход$' })
             Check ($menu.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($menu.Unexpected -join ' | '))
             Check (@($menu.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('ночной прогон') -and $_.Contains('ЗЕЛЁНЫЙ') }).Count -gt 0) 'в меню гейта нет итога ночного прогона'
+        }
+    },
+    @{
+        Name = 'review-nightly-runtime-denied'
+        Text = 'ночной запуск в запрещённые часы пишет NONE и не обращается к 1С, даже если задание стартовало с опозданием'
+        Run = {
+            param($Name)
+            $hour = (Get-Date).Hour
+            $sb = New-Sandbox $Name -Config @{ NightlyDeniedFrom = (($hour + 23) % 24); NightlyDeniedTo = (($hour + 2) % 24) }
+            $r = Invoke-Script -Sandbox $sb -Script 'nightly.ps1'
+            Check ($r.ExitCode -eq 0 -and -not $r.TimedOut) 'планировщик должен получить успешный пропуск'
+            $last = Get-Content -LiteralPath (Join-Path $sb 'nightly/last.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+            Check ($last.verdict -ceq 'NONE' -and -not $last.runId -and $last.note -match 'запретные часы') 'нет объяснения пропуска'
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'runs'))) 'в запрещённые часы создан прогон'
         }
     },
     @{
@@ -4208,7 +4222,7 @@ $tests = @(
         Text = 'ночной прогон с ExtensionsRepo: сначала «Загрузить из git» без человека - main ушёл вперёд, правок temp нет - прогон гейта с ним без вопросов (-OnNotGreen Keep), он и есть ночной (второго «как есть» нет), итог в nightly\last.json; следующей ночью temp правили - ветка и pull request «выгружено ночью», main не тронут и не грузится, прогон «как есть»'
         Run = {
             param($Name)
-            $sb = New-GitSandbox $Name
+            $sb = New-GitSandbox $Name -Extra @{ NightlyDeniedFrom = 0; NightlyDeniedTo = 0 }
             $gh = Get-FakeGh $sb
             $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
             $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers $gitBootstrapAnswers

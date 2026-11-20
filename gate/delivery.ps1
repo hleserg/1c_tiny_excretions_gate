@@ -744,7 +744,8 @@ function Complete-DeliveryPull {
         return $false
     }
     if (-not $D.AutoMerge) {
-        Write-DeliveryEvent $D $State 'wait-merge' ("PR #{0} {1}: CI зелёный для merge {2}; слияние - за человеком (DeliveryAutoMerge выключен): python ci/merge_checked.py {0} --merge {2}" -f $Number, $What, $ci.Merge) 'Yellow'
+        $command = Format-DeliveryManualCommand -D $D -Number $Number -Merge $ci.Merge
+        Write-DeliveryEvent $D $State 'wait-merge' ("PR #{0} {1}: CI зелёный для merge {2}. Слияние за человеком. {3}" -f $Number, $What, $ci.Merge, $command) 'Yellow'
         Set-DeliveryStatus $D $State 'waiting-merge' ("ждёт слияния PR #{0}" -f $Number)
         return $false
     }
@@ -844,6 +845,17 @@ function Get-DeliveryPython {
     $exe = Join-Path $runtime ("python-{0}\python.exe" -f $version)
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw ("нет {0}: переустанови комплект гейта" -f $exe) }
     return $exe
+}
+
+function Format-DeliveryManualCommand {
+    # Строка для PowerShell оператора в корне доверенной копии main. Кавычки в путях остаются частью пути.
+    param($D, [int]$Number, [string]$Merge)
+    try { $exe = Get-DeliveryPython $D.Python }
+    catch { return ('Комплектный Python недоступен: {0}. Слияние можно выполнить на другом рабочем месте по разделу 5.26.' -f $_.Exception.Message) }
+    $quotedExe = $exe.Replace("'", "''")
+    $quotedScript = ([string]$D.MergeCheckedPath).Replace("'", "''")
+    $quotedMerge = $Merge.Replace("'", "''")
+    return ("PowerShell, из корня репозитория расширений (main): & '{0}' -I -X utf8 '{1}' {2} --merge '{3}'" -f $quotedExe, $quotedScript, $Number, $quotedMerge)
 }
 
 function Invoke-MergeCheckedScript {
@@ -1297,7 +1309,8 @@ function Invoke-DeliveryApply {
             if ($ci.Result -ne 'success') { Unlock-DeliveryTemp $lock; Set-DeliveryStatus $D $State 'ci' ('CI: ' + $ci.Result); return $ci.Result }
             if (-not $D.AutoMerge) {
                 Unlock-DeliveryTemp $lock
-                Write-DeliveryEvent $D $State 'wait-merge' ("CI зелёный для merge {0}. Слияние - за человеком: python ci/merge_checked.py {1} --merge {0}; дальше гейт загрузит сам" -f $ci.Merge, $pr['number']) 'Yellow'
+                $command = Format-DeliveryManualCommand -D $D -Number ([int]$pr['number']) -Merge $ci.Merge
+                Write-DeliveryEvent $D $State 'wait-merge' ("CI зелёный для merge {0}. После ручного слияния гейт загрузит поставку сам. {1}" -f $ci.Merge, $command) 'Yellow'
                 Set-DeliveryStatus $D $State 'waiting-merge' ('ждёт слияния PR #{0}' -f $pr['number'])
                 return 'waiting-merge'
             }
@@ -1542,7 +1555,7 @@ function Get-DeliveryReport {
         $lines.Add('')
     }
     else {
-        $lines.Add('Перед слиянием - CI для текущего merge SHA (`python ci/merge_checked.py <номер>`); после слияния гейт загружает именно этот SHA в temp и пишет итог сюда комментарием.')
+        $lines.Add('Перед слиянием гейт проверяет CI для текущего merge SHA. Для ручного слияния команда PowerShell с комплектным Python и проверенным SHA есть в журнале поставки на машине гейта (руководство, раздел 5.26). После слияния гейт загружает этот SHA в temp и пишет итог сюда комментарием.')
     }
     return ($lines -join "`n")
 }

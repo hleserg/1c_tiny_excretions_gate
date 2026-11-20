@@ -504,6 +504,14 @@ function Check-DeliveryCommon {
             param($Name)
             $com = New-ComState
             $sb = New-DeliverySandbox $Name -Com $com -Dumps (New-DDumps) -Extra @{ DeliveryAutoMerge = $false }
+            # Этот сценарий только печатает команду. Выполнение настоящего python.exe проверяет тест установленного ZIP.
+            $runtime = Join-Path $sb 'runtime'
+            $pyDir = Join-Path $runtime 'python-3.14.10'
+            $null = New-Item -ItemType Directory -Path $pyDir -Force
+            [IO.File]::WriteAllText((Join-Path $runtime 'python-version.txt'), '3.14.10')
+            $expectedExe = Join-Path $pyDir 'python.exe'
+            $fixtureId = [guid]::NewGuid().ToString()
+            [IO.File]::WriteAllText($expectedExe, $fixtureId)
             $gh = Get-FakeGh $sb
             $null = New-DZip -Path (Join-Path $sb 'Входящие\Доработки.cfe') -Files (New-DExtFiles -Module (New-DModule -Extra 'Сумма * 0.3'))
             $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{ dumps = (New-DDumps) } -Com $null
@@ -511,7 +519,17 @@ function Check-DeliveryCommon {
             $state = @(Get-DeliveryStates $sb)[0]
             Check ([string]$state.status -eq 'waiting-merge') ("без автослияния статус {0} ({1})" -f $state.status, $state.note)
             Check ((Get-DStubs $sb).Count -eq 0) 'до слияния гейт запускался'
-            Check (@($first.Output | Where-Object { $_ -match 'merge_checked.py .* --merge ' }).Count -gt 0) 'не сказано, как слить'
+            $pull = Get-GhPull -Gh $gh -Number ([int]$state.pr.number)
+            # %TEMP% может использовать короткое имя 8.3. Проверяем файл, который откроет команда из журнала.
+            $entry = @($state.events | Where-Object { $_.event -eq 'wait-merge' })[-1].text
+            $pattern = "& '(?<exe>(?:[^']|'')+)' -I -X utf8 'ci/merge_checked\.py' " + $state.pr.number + " --merge '" + [regex]::Escape($pull.Merge) + "'$"
+            $found = [regex]::Match($entry, $pattern)
+            Check $found.Success 'в журнале нет команды с точным номером PR и проверенным SHA'
+            if ($found.Success) {
+                $actualExe = $found.Groups['exe'].Value.Replace("''", "'")
+                Check ((Test-Path -LiteralPath $actualExe -PathType Leaf) -and [IO.File]::ReadAllText($actualExe) -ceq $fixtureId) 'команда ссылается на другой интерпретатор'
+                Check (@($first.Output | Where-Object { $_.Contains($found.Value) }).Count -gt 0) 'команда из журнала не показана оператору'
+            }
             # Человек слил PR (здесь - main на коммит кандидата).
             Set-GhBranch -Gh $gh -Branch 'main' -Sha ([string]$state.pr.head)
             $pulls = (Get-DPulls $sb).Count
