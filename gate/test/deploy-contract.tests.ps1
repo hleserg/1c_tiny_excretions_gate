@@ -116,6 +116,40 @@ function New-ContractCatalogLink {
         }
     },
     @{
+        Name = 'deploy-contract-legacy-record'
+        Text = 'подготовка без идентификатора цели (её записал гейт прежней версии): вопрос человеку; «нет» - ничего не меняется, «да» - отмена проходит как обычно'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $prepared = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Prepare' -Com (New-ComState) -Answers @(
+                @{ Kind = 'one'; Header = 'Подготовка обновления'; Item = '^Подготовить все' }, $deployRiskAnswer, $deployNameAnswer)
+            Check-DeployCommon $prepared -LocksExpected $false
+            $manifest = Join-Path $sb 'deploy\prepared.json'
+            Check ($prepared.ExitCode -eq 0 -and (Test-Path -LiteralPath $manifest)) 'контрольная подготовка не создала манифест'
+            if (-not (Test-Path -LiteralPath $manifest)) { return }
+            # Запись прежней версии: поля target в ней нет.
+            $state = [System.IO.File]::ReadAllText($manifest, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+            Check ($null -ne $state.PSObject.Properties['target']) 'в манифесте подготовки нет идентификатора цели'
+            $state.PSObject.Properties.Remove('target')
+            [System.IO.File]::WriteAllText($manifest, (ConvertTo-Json -InputObject $state -Depth 5), $utf8Bom)
+            $before = (Get-FileHash -LiteralPath $manifest).Hash
+            $writes = @('/LoadCfg', '/DeleteCfg', '/UpdateDBCfg')
+            $no = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CancelPrepared' -Com (New-ComState) -Answers @(
+                @{ Kind = 'confirm'; Header = 'нет идентификатора кластера и базы'; Yes = $false })
+            Check ($no.ExitCode -ne 0 -and -not $no.TimedOut -and $no.Unexpected.Count -eq 0 -and $no.UnusedAnswers -eq 0) 'ответ «нет» по записи без идентификатора не остановил отмену'
+            foreach ($command in $writes) { Check ((Get-Calls $no @($command)).Count -eq 0) ('после «нет» отправлена команда записи ' + $command) }
+            Check (@($no.ComLog | Where-Object { $_ -match 'UpdateInfoBase|TerminateSession' }).Count -eq 0) 'после «нет» изменились свойства или сеансы'
+            Check ((Test-Path -LiteralPath $manifest) -and (Get-FileHash -LiteralPath $manifest).Hash -eq $before) 'после «нет» манифест изменён или удалён'
+            $yes = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CancelPrepared' -Com (New-ComState) -Answers @(
+                @{ Kind = 'confirm'; Header = 'нет идентификатора кластера и базы'; Yes = $true },
+                @{ Kind = 'confirm'; Header = 'Вернуть расширения'; Yes = $true })
+            Check-DeployCommon $yes -LocksExpected $false
+            Check ($yes.ExitCode -eq 0) ("после «да» отмена подготовки: код возврата {0}, ждали 0" -f $yes.ExitCode)
+            Check ((Get-Calls $yes @('/LoadCfg', '-Extension Адаптация')).Count -eq 1) 'после «да» расширение не возвращено из резервной копии'
+            Check (-not (Test-Path -LiteralPath $manifest)) 'после «да» и отмены манифест остался'
+        }
+    },
+    @{
         Name = 'deploy-contract-existing-locks'
         Text = 'очистка без собственных изменений сохраняет исходные свойства ИБ в fakecom'
         Run = {

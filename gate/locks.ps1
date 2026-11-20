@@ -17,16 +17,37 @@ function New-GateLockState {
         JobsSet = $false
         Before = $null
         Expected = @()
-        Marker = [guid]::NewGuid().ToString('N')
+        # Метка запуска в сообщении блокировки: его видят пользователи, поэтому она короткая.
+        Marker = [guid]::NewGuid().ToString('N').Substring(0, 6)
     }
 }
 
+function Test-GateSameMoment {
+    # Кластер хранит время с точностью до секунды и может вернуть его не знак в знак: допуск - секунда.
+    param($Left, $Right)
+    if ($null -eq $Left -or $null -eq $Right) { return ($null -eq $Left -and $null -eq $Right) }
+    try { return ([Math]::Abs(([datetime]$Left - [datetime]$Right).TotalSeconds) -le 1) }
+    catch { return ($Left -eq $Right) }
+}
+
 function Test-GateSessionSettings {
+    # Те же параметры запрета сеансов? Код разрешения - знак в знак; сообщение - без крайних пробелов; даты - с
+    # допуском в секунду: точное сравнение при малейшем расхождении посчитало бы свою блокировку чужой, и она
+    # осталась бы на базе.
     param($Settings, $InfoBase)
     return ($Settings.SessionsDenied -eq [bool]$InfoBase.SessionsDenied -and
         $Settings.PermissionCode -ceq [string]$InfoBase.PermissionCode -and
-        $Settings.DeniedMessage -ceq [string]$InfoBase.DeniedMessage -and
-        $Settings.DeniedFrom -eq $InfoBase.DeniedFrom -and $Settings.DeniedTo -eq $InfoBase.DeniedTo)
+        ([string]$Settings.DeniedMessage).Trim() -ceq ([string]$InfoBase.DeniedMessage).Trim() -and
+        (Test-GateSameMoment $Settings.DeniedFrom $InfoBase.DeniedFrom) -and (Test-GateSameMoment $Settings.DeniedTo $InfoBase.DeniedTo))
+}
+
+function Test-GateOwnWrite {
+    # Запись блокировки подтверждена: запрет стоит, код разрешения наш, в сообщении метка этого запуска. Даты и
+    # точный текст кластер может вернуть иначе, чем их записали (точность, часовой пояс), поэтому «своей» дальше
+    # считается то, что он вернул сам (Set-GateSessionLock запоминает прочитанное, а не записанное).
+    param([string]$Code, [string]$Marker, $InfoBase)
+    return ([bool]$InfoBase.SessionsDenied -and $Code -ceq [string]$InfoBase.PermissionCode -and
+        ([string]$InfoBase.DeniedMessage).Contains(('[{0}]' -f $Marker)))
 }
 
 function Test-GateSessionLock {
@@ -68,15 +89,16 @@ function Set-GateSessionLock {
     $InfoBase.DeniedFrom = $From.AddTicks(-($From.Ticks % [timespan]::TicksPerSecond))
     $InfoBase.DeniedTo = $Until.AddTicks(-($Until.Ticks % [timespan]::TicksPerSecond))
     $InfoBase.PermissionCode = $Code
-    $InfoBase.DeniedMessage = "$Message [гейт $($State.Marker)]"
+    $InfoBase.DeniedMessage = '{0} [{1}]' -f $Message, $State.Marker
     $InfoBase.SessionsDenied = $true
     $next = Get-GateSessionSettings $InfoBase
     # При потере ответа на перенос начала блокировки в кластере может остаться любая из двух наших записей.
     $State.Expected = @($State.Expected) + @($next)
     $null = $Target.Process.UpdateInfoBase($InfoBase)
     $check = & $ReadAgain $Target
-    if (-not (Test-GateSessionSettings $next $check)) { throw 'запись блокировки начала сеансов не подтверждена' }
-    $State.Expected = @($next)
+    if (-not (Test-GateOwnWrite $Code $State.Marker $check)) { throw 'запись блокировки начала сеансов не подтверждена' }
+    # Своя блокировка - в том виде, в каком её вернул кластер: с ним и сверяется перед переносом и снятием.
+    $State.Expected = @(Get-GateSessionSettings $check)
 }
 
 function Restore-GateLocks {
