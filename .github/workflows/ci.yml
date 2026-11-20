@@ -49,20 +49,6 @@ jobs:
         working-directory: src/merge1c
         run: go build -o ../../gate/test/merge1c.exe .
 
-      - name: Тесты гейта без 1С (Windows PowerShell 5.1)
-        shell: powershell
-        run: |
-          & ./gate/test/tests.ps1 -TimeoutSec 600
-          exit $LASTEXITCODE
-
-      - name: Отчёт тестов
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tests-last-run
-          path: gate/test/last-run.txt
-          if-no-files-found: ignore
-
       - name: Сборка
         shell: pwsh
         run: |
@@ -79,7 +65,21 @@ jobs:
         run: |
           $bundle = @(Get-ChildItem dist/ci-gate_*.zip -File)
           if ($bundle.Count -ne 1) { throw 'ожидается один комплект гейта' }
-          & ./gate/test/portable-python.ps1 -Bundle $bundle[0].FullName
+          & ./gate/test/portable-python-ci.ps1 -Bundle $bundle[0].FullName
+
+      - name: Тесты гейта без 1С (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          & ./gate/test/tests.ps1 -TimeoutSec 600
+          exit $LASTEXITCODE
+
+      - name: Отчёт тестов
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-last-run
+          path: gate/test/last-run.txt
+          if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v4
         with:

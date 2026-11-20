@@ -1,8 +1,14 @@
 ﻿#requires -Version 5.1
 # Проверка поставляемого ZIP на Windows без Python и gh в PATH.
-param([Parameter(Mandatory)][string]$Bundle)
+param([Parameter(Mandatory)][string]$Bundle, [switch]$RequireStandardUser)
 
 $ErrorActionPreference = 'Stop'
+if ($RequireStandardUser) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Проверка запущена с правами администратора' }
+    Write-Host ("Windows PowerShell {0}, учётная запись {1}, токен без прав администратора" -f $PSVersionTable.PSVersion, $identity.Name)
+}
 $work = Join-Path ([System.IO.Path]::GetTempPath()) ('gate-python-' + [guid]::NewGuid())
 $kit = Join-Path $work 'комплект'
 $target = Join-Path $work 'папка гейта'
