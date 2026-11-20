@@ -261,3 +261,31 @@ func TestDangerNeedsSecondClick(t *testing.T) {
 		t.Fatalf("обычный пункт не выбрался сразу: %q", lastLine(m))
 	}
 }
+
+// F2 - весь журнал в буфер обмена, без раскраски; работает и при открытом вопросе с кнопками внизу.
+func TestCopyLogF2(t *testing.T) {
+	var copied string
+	prev := writeClipboard
+	writeClipboard = func(text string) error { copied = text; return nil }
+	t.Cleanup(func() { writeClipboard = prev })
+
+	m := testModel(100, 40)
+	m.appendLine("ВЫГРУЗИТЬ temp В GIT")
+	m.appendLine(styleOk.Render("       готово за 6:07"))
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyF2})
+	m = next.(model)
+	if copied != "ВЫГРУЗИТЬ temp В GIT\r\n       готово за 6:07" {
+		t.Fatalf("в буфере обмена: %q", copied)
+	}
+	if !strings.Contains(m.notice, "строк 2") {
+		t.Fatalf("нет сообщения о копировании: %q", m.notice)
+	}
+	// Вопрос с кнопками внизу открыт: F2 копирует и вопрос не трогает.
+	copied = ""
+	m = ask(m, uiEvent{Kind: "one", ID: 7, Style: "dock", Header: "Посмотрел?", Items: []string{"Вернуться в меню"}})
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyF2})
+	m = next.(model)
+	if copied == "" || m.dialog == nil {
+		t.Fatalf("при открытом вопросе: скопировано %q, вопрос открыт %v", copied, m.dialog != nil)
+	}
+}
