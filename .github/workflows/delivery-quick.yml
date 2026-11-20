@@ -1,0 +1,69 @@
+name: Delivery quick (temporary)
+
+on:
+  push:
+    branches: [agent/delivery-report-sample-20261120]
+
+permissions:
+  contents: read
+
+jobs:
+  quick:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        only: ['delivery']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/ci-tui/go.mod
+          cache: false
+      - name: go test merge1c
+        shell: pwsh
+        working-directory: src/merge1c
+        run: |
+          go vet ./...
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          go test ./...
+      - name: Разбор скриптов
+        shell: powershell
+        run: |
+          & ./gate/check.ps1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Подставная 1С и merge1c
+        shell: pwsh
+        run: |
+          Push-Location src/fake1c; go build -o ../../gate/test/fake1c.exe .; Pop-Location
+          Push-Location src/merge1c; go build -o ../../gate/test/merge1c.exe .; Pop-Location
+      - name: Тесты приёмки и git
+        shell: powershell
+        run: |
+          if ('${{ matrix.only }}') { & ./gate/test/tests.ps1 -Only '${{ matrix.only }}' -TimeoutSec 600 -Keep }
+          else { & ./gate/test/tests.ps1 -TimeoutSec 600 }
+          exit $LASTEXITCODE
+      - name: Собрать песочницы
+        if: always()
+        shell: pwsh
+        run: |
+          $dst = 'gate/test/out'
+          New-Item -ItemType Directory -Path $dst -Force | Out-Null
+          $src = Join-Path $env:TEMP 'ci-tests'
+          if (Test-Path $src) {
+            Get-ChildItem $src -Recurse -File | Where-Object { $_.Extension -in '.txt','.json','.jsonl','.md','.log' -and $_.Length -lt 2MB } | ForEach-Object {
+              $rel = $_.FullName.Substring($src.Length).TrimStart('\')
+              $to = Join-Path $dst $rel
+              New-Item -ItemType Directory -Path (Split-Path -Parent $to) -Force | Out-Null
+              Copy-Item $_.FullName $to
+            }
+          }
+      - name: Отчёт
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delivery-quick-${{ matrix.only || 'all' }}
+          path: |
+            gate/test/last-run.txt
+            gate/test/out/**
+          if-no-files-found: ignore
