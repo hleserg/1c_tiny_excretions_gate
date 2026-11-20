@@ -43,6 +43,11 @@
     внешние обработки»: без блокировок рабочей базы, без обновления конфигурации БД). Записывает их
     «Выполнить после обновления» в режиме regepf; прежняя версия сохраняется до записи - это откат.
 
+    .\deploy.ps1 -Delivery [-DeliveryUnattended] [-DeliveryId <номер>]
+        Приёмка поставок подрядчика (раздел 5.25): файлы .cfe, .epf, .erf или папка комплекта из «Входящих» -
+        реестр (оригинал, SHA-256), разбор в технической базе, объединение с main, pull request и CI, слияние
+        проверенного SHA, загрузка в temp под блокировкой и прогон гейта. Рабочую базу не трогает.
+
     .\deploy.ps1 -NoDump
         Ничего не делает: сравнение теперь по хеш-суммам через внешнее соединение, без выгрузки.
         Ключ оставлен, чтобы старые ярлыки не ломались.
@@ -99,6 +104,14 @@ param(
     # С -GitImport: без человека (ночной прогон): правки temp - веткой и pull request, temp не трогается;
     # правок нет и main ушёл вперёд - прогон гейта с ним без вопросов (-OnNotGreen Keep).
     [switch]$GitUnattended,
+    # С -GitImport: грузить только этот коммит main (полный SHA); main уже другой - не грузить.
+    [string]$GitCommit = '',
+    # Приёмка поставок подрядчика (раздел 5.25): «Входящие» -> разбор в технической базе -> объединение с git ->
+    # pull request и CI -> загрузка проверенного SHA в temp -> гейт. DeliveryUnattended - без человека: решения
+    # ждут, остальное идёт само. DeliveryId - только эта поставка.
+    [switch]$Delivery,
+    [switch]$DeliveryUnattended,
+    [string]$DeliveryId = '',
     # Папка канала интерфейса ci.exe: его задаёт сам ci.exe (или run.ps1 из ci.exe), руками не нужен.
     [string]$UiChannel = ''
 )
@@ -938,13 +951,13 @@ Initialize-Stats -Dir (Resolve-RootPath ([string](Get-Setting $cfg 'StatsDir' 's
 $deployRoot = Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))
 $mirrorRoot = Join-Path $deployRoot 'mirror'
 $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
-$viewOnly = ($BaseState -or $ManualLocks -or $CompareExtensions -or $CompareProcessings -or $ProdPreCheck -or $ComCheck -or $GitExport -or $GitImport -or $GitProd -or $GitTypical)
+$viewOnly = ($BaseState -or $ManualLocks -or $CompareExtensions -or $CompareProcessings -or $ProdPreCheck -or $ComCheck -or $GitExport -or $GitImport -or $GitProd -or $GitTypical -or $Delivery)
 if ($viewOnly) {
     # Показать состояние или сравнить - не запуск обновления: своей папки запуска нет (в истории обновлений его не видно),
     # журнал - в deploy\state\run.log, каждый раз заново.
     $viewName = 'state'
     if ($ManualLocks) { $viewName = 'locks' }
-    if ($CompareExtensions) { $viewName = 'compare-ext' } elseif ($CompareProcessings) { $viewName = 'compare-epf' } elseif ($ProdPreCheck) { $viewName = 'precheck' } elseif ($ComCheck) { $viewName = 'comcheck' } elseif ($GitExport -or $GitImport -or $GitProd -or $GitTypical) { $viewName = 'git' }
+    if ($CompareExtensions) { $viewName = 'compare-ext' } elseif ($CompareProcessings) { $viewName = 'compare-epf' } elseif ($ProdPreCheck) { $viewName = 'precheck' } elseif ($ComCheck) { $viewName = 'comcheck' } elseif ($GitExport -or $GitImport -or $GitProd -or $GitTypical) { $viewName = 'git' } elseif ($Delivery) { $viewName = 'delivery' }
     $script:RunDir = Join-Path $deployRoot $viewName
     New-Item -ItemType Directory -Path $script:RunDir -Force | Out-Null
     $script:RunLogPath = Join-Path $script:RunDir 'run.log'
@@ -2704,14 +2717,16 @@ function Get-TempSnapshot {
     }
     $items = @()
     $folders = @{}
+    $skipped = @()
     if ($WithProcessings) {
         $taken = Add-GitProcessingSnapshot -Files $files -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword `
             -Root (Join-Path $Setup.Work 'processings') -EpfDir (Join-Path $script:RunDir 'epf') -Source 'temp'
         $items = $taken.Items
         $folders = $taken.Folders
+        $skipped = @($taken.Skipped)
         $prefixes.Add('processings/')
     }
-    return [pscustomobject]@{ Files = $files; Missing = $missing.ToArray(); Prefixes = $prefixes.ToArray(); Processings = $items; Folders = $folders }
+    return [pscustomobject]@{ Files = $files; Missing = $missing.ToArray(); Prefixes = $prefixes.ToArray(); Processings = $items; Folders = $folders; Skipped = $skipped }
 }
 
 function Add-GitProcessingSnapshot {
@@ -2736,6 +2751,7 @@ function Add-GitProcessingSnapshot {
         catch { Write-RunLog ("git: {0} не прочитан, обработки выгружаю заново: {1}" -f $cachePath, $_.Exception.Message) }
     }
     $kept = [ordered]@{}
+    $skipped = @()
     $dumpedCount = 0
     $withFile = @($items | Where-Object { $_.File } | Sort-Object @{ Expression = { [string]$folders[[string]$_.Ref] } })
     # Сколько выгружать конфигуратором (не с прошлого раза) - чтобы в строке хода было «N из M».
@@ -2749,7 +2765,16 @@ function Add-GitProcessingSnapshot {
         if (-not (& $isFresh $item)) {
             $dumpedCount++
             $dumped = Get-ProcessingDump -File $item.File -Dir $dir -Title ("Выгрузить в файлы {0} из {1} ({2} из {3})" -f $folder, $Source, $dumpedCount, $toDump)
-            if (-not $dumped) { throw ("обработка {0} ({1}) из {2} не выгрузилась в файлы, см. run.log" -f $folder, $item.Title, $BaseName) }
+            if (-not $dumped) {
+                # Принятая файлом целиком (binaries/manifest.json, тот же sha256) не выгружается в файлы - так и задумано.
+                $itemSha = ([string]$item.Hash).Replace('-', '').ToLowerInvariant()
+                if ($null -ne $script:GitBinaryShas -and $script:GitBinaryShas.ContainsKey($itemSha)) {
+                    Write-RunLog ("git: {0} - принята файлом целиком (sha256 {1}), в файлы не выгружаю" -f $folder, $itemSha)
+                    $skipped += $folder
+                    continue
+                }
+                throw ("обработка {0} ({1}) из {2} не выгрузилась в файлы, см. run.log" -f $folder, $item.Title, $BaseName)
+            }
         }
         $kept[$folder] = $key
         Add-GitSnapshotFiles -Files $Files -Dir $dir -Prefix ('processings/' + $folder + '/')
@@ -2761,7 +2786,69 @@ function Add-GitProcessingSnapshot {
     [System.IO.File]::WriteAllText($manifest, (Get-GitProcessingManifest -Items $items -Folders $folders), (New-Object System.Text.UTF8Encoding($false)))
     $Files['processings/manifest.json'] = $manifest
     Write-RunLog ("git: обработок {0} в справочнике {1}, с файлом {2}, выгружено конфигуратором {3}, остальные - с прошлого раза" -f $BaseName, $items.Count, $kept.Count, $dumpedCount)
-    return [pscustomobject]@{ Items = $items; Folders = $folders }
+    return [pscustomobject]@{ Items = $items; Folders = $folders; Skipped = $skipped }
+}
+
+function Read-GitJsonFile {
+    # JSON-файл коммита (Files - Get-GhFiles этого коммита) как объект; нет файла или не разобрался - $null.
+    param($Setup, [hashtable]$Files, [string]$Path)
+    if (-not $Files.ContainsKey($Path)) { return $null }
+    try {
+        $bytes = Get-GhBlob -Gh $Setup.Gh -Sha ([string]$Files[$Path])
+        $text = (New-Object System.Text.UTF8Encoding($false)).GetString($bytes).TrimStart([char]0xFEFF)
+        if (-not $text.Trim()) { return $null }
+        return (ConvertFrom-Json -InputObject $text)
+    }
+    catch { Write-RunLog ("git: {0} не прочитан: {1}" -f $Path, $_.Exception.Message); return $null }
+}
+
+function Get-GitManifestRefs {
+    # processings/manifest.json коммита: папка -> элемент справочника (ref, objectName, file). По ним загрузка пишет
+    # обработку в свой элемент, а не в первый с тем же именем объекта.
+    param($Setup, [hashtable]$Files)
+    $refs = @{}
+    $manifest = Read-GitJsonFile -Setup $Setup -Files $Files -Path 'processings/manifest.json'
+    foreach ($item in @($manifest)) {
+        if ($null -eq $item -or $null -eq $item.PSObject.Properties['folder'] -or -not [string]$item.folder) { continue }
+        $refs[[string]$item.folder] = $item
+    }
+    return $refs
+}
+
+function Get-GitBinaries {
+    # binaries/manifest.json коммита (раздел 5.25): обработки, принятые файлом целиком (защищённые, непрозрачные) -
+    # папка -> запись (folder, objectName, file, sha256, ref). Файл - binaries/<папка>/<файл>, ставится только с этим sha256.
+    param($Setup, [hashtable]$Files)
+    $list = @{}
+    $manifest = Read-GitJsonFile -Setup $Setup -Files $Files -Path 'binaries/manifest.json'
+    foreach ($item in @($manifest)) {
+        if ($null -eq $item -or $null -eq $item.PSObject.Properties['folder'] -or -not [string]$item.folder) { continue }
+        $list[[string]$item.folder] = $item
+    }
+    return $list
+}
+
+function Initialize-GitBinaryShas {
+    # sha256 файлов, принятых целиком (binaries/manifest.json данных коммитов): такие элементы справочника temp не
+    # выгружаются в файлы (Add-GitProcessingSnapshot) и не считаются правкой temp.
+    param($Setup, $FileSets)
+    $script:GitBinaryShas = @{}
+    foreach ($files in @($FileSets)) {
+        if ($null -eq $files) { continue }
+        $binaries = Get-GitBinaries -Setup $Setup -Files $files
+        foreach ($folder in @($binaries.Keys)) { $script:GitBinaryShas[([string]$binaries[$folder].sha256).ToLowerInvariant()] = $folder }
+    }
+}
+
+function Get-GitSkippedPaths {
+    # Пути папок processings/<папка>/ коммита, которые выгрузка temp пропустила (обработка принята файлом целиком).
+    param($Snapshot, [hashtable]$Files)
+    $paths = @()
+    foreach ($folder in @($Snapshot.Skipped)) {
+        $prefix = 'processings/' + $folder + '/'
+        $paths += @($Files.Keys | Where-Object { ([string]$_).StartsWith($prefix, [System.StringComparison]::Ordinal) })
+    }
+    return , @($paths)
 }
 
 function Test-GitPrefix {
@@ -2881,8 +2968,29 @@ function Select-GitTracked {
 
 function New-GitTempBranch {
     # Снимок temp поверх Base. Только новая ветка и PR. Отмечаем снимок в state.json после создания PR.
+    # Открытый PR выгрузки, и снимок - поверх его же коммита: новый коммит в ту же ветку, второго PR нет.
     param($Setup, $State, [string]$Base, $Changes, [string]$Note = '')
     $stamp = Get-Date
+    if ([int]$State['pendingNumber'] -gt 0 -and [string]$State['pendingBranch'] -and $Base -eq [string]$State['pendingCommit']) {
+        $open = $null
+        try { $open = Get-GhPull -Gh $Setup.Gh -Number ([int]$State['pendingNumber']) }
+        catch { Write-RunLog ("git: pull request #{0} не прочитан, выгружаю новым: {1}" -f $State['pendingNumber'], $_.Exception.Message) }
+        if ($null -ne $open -and $open.State -eq 'open' -and $open.HeadRef -eq [string]$State['pendingBranch'] -and $open.Head -eq $Base) {
+            $sha = New-GitVerifiedCommit -Setup $Setup -Parent $Base -Changes $Changes -Message ("Правки {0} от {1}" -f $script:TempBase, $stamp.ToString('dd.MM.yyyy HH:mm'))
+            Set-GhBranch -Gh $Setup.Gh -Branch $open.HeadRef -Sha $sha
+            $comment = New-Object System.Collections.Generic.List[string]
+            $comment.Add(("Ещё правки {0} от {1} (коммит {2}) - в этот же pull request, второго не открываю." -f $script:TempBase, $stamp.ToString('dd.MM.yyyy HH:mm'), $sha))
+            foreach ($line in (Get-GitChangeLines $Changes)) { $comment.Add(('- ' + $line)) }
+            try { Add-GhComment -Gh $Setup.Gh -Number $open.Number -Body ($comment -join "`n") }
+            catch { Write-RunLog ("git: комментарий к pull request #{0} не записан: {1}" -f $open.Number, $_.Exception.Message) }
+            $State['commit'] = $sha
+            $State['how'] = 'export'
+            $State['pendingCommit'] = $sha
+            Save-GitState $Setup $State
+            Write-Line ("Дописал в открытый pull request #{0} (ветка {1}): коммит {2}. Дождись CI для новой версии PR." -f $open.Number, $open.HeadRef, (Get-GitShort $sha)) 'Green'
+            return [pscustomobject]@{ Branch = $open.HeadRef; Sha = $sha; Number = $open.Number; Url = $open.Url; Continued = $true }
+        }
+    }
     $branchName = 'temp/' + $stamp.ToString('yyyyMMdd-HHmmss')
     # Такая ветка уже есть (две выгрузки в одну секунду) - с номером.
     for ($suffix = 2; (Get-GhHead -Gh $Setup.Gh -Branch $branchName).Sha -and $suffix -lt 20; $suffix++) {
@@ -2926,7 +3034,7 @@ function New-GitTempBranch {
     Save-GitState $Setup $State
     Write-Line ("Выгрузил: ветка {0}, коммит {1}, pull request #{2}: {3}" -f $branchName, (Get-GitShort $sha), $pull.Number, $pull.Url) 'Green'
     Write-Line ("Проверь изменения и дождись зелёного CI в PR. Затем слей его в {0} через Create a merge commit и повтори «Загрузить из git»." -f $Setup.Branch)
-    return [pscustomobject]@{ Branch = $branchName; Sha = $sha; Number = $pull.Number; Url = $pull.Url }
+    return [pscustomobject]@{ Branch = $branchName; Sha = $sha; Number = $pull.Number; Url = $pull.Url; Continued = $false }
 }
 
 function Invoke-GitExport {
@@ -2948,10 +3056,11 @@ function Invoke-GitExport {
     Write-Line ("Выгружаю из {0} в файлы: расширения {1}; обработки {2}" -f $script:TempBase, (Get-NonEmpty (@($tracked.Extensions) -join ', ') 'нет'), $processingsText) 'Cyan'
     # Колонка шагов ci.exe: выгрузки расширений видны заранее, серыми (названия - заголовки самих операций).
     Send-UiPlan -StepNames @(@($tracked.Extensions) | ForEach-Object { 'Выгрузить {0} из {1}' -f $_, $script:TempBase }) -Operations
+    Initialize-GitBinaryShas -Setup $Setup -FileSets @($baseFiles)
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$tracked.HasProcessings
     foreach ($item in $snapshot.Missing) { Write-Line ("  в {0} нет: {1} - в git остаётся как есть" -f $script:TempBase, $item) 'Yellow' }
     # Без @(): функция возвращает массив запятой, @() завернул бы его ещё раз.
-    $changes = Compare-GitSnapshot -Local $snapshot.Files -Remote $baseFiles -Prefixes $snapshot.Prefixes
+    $changes = Compare-GitSnapshot -Local $snapshot.Files -Remote $baseFiles -Prefixes $snapshot.Prefixes -Ignore (Get-GitSkippedPaths $snapshot $baseFiles)
     if ($changes.Count -eq 0) {
         Write-Line ("{0} совпадает с git (коммит {1}): выгружать нечего." -f $script:TempBase, (Get-GitShort $base)) 'Green'
         if (-not [string]$State['commit'] -and $base) { $State['commit'] = $base; $State['how'] = 'export'; Save-GitState $Setup $State }
@@ -2972,6 +3081,20 @@ function Invoke-GitExport {
     $null = New-GitTempBranch -Setup $Setup -State $State -Base $base -Changes $changes
 }
 
+function Get-GitFileSha256 {
+    param([string]$Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return (-join @($sha.ComputeHash([System.IO.File]::ReadAllBytes($Path)) | ForEach-Object { $_.ToString('x2') })) } finally { $sha.Dispose() }
+}
+
+function Write-GitKitTarget {
+    # <файл или папка комплекта>.gate.json: в какой элемент справочника писать (ref) и какой sha256 у файла ждать.
+    # Его читает run.ps1 (New-KitProcessing): запись - режимом regepf с ref=, файл с другим хешем не ставится.
+    param([string]$Path, [string]$Ref, [string]$Folder, [string]$Sha256)
+    $record = [ordered]@{ ref = $Ref; folder = $Folder; sha256 = $Sha256 }
+    [System.IO.File]::WriteAllText(($Path.TrimEnd('\', '/') + '.gate.json'), (ConvertTo-Json -InputObject $record), (New-Object System.Text.UTF8Encoding($false)))
+}
+
 function Get-GitFolderPrint {
     # Отпечаток папки: её файлы и хеши одной строкой - сравнить папку в main с тем, что в temp.
     param([hashtable]$Shas, [string]$Prefix)
@@ -2979,10 +3102,22 @@ function Get-GitFolderPrint {
 }
 
 function Save-GitImportResult {
-    # Чем кончилась загрузка - для ночного прогона (nightly.ps1): был ли прогон гейта, какой, что сказать.
-    param($Setup, [bool]$Ran, [string]$Run, [int]$Code, [string]$Note)
-    $record = [ordered]@{ time = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); ran = $Ran; run = $Run; code = $Code; note = $Note }
+    # Чем кончилась загрузка - для ночного прогона (nightly.ps1) и приёмки поставок (delivery.ps1): был ли прогон
+    # гейта, какой, что сказать. Outcome - коротко для программ: drift (правки temp ушли в PR), pending (PR с
+    # правками temp не слит), moved (main не тот коммит, что просили), same (temp уже на main), ran (прогон был),
+    # loaded (temp теперь на main), partial (загрузилось не всё), rolledback, noverdict, nostart, cancel.
+    param($Setup, [bool]$Ran, [string]$Run, [int]$Code, [string]$Note, [string]$Outcome = '', [string]$Commit = '')
+    $record = [ordered]@{ time = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); ran = $Ran; run = $Run; code = $Code; note = $Note; outcome = $Outcome; commit = $Commit }
+    $script:GitImportLast = [pscustomobject]$record
     [System.IO.File]::WriteAllText((Join-Path $Setup.Root 'last-import.json'), (ConvertTo-Json -InputObject $record), $Utf8Bom)
+}
+
+function Test-GitSameAsHead {
+    # Правка temp совпадает с main: так бывает, когда прежняя загрузка оборвалась на середине - часть объектов уже
+    # стоит в temp в версии main. Это не правка temp: её не выгружать, а догрузить остальное.
+    param($Change, [hashtable]$HeadFiles)
+    if ($Change.Kind -eq 'delete') { return (-not $HeadFiles.ContainsKey([string]$Change.Path)) }
+    return ($HeadFiles.ContainsKey([string]$Change.Path) -and [string]$HeadFiles[[string]$Change.Path] -eq [string]$Change.Sha)
 }
 
 function Invoke-GitImport {
@@ -2991,10 +3126,16 @@ function Invoke-GitImport {
     # в main. Правки temp можно сохранить веткой и PR. Загрузка после слияния - при следующем запуске.
     # Комплект оставлен и загрузилось всё - temp соответствует main. Unattended - без вопросов (ночью).
     # Возвращает код прогона.
-    param($Setup, $State, [switch]$Unattended)
-    Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note 'загрузка не закончилась'
+    # ExpectCommit - грузить только этот коммит (приёмка поставки: проверенный SHA); main другой - не грузить.
+    param($Setup, $State, [switch]$Unattended, [string]$ExpectCommit = '')
+    Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note 'загрузка не закончилась' -Outcome 'nostart'
     $head = Get-GhHead -Gh $Setup.Gh -Branch $Setup.Branch
     if (-not $head.Sha) { throw ("в {0} ({1}) пусто: сначала «Выгрузить temp в git»" -f $Setup.Repo, $Setup.Branch) }
+    if ($ExpectCommit -and $head.Sha -ne $ExpectCommit) {
+        Write-Line ("{0} сейчас на {1}, а грузить велено {2}: не гружу." -f $Setup.Branch, (Get-GitShort $head.Sha), (Get-GitShort $ExpectCommit)) 'Yellow'
+        Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note ('main не на ' + $ExpectCommit) -Outcome 'moved' -Commit $head.Sha
+        return 0
+    }
     $headFiles = Get-GhFiles -Gh $Setup.Gh -Commit $head.Sha
     $known = [string]$State['commit']
     $knownFiles = $headFiles
@@ -3007,11 +3148,25 @@ function Invoke-GitImport {
     $tracked = Get-GitFolders $knownFiles
     $withProcessings = $tracked.HasProcessings -or (Get-GitFolders $headFiles).HasProcessings
     Write-Line ("Проверяю, не правили ли {0} после прошлой загрузки: выгружаю и сравниваю с коммитом {1}" -f $script:TempBase, $knownName) 'Cyan'
+    Initialize-GitBinaryShas -Setup $Setup -FileSets @($knownFiles, $headFiles)
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$withProcessings
+    $skippedPaths = Get-GitSkippedPaths $snapshot $knownFiles
     # manifest.json правкой temp не считается: версия и хеш обработки меняются от самой загрузки из git. В ветку с
     # правками он идёт, если правки есть.
-    $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes -Ignore @('processings/manifest.json')
-    if ($drift.Count -gt 0) { $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes }
+    $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes -Ignore (@('processings/manifest.json') + @($skippedPaths))
+    # Совпадающее с main - не правка temp, а недогруженная прежняя загрузка (раздел 5.25: обрыв после первого объекта).
+    $sameAsHead = @()
+    if ($drift.Count -gt 0 -and $known -and $known -ne $head.Sha) {
+        $sameAsHead = @($drift | Where-Object { Test-GitSameAsHead $_ $headFiles })
+        if ($sameAsHead.Count -gt 0) {
+            Write-Line ("  в {0} уже как в {1} (прежняя загрузка оборвалась?): {2} - это не правки, догружаю остальное" -f $script:TempBase, $Setup.Branch, (@($sameAsHead | ForEach-Object { $_.Path } | Select-Object -First 3) -join ', ')) 'Yellow'
+            $drift = @($drift | Where-Object { -not (Test-GitSameAsHead $_ $headFiles) })
+        }
+    }
+    if ($drift.Count -gt 0) {
+        $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes -Ignore $skippedPaths
+        if ($sameAsHead.Count -gt 0) { $drift = @($drift | Where-Object { -not (Test-GitSameAsHead $_ $headFiles) }) }
+    }
     # Итог сверки - на экран и когда правок нет: иначе по выводу не понять, чем кончилась проверка.
     if ($drift.Count -eq 0) { Write-Line ("  правок нет: {0} совпадает с коммитом {1}" -f $script:TempBase, $knownName) 'Green' }
     if ($drift.Count -gt 0) {
@@ -3026,14 +3181,14 @@ function Invoke-GitImport {
                 'Выгрузить правки temp в git (ветка и pull request), загрузку не делать',
                 ('Загрузить {0} всё равно: правки temp пропадут' -f $Setup.Branch),
                 'Отмена') -Danger @(1)
-            if ($choice -ne 0 -and $choice -ne 1) { Write-Line ("Отмена: {0} не трогаю." -f $script:TempBase); return 0 }
+            if ($choice -ne 0 -and $choice -ne 1) { Write-Line ("Отмена: {0} не трогаю." -f $script:TempBase); Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note 'отмена' -Outcome 'cancel'; return 0 }
             $saveDrift = $choice -eq 0
         }
         if ($saveDrift) {
             $note = ''
             if ($Unattended) { $note = 'выгружено ночью' }
             $made = New-GitTempBranch -Setup $Setup -State $State -Base $driftBase -Changes $drift -Note $note
-            Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note ("правки temp - веткой {0}, pull request #{1}; temp не трогал" -f $made.Branch, $made.Number)
+            Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note ("правки temp - веткой {0}, pull request #{1}; temp не трогал" -f $made.Branch, $made.Number) -Outcome 'drift' -Commit $made.Sha
             return 0
         }
         Write-Line ("Загружаю {0} поверх правок {1}: так решили." -f $Setup.Branch, $script:TempBase) 'Yellow'
@@ -3041,7 +3196,7 @@ function Invoke-GitImport {
     elseif ([string]$State['pendingCommit'] -and -not (Test-GhContains -Gh $Setup.Gh -Branch '' -Head $head.Sha -Commit ([string]$State['pendingCommit']))) {
         if ($Unattended) {
             Write-Line ("Правки {0} из pull request #{1} ещё не в {2}: без человека {2} не гружу." -f $script:TempBase, $State['pendingNumber'], $Setup.Branch) 'Yellow'
-            Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note ("pull request #{0} с правками temp не слит: main не грузил" -f $State['pendingNumber'])
+            Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note ("pull request #{0} с правками temp не слит: main не грузил" -f $State['pendingNumber']) -Outcome 'pending' -Commit $head.Sha
             return 0
         }
         $choice = Select-UiOne -Header ("Правки {0} из pull request #{1} ещё не в {2}: загрузка {2} уберёт их из temp" -f $script:TempBase, $State['pendingNumber'], $Setup.Branch) -Items @(
@@ -3056,15 +3211,31 @@ function Invoke-GitImport {
     $toLoad = New-Object System.Collections.Generic.List[object]
     foreach ($name in @($headTracked.Extensions)) {
         $prefix = 'extensions/' + $name + '/'
-        if ((Get-GitFolderPrint $headFiles $prefix) -ne (Get-GitFolderPrint $localShas $prefix)) { $toLoad.Add([pscustomobject]@{ Kind = 'extension'; Name = $name; Prefix = $prefix }) }
+        if ((Get-GitFolderPrint $headFiles $prefix) -ne (Get-GitFolderPrint $localShas $prefix)) { $toLoad.Add([pscustomobject]@{ Kind = 'extension'; Name = $name; Prefix = $prefix; Ref = ''; Binary = $null }) }
     }
+    # Элемент справочника каждой папки - из manifest.json main: запись идёт в него (regepf с ref=), а не в первый
+    # элемент с тем же именем объекта. Обработки, принятые файлом целиком, - из binaries/ (раздел 5.25).
+    $manifestRefs = Get-GitManifestRefs -Setup $Setup -Files $headFiles
+    $binaries = Get-GitBinaries -Setup $Setup -Files $headFiles
     foreach ($name in @($headTracked.Processings)) {
         $prefix = 'processings/' + $name + '/'
+        if ($binaries.ContainsKey($name)) { continue }
         if ((Get-GitFolderPrint $headFiles $prefix) -eq (Get-GitFolderPrint $localShas $prefix)) { continue }
-        # <имя>~<ссылка> - не основной элемент с этим именем объекта (помечен на удаление или не используется):
-        # загрузка писала бы в основной.
-        if ($name.Contains('~')) { Write-Line ("  {0}: в {1} не такая, как в {2}, но это не основной элемент справочника с этим именем - не гружу" -f $prefix.TrimEnd('/'), $Setup.Branch, $script:TempBase) 'Yellow'; continue }
-        $toLoad.Add([pscustomobject]@{ Kind = 'processing'; Name = $name; Prefix = $prefix })
+        $ref = ''
+        if ($manifestRefs.ContainsKey($name)) { $ref = [string]$manifestRefs[$name].ref }
+        # <имя>~<ссылка> - не основной элемент с этим именем объекта: без ссылки из manifest.json загрузка писала бы в
+        # основной - такую не гружу.
+        if ($name.Contains('~') -and -not $ref) { Write-Line ("  {0}: в {1} не такая, как в {2}, но это не основной элемент справочника с этим именем и его ссылки нет в manifest.json - не гружу" -f $prefix.TrimEnd('/'), $Setup.Branch, $script:TempBase) 'Yellow'; continue }
+        $toLoad.Add([pscustomobject]@{ Kind = 'processing'; Name = $name; Prefix = $prefix; Ref = $ref; Binary = $null })
+    }
+    foreach ($name in @($binaries.Keys | Sort-Object)) {
+        $entry = $binaries[$name]
+        $wanted = ([string]$entry.sha256).ToLowerInvariant()
+        $inTemp = @($snapshot.Processings | Where-Object { ([string]$_.Hash).Replace('-', '').ToLowerInvariant() -eq $wanted })
+        if ($inTemp.Count -gt 0) { continue }
+        $ref = [string]$entry.ref
+        if (-not $ref -and $manifestRefs.ContainsKey($name)) { $ref = [string]$manifestRefs[$name].ref }
+        $toLoad.Add([pscustomobject]@{ Kind = 'binary'; Name = $name; Prefix = ('binaries/' + $name + '/'); Ref = $ref; Binary = $entry })
     }
     foreach ($name in @($tracked.Extensions | Where-Object { @($headTracked.Extensions) -notcontains $_ })) { Write-Line ("  в {0} больше нет расширения {1}: из {2} не убираю" -f $Setup.Branch, $name, $script:TempBase) 'Yellow' }
     foreach ($name in @($tracked.Processings | Where-Object { @($headTracked.Processings) -notcontains $_ })) { Write-Line ("  в {0} больше нет обработки {1}: из {2} не убираю" -f $Setup.Branch, $name, $script:TempBase) 'Yellow' }
@@ -3076,10 +3247,10 @@ function Invoke-GitImport {
     if ($toLoad.Count -eq 0 -and $newActions.Count -eq 0) {
         Write-Line ("{0} уже совпадает с {1} (коммит {2}): загружать нечего." -f $script:TempBase, $Setup.Branch, (Get-GitShort $head.Sha)) 'Green'
         Set-GitLoaded -Setup $Setup -State $State -Commit $head.Sha -Run ''
-        Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note ('temp уже на ' + $Setup.Branch)
+        Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note ('temp уже на ' + $Setup.Branch) -Outcome 'same' -Commit $head.Sha
         return 0
     }
-    $whatList = @($toLoad | ForEach-Object { if ($_.Kind -eq 'extension') { 'расширение ' + $_.Name } else { 'обработка ' + $_.Name } })
+    $whatList = @($toLoad | ForEach-Object { if ($_.Kind -eq 'extension') { 'расширение ' + $_.Name } elseif ($_.Kind -eq 'binary') { 'обработка файлом целиком ' + $_.Name } else { 'обработка ' + $_.Name } })
     if ($newActions.Count -gt 0) { $whatList += ('действия после обновления ({0}): {1}' -f $newActions.Count, ($newActions -join ', ')) }
     $what = $whatList -join ', '
     # Что изменит загрузка - на экран до вопроса: файлы main против того, что в temp сейчас. Вопрос после ответа с
@@ -3117,6 +3288,18 @@ function Invoke-GitImport {
     Write-RunLog ("git: из {0} скачано файлов {1} в {2}" -f (Get-GitShort $head.Sha), $count, $source)
     New-Item -ItemType Directory -Path $kitDir -Force | Out-Null
     foreach ($entry in $toLoad) {
+        if ($entry.Kind -eq 'binary') {
+            # Файл целиком: в корень комплекта под своим именем, рядом - что за элемент и какой sha256 ждём.
+            $fileName = [string]$entry.Binary.file
+            $from = Join-Path (Join-Path (Join-Path $source 'binaries') $entry.Name) $fileName
+            $target = Join-Path $kitDir $fileName
+            if (Test-Path -LiteralPath $target) { throw ("в комплекте два файла {0}: переименуй один в binaries/manifest.json" -f $fileName) }
+            Move-Item -LiteralPath $from -Destination $target
+            $actual = Get-GitFileSha256 $target
+            if ($actual -ne ([string]$entry.Binary.sha256).ToLowerInvariant()) { throw ("binaries/{0}/{1}: sha256 {2}, а в manifest.json {3} - не гружу" -f $entry.Name, $fileName, $actual, $entry.Binary.sha256) }
+            Write-GitKitTarget -Path $target -Ref $entry.Ref -Folder $entry.Name -Sha256 $actual
+            continue
+        }
         $folder = 'extensions'
         $target = Join-Path $kitDir $entry.Name
         if ($entry.Kind -eq 'processing') {
@@ -3124,6 +3307,7 @@ function Invoke-GitImport {
             if (Test-Path -LiteralPath $target) { $target = Join-Path $kitDir ('epf_' + $entry.Name) }
         }
         Move-Item -LiteralPath (Join-Path (Join-Path $source $folder) $entry.Name) -Destination $target
+        if ($entry.Kind -eq 'processing' -and $entry.Ref) { Write-GitKitTarget -Path $target -Ref $entry.Ref -Folder $entry.Name -Sha256 '' }
     }
     $actionsDir = ''
     if ($actionFiles.Count -gt 0) {
@@ -3160,10 +3344,10 @@ function Invoke-GitImport {
     if (Test-Path -LiteralPath $runsRoot) { $fresh = @(Get-ChildItem -LiteralPath $runsRoot -Directory | Where-Object { -not $before.ContainsKey($_.Name) -and $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name | Select-Object -Last 1) }
     if ($fresh.Count -eq 0) {
         Write-Line 'Прогон не начался: temp не трогал, состояние git не меняю.' 'Yellow'
-        Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code $runCode -Note 'прогон гейта с комплектом из git не начался'
+        Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code $runCode -Note 'прогон гейта с комплектом из git не начался' -Outcome 'nostart' -Commit $head.Sha
         return $runCode
     }
-    Save-GitImportResult -Setup $Setup -Ran $true -Run $fresh[0].Name -Code $runCode -Note ('загрузка из git, коммит ' + (Get-GitShort $head.Sha))
+    Save-GitImportResult -Setup $Setup -Ran $true -Run $fresh[0].Name -Code $runCode -Note ('загрузка из git, коммит ' + (Get-GitShort $head.Sha)) -Outcome 'ran' -Commit $head.Sha
     # Выполненные действия - в состояние при любом исходе: откат комплекта данных не возвращает, а выполненное
     # обработка всё равно не повторит. Упавшее и невыполненное - нет: следующая загрузка запустит их снова.
     $actionsResult = Join-Path $fresh[0].FullName 'actions.txt'
@@ -3184,24 +3368,32 @@ function Invoke-GitImport {
     if ($toLoad.Count -eq 0) {
         # Только действия: расширения и обработки temp и так на main.
         Set-GitLoaded -Setup $Setup -State $State -Commit $head.Sha -Run $fresh[0].Name
+        Save-GitImportResult -Setup $Setup -Ran $true -Run $fresh[0].Name -Code $runCode -Note 'только действия после обновления' -Outcome 'loaded' -Commit $head.Sha
         if ($failedActions.Count -eq 0) { Write-Line ("{0} на {1}, коммит {2}: действия после обновления выполнены (прогон {3})." -f $script:TempBase, $Setup.Branch, (Get-GitShort $head.Sha), $fresh[0].Name) 'Green' }
         return $runCode
     }
     $verdictFile = Join-Path $fresh[0].FullName 'verdict.json'
-    if (-not (Test-Path -LiteralPath $verdictFile)) { Write-Line ("Прогон {0} без итога: состояние git не меняю, temp смотреть по прогону." -f $fresh[0].Name) 'Yellow'; return $runCode }
+    if (-not (Test-Path -LiteralPath $verdictFile)) {
+        Write-Line ("Прогон {0} без итога: состояние git не меняю, temp смотреть по прогону." -f $fresh[0].Name) 'Yellow'
+        Save-GitImportResult -Setup $Setup -Ran $true -Run $fresh[0].Name -Code $runCode -Note 'прогон без итога' -Outcome 'noverdict' -Commit $head.Sha
+        return $runCode
+    }
     $result = [System.IO.File]::ReadAllText($verdictFile, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
     $decision = [string]$result.kitDecision
     $notLoaded = @(@($result.kitItems) | Where-Object { $null -ne $_.PSObject.Properties['loadTried'] -and $_.loadTried -and -not $_.touched } | ForEach-Object { [string]$_.name })
     $notLoaded += @(@($result.kitProcessings) | Where-Object { $null -ne $_.PSObject.Properties['tried'] -and $_.tried -and -not $_.touched } | ForEach-Object { [string]$_.name })
     if ($decision -eq 'rolledBack' -or $decision -eq 'rollbackFailed') {
         Write-Line ("Комплект из git откачен (прогон {0}): {1} - как до загрузки, состояние git не меняю." -f $fresh[0].Name, $script:TempBase) 'Yellow'
+        Save-GitImportResult -Setup $Setup -Ran $true -Run $fresh[0].Name -Code $runCode -Note ('откат: ' + $decision) -Outcome 'rolledback' -Commit $head.Sha
     }
     elseif ($notLoaded.Count -gt 0) {
         Write-Line ("Загрузилось не всё ({0}): {1} не соответствует {2}, состояние git не меняю." -f ($notLoaded -join ', '), $script:TempBase, $Setup.Branch) 'Yellow'
+        Save-GitImportResult -Setup $Setup -Ran $true -Run $fresh[0].Name -Code $runCode -Note ('загрузилось не всё: ' + ($notLoaded -join ', ')) -Outcome 'partial' -Commit $head.Sha
     }
     else {
         Set-GitLoaded -Setup $Setup -State $State -Commit $head.Sha -Run $fresh[0].Name
         Write-Line ("{0} теперь на {1}, коммит {2} (прогон {3}, вердикт {4})." -f $script:TempBase, $Setup.Branch, (Get-GitShort $head.Sha), $fresh[0].Name, $result.verdict) 'Green'
+        Save-GitImportResult -Setup $Setup -Ran $true -Run $fresh[0].Name -Code $runCode -Note ('загрузка из git, коммит ' + (Get-GitShort $head.Sha)) -Outcome 'loaded' -Commit $head.Sha
     }
     return $runCode
 }
@@ -3569,6 +3761,15 @@ function Set-GitLoaded {
     Save-GitState $Setup $State
 }
 
+if ($Delivery) {
+    # Приёмка поставок (раздел 5.25): свой файл, подключается точкой - пользуется функциями git этого скрипта.
+    if (-not $DeliveryUnattended -and -not (Test-UiCanAsk)) { throw 'приёмку поставок с вопросами - из консоли или ci.exe; без человека - deploy.ps1 -Delivery -DeliveryUnattended' }
+    . (Join-Path $Root 'github.ps1')
+    . (Join-Path $Root 'delivery.ps1')
+    $deliveryCode = Invoke-Delivery -Unattended:$DeliveryUnattended -OnlyId $DeliveryId
+    exit $deliveryCode
+}
+
 if ($GitExport -or $GitImport -or $GitProd -or $GitTypical) {
     if (-not $GitUnattended -and -not (Test-UiCanAsk)) { throw 'выгрузить в git и загрузить из git можно только из консоли или ci.exe (без человека - deploy.ps1 -GitImport -GitUnattended)' }
     if ($GitUnattended -and ($GitProd -or $GitTypical)) { throw 'снимок рабочей и типовую в git без человека пока не выгружаю: запусти из меню' }
@@ -3594,7 +3795,7 @@ if ($GitExport -or $GitImport -or $GitProd -or $GitTypical) {
         exit 0
     }
     Write-Host ("ЗАГРУЗИТЬ ИЗ GIT В {0} ({1}, {2})" -f $script:TempBase, $gitSetup.Repo, $gitSetup.Branch) -ForegroundColor Cyan
-    $gitCode = Invoke-GitImport -Setup $gitSetup -State $gitState -Unattended:$GitUnattended
+    $gitCode = Invoke-GitImport -Setup $gitSetup -State $gitState -Unattended:$GitUnattended -ExpectCommit $GitCommit
     exit $gitCode
 }
 

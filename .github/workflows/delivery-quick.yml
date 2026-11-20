@@ -1,0 +1,52 @@
+name: Delivery quick (temporary)
+
+on:
+  push:
+    branches: [agent/delivery-intake-20261120]
+
+permissions:
+  contents: read
+
+jobs:
+  quick:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/ci-tui/go.mod
+          cache: false
+      - name: go test merge1c
+        shell: pwsh
+        working-directory: src/merge1c
+        run: |
+          go vet ./...
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          go test ./...
+      - name: Разбор скриптов
+        shell: powershell
+        run: |
+          & ./gate/check.ps1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Подставная 1С и merge1c
+        shell: pwsh
+        run: |
+          Push-Location src/fake1c; go build -o ../../gate/test/fake1c.exe .; Pop-Location
+          Push-Location src/merge1c; go build -o ../../gate/test/merge1c.exe .; Pop-Location
+      - name: Тесты приёмки и git
+        shell: powershell
+        run: |
+          & ./gate/test/tests.ps1 -Only delivery -TimeoutSec 600 -Keep
+          exit $LASTEXITCODE
+      - name: Отчёт
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delivery-quick
+          path: |
+            gate/test/last-run.txt
+            ${{ runner.temp }}/ci-tests/**/output.txt
+            ${{ runner.temp }}/ci-tests/**/deliveries/**/state.json
+            ${{ runner.temp }}/ci-tests/**/deliveries/**/report.md
+            ${{ runner.temp }}/ci-tests/**/deploy/delivery/run.log
+          if-no-files-found: ignore

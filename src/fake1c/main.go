@@ -19,9 +19,17 @@
 // Загрузка расширения из файлов (/LoadConfigFromFiles <папка> -Extension <имя>) запоминает папку в каталоге журнала
 // (ext\<имя>); выгрузка этого расширения (/DumpConfigToFiles) отдаёт потом её файлы - как настоящая база. Расширения
 // из списка absent до загрузки «нет в базе»: их выгрузка - код 1 и «не найдено».
+//
+// Приёмка поставок (техническая база, файловая /F): у файловой базы свой склад расширений (ext@<база>\<имя>).
+// /LoadCfg <файл> -Extension <имя> с файлом-архивом zip (подставной .cfe - архив выгрузки в файлы) кладёт его выгрузку
+// в склад, /DeleteCfg -Extension <имя> - убирает. /DumpExternalDataProcessorOrReportToFiles с архивом zip (подставной
+// .epf/.erf - архив выгрузки: <Имя>.xml и <Имя>/...) отдаёт его под именем корня; в архиве есть PROTECTED - код 1,
+// «модуль без исходного текста».
 package main
 
 import (
+	"archive/zip"
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -289,13 +297,38 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 	if rule.Exit != 0 {
 		return rule.Exit
 	}
+	if file := valueAfter(args, "/LoadCfg"); file != "" && logDir != "" {
+		if ext := valueAfter(args, "-Extension"); ext != "" {
+			if data, err := os.ReadFile(file); err == nil && bytes.HasPrefix(data, []byte("PK")) {
+				if !zipHas(data, "Configuration.xml") {
+					if out := valueAfter(args, "/Out"); out != "" {
+						writeUTF8(out, "Файл не является расширением конфигурации")
+					}
+					return 1
+				}
+				store := extStore(args, ext)
+				_ = os.RemoveAll(store)
+				if err := unzipTo(data, store, ""); err != nil {
+					if out := valueAfter(args, "/Out"); out != "" {
+						writeUTF8(out, "Файл не является расширением конфигурации: "+err.Error())
+					}
+					return 1
+				}
+			}
+		}
+	}
+	if hasArg(args, "/DeleteCfg") && logDir != "" {
+		if ext := valueAfter(args, "-Extension"); ext != "" {
+			_ = os.RemoveAll(extStore(args, ext))
+		}
+	}
 	if file := valueAfter(args, "/DumpCfg"); file != "" && !rule.NoDump {
 		_ = os.MkdirAll(filepath.Dir(file), 0o755)
 		_ = os.WriteFile(file, []byte("FAKECFE "+valueAfter(args, "-Extension")), 0o644)
 	}
 	if dir := valueAfter(args, "/LoadConfigFromFiles"); dir != "" && logDir != "" {
 		ext := valueAfter(args, "-Extension")
-		store := filepath.Join(logDir, "ext", ext)
+		store := extStore(args, ext)
 		_ = os.RemoveAll(store)
 		copyTree(dir, store)
 	}
@@ -303,7 +336,7 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 		ext := valueAfter(args, "-Extension")
 		store := ""
 		if logDir != "" {
-			store = filepath.Join(logDir, "ext", ext)
+			store = extStore(args, ext)
 		}
 		loaded := false
 		if store != "" {
@@ -345,6 +378,18 @@ func designer(sc scenario, args []string, line string, state map[string]int) int
 			root := args[i+1]
 			name := strings.TrimSuffix(filepath.Base(root), filepath.Ext(root))
 			data, _ := os.ReadFile(args[i+2])
+			if bytes.HasPrefix(data, []byte("PK")) {
+				if zipHas(data, "PROTECTED") {
+					if out := valueAfter(args, "/Out"); out != "" {
+						writeUTF8(out, "Модуль без исходного текста: выгрузка в файлы невозможна")
+					}
+					return 1
+				}
+				if err := unzipTo(data, filepath.Dir(root), name); err != nil {
+					return 1
+				}
+				continue
+			}
 			writeUTF8(root, "<MetaDataObject><ExternalDataProcessor><Properties><Name>"+name+"</Name></Properties></ExternalDataProcessor></MetaDataObject>")
 			writeUTF8(filepath.Join(filepath.Dir(root), name, "Ext", "ObjectModule.bsl"), string(trimBOM(data)))
 		}
@@ -752,6 +797,9 @@ func processingRun(mode string, r processing, dir string, p map[string]string) {
 		}
 		ref := r.Ref
 		if ref == "" {
+			ref = p["ref"]
+		}
+		if ref == "" {
 			ref = "00000000-0000-0000-0000-000000000001"
 		}
 		check := r.Check
@@ -766,8 +814,87 @@ func processingRun(mode string, r processing, dir string, p map[string]string) {
 		for _, f := range r.FormErrors {
 			lines = append(lines, "formerror="+f)
 		}
+		// Что запись поменяла в карточке (как у обработки со сборки 20261120): с ref= назначение остаётся прежним.
+		kept := "0"
+		if p["ref"] != "" {
+			kept = "1"
+		}
+		lines = append(lines, "commandsold=Печать", "commandsnew=Печать", "targetsold=Документ.Заказ", "targetsnew=Документ.Заказ", "targetskept="+kept, "publication=Используется")
 	}
 	writeUTF8(dir+"result.txt", strings.Join(lines, "\n"))
+}
+
+// extStore - склад выгрузок расширения базы: у серверной - ext\<имя> (как раньше), у файловой - ext@<папка базы>\<имя>.
+func extStore(args []string, ext string) string {
+	for _, a := range args {
+		if len(a) > 2 && (strings.HasPrefix(a, "/F") || strings.HasPrefix(a, "/f")) {
+			return filepath.Join(logDir, "ext@"+filepath.Base(strings.Trim(a[2:], "\"")), ext)
+		}
+	}
+	return filepath.Join(logDir, "ext", ext)
+}
+
+func hasArg(args []string, key string) bool {
+	for _, a := range args {
+		if strings.EqualFold(a, key) {
+			return true
+		}
+	}
+	return false
+}
+
+func zipHas(data []byte, name string) bool {
+	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return false
+	}
+	for _, f := range r.File {
+		if f.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// unzipTo - архив в папку. Root - имя корня выгрузки обработки: <первая папка>.xml и <первая папка>/... ложатся как
+// <root>.xml и <root>/... (выгрузка обработки называется по корневому файлу).
+func unzipTo(data []byte, dir, root string) error {
+	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return err
+	}
+	first := ""
+	for _, f := range r.File {
+		if root != "" && strings.HasSuffix(f.Name, ".xml") && !strings.Contains(f.Name, "/") {
+			first = strings.TrimSuffix(f.Name, ".xml")
+		}
+	}
+	for _, f := range r.File {
+		if strings.HasSuffix(f.Name, "/") || f.Name == "PROTECTED" {
+			continue
+		}
+		name := f.Name
+		if root != "" && first != "" {
+			if name == first+".xml" {
+				name = root + ".xml"
+			} else if strings.HasPrefix(name, first+"/") {
+				name = root + "/" + strings.TrimPrefix(name, first+"/")
+			}
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		var buf bytes.Buffer
+		_, _ = buf.ReadFrom(rc)
+		rc.Close()
+		target := filepath.Join(dir, filepath.FromSlash(name))
+		_ = os.MkdirAll(filepath.Dir(target), 0o755)
+		if err := os.WriteFile(target, buf.Bytes(), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // infobaseName - имя базы из ключа /S"сервер\база" (кавычки уже сняты разбором командной строки) или

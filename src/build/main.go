@@ -665,7 +665,7 @@ func goBuild(dir, out, ldflags string) []byte {
 func buildGate() []entry {
 	gate := filepath.Join(root, "gate")
 	version := "Версия " + placeholder + "."
-	scripts := []string{"run.ps1", "deploy.ps1", "nightly.ps1", "report.ps1", "settings.ps1", "stats.ps1", "ui.ps1", "unittests.ps1", "unittests-cli.ps1", "update.ps1", "publish.ps1", "github.ps1", "cluster-target.ps1", "locks.ps1", "check.ps1", "test/tests.ps1", "test/fakecom.ps1", "test/deploy-contract.tests.ps1"}
+	scripts := []string{"run.ps1", "deploy.ps1", "nightly.ps1", "report.ps1", "settings.ps1", "stats.ps1", "ui.ps1", "unittests.ps1", "unittests-cli.ps1", "update.ps1", "publish.ps1", "github.ps1", "delivery.ps1", "cluster-target.ps1", "locks.ps1", "check.ps1", "test/tests.ps1", "test/fakecom.ps1", "test/deploy-contract.tests.ps1", "test/delivery.tests.ps1"}
 	stamped := map[string]bool{"run.ps1": true, "deploy.ps1": true, "nightly.ps1": true, "report.ps1": true, "settings.ps1": true, "stats.ps1": true, "unittests-cli.ps1": true, "update.ps1": true, "publish.ps1": true, "github.ps1": true, "test/tests.ps1": true, "test/fakecom.ps1": true}
 	var files []entry
 	texts := map[string]string{}
@@ -709,6 +709,8 @@ func buildGate() []entry {
 	files = append(files, entry{"ci/readme.txt", windowsBytes(manual, true)})
 	files = append(files, entry{"ci/ci.exe", goBuild(filepath.Join(root, "src", "ci-tui"), filepath.Join(outDir, "ci.exe"), "-s -w -X main.version="+stamp)})
 	files = append(files, entry{"ci/test/fake1c.exe", goBuild(filepath.Join(root, "src", "fake1c"), filepath.Join(outDir, "fake1c.exe"), "-s -w")})
+	// Объединение поставок подрядчика (deploy.ps1 -Delivery, раздел 5.25 руководства).
+	files = append(files, entry{"ci/merge1c.exe", goBuild(filepath.Join(root, "src", "merge1c"), filepath.Join(outDir, "merge1c.exe"), "-s -w")})
 	// Установщик - в архиве рядом с папкой ci.
 	for _, f := range []string{"install.ps1", "install.cmd"} {
 		text := readText(filepath.Join(root, f))
@@ -722,7 +724,7 @@ func buildGate() []entry {
 func clashCheck(texts map[string]string) {
 	vars := map[string]bool{}
 	re := regexp.MustCompile(`\$script:([A-Za-z_][A-Za-z0-9_]*)`)
-	for _, s := range []string{"ui.ps1", "stats.ps1", "unittests.ps1", "github.ps1"} {
+	for _, s := range []string{"ui.ps1", "stats.ps1", "unittests.ps1", "github.ps1", "delivery.ps1"} {
 		for _, m := range re.FindAllStringSubmatch(texts[s], -1) {
 			vars[strings.ToLower(m[1])] = true
 		}
