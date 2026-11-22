@@ -167,6 +167,7 @@
 
     # Обновление гейта из релизов GitHub (readme.txt, раздел 5.20): пусто - пункта в меню нет.
     # UpdateRepo = 'владелец/репозиторий'
+    # CheckUpdatesOnStartup = $true  # предлагать обновление при открытии ci
     # GitHubTokenPassFile = 'secrets\githubtoken.txt'   # токен, зашифрован DPAPI: «Настройки - Обновление гейта и git»
     # Итог каждого прогона - в GitHub (раздел 5.22): событие gate-run в этот репозиторий, нужен Contents: write.
     # RunReportRepo = 'владелец/репозиторий'

@@ -3792,7 +3792,11 @@ $tests = @(
                     Check (-not $liveFiles.ContainsKey('runs/latest.txt')) 'промежуточный отчёт обновил указатель итогов'
                 }
             } finally { Remove-Job $worker -Force }
-            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep'
+            $profileDir = New-Item -ItemType Directory -Path (Join-Path $sb 'profiles') -Force
+            $profileText = [IO.File]::ReadAllText((Join-Path $sb 'config.psd1'), $utf8)
+            $profileText = $profileText.Insert($profileText.IndexOf('@{') + 2, [Environment]::NewLine + '    RunProgressToGit = $true' + [Environment]::NewLine)
+            [IO.File]::WriteAllText((Join-Path $profileDir.FullName 'live.psd1'), $profileText, $utf8Bom)
+            $r = Invoke-Script -Sandbox $sb -Arguments '-Config profiles\live.psd1 -OnNotGreen Keep'
             Check-Common $r; Check-Verdict $r 'GREEN' 0
             $id = ''
             if ($r.RunDir) { $id = Split-Path -Leaf $r.RunDir }
@@ -3802,6 +3806,7 @@ $tests = @(
             if ($head -and $id) {
                 Check (-not (Get-GhFakeAncestors $gh $head).ContainsKey($seed)) 'ветка gate-runs ответвлена от main, а должна быть сиротой'
                 $files = (Read-GhFakeCommit $gh $head).Files
+                Check ($files.ContainsKey(('live/{0}.txt' -f $id))) 'прогон с относительным профилем не выложил промежуточный журнал'
                 foreach ($path in @('report.txt', 'summary.txt', 'run.log', 'verdict.json', 'timeline.txt', 'selfcheck-groups.txt', 'README.md')) {
                     Check ($files.ContainsKey(('runs/{0}/{1}' -f $id, $path))) ('в ветке нет runs/{0}/{1}' -f $id, $path)
                 }
@@ -4599,6 +4604,12 @@ $tests = @(
                 @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход$' })
             Check ($r.UnusedAnswers -eq 0 -and $r.Unexpected.Count -eq 0) ('неверный порядок вопросов: ' + ($r.Unexpected -join ' | '))
             Check (-not (Test-Path -LiteralPath (Join-Path $sb 'installed-marker.txt'))) 'комплект установлен после отказа'
+            $off = New-Sandbox ($Name + '-off') -Config @{ CheckUpdatesOnStartup = $false; UpdateRepo = 'owner/repo'; GitHubTokenPassFile = 'secrets\github.txt' }
+            $release = New-FakeGateRelease -Sandbox $off -Name ($Name + '-off')
+            $r = Invoke-Script -Sandbox $off -Arguments '-CheckUpdate' -Answers @(
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход$' })
+            Check ($r.UnusedAnswers -eq 0 -and $r.Unexpected.Count -eq 0) 'при выключенной настройке ожидалось только меню'
+            Check (-not (Test-Path -LiteralPath (Join-Path $release.Http 'requests.log'))) 'при выключенной настройке был сетевой запрос'
         }
     },
     @{

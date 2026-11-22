@@ -2327,6 +2327,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Accept') {
 $configPath = $Config
 if ([string]::IsNullOrWhiteSpace($configPath)) { $configPath = Join-Path $Root 'config.psd1' }
 if (-not (Test-Path -LiteralPath $configPath)) { throw "Нет файла настроек: $configPath" }
+$configPath = (Get-Item -LiteralPath $configPath).FullName
 $cfg = Import-PowerShellDataFile -LiteralPath $configPath
 # Настройки площадки из поставки гейта (config.site.psd1 рядом с run.ps1, его кладёт установщик и заменяет
 # при каждой установке): ключ, которого нет в config.psd1, берётся оттуда. Свой ключ в config.psd1 важнее, но пустой
@@ -4383,7 +4384,7 @@ function Invoke-MenuUpdate {
 $menuKeys = @($PSBoundParameters.Keys | Where-Object { $_ -ne 'UiChannel' -and $_ -ne 'CheckUpdate' })
 if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-UiCanAsk)) {
     $choice = ''
-    if ($CheckUpdate -and $UiChannel -and [string](Get-Setting $cfg 'UpdateRepo' '')) { Invoke-MenuUpdate -Startup }
+    if ($CheckUpdate -and $UiChannel -and (Get-Setting $cfg 'CheckUpdatesOnStartup' $true) -and [string](Get-Setting $cfg 'UpdateRepo' '')) { Invoke-MenuUpdate -Startup }
     # Слоты меню: порядок строк - порядок пунктов на экране, у пункта - группа и своя клавиша. Клавиша не зависит от
     # того, какие условные пункты сейчас показаны (inbox пуст, прогон зелёный, подготовки нет): «d» - всегда
     # «Обновить рабочую базу». Новый пункт меню - новая строка здесь (клавиши - из 1-9, a-z, без повторов).
