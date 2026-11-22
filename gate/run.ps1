@@ -68,6 +68,8 @@ param(
     [Parameter(ParameterSetName = 'Run', Position = 0)]
     [string]$Kit = '',
 
+    [switch]$CheckUpdate,
+
     # Файл настроек вместо config.psd1. И для -AcceptBaseline: эталон - той базы, чей это профиль (#12).
     [Parameter(ParameterSetName = 'Run')]
     [Parameter(ParameterSetName = 'Accept')]
@@ -4354,10 +4356,34 @@ function Show-UtMenu {
 # Итоги прежних прогонов, которые не ушли в GitHub (прогон оборвался, не было связи), - до всего остального.
 if (-not ($Tests -or $SelfCheckGroup)) { Invoke-RunPublish -Pending } # ** Хлебников С.Ю. 20261120 служебные запуски не публикуются
 
+function Invoke-MenuUpdate {
+    param([switch]$Startup)
+    $updateArgs = @{ Startup = $Startup.IsPresent }
+    if ($UiChannel) { $updateArgs['UiChannel'] = $UiChannel }
+    & (Join-Path $Root 'update.ps1') @updateArgs
+    $updateCode = $LASTEXITCODE
+    if ($updateCode -eq 10) {
+        if ($UiChannel) {
+            $afterUpdate = Read-UiChoice -Header 'Гейт обновлён, а работает ещё прежний. Что дальше?' -Keys @('1', '2') -Labels @('Перезапустить ci: новый откроется в этом же окне', 'Закрыть ci') -CancelKey '2' -DefaultKey '1' -Dock
+            Send-UiClose -Restart:($afterUpdate -eq '1')
+            if ($afterUpdate -eq '1') { Write-Host 'Гейт обновлён: перезапускаю ci.' -ForegroundColor Green }
+            else { Write-Host 'Гейт обновлён: закрываю ci, новый - при следующем запуске.' -ForegroundColor Green }
+            # Эту строку видно, только если ci.exe события close не знает (он старше этой кнопки).
+            Write-Host 'Если окно ci осталось на этом экране - закрой его и открой снова.' -ForegroundColor DarkGray
+        }
+        else {
+            Wait-UiAcknowledge -Label 'Закрыть'
+            Write-Host 'Гейт обновлён: запусти гейт заново.' -ForegroundColor Green
+        }
+        exit 0
+    }
+}
+
 # Меню - при запуске без ключей (ключ -UiChannel от ci.exe не в счёт).
-$menuKeys = @($PSBoundParameters.Keys | Where-Object { $_ -ne 'UiChannel' })
+$menuKeys = @($PSBoundParameters.Keys | Where-Object { $_ -ne 'UiChannel' -and $_ -ne 'CheckUpdate' })
 if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-UiCanAsk)) {
     $choice = ''
+    if ($CheckUpdate -and $UiChannel -and [string](Get-Setting $cfg 'UpdateRepo' '')) { Invoke-MenuUpdate -Startup }
     # Слоты меню: порядок строк - порядок пунктов на экране, у пункта - группа и своя клавиша. Клавиша не зависит от
     # того, какие условные пункты сейчас показаны (inbox пуст, прогон зелёный, подготовки нет): «d» - всегда
     # «Обновить рабочую базу». Новый пункт меню - новая строка здесь (клавиши - из 1-9, a-z, без повторов).
@@ -4624,25 +4650,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             # update.ps1: релизы GitHub, выбрать, поставить. Код 10 - поставлен: скрипты и ci.exe на диске уже новые,
             # а работают прежние. Меню здесь больше не открывается: в ci.exe - перезапустить его или закрыть (событие
             # close, новый ci.exe - в этом же окне), в консоли - выйти.
-            $updateArgs = @{}
-            if ($UiChannel) { $updateArgs['UiChannel'] = $UiChannel }
-            & (Join-Path $Root 'update.ps1') @updateArgs
-            $updateCode = $LASTEXITCODE
-            if ($updateCode -eq 10) {
-                if ($UiChannel) {
-                    $afterUpdate = Read-UiChoice -Header 'Гейт обновлён, а работает ещё прежний. Что дальше?' -Keys @('1', '2') -Labels @('Перезапустить ci: новый откроется в этом же окне', 'Закрыть ci') -CancelKey '2' -DefaultKey '1' -Dock
-                    Send-UiClose -Restart:($afterUpdate -eq '1')
-                    if ($afterUpdate -eq '1') { Write-Host 'Гейт обновлён: перезапускаю ci.' -ForegroundColor Green }
-                    else { Write-Host 'Гейт обновлён: закрываю ci, новый - при следующем запуске.' -ForegroundColor Green }
-                    # Эту строку видно, только если ci.exe события close не знает (он старше этой кнопки).
-                    Write-Host 'Если окно ci осталось на этом экране - закрой его и открой снова.' -ForegroundColor DarkGray
-                }
-                else {
-                    Wait-UiAcknowledge -Label 'Закрыть'
-                    Write-Host 'Гейт обновлён: запусти гейт заново.' -ForegroundColor Green
-                }
-                exit 0
-            }
+            Invoke-MenuUpdate
             Wait-UiAcknowledge
             continue
         }
@@ -4769,6 +4777,15 @@ if (-not ($Tests -or $SelfCheckGroup)) {
         $selfProcess = Get-Process -Id $PID
         [System.IO.File]::WriteAllText((Join-Path $RunDir 'pid.txt'), ('{0}|{1}' -f $PID, $selfProcess.StartTime.ToString('o')), $Utf8Bom)
         $script:PublishRunDir = $RunDir
+        if ((Get-Setting $cfg 'RunProgressToGit' $false) -and [string](Get-Setting $cfg 'RunFilesRepo' '')) {
+            try {
+                # Задание принадлежит процессу прогона. Сетевое ожидание не задерживает проверки 1С.
+                $null = Start-Job -ArgumentList (Join-Path $Root 'publish.ps1'), $configPath, $RunDir -ScriptBlock {
+                    param($publisher, $profilePath, $dir)
+                    & $publisher -WatchProgress -Config $profilePath -RunDir $dir
+                } -ErrorAction Stop
+            } catch { Write-RunLog ('Не запущена промежуточная публикация: ' + $_.Exception.Message) }
+        }
     }
 }
 if ($script:SiteSettingKeys.Count -gt 0) { Write-RunLog ("Настройки площадки из config.site.psd1: {0}" -f ($script:SiteSettingKeys -join ', ')) }
@@ -7465,8 +7482,9 @@ else {
             if ($prepCanAsk) {
                 # Пока ждём ответа, раз в 3 секунды смотрим сеансы: ушли сами - блокировка и дальше без ответа.
                 $script:PrepLastCount = $prepOthers.Count
-                $answer = Read-UiChoice -Header ("В {0} есть сеансы: {1}. Можно дождаться, пока закончатся сами, или:" -f $script:Base, $prepOthers.Count) `
-                    -Keys @('1', '2', '3') -CancelKey '2' -Labels @(
+                $sessionHeader = 'В {0} есть сеансы: {1}. Можно дождаться, пока закончатся сами, или:'
+                $answer = Read-UiChoice -Header ($sessionHeader -f $script:Base, $prepOthers.Count) `
+                    -Keys @('1', '2', '3') -CancelKey '2' -SessionLines @($prepOthers | ForEach-Object { $_.Text }) -Labels @(
                     'Продолжить так',
                     'Выйти',
                     ("Поставить блокировку начала сеансов на {0} ч, завершить сеансы и продолжить" -f $sessionLockHours)) -Poll {
@@ -7474,6 +7492,7 @@ else {
                     # Список не прочитался - это не «никого нет», ждём дальше. Конфигуратор тоже считается.
                     if (@($nowSessions | Where-Object { $_.IsError }).Count -gt 0) { return '' }
                     if ($nowSessions.Count -eq 0) { return 'empty' }
+                    Update-UiSessionList -Lines @($nowSessions | ForEach-Object { $_.Text }) -Header ($sessionHeader -f $script:Base, $nowSessions.Count)
                     if ($nowSessions.Count -ne $script:PrepLastCount) {
                         $script:PrepLastCount = $nowSessions.Count
                         Write-Host ("  сеансов осталось: {0}" -f $nowSessions.Count) -ForegroundColor DarkGray

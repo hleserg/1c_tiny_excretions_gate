@@ -209,12 +209,16 @@ func newDialog(ev uiEvent, width, height int) *dialog {
 		ti.Focus()
 		d.input = ti
 	}
-	if ev.Kind == "view" {
+	if ev.Kind == "view" || d.sessionList() {
 		d.view = viewport.New(10, 10)
 		d.view.SetContent(colorizeWrapped(ev.Lines, max(20, width-8)))
 	}
 	d.resize(width, height)
 	return d
+}
+
+func (d *dialog) sessionList() bool {
+	return d.ev.Kind == "one" && len(d.ev.Lines) > 0
 }
 
 func (d *dialog) resize(width, height int) {
@@ -224,6 +228,16 @@ func (d *dialog) resize(width, height int) {
 		d.view.Width = max(20, width-8)
 		d.view.Height = max(5, height-8)
 		d.view.SetContent(colorizeWrapped(d.ev.Lines, d.view.Width))
+	}
+	if d.sessionList() {
+		d.view.Width = max(1, d.innerWidth())
+		content := colorizeWrapped(d.ev.Lines, d.view.Width)
+		fixed := 9 + lipgloss.Height(styleDialogTitle.Width(d.view.Width).Render(d.ev.Header))
+		for i := range d.ev.Items {
+			fixed += d.itemRows(i)
+		}
+		d.view.Height = max(1, min(lipgloss.Height(content), height-fixed))
+		d.view.SetContent(content)
 	}
 	if d.ev.Kind == "text" {
 		d.input.Width = max(20, min(80, width-12))
@@ -263,6 +277,17 @@ func (d *dialog) Update(msg tea.Msg) tea.Cmd {
 		return nil
 	}
 	s := key.String()
+	if d.sessionList() && (s == "pgup" || s == "pgdown" || s == "home" || s == "end") {
+		switch s {
+		case "home":
+			d.view.GotoTop()
+		case "end":
+			d.view.GotoBottom()
+		default:
+			d.view, _ = d.view.Update(msg)
+		}
+		return nil
+	}
 	switch d.ev.Kind {
 	case "one", "many":
 		n := len(d.ev.Items)
@@ -449,6 +474,10 @@ func (d *dialog) mouse(msg tea.MouseMsg) tea.Cmd {
 	}
 	switch msg.Button {
 	case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
+		if d.sessionList() {
+			d.view, _ = d.view.Update(msg)
+			return nil
+		}
 		if d.docked() {
 			return nil
 		}
@@ -572,6 +601,12 @@ func (d *dialog) View() string {
 	}
 	b.WriteString(styleDialogTitle.Width(inner).Render(header))
 	b.WriteString("\n")
+	if d.sessionList() {
+		b.WriteString(d.view.View() + "\n")
+		if d.view.TotalLineCount() > d.view.Height {
+			b.WriteString(styleDim.Width(inner).Render("Сеансы: PgUp/PgDn или колесо мыши") + "\n")
+		}
+	}
 	for _, note := range d.ev.Notes {
 		b.WriteString(styleDim.Width(inner).Render(note))
 		b.WriteString("\n")

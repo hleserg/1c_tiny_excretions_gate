@@ -16,6 +16,7 @@
 param(
     [string]$Tag = '',
     [switch]$Latest,
+    [switch]$Startup,
     [switch]$List,
     [string]$Config = '',
     [string]$UiChannel = ''
@@ -108,8 +109,13 @@ function Invoke-UpdateHttp {
         $request.AllowAutoRedirect = $false
         $request.UserAgent = 'ci-gate'
         $request.Accept = $Accept
-        $request.Timeout = 60000
-        $request.ReadWriteTimeout = 300000
+        if ($Startup -and -not $OutFile) {
+            $request.Timeout = 4000
+            $request.ReadWriteTimeout = 4000
+        } else {
+            $request.Timeout = 60000
+            $request.ReadWriteTimeout = 300000
+        }
         if ($null -ne $request.Proxy) { $request.Proxy.Credentials = [System.Net.CredentialCache]::DefaultCredentials }
         if ($sendToken) {
             $request.Headers['Authorization'] = 'Bearer ' + $Token
@@ -179,6 +185,8 @@ function Get-GateReleases {
     $parsed = ConvertFrom-Json $text
     foreach ($release in @($parsed)) {
         if ($release.draft) { continue }
+        if ($Startup -and (($release.PSObject.Properties['prerelease'] -and $release.prerelease) -or
+                ([string]$release.tag_name -notmatch ('^' + [regex]::Escape($Prefix) + '\d{8}\.\d{6}$')))) { continue }
         $tagName = [string]$release.tag_name
         if (-not $tagName.StartsWith($Prefix)) { continue }
         $asset = $null
@@ -265,7 +273,13 @@ try {
     Write-Host ("Гейт: установлен {0}, последний в {1} - {2}" -f $installedText, $repo, $newest.Version)
 
     $chosen = $null
-    if ($List) {
+    if ($Startup) {
+        if ($installed -and $newest.Version -gt $installed -and
+            (Confirm-Ui -Question ("Доступен гейт {0}, установлен {1}. Обновить сейчас?" -f $newest.Version, $installed) -Yes 'Обновить' -No 'Продолжить' -DefaultNo)) {
+            $chosen = $newest
+        }
+    }
+    elseif ($List) {
         foreach ($release in $releases) {
             $mark = ''
             if ($release.Version -eq $installed) { $mark = ' [установлен]' }

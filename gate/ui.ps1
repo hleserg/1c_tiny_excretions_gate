@@ -207,6 +207,15 @@ function Request-UiAnswer {
     }
 }
 
+function Update-UiSessionList {
+    param([string[]]$Lines, [string]$Header)
+    $signature = $Lines -join "`n"
+    if ($script:UiSessionSignature -ceq $signature) { return }
+    $script:UiSessionSignature = $signature
+    if ($script:UiChannelDir) { Send-UiEvent @{ kind = 'sessions'; id = $script:UiQuestionId; lines = @($Lines); header = $Header } }
+    else { foreach ($line in $Lines) { Write-Host ('  ' + $line) } }
+}
+
 function Read-UiChoice {
     # Вопрос с вариантами-клавишами. Keys и Labels - параллельные массивы. Poll - как у Request-UiAnswer:
     # вернула непустое - это и есть ответ. Esc в ci.exe - CancelKey.
@@ -214,9 +223,11 @@ function Read-UiChoice {
     # варианте стоит выбор сразу. Danger - номера опасных вариантов (откат): в ci.exe щелчок мышью по ним
     # срабатывает только со второго раза.
     param([string]$Header, [string[]]$Keys, [string[]]$Labels, [scriptblock]$Poll = $null, [string]$CancelKey = '', [string[]]$Notes = @(),
-        [switch]$Dock, [string]$DefaultKey = '', [int[]]$Danger = @())
+        [switch]$Dock, [string]$DefaultKey = '', [int[]]$Danger = @(), [string[]]$SessionLines = @())
+    $script:UiSessionSignature = $SessionLines -join "`n"
     if ($script:UiChannelDir) {
         $question = @{ kind = 'one'; header = $Header; items = @($Labels); notes = @($Notes) }
+        if ($SessionLines.Count) { $question['lines'] = @($SessionLines) }
         if ($Dock) { $question['style'] = 'dock' }
         if ($Danger.Count -gt 0) { $question['danger'] = @($Danger) }
         if ($DefaultKey) { $question['preselected'] = @([array]::IndexOf($Keys, $DefaultKey)) }

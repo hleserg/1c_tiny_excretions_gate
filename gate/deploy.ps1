@@ -5597,11 +5597,13 @@ if ($needExclusive) {
             $sessionLabels += ("Предупредить пользователей и закрыть базу через {0} мин; пока они сохраняются - выгрузки и резервные копии, оставшиеся сеансы завершить перед загрузкой" -f $deployWarnMinutes)
             $sessionDefault = '4'
         }
-        $answer = Read-UiChoice -Header ("В {0} есть сеансы: {1}. Можно дождаться, пока закончатся сами, или:" -f $script:ProdBase, $others.Count) `
-            -Keys $sessionKeys -CancelKey '2' -DefaultKey $sessionDefault -Labels $sessionLabels -Poll {
+        $sessionHeader = 'В {0} есть сеансы: {1}. Можно дождаться, пока закончатся сами, или:'
+        $answer = Read-UiChoice -Header ($sessionHeader -f $script:ProdBase, $others.Count) `
+            -Keys $sessionKeys -CancelKey '2' -SessionLines @($others | ForEach-Object { $_.Text }) -DefaultKey $sessionDefault -Labels $sessionLabels -Poll {
             $now = @(Get-BaseSessions $prepLink $script:ProdBase)
             if (@($now | Where-Object { $_.IsError }).Count -gt 0) { return '' }
             if ($now.Count -eq 0) { return 'empty' }
+            Update-UiSessionList -Lines @($now | ForEach-Object { $_.Text }) -Header ($sessionHeader -f $script:ProdBase, $now.Count)
             if ($now.Count -ne $script:LastSessionCount) {
                 $script:LastSessionCount = $now.Count
                 Write-Host ("  сеансов осталось: {0}" -f $now.Count) -ForegroundColor DarkGray

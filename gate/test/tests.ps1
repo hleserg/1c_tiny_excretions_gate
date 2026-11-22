@@ -3766,6 +3766,32 @@ $tests = @(
             $seed = New-GhCommit -Gh $gh -Parent '' -Changes @($seedFile) -Message 'Начальный коммит'
             Set-GhBranch -Gh $gh -Branch 'main' -Sha $seed -Create
 
+            # Ещё нет вердикта. Проверяем отправку в отдельную ветку и отсев строки с паролем.
+            $liveId = '20200101-010203'
+            $liveDir = Join-Path $sb ('runs\' + $liveId)
+            New-Item -ItemType Directory -Path $liveDir -Force | Out-Null
+            [IO.File]::WriteAllText((Join-Path $liveDir 'pid.txt'), ('{0}|{1}' -f $PID, (Get-Process -Id $PID).StartTime.ToString('o')), $utf8Bom)
+            [IO.File]::WriteAllLines((Join-Path $liveDir 'run.log'), @('12:00:00 Началась проверка', "12:00:01 значение $secret"), $utf8Bom)
+            $worker = Start-Job -ArgumentList $sb, $liveDir -ScriptBlock {
+                param($sandbox, $dir)
+                $env:CI_FAKE_GITHUB = Join-Path $sandbox 'fake-github'
+                & (Join-Path $sandbox 'publish.ps1') -WatchProgress -RunDir $dir
+            }
+            try {
+                $deadline = (Get-Date).AddSeconds(20)
+                do {
+                    Start-Sleep -Milliseconds 200
+                    $liveHead = (Get-GhHead -Gh $gh -Branch 'gate-runs').Sha
+                } while (-not $liveHead -and (Get-Date) -lt $deadline -and $worker.State -eq 'Running')
+                Check ([bool]$liveHead) 'промежуточный файл не появился до вердикта'
+                if ($liveHead) {
+                    $liveFiles = (Read-GhFakeCommit $gh $liveHead).Files
+                    $blob = $liveFiles['live/' + $liveId + '.txt']
+                    $body = $utf8.GetString((Get-GhBlob $gh $blob))
+                    Check ($body.Contains('Началась проверка') -and -not $body.Contains($secret)) 'нарушена фильтрация промежуточного журнала'
+                    Check (-not $liveFiles.ContainsKey('runs/latest.txt')) 'промежуточный отчёт обновил указатель итогов'
+                }
+            } finally { Remove-Job $worker -Force }
             $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep'
             Check-Common $r; Check-Verdict $r 'GREEN' 0
             $id = ''
@@ -4559,6 +4585,20 @@ $tests = @(
             Check ($bad.ExitCode -eq 1) ("не та сумма: код {0}, ждали 1" -f $bad.ExitCode)
             Check (@($bad.Output | Where-Object { $_ -match 'контрольная сумма' }).Count -gt 0) 'нет объяснения про контрольную сумму'
             Check (-not (Test-Path -LiteralPath $marker)) 'установщик запущен при неверной сумме'
+        }
+    },
+    @{
+        Name = 'menu-startup-update'
+        Text = 'при запуске ci предлагается новая версия; отказ оставляет обычное меню и не ставит комплект'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ UpdateRepo = 'owner/repo'; GitHubTokenPassFile = 'secrets\github.txt' }
+            $null = New-FakeGateRelease -Sandbox $sb -Name $Name
+            $r = Invoke-Script -Sandbox $sb -Arguments '-CheckUpdate' -Answers @(
+                @{ Kind = 'confirm'; Header = 'Доступен гейт'; Yes = $false },
+                @{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход$' })
+            Check ($r.UnusedAnswers -eq 0 -and $r.Unexpected.Count -eq 0) ('неверный порядок вопросов: ' + ($r.Unexpected -join ' | '))
+            Check (-not (Test-Path -LiteralPath (Join-Path $sb 'installed-marker.txt'))) 'комплект установлен после отказа'
         }
     },
     @{

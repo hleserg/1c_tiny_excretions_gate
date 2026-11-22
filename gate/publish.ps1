@@ -26,6 +26,7 @@ param(
     [string]$Stage = 'final',
     [string]$Message = '',
     [switch]$Pending,
+    [switch]$WatchProgress,
     [string]$Config = ''
 )
 
@@ -693,6 +694,52 @@ function Publish-Run {
 
 #endregion
 
+function Watch-RunProgress {
+    # Только один файл конкретного прогона. Итог и runs/latest.txt по-прежнему принадлежат штатной публикации.
+    param([string]$Dir, [hashtable]$Settings)
+    $repo = [string](Get-PublishSetting $Settings 'RunFilesRepo' '')
+    $branch = [string](Get-PublishSetting $Settings 'RunFilesBranch' 'gate-runs')
+    $id = Split-Path -Leaf $Dir
+    if (-not $repo -or $branch -in @('main', 'master') -or $id -notmatch '^\d{8}-\d{6}$') { return }
+    $previous = $null
+    $failed = $false
+    while ((Test-RunAlive $Dir) -and -not (Test-Path -LiteralPath (Join-Path $Dir 'verdict.json'))) {
+        try {
+            $log = Join-Path $Dir 'run.log'
+            $lines = @('Промежуточный журнал прогона ' + $id)
+            if (Test-Path -LiteralPath $log) {
+                $lines += @(Get-Content -Encoding UTF8 -LiteralPath $log -Tail 20 -ErrorAction Stop | ForEach-Object { [string]$_ })
+            }
+            $content = $lines -join [Environment]::NewLine
+            if ($content -cne $previous) {
+                $token = Get-PublishToken ([string](Get-PublishSetting $Settings 'GitHubTokenPassFile' ''))
+                $secrets = Get-PublishSecrets -Settings $Settings -Token $token
+                # Убираем строку целиком до обрезки: в Git не попадёт даже начало найденного пароля.
+                $safe = foreach ($line in $lines) {
+                    $hidden = $false
+                    foreach ($secret in $secrets) {
+                        if ($line.Contains([string]$secret.Value)) { $hidden = $true; break }
+                    }
+                    if ($hidden) { '[строка скрыта]' } else { $line.Substring(0, [Math]::Min(512, $line.Length)) }
+                }
+                $gh = New-GhContext -Repo $repo -Token $token
+                $head = Get-GhHead -Gh $gh -Branch $branch
+                if ($head.Empty) { throw 'Репозиторий пуст' }
+                $change = [pscustomobject]@{ Path = "live/$id.txt"; Bytes = $Utf8NoBom.GetBytes(($safe -join [Environment]::NewLine)) }
+                $commit = New-GhCommit -Gh $gh -Parent $head.Sha -Changes @($change) -Message ("Ход прогона {0}" -f $id)
+                if ($head.Sha) { Set-GhBranch -Gh $gh -Branch $branch -Sha $commit }
+                else { Set-GhBranch -Gh $gh -Branch $branch -Sha $commit -Create }
+                $previous = $content
+                $failed = $false
+            }
+        } catch {
+            if (-not $failed) { Write-PublishLog $Dir 'Промежуточный журнал не отправлен. При следующем опросе будет повтор.' }
+            $failed = $true
+        }
+        Start-Sleep -Seconds 60
+    }
+}
+
 $configFile = $Config
 if ([string]::IsNullOrWhiteSpace($configFile)) { $configFile = Join-Path $Root 'config.psd1' }
 if (-not (Test-Path -LiteralPath $configFile)) { return }
@@ -700,6 +747,8 @@ $cfg = Read-PublishConfig $configFile
 $repoName = [string](Get-PublishSetting $cfg 'RunReportRepo' '')
 if (-not $repoName) { return }
 $tokenFile = [string](Get-PublishSetting $cfg 'GitHubTokenPassFile' '')
+
+if ($WatchProgress) { Watch-RunProgress -Dir $RunDir -Settings $cfg; return }
 
 if ($Pending) {
     # Не ушедшее: прогоны с pid.txt (их запускал гейт с отправкой итогов), процесс которых уже не живёт, а итог

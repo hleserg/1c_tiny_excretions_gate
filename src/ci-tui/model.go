@@ -113,6 +113,10 @@ func newModel(baseDir, script string, extra []string) model {
 }
 
 func (m model) Init() tea.Cmd {
+	// Только первый интерактивный запуск процесса ci проверяет обновления.
+	if m.script == "run.ps1" && len(m.extra) == 0 {
+		m.extra = []string{"-CheckUpdate"}
+	}
 	return tea.Batch(m.startCmd(), tick(), m.spin.Tick)
 }
 
@@ -257,6 +261,12 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		ev := msg.ev
 		m.lastOutput = time.Now()
 		switch ev.Kind {
+		case "sessions":
+			if m.dialog != nil && m.dialog.sessionList() && m.dialog.ev.ID == ev.ID {
+				m.dialog.ev.Lines = ev.Lines
+				m.dialog.ev.Header = ev.Header
+				m.dialog.resize(m.width, m.height)
+			}
 		case "context":
 			m.context = ev.Text
 		case "plan":
