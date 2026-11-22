@@ -3776,7 +3776,7 @@ $tests = @(
             if ($head -and $id) {
                 Check (-not (Get-GhFakeAncestors $gh $head).ContainsKey($seed)) 'ветка gate-runs ответвлена от main, а должна быть сиротой'
                 $files = (Read-GhFakeCommit $gh $head).Files
-                foreach ($path in @('report.txt', 'summary.txt', 'run.log', 'verdict.json', 'README.md')) {
+                foreach ($path in @('report.txt', 'summary.txt', 'run.log', 'verdict.json', 'timeline.txt', 'selfcheck-groups.txt', 'README.md')) {
                     Check ($files.ContainsKey(('runs/{0}/{1}' -f $id, $path))) ('в ветке нет runs/{0}/{1}' -f $id, $path)
                 }
                 $latest = ''

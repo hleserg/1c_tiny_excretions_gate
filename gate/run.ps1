@@ -8482,6 +8482,10 @@ else {
 Write-Host ("Итог и логи: {0}" -f $RunDir)
 if ($verdict -ne 'GREEN') { Invoke-RunReport -Quiet $false } else { Invoke-RunReport -Quiet $true }
 
+# До первого сообщения в git, пока оператор ещё не выбирал судьбу комплекта.
+try { & (Join-Path $Root 'timeline.ps1') -RunDir $RunDir -Quiet }
+catch { Write-RunLog ("Разбор времени прогона не получился: {0}" -f $_.Exception.Message) }
+
 # Что делать с комплектом. Вопрос задаётся, когда комплект загружался, а вердикт красный или жёлтый
 # с замечаниями. Жёлтый только из-за шагов, пропущенных ключами, вопроса не вызывает.
 $tried = @($kitItems | Where-Object { $_.LoadTried })
