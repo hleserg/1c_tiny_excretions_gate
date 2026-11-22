@@ -109,7 +109,7 @@ function Test-RunAlive {
     if (-not $text) { return $false }
     $parts = $text.Split('|')
     $processId = 0
-    if (-not [int]::TryParse($parts[0], [ref]$processId)) { return $false }
+    if (-not [int]::TryParse($parts[0], [ref]$processId) -or $processId -le 0) { return $false }
     $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
     if ($null -eq $process) { return $false }
     if ($parts.Count -lt 2) { return $true }

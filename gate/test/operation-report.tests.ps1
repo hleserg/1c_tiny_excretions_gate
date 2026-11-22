@@ -37,7 +37,7 @@
                 Check ($first.Count -eq 1) 'до обрыва должна уйти только первая часть'
                 Remove-Item -LiteralPath $fail
                 $other = Join-Path $sb 'other.psd1'
-                [IO.File]::WriteAllText($other, ([IO.File]::ReadAllText($cfg)).Replace('owner/reports', 'owner/other'))
+                [IO.File]::WriteAllText($other, ([IO.File]::ReadAllText($cfg)).Replace('owner/reports', 'owner/other'), $utf8Bom)
                 & (Join-Path $sb 'publish.ps1') -Pending -Config $other
                 Check (@(Get-ChildItem $http -Filter 'dispatch-*.json').Count -eq 1) 'другой профиль дослал чужой отчёт'
                 & (Join-Path $sb 'publish.ps1') -Pending -Config $cfg
