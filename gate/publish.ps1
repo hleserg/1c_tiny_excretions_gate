@@ -724,7 +724,15 @@ function Publish-Run {
     # Файлы прогона (RunFilesRepo) уходят до события: ссылка на них - в тексте итога; их сбой событию не мешает.
     param([string]$Dir, [string]$Kind, [string]$Reason, [string]$Repo, [string]$TokenFile, [hashtable]$Settings = @{}, [switch]$Retry)
     try { $lease = [IO.File]::Open((Join-Path $Dir 'publish.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
-    catch [IO.IOException] { return $false }
+    catch [IO.IOException] {
+        if (-not $Retry -and $Kind -in @('final', 'crash')) {
+            # Другая отправка успела занять папку. Даже если процесс сейчас закончится,
+            # досылка должна знать реальный исход, а не объявлять завершённый прогон оборванным.
+            $masked = Protect-GateReportText $Reason (Get-PublishSecrets -Settings $Settings -Token '')
+            Save-GateReportJson (Join-Path $Dir 'end.pending') @{ kind = $Kind; reason = $masked }
+        }
+        return $false
+    }
     try {
         $state = Get-PublishState $Dir
         if ($Retry -and $state['wanted'] -eq $Kind -and $state['sent'] -eq $Kind) { return $true }
@@ -844,8 +852,16 @@ if ($Pending) {
             if ($destination -and $destination -ne $repoName) { continue }
         }
         $state = Get-PublishState $candidate.FullName
-        $finished = @('final', 'crash', 'broken') -contains $state['wanted']
-        $eventDone = $finished -and $state['sent'] -eq $state['wanted']
+        $wanted = $state['wanted']
+        $reason = $state['message']
+        $deferred = Read-TextFile (Join-Path $candidate.FullName 'end.pending')
+        if ($deferred) {
+            $saved = $deferred | ConvertFrom-Json
+            $wanted = $saved.kind
+            $reason = $saved.reason
+        }
+        $finished = @('final', 'crash', 'broken') -contains $wanted
+        $eventDone = $finished -and $state['sent'] -eq $wanted
         $filesPending = $filesOn -and $state['filesWanted'] -and $state['filesSent'] -ne $state['filesWanted']
         if ($eventDone -and -not $filesPending) { continue }
         if (Test-RunAlive $candidate.FullName) { continue }
@@ -855,8 +871,8 @@ if ($Pending) {
             continue
         }
         $kind = 'broken'
-        if ($finished) { $kind = $state['wanted'] }
-        $sent = Publish-Run -Dir $candidate.FullName -Kind $kind -Reason $state['message'] -Repo $repoName -TokenFile $tokenFile -Settings $cfg -Retry
+        if ($finished) { $kind = $wanted }
+        $sent = Publish-Run -Dir $candidate.FullName -Kind $kind -Reason $reason -Repo $repoName -TokenFile $tokenFile -Settings $cfg -Retry
         if (-not $sent) { break }
     }
     return
