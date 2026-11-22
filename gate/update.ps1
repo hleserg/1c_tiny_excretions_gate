@@ -30,6 +30,7 @@ if ($UiChannel) {
 }
 $Root = $PSScriptRoot
 . (Join-Path $Root 'ui.ps1')
+. (Join-Path $Root 'operation-report.ps1')
 Initialize-Ui -Channel $UiChannel
 
 #region Настройки и токен
@@ -235,6 +236,8 @@ function Install-GateRelease {
     if (-not (Test-Path -LiteralPath $installer) -or -not (Test-Path -LiteralPath (Join-Path $unpacked 'ci\run.ps1'))) {
         throw ("в {0} нет install.ps1 и ci\run.ps1 - это не комплект гейта" -f $Release.AssetName)
     }
+    # Во время скачивания или распаковки оператор мог нажать «Стоп». Файлы установленной версии пока целы.
+    Test-UiStop
     # Работающий ci.exe заменить нельзя, а переименовать - можно: новый ляжет рядом, старый уйдёт при следующем обновлении.
     $exe = Join-Path $Root 'ci.exe'
     if (Test-Path -LiteralPath $exe) {
@@ -255,8 +258,21 @@ function Install-GateRelease {
 
 $configPath = $Config
 if (-not $configPath) { $configPath = Join-Path $Root 'config.psd1' }
+elseif (-not [IO.Path]::IsPathRooted($configPath)) { $configPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($configPath) }
 $exitCode = 0
+$updateReport = $null
+$startupLaunch = $null
+$chosen = $null
+$updateOutcome = 'cancelled'
+$updateResult = 'Установка отменена.'
+$installedText = 'неизвестно'
+$targetVersion = $Tag
+# Просмотр релизов и проверка при старте, если обновления нет, - без отдельного итога.
+if ($Startup) { $startupLaunch = New-GateLaunchMetadata -Operation 'update-gate' }
+elseif (-not $List) { $updateReport = Start-GateOperation -Operation 'update-gate' -Config $configPath }
 try {
+    $installed = Get-InstalledVersion
+    if ($installed) { $installedText = $installed }
     if (-not (Test-Path -LiteralPath $configPath)) { throw "нет файла настроек: $configPath" }
     $cfg = Read-UpdateConfig -Path $configPath
     $repo = [string](Get-UpdateSetting $cfg 'UpdateRepo' '')
@@ -264,19 +280,16 @@ try {
     $api = [string](Get-UpdateSetting $cfg 'UpdateApi' 'https://api.github.com')
     $prefix = [string](Get-UpdateSetting $cfg 'UpdateTagPrefix' 'gate-')
     $token = Get-UpdateToken ([string](Get-UpdateSetting $cfg 'GitHubTokenPassFile' ''))
-    $installed = Get-InstalledVersion
     $releases = Get-GateReleases -Api $api -Repo $repo -Prefix $prefix -Token $token
     if ($releases.Count -eq 0) { throw ("в {0} нет релизов {1}* с комплектом ci-gate_*.zip" -f $repo, $prefix) }
     $newest = $releases[0]
-    $installedText = $installed
-    if (-not $installedText) { $installedText = 'неизвестно' }
     Write-Host ("Гейт: установлен {0}, последний в {1} - {2}" -f $installedText, $repo, $newest.Version)
 
-    $chosen = $null
     if ($Startup) {
-        if ($installed -and $newest.Version -gt $installed -and
-            (Confirm-Ui -Question ("Доступен гейт {0}, установлен {1}. Обновить сейчас?" -f $newest.Version, $installed) -Yes 'Обновить' -No 'Продолжить' -DefaultNo)) {
-            $chosen = $newest
+        if ($installed -and $newest.Version -gt $installed) {
+            $updateReport = Start-GateOperation -Operation 'update-gate' -Config $configPath -Launch $startupLaunch
+            $targetVersion = $newest.Version
+            if (Confirm-Ui -Question ("Доступен гейт {0}, установлен {1}. Обновить сейчас?" -f $newest.Version, $installed) -Yes 'Обновить' -No 'Продолжить' -DefaultNo) { $chosen = $newest }
         }
     }
     elseif ($List) {
@@ -291,7 +304,11 @@ try {
         if ($null -eq $chosen) { throw ("релиза {0} нет среди последних в {1}" -f $Tag, $repo) }
     }
     elseif ($Latest) {
-        if ($installed -and $newest.Version -le $installed) { Write-Host ('Обновлять нечего: стоит {0}.' -f $installed) -ForegroundColor Green }
+        if ($installed -and $newest.Version -le $installed) {
+            $updateOutcome = 'unchanged'
+            $updateResult = 'Обновлять нечего: стоит {0}, последний релиз {1}.' -f $installed, $newest.Version
+            Write-Host $updateResult -ForegroundColor Green
+        }
         else { $chosen = $newest }
     }
     else {
@@ -309,6 +326,7 @@ try {
         $index = Select-UiOne -Header ('Обновление гейта из {0}' -f $repo) -Items $labels -Notes $notes
         if ($index -ge 0 -and $index -lt $shown.Count) {
             $candidate = $shown[$index]
+            $targetVersion = $candidate.Version
             $lines = @(('{0}, опубликован {1}' -f $candidate.Tag, $candidate.Date), '') + @($candidate.Notes.Replace("`r", '').Split("`n"))
             Show-UiPager -Lines $lines -Header ('Что в {0}' -f $candidate.Version)
             $question = 'Поставить {0}?' -f $candidate.Version
@@ -317,14 +335,33 @@ try {
         }
     }
     if ($null -ne $chosen) {
+        $targetVersion = $chosen.Version
+        Add-GateOperationLine -Context $updateReport -Text ('Установка гейта: {0} → {1}.' -f $installedText, $targetVersion)
+        Test-UiStop
         Install-GateRelease -Release $chosen -Token $token
+        $updateOutcome = 'updated'
+        $updateResult = 'Гейт обновлён до {0}. Работает ещё прежний: новый - после перезапуска ci.' -f $chosen.Version
         Write-Host ''
-        Write-Host ("Гейт обновлён до {0}. Работает ещё прежний: новый - после перезапуска ci." -f $chosen.Version) -ForegroundColor Green
+        Write-Host $updateResult -ForegroundColor Green
         $exitCode = 10
     }
 }
 catch {
-    Write-Host ("Обновление не вышло: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    $reason = $_.Exception.Message
+    if ($Startup -and $null -eq $updateReport) { $updateReport = Start-GateOperation -Operation 'update-gate' -Config $configPath -Launch $startupLaunch }
+    if ($reason -ne 'остановлено из интерфейса ci.exe') { $updateOutcome = 'failed' }
+    $updateResult = 'Обновление не вышло: {0}' -f $reason
+    Write-Host $updateResult -ForegroundColor Red
     $exitCode = 1
+}
+finally {
+    if ($null -ne $updateReport) {
+        if ($null -eq $chosen) {
+            $versions = 'До обновления: {0}.' -f $installedText
+            if ($targetVersion) { $versions += ' Релиз для установки: {0}.' -f $targetVersion }
+            $updateResult = $versions + [Environment]::NewLine + $updateResult
+        }
+        Complete-GateOperation -Context $updateReport -Outcome $updateOutcome -Text $updateResult
+    }
 }
 exit $exitCode
