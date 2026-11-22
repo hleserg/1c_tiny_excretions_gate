@@ -722,36 +722,41 @@ function Publish-Operation {
 function Publish-Run {
     # Отправить итог одного прогона. Возвращает $true, если ушло. Сбой - в выводе и в run.log, не исключением.
     # Файлы прогона (RunFilesRepo) уходят до события: ссылка на них - в тексте итога; их сбой событию не мешает.
-    param([string]$Dir, [string]$Kind, [string]$Reason, [string]$Repo, [string]$TokenFile, [hashtable]$Settings = @{})
-    $state = Get-PublishState $Dir
-    if ($state['wanted'] -ne $Kind -or $state['sent'] -eq $Kind) { $state['sentPart'] = 0 }
-    $secrets = Get-PublishSecrets -Settings $Settings -Token ''
-    $Reason = Protect-GateReportText $Reason $secrets
-    $state['wanted'] = $Kind
-    $state['message'] = $Reason
-    Save-PublishState $Dir $state
+    param([string]$Dir, [string]$Kind, [string]$Reason, [string]$Repo, [string]$TokenFile, [hashtable]$Settings = @{}, [switch]$Retry)
+    try { $lease = [IO.File]::Open((Join-Path $Dir 'publish.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
+    catch [IO.IOException] { return $false }
     try {
-        $token = Get-PublishToken $TokenFile
-        $filesLine = ''
-        if ([string](Get-PublishSetting $Settings 'RunFilesRepo' '')) {
-            $filesLine = Invoke-RunFilesUpload -Dir $Dir -Kind $Kind -State $state -Settings $Settings -Token $token
+        $state = Get-PublishState $Dir
+        if ($Retry -and $state['wanted'] -eq $Kind -and $state['sent'] -eq $Kind) { return $true }
+        if ($state['wanted'] -ne $Kind -or $state['sent'] -eq $Kind) { $state['sentPart'] = 0 }
+        $secrets = Get-PublishSecrets -Settings $Settings -Token ''
+        $Reason = Protect-GateReportText $Reason $secrets
+        $state['wanted'] = $Kind
+        $state['message'] = $Reason
+        Save-PublishState $Dir $state
+        try {
+            $token = Get-PublishToken $TokenFile
+            $filesLine = ''
+            if ([string](Get-PublishSetting $Settings 'RunFilesRepo' '')) {
+                $filesLine = Invoke-RunFilesUpload -Dir $Dir -Kind $Kind -State $state -Settings $Settings -Token $token
+                Save-PublishState $Dir $state
+            }
+            Send-ReportParts $Dir $Kind $Reason $filesLine $Repo $token $secrets $state
+            $state['sent'] = $Kind
+            $state['error'] = ''
             Save-PublishState $Dir $state
+            Write-Host ("Итог прогона {0} ушёл в GitHub ({1})." -f (Split-Path -Leaf $Dir), $Repo) -ForegroundColor DarkGray
+            Write-PublishLog $Dir ("Итог прогона ушёл в GitHub ({0}): {1}" -f $Repo, $Kind)
+            return $true
         }
-        Send-ReportParts $Dir $Kind $Reason $filesLine $Repo $token $secrets $state
-        $state['sent'] = $Kind
-        $state['error'] = ''
-        Save-PublishState $Dir $state
-        Write-Host ("Итог прогона {0} ушёл в GitHub ({1})." -f (Split-Path -Leaf $Dir), $Repo) -ForegroundColor DarkGray
-        Write-PublishLog $Dir ("Итог прогона ушёл в GitHub ({0}): {1}" -f $Repo, $Kind)
-        return $true
-    }
-    catch {
-        $state['error'] = Protect-GateReportText $_.Exception.Message $secrets
-        Save-PublishState $Dir $state
-        Write-Host ("Итог прогона {0} в GitHub не ушёл: {1}. Уйдёт при следующем запуске гейта." -f (Split-Path -Leaf $Dir), $state['error']) -ForegroundColor Yellow
-        Write-PublishLog $Dir ("Итог прогона в GitHub не ушёл ({0}): {1}" -f $Kind, $state['error'])
-        return $false
-    }
+        catch {
+            $state['error'] = Protect-GateReportText $_.Exception.Message $secrets
+            Save-PublishState $Dir $state
+            Write-Host ("Итог прогона {0} в GitHub не ушёл: {1}. Уйдёт при следующем запуске гейта." -f (Split-Path -Leaf $Dir), $state['error']) -ForegroundColor Yellow
+            Write-PublishLog $Dir ("Итог прогона в GitHub не ушёл ({0}): {1}" -f $Kind, $state['error'])
+            return $false
+        }
+    } finally { $lease.Dispose() }
 }
 
 #endregion
@@ -851,7 +856,7 @@ if ($Pending) {
         }
         $kind = 'broken'
         if ($finished) { $kind = $state['wanted'] }
-        $sent = Publish-Run -Dir $candidate.FullName -Kind $kind -Reason $state['message'] -Repo $repoName -TokenFile $tokenFile -Settings $cfg
+        $sent = Publish-Run -Dir $candidate.FullName -Kind $kind -Reason $state['message'] -Repo $repoName -TokenFile $tokenFile -Settings $cfg -Retry
         if (-not $sent) { break }
     }
     return

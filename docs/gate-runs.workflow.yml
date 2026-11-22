@@ -9,9 +9,10 @@ on:
 permissions:
   issues: write
 
-# Части одного сообщения могут прибыть в разном порядке. Каждая изменяет только свой комментарий.
+# Первые части без заданных номеров лент создают issue по очереди. Другие части и настроенные
+# ленты работают параллельно. Повтор одной части обновляет тот же комментарий.
 concurrency:
-  group: gate-report-${{ github.event.client_payload.run }}-${{ github.event.client_payload.part || 1 }}
+  group: gate-report-${{ (!vars.GATE_RUNS_ISSUE || !vars.GATE_OPERATIONS_ISSUE) && (github.event.client_payload.part || 1) == 1 && 'create-feed' || format('{0}-{1}', github.event.client_payload.run, github.event.client_payload.part || 1) }}
   queue: max
 
 jobs:
