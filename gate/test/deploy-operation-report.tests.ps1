@@ -36,6 +36,24 @@
         }
     },
     @{
+        Name = 'operation-report-deploy-selfcheck'
+        Text = 'отчёт обновления: версии до и после, простой, подтверждение снятия каждой блокировки и весь журнал ошибок самопроверки за пределами первых 50'
+        Run = {
+            param($Name)
+            $sb = New-ReportingDeploySandbox $Name
+            $lines = @(1..55 | ForEach-Object { '[ОШИБКА] Строка проверки {0:000}' -f $_ })
+            $lines[54] += ' /P"test-report-token" /UC"test-report-unlock"'
+            $fake = @{ selfcheck = @(@{ tasks = @(@{ key = 'Check/Report'; title = 'Проверка'; step = 'Отчёт'; lines = $lines }) }) }
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com (New-ComState) -Fake $fake -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление'; Item = '^Обновить все' }, $deployRiskAnswer, $deployNameAnswer)
+            Check-DeployCommon $r
+            Check ($r.ExitCode -eq 0) 'предупреждения самопроверки изменили исход обновления'
+            Check-OperationDispatch $sb 'deploy' 'updated' @(
+                '1\.0\.0\.h1 → 1\.0\.0\.h2', 'Простой', 'начала сеансов: снята, проверено', 'регламентных заданий: снят, проверено',
+                'ошибок 55', 'Строка проверки 001', 'Строка проверки 055')
+        }
+    },
+    @{
         Name = 'operation-report-git-choice'
         Text = 'выгрузка в git: отказ при выборе расширений, затем создание PR; загрузка при сдвинутом main завершается без прогона'
         Run = {
