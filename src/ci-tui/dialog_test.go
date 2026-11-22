@@ -277,3 +277,23 @@ func TestOneHints(t *testing.T) {
 		t.Fatal("пояснение показано, хотя hints нет")
 	}
 }
+
+func TestSessionsScrollIndependentlyOfDecision(t *testing.T) {
+	var lines []string
+	for i := 0; i < 80; i++ {
+		lines = append(lines, fmt.Sprintf("сеанс %03d", i))
+	}
+	d := newDialog(uiEvent{Kind: "one", Items: []string{"Продолжить", "Выйти", "Завершить сеансы"}, Lines: lines}, 70, 22)
+	if view := d.View(); !strings.Contains(view, "сеанс 000") || strings.Contains(view, "сеанс 079") {
+		t.Fatal("неверная начальная страница")
+	}
+	d.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	if !strings.Contains(d.View(), "сеанс 079") || d.finished || d.cursor != 0 {
+		t.Fatal("прокрутка должна показать конец без выбора действия")
+	}
+	d.Update(tea.KeyMsg{Type: tea.KeyHome})
+	d.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	if d.view.YOffset == 0 || d.cursor != 0 {
+		t.Fatal("PgDn не прокрутил сеансы")
+	}
+}
