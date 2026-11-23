@@ -37,12 +37,23 @@ function Get-DeliverySetup {
     if ([System.IO.Path]::GetFullPath($inbox).TrimEnd('\') -ieq [System.IO.Path]::GetFullPath($oldInbox).TrimEnd('\')) {
         throw ("DeliveryInboxDir и InboxDir - одна папка ({0}): поставки для приёмки и обновления для прямой загрузки должны лежать отдельно" -f $inbox)
     }
-    # ** Хлебников С.Ю. 20261123 Серверная техническая база вместо локальной файловой без клиентской лицензии.
-    # Только явно назначенная отдельная база, существование и версия проверяются до изменения её конфигурации.
+    # ** Хлебников С.Ю. 20261123 Разрешить отдельно настроенную техническую базу на лицензированном сервере 1С.
+    # Рабочую и erp_temp запрещено использовать как техническую.
     $techServer = [string](Get-Setting $cfg 'DeliveryTechServerBase' '')
     $tech = Resolve-RootPath ([string](Get-Setting $cfg 'DeliveryTechBase' 'deliveries\tech-stand'))
     if ($techServer) {
-        if ($techServer -notmatch '^[a-zA-Zа-яА-ЯёЁ0-9_]+
+        if ($techServer -notmatch '^[a-zA-Zа-яА-ЯёЁ0-9_]+$' -or $techServer -notmatch '(?i)temp|test|stand') {
+            throw 'DeliveryTechServerBase: нужно отдельное имя базы с temp/test/stand (только буквы, цифры, подчёркивания)'
+        }
+        if ($techServer -ieq $script:TempBase -or $techServer -ieq $script:ProdBase) {
+            throw 'DeliveryTechServerBase совпадает с temp или рабочей базой; это запрещено'
+        }
+        foreach ($forbiddenName in @(Get-Setting $cfg 'ForbiddenBases' @() | Where-Object { $_ })) {
+            if ($techServer -ieq [string]$forbiddenName) { throw 'Техническая серверная база входит в ForbiddenBases; операция запрещена' }
+        }
+    }
+    # ** Хлебников С.Ю. 20261123 конец
+    $techName = Split-Path -Leaf $tech
     if ($techName -notmatch $TestBasePattern) { throw ("техническая база {0}: имя папки должно быть похоже на тестовую (stand, test, temp и т. п.)" -f $tech) }
     foreach ($name in @(Get-Setting $cfg 'ForbiddenBases' @() | Where-Object { $_ })) {
         if ($techName -ieq [string]$name) { throw ("техническая база {0} в списке запрещённых (ForbiddenBases)" -f $tech) }
@@ -289,8 +300,8 @@ function Invoke-TechDesigner {
     param($D, [string[]]$Command, [string]$LogName, [int]$TimeoutSec, [string]$Title = '')
     $logPath = Join-Path $script:RunDir $LogName
     if (Test-Path -LiteralPath $logPath) { Remove-Item -LiteralPath $logPath -Force }
-    # ** Хлебников С.Ю. 20261123 Выделенная серверная база использует тот же лицензированный кластер, что erp_temp.
-    $techConnection = @('/F"{0}"' -f $D.Tech)
+    # ** Хлебников С.Ю. 20261123 Для серверной технической базы используем лицензированный кластер вместо /F.
+    $techConnection = @(('/F"{0}"' -f $D.Tech))
     if ([string]$D.TechServerBase) {
         $techConnection = @(Get-ConnectionArgs -BaseName ([string]$D.TechServerBase) -User $script:TempUser -Password $script:TempPassword)
     }
@@ -305,31 +316,25 @@ function Initialize-TechBase {
     # Техническая база для разбора поставок: пустая файловая база с основной конфигурацией temp. Создаётся при первой
     # поставке и после обновления типовой (версия - в <база>.json). В temp не пишет: оттуда только /DumpCfg.
     param($D)
-    # ** Хлебников С.Ю. 20261123 Не создавать и не перезагружать техническую серверную базу автоматически.
-    # Серверный режим требует существующую выделенную базу-клон с той же основной конфигурацией, что erp_temp.
-    # Так нельзя случайно перезаписать живую базу или создать её без согласованных прав на кластер и СУБД.
+    # ** Хлебников С.Ю. 20261123 Серверный технический клон: проверяем готовность, не пересоздаём и не перезаписываем основу.
     if ([string]$D.TechServerBase) {
         $technicalName = [string]$D.TechServerBase
         $tempInfo = Get-ComConfigInfo -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
         $technicalInfo = Get-ComConfigInfo -BaseName $technicalName -User $script:TempUser -Password $script:TempPassword
         if (-not $tempInfo.Ok -or -not $technicalInfo.Ok) {
-            return [pscustomobject]@{ Ok = $false; Note = ("Не удалось прочитать конфигурации erp_temp и {0}: нужна заранее созданная отдельная серверная техническая база и доступ тем же пользователем 1С" -f $technicalName) }
+            return [pscustomobject]@{ Ok = $false; Note = ("Нет доступа к конфигурациям temp и {0}: предварительно создай отдельную серверную базу-клон, доступную тем же пользователем 1С" -f $technicalName) }
         }
         if ([string]$tempInfo.Name -ne [string]$technicalInfo.Name -or [string]$tempInfo.Version -ne [string]$technicalInfo.Version) {
-            return [pscustomobject]@{ Ok = $false; Note = ("Конфигурация {0} ({1} {2}) не совпадает с erp_temp ({3} {4}). Обнови технический клон отдельно; гейт не меняет его основную конфигурацию." -f $technicalName, $technicalInfo.Name, $technicalInfo.Version, $tempInfo.Name, $tempInfo.Version) }
+            return [pscustomobject]@{ Ok = $false; Note = ("Основная конфигурация базы {0} ({1} {2}) не совпадает с temp ({3} {4}). Гейт не перезаписывает серверную базу автоматически." -f $technicalName, $technicalInfo.Name, $technicalInfo.Version, $tempInfo.Name, $tempInfo.Version) }
         }
         try {
             $agent = Connect-ClusterAgent
             $sessions = @(Get-BaseSessions $agent $technicalName)
-            if (@($sessions | Where-Object { $_.IsError }).Count -gt 0) {
-                throw "Не удалось проверить сеансы технической базы"
-            }
-            if ($sessions.Count -gt 0) {
-                throw ("В технической базе {0} есть чужие сеансы; остановлена приёмка, чтобы не затронуть их" -f $technicalName)
-            }
+            if (@($sessions | Where-Object { $_.IsError }).Count -gt 0) { throw 'Нельзя прочитать сеансы технической базы' }
+            if ($sessions.Count -gt 0) { throw ("Техническая база {0} занята: гейт не прерывает чужие сеансы" -f $technicalName) }
         }
         catch { return [pscustomobject]@{ Ok = $false; Note = $_.Exception.Message } }
-        return [pscustomobject]@{ Ok = $true; Note = ("Серверная техническая база {0}: проверена, основная конфигурация совпадает с erp_temp" -f $technicalName) }
+        return [pscustomobject]@{ Ok = $true; Note = ("Выделенная серверная техническая база {0} готова" -f $technicalName) }
     }
     # ** Хлебников С.Ю. 20261123 конец
     $marker = $D.Tech.TrimEnd('\') + '.json'
