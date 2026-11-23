@@ -84,6 +84,7 @@ type selfcheck struct {
 }
 
 type canary struct {
+	User     *string  `json:"user"`
 	Status   string   `json:"status"`
 	Ext      []string `json:"ext"`
 	Sessions []string `json:"sessions"`
@@ -490,7 +491,12 @@ func client(sc scenario, args []string, state map[string]int) int {
 		if c.NoResult {
 			time.Sleep(time.Hour)
 		}
-		lines := []string{"canary=20261117.999999", "status=" + c.Status, "user=Тест"}
+		lines := []string{"canary=20261117.999999", "status=" + c.Status}
+		if c.User == nil {
+			lines = append(lines, "user=Тест")
+		} else if *c.User != "" {
+			lines = append(lines, "user="+*c.User)
+		}
 		for _, e := range c.Ext {
 			lines = append(lines, "ext="+e)
 		}

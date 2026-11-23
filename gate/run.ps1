@@ -2421,6 +2421,7 @@ function Test-DeliveryPath {
 }
 # Меню и вопросы (ui.ps1): из ci.exe их рисует ci.exe, без него - консоль.
 . (Join-Path $Root 'locks.ps1')
+. (Join-Path $Root 'canary-users.ps1')
 . (Join-Path $Root 'post-update.ps1')
 . (Join-Path $Root 'ui.ps1')
 Initialize-Ui -Channel $UiChannel
@@ -2884,6 +2885,10 @@ function Get-PhaseInputs {
         }
         'canary' {
             $keys = @('CanaryUsers', 'CanaryWaitSec')
+            if ($cfg.ContainsKey('PriorityCanaryUsers')) {
+                $keys += 'PriorityCanaryUsers'
+                $flags['Режимы входа'] = (@(Get-GateCanaryProfiles $cfg | ForEach-Object { $_.Mode }) -join ',')
+            }
             $files['CanaryEpf'] = Resolve-RootPath ([string](Get-Setting $cfg 'CanaryEpf' 'tools\Канарейка.epf'))
             $flags['-SkipCanary'] = [bool]$SkipCanary
         }
@@ -7343,15 +7348,13 @@ elseif (-not $SkipChecks) {
     }
     if ([bool](Get-Setting $cfg 'RunCheckCanApply' $true)) { $planSteps.Add('Проверка применимости') }
 }
-$planCanary = @(Get-Setting $cfg 'CanaryUsers' @() | Where-Object { $_ })
+$canaryUsers = @(Get-GateCanaryProfiles $cfg)
+$planCanary = @($canaryUsers | Where-Object { -not ($_.Mode -eq 'Missing' -and $_.Optional) })
 if ($processingOnly) { Write-RunLog 'План: комплект только из внешних обработок, канарейки нет' }
 elseif ($SkipCanary -or $planCanary.Count -eq 0) { $planSteps.Add('Канареечный вход') }
 else {
     foreach ($planUser in $planCanary) {
-        $planLabel = ''
-        if ($planUser.ContainsKey('Name') -and $null -ne $planUser['Name']) { $planLabel = [string]$planUser['Name'] }
-        if ([string]::IsNullOrEmpty($planLabel)) { $planLabel = 'текущий пользователь Windows' }
-        $planSteps.Add("Канареечный вход: $planLabel")
+        $planSteps.Add(("Канареечный вход: {0}" -f $planUser.Label))
     }
 }
 if ($script:GateActionsNeeded) { $planSteps.Add('Действия после обновления') }
@@ -8005,7 +8008,6 @@ if ($checksState -and ($null -ne $script:BackgroundCheck -or $null -ne $script:B
 if ($checksState) { Set-PhaseState 'checks' $checksState }
 
 # 5. Канареечный вход: сеанс стартует, сервер отвечает, расширения применились.
-$canaryUsers = @(Get-Setting $cfg 'CanaryUsers' @() | Where-Object { $_ })
 $canaryEpf = Resolve-RootPath ([string](Get-Setting $cfg 'CanaryEpf' 'tools\Канарейка.epf'))
 $canaryWaitSec = [int](Get-Setting $cfg 'CanaryWaitSec' 10)
 $canaryTimeoutSec = [int](Get-Setting $cfg 'CanaryTimeoutSec' 300)
@@ -8039,28 +8041,35 @@ else {
     $userNumber = 0
     foreach ($user in $canaryUsers) {
         $userNumber++
-        $userName = ''
-        $userPassFile = ''
-        if ($user.ContainsKey('Name') -and $null -ne $user['Name']) { $userName = [string]$user['Name'] }
-        if ($user.ContainsKey('PassFile') -and $null -ne $user['PassFile']) { $userPassFile = [string]$user['PassFile'] }
-        $label = $userName
-        if ([string]::IsNullOrEmpty($label)) { $label = 'текущий пользователь Windows' }
-        $stepName = "Канареечный вход: $label"
-
+        $stepName = "Канареечный вход: $($user.Label)"
+        if ($user.Optional -and $user.Mode -eq 'Missing') {
+            $notice = "$stepName пропущен: нет доменной учётки или сохранённого пароля для этого входа."
+            Write-Host $notice
+            Write-RunLog $notice
+            continue
+        }
+        try { $authArgs = @(Get-GateCanaryAuthArgs $user) }
+        catch {
+            Add-StepResult -Name $stepName -Status 'FAIL' -Detail ("Не удалось подготовить вход: {0}" -f $_.Exception.Message)
+            continue
+        }
         $outFile = Join-Path $RunDir ("canary_{0}.txt" -f $userNumber)
-        $userPassword = Get-PlainPassword $userPassFile
-        $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -User $userName -Password $userPassword) + @(
+        $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -User '' -Password '') + $authArgs + @(
             '/DisableStartupDialogs',
             '/DisableStartupMessages',
             '/Execute', ('"{0}"' -f $canaryEpf),
             ('/C"canary;out={0};wait={1}"' -f $outFile, $canaryWaitSec)
         )
         $argLine = $argList -join ' '
-        Write-RunLog ("> 1cv8c.exe {0}" -f ([regex]::Replace([regex]::Replace($argLine, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"')))
+        Write-RunLog ("> 1cv8c.exe {0}" -f (Format-GateCanaryCommand $argList))
 
         Write-Host ("  ...  {0}: клиент запущен в {1}, жду не дольше {2} с" -f $stepName, (Get-Date -Format 'HH:mm:ss'), $canaryTimeoutSec) -ForegroundColor DarkGray
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
-        $process = Start-Process -FilePath $v8c -ArgumentList $argLine -PassThru
+        try { $process = Start-Process -FilePath $v8c -ArgumentList $argLine -PassThru -ErrorAction Stop }
+        catch {
+            Add-StepResult -Name $stepName -Status 'FAIL' -Detail 'Тонкий клиент не запустился.'
+            continue
+        }
         $null = $process.Handle
 
         # Ждём файл результата. Клиент после записи закрывается сам.
@@ -8086,11 +8095,15 @@ else {
             $activeCount = @($content | Where-Object { $_ -like 'ext=*|active' }).Count
             $extensionError = @($content | Where-Object { $_ -like 'exterror=*' } | Select-Object -First 1)
             $seconds = [int]$watch.Elapsed.TotalSeconds
+            $identityError = Test-GateCanaryIdentity $user $content
             $canaryStat = 'FAIL'
-            if ($status -eq 'ok') { $canaryStat = 'OK' }
+            if ($status -eq 'ok' -and -not $identityError) { $canaryStat = 'OK' }
             Add-StatFact -Title $stepName -Seconds $watch.Elapsed.TotalSeconds -Status $canaryStat
 
-            if ($status -ne 'ok') {
+            if ($identityError) {
+                Add-StepResult -Name $stepName -Status 'FAIL' -Detail $identityError -Log $outFile -Seconds $seconds
+            }
+            elseif ($status -ne 'ok') {
                 Add-StepResult -Name $stepName -Status 'FAIL' -Detail ("сеанс стартовал, но канарейка сообщила: {0}" -f ($content -join ' | ')) -Log $outFile -Seconds $seconds
             }
             elseif ($notApplied.Count -gt 0) {

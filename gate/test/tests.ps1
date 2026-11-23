@@ -54,7 +54,7 @@ function New-Sandbox {
     param([string]$Name, [hashtable]$Config = @{})
     $dir = Join-Path $workRoot $Name
     foreach ($sub in @('bin', 'tools', 'inbox', 'fake')) { New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null }
-    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'delivery.ps1', 'cluster-target.ps1', 'locks.ps1', 'post-update.ps1', 'timeline.ps1', 'selfcheck-compare.ps1')) {
+    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'delivery.ps1', 'cluster-target.ps1', 'canary-users.ps1', 'locks.ps1', 'post-update.ps1', 'timeline.ps1', 'selfcheck-compare.ps1')) {
         Copy-Item -LiteralPath (Join-Path $ciRoot $script) -Destination $dir
     }
     # Объединение поставок (раздел 5.26): merge1c.exe рядом с fake1c.exe (собирает CI).
@@ -4779,6 +4779,77 @@ $tests = @(
             Check ($null -ne $r.Verdict -and $r.Verdict.resume.start -eq 'canary') 'продолжение не с канарейки'
             Check ((Get-Calls $r @('/CheckConfig')).Count -eq 0) 'проверка конфигурации повторялась'
             Check ((Get-Calls $r @('start=999999')).Count -eq 0) 'был сеанс проверки базы, хотя сравнивать не с чем'
+        }
+    },
+    @{
+        Name = 'gate-priority-canary-order'
+        Text = 'именованные входы площадки идут раньше локальных; пароль и доменный токен выбираются по профилю'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{ CanaryUsers = @(@{ Name = '' }, @{ Name = 'Основной' }, @{ Name = 'Дополнительный' }) }
+            $users = @(
+                @{ Name = 'Читатель'; PassFile = 'reader.txt'; Optional = $true },
+                @{ Name = 'Основной'; WindowsAccount = [Security.Principal.WindowsIdentity]::GetCurrent().Name }
+            )
+            [IO.File]::WriteAllText((Join-Path $sb 'config.site.psd1'), (ConvertTo-Psd1 @{ PriorityCanaryUsers = $users }), $utf8Bom)
+            $secret = 'test"tail\'
+            ConvertTo-SecureString $secret -AsPlainText -Force | ConvertFrom-SecureString | Set-Content -LiteralPath (Join-Path $sb 'reader.txt')
+            $fake = @{ canary = @(@{ status = 'ok'; user = 'Читатель' }, @{ status = 'ok'; user = 'Основной' }, @{ status = 'ok' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
+            Check-Common $r
+            $calls = Get-Calls $r @('canary;')
+            Check ($calls.Count -eq 3) 'лишний или пропущенный вход'
+            if ($calls.Count -eq 3) {
+                Check ($calls[0].Line.Contains('/WA-') -and $calls[0].Line.Contains('/NЧитатель') -and $calls[0].Line.Contains('/P' + $secret)) 'первый вход с паролем ИБ'
+                Check ($calls[1].Line.Contains('/WA+') -and -not $calls[1].Line.Contains('/P')) 'второй вход под закреплённой доменной учёткой'
+                Check ($calls[2].Line.Contains('/NДополнительный')) 'дополнительный профиль должен идти последним'
+            }
+            Check-Step $r 'Канареечный вход: Читатель' 'OK'
+            Check-Step $r 'Канареечный вход: Основной' 'OK'
+            Check (-not [IO.File]::ReadAllText((Join-Path $r.RunDir 'run.log')).Contains('tail')) 'часть пароля попала в журнал'
+        }
+    },
+    @{
+        Name = 'gate-priority-canary-identity'
+        Text = 'необязательный без пароля пропущен, отсутствующее и чужое имя ИБ не подтверждают вход'
+        Run = {
+            param($Name)
+            $windows = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            $sb = New-Sandbox $Name -Config @{ PriorityCanaryUsers = @(
+                @{ Name = 'Без пароля'; Optional = $true; PassFile = 'missing.txt' },
+                @{ Name = 'Первый'; WindowsAccount = $windows },
+                @{ Name = 'Второй'; WindowsAccount = $windows },
+                @{ Name = 'Нет доступа'; PassFile = 'missing.txt' }) }
+            $fake = @{ canary = @(@{ status = 'ok'; user = 'Чужой' }, @{ status = 'ok'; user = '' }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
+            Check-Common $r
+            Check-Step $r 'Канареечный вход: Первый' 'FAIL'
+            Check-Step $r 'Канареечный вход: Второй' 'FAIL'
+            Check-Step $r 'Канареечный вход: Нет доступа' 'FAIL'
+            Check ((Get-Calls $r @('canary;')).Count -eq 2) 'при отсутствии доступа запущен лишний клиент'
+            Check ((Get-Step $r 'Канареечный вход: Первый').detail.Contains('Чужой')) 'нет фактического пользователя'
+            Check ([IO.File]::ReadAllText((Join-Path $r.RunDir 'run.log')).Contains('Без пароля пропущен')) 'нет причины пропуска'
+        }
+    },
+    @{
+        Name = 'deploy-priority-canary'
+        Text = 'лёгкий прогон сверяет имя ИБ; после открытия базы проверяет обязательный профиль без кода'
+        Run = {
+            param($Name)
+            $config = $deployConfig.Clone()
+            $config['PriorityCanaryUsers'] = @(@{ Name = 'Читатель'; Optional = $true; PassFile = 'missing.txt' },
+                @{ Name = 'Основной'; WindowsAccount = [Security.Principal.WindowsIdentity]::GetCurrent().Name })
+            $sb = New-Sandbox $Name -Config $config
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com (New-ComState) -Fake @{ canary = @(
+                @{ status = 'ok'; user = 'Основной' }, @{ status = 'ok'; user = 'Чужой' }) } -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление'; Item = '^Обновить все' }, $deployRiskAnswer, $deployNameAnswer)
+            Check-DeployCommon $r
+            $record = Get-DeployRecord $sb
+            Check (@($record.light | Where-Object { $_.name -eq 'Канареечный вход: Основной' -and $_.status -eq 'OK' }).Count -eq 1) 'вход обязательного профиля не подтверждён'
+            Check ($record.plainLogin.status -eq 'FAIL' -and $record.plainLogin.text.Contains('Чужой')) 'чужой сеанс принят после открытия'
+            Check ((Get-Calls $r @('canary_2.txt', '/WA+', '/UC')).Count -eq 1) 'нет именного входа во время блокировки'
+            $plain = Get-Calls $r @('canary-plain', '/WA+')
+            Check ($plain.Count -eq 1 -and -not $plain[0].Line.Contains('/UC')) 'проверка открытой базы подменена'
         }
     },
     @{
