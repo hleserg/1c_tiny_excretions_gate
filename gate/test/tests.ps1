@@ -4788,7 +4788,7 @@ $tests = @(
             param($Name)
             $sb = New-Sandbox $Name -Config @{ CanaryUsers = @(@{ Name = '' }, @{ Name = 'Основной' }, @{ Name = 'Дополнительный' }) }
             $users = @(
-                @{ Name = 'Читатель'; PassFile = 'reader.txt'; Optional = $true },
+                @{ Name = 'Читатель'; PassFile = 'reader.txt'; WindowsAccount = [Security.Principal.WindowsIdentity]::GetCurrent().Name; Optional = $true },
                 @{ Name = 'Основной'; WindowsAccount = [Security.Principal.WindowsIdentity]::GetCurrent().Name }
             )
             [IO.File]::WriteAllText((Join-Path $sb 'config.site.psd1'), (ConvertTo-Psd1 @{ PriorityCanaryUsers = $users }), $utf8Bom)

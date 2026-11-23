@@ -14,8 +14,8 @@ function Get-GateCanaryProfiles {
         $passFile = [string]$entry['PassFile']
         $windows = [string]$entry['WindowsAccount']
         $mode = 'Missing'
-        if ($windows -and [Security.Principal.WindowsIdentity]::GetCurrent().Name -ieq $windows) { $mode = 'Windows' }
-        elseif ($passFile -and (Test-Path -LiteralPath (Resolve-RootPath $passFile) -PathType Leaf)) { $mode = 'Password' }
+        if ($passFile -and (Test-Path -LiteralPath (Resolve-RootPath $passFile) -PathType Leaf)) { $mode = 'Password' }
+        elseif ($windows -and [Security.Principal.WindowsIdentity]::GetCurrent().Name -ieq $windows) { $mode = 'Windows' }
         [pscustomobject]@{ Name = $name; Label = $name; PassFile = $passFile; Mode = $mode; Optional = [bool]$entry['Optional']; Expected = $name }
     }
     if ($priority.Count -gt 0 -and @($priority | Where-Object { -not [bool]$_['Optional'] }).Count -eq 0) {
