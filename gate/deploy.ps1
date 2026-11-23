@@ -820,6 +820,15 @@ function Read-DeployConfig {
             if (-not $read.ContainsKey($siteKey) -or $ownEmpty) { $read[$siteKey] = $site[$siteKey] }
         }
     }
+    # ** Хлебников С.Ю. 20261124 Управляемое окно площадки распространяется и на установленные ранее профили.
+    if ((Test-Path -LiteralPath $sitePath) -and $site['DeployWindowFromSite']) {
+        foreach ($key in 'DeployDeniedFrom','DeployDeniedTo') {
+            if ($site[$key] -isnot [int] -or $site[$key] -lt 0 -or $site[$key] -gt 23) { throw ("Неверная граница окна площадки: {0}" -f $key) }
+            $read[$key] = $site[$key]
+        }
+        if ($read.DeployDeniedFrom -eq $read.DeployDeniedTo) { throw 'Границы управляемого окна площадки совпадают' }
+    }
+    # ** Хлебников С.Ю. 20261124 конец
     return $read
 }
 
@@ -915,6 +924,10 @@ foreach ($name in $deployExtensions) {
         throw ("{0} - тестовое расширение (UnitTestExtensions или UnitTestEngine), а стоит в DeployExtensions/Extensions config.psd1: в рабочую тесты не уходят. Убери его оттуда." -f $name)
     }
 }
+# ** Хлебников С.Ю. 20261124 Обработки поставщиков переносятся исходным файлом из проверенной базы.
+$vendorProcessings = @(Get-Setting $cfg 'VendorProcessings' @() | Where-Object { $_ })
+$retainedVendorProcessings = @{}
+# ** Хлебников С.Ю. 20261124 конец
 $deniedFrom = [int](Get-Setting $cfg 'DeployDeniedFrom' 22)
 $deniedTo = [int](Get-Setting $cfg 'DeployDeniedTo' 2)
 # ** Хлебников С.Ю. 20261120 Часы обновления рабочей - из настроек (DeployDeniedFrom/To): подсказка, проверка перед
@@ -1714,7 +1727,7 @@ function Invoke-ProdProcessing {
     # именем объекта обновляется, иначе добавляется новый); прежняя версия до записи ложится в old.b64 папки
     # OutDir, без неё обработка не заменяется. File - сам .epf/.erf, TextFile - уже base64 (откат из old.b64).
     # unregepf: снять обработку - по имени объекта и ссылке элемента вместе.
-    param([string]$Mode, [string]$OutDir, [string]$File = '', [string]$TextFile = '', [string]$Name, [string]$Ref = '', [string]$Title)
+    param([string]$Mode, [string]$OutDir, [string]$File = '', [string]$TextFile = '', [string]$Name, [string]$Ref = '', [string]$Title, [string]$GuardVersion = '', [string]$ExpectedHash = '')
     $null = Get-BaseInfo $deployLink $script:ProdBase $script:ProdUser $script:ProdPassword
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
     $parts = New-Object System.Collections.Generic.List[string]
@@ -1724,8 +1737,21 @@ function Invoke-ProdProcessing {
     if ($Mode -eq 'regepf') {
         $newB64 = Join-Path $OutDir 'new.b64'
         if ($TextFile) { Copy-Item -LiteralPath $TextFile -Destination $newB64 -Force }
-        else { [System.IO.File]::WriteAllText($newB64, [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($File)), [System.Text.Encoding]::ASCII) }
-        $parts.Add(("file={0}" -f $newB64))
+        else {
+            $bytes = [System.IO.File]::ReadAllBytes($File)
+            # ** Хлебников С.Ю. 20261124 Сверяем именно те байты, которые отдаём на регистрацию.
+            if ($GuardVersion) {
+                $sha = [Security.Cryptography.SHA256]::Create()
+                try { $actual = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '') } finally { $sha.Dispose() }
+                if ($actual -ne $ExpectedHash.Replace('-', '')) { throw ("{0}: файл изменился перед записью" -f $Name) }
+            }
+            # ** Хлебников С.Ю. 20261124 конец
+            [System.IO.File]::WriteAllText($newB64, [Convert]::ToBase64String($bytes), [System.Text.Encoding]::ASCII)
+        }
+        # ** Хлебников С.Ю. 20261124 Старый клиент не получает file= и не сможет выполнить запись без сравнения.
+        if ($GuardVersion) { $parts.Add(("guardfile={0}|{1}" -f $GuardVersion, $newB64)) }
+        else { $parts.Add(("file={0}" -f $newB64)) }
+        # ** Хлебников С.Ю. 20261124 конец
     }
     if ($Ref) { $parts.Add(("ref={0}" -f $Ref)) }
     $resultFile = Join-Path $OutDir 'result.txt'
@@ -1755,6 +1781,17 @@ function Invoke-ProdProcessing {
     }
 }
 
+# ** Хлебников С.Ю. 20261124 Версии поставщика сравниваются по числам, недостающие компоненты равны нулю.
+function ConvertTo-VendorVersion {
+    param([string]$Text, [string]$Name)
+    if ($Text.Trim() -notmatch '^[0-9]{1,9}(\.[0-9]{1,9}){0,3}$') {
+        throw ("{0}: не удалось сравнить версию «{1}». Нужна сверка карточки." -f $Name, $Text)
+    }
+    $parts = @($Text.Trim().Split('.')) + @('0', '0', '0')
+    return [version]($parts[0..3] -join '.')
+}
+# ** Хлебников С.Ю. 20261124 конец
+
 function Compare-Processings {
     # Внешние обработки temp против рабочей: изменённые в temp и новые. Те, что есть только в рабочей,
     # не трогаются: скрипт обновления обработки из рабочей не удаляет.
@@ -1765,10 +1802,26 @@ function Compare-Processings {
     foreach ($item in @($TempExport.Items | Sort-Object ObjName)) {
         $prodItem = $null
         if ($prodByName.ContainsKey($item.ObjName)) { $prodItem = $prodByName[$item.ObjName] }
+        # ** Хлебников С.Ю. 20261124 Совпадение имён карточек или непонятная версия требуют решения.
+        if ($vendorProcessings -contains $item.ObjName) {
+            if (@($TempExport.Items | Where-Object ObjName -eq $item.ObjName).Count -ne 1 -or
+                @($ProdExport.Items | Where-Object ObjName -eq $item.ObjName).Count -gt 1) {
+                throw ("{0}: несколько карточек с одним именем объекта, выпуск остановлен" -f $item.ObjName)
+            }
+        }
         if ($null -ne $prodItem -and $prodItem.Hash -eq $item.Hash) { continue }
+        if ($vendorProcessings -contains $item.ObjName) {
+            $candidateVersion = ConvertTo-VendorVersion $item.Version $item.ObjName
+            if ($null -ne $prodItem -and (ConvertTo-VendorVersion $prodItem.Version $item.ObjName) -gt $candidateVersion) {
+                $retainedVendorProcessings[$item.ObjName] = @{TempHash=$item.Hash; ProdHash=$prodItem.Hash; Version=$prodItem.Version}
+                Write-Line ("  {0}: в рабочей новее ({1}, temp {2}), оставляю рабочую версию" -f $item.ObjName, $prodItem.Version, $item.Version)
+                continue
+            }
+        }
+        # ** Хлебников С.Ю. 20261124 конец
         $entry = [pscustomobject]@{
             ObjName = $item.ObjName; Title = $item.Title; FileName = (Split-Path -Leaf $item.File); TempFile = $item.File
-            TempVersion = $item.Version; ProdVersion = ''; ProdFile = ''; Status = 'new'; Text = 'новая: в рабочей её нет'
+            TempHash = $item.Hash; TempVersion = $item.Version; ProdVersion = ''; ProdFile = ''; Status = 'new'; Text = 'новая: в рабочей её нет'
         }
         if ($null -ne $prodItem) {
             $entry.ProdVersion = $prodItem.Version
@@ -2572,12 +2625,16 @@ function Get-ToolSourceHash {
 }
 
 function Update-SelfCheckEpf {
+    param([switch]$RequireCurrent) # ** Хлебников С.Ю. 20261124 Для записи с guardfile нужен действующий исполнитель.
     # Обработка самопроверки - из исходников поставки tools\src, как её собирает гейт перед прогоном (run.ps1,
     # Update-GateTools): после обновления гейта и до первого прогона на диске ещё прежняя сборка, а нужный режим мог
     # появиться только в новой. Собирает конфигуратор тестовой базы - рабочая для этого не открывается.
     # Не собралась - работаем с прежней.
     $xml = Join-Path (Resolve-RootPath 'tools\src') 'ВыполнитьПослеОбновления.xml'
-    if (-not (Test-Path -LiteralPath $xml)) { return }
+    if (-not (Test-Path -LiteralPath $xml)) {
+        if ($RequireCurrent) { throw 'Нет исходников исполнителя регистрации с проверкой версии' }
+        return
+    }
     $hash = Get-ToolSourceHash $xml
     $marker = $selfCheckEpf + '.source.txt'
     $built = ''
@@ -2590,6 +2647,7 @@ function Update-SelfCheckEpf {
     $result = Invoke-Designer -BaseName $script:TempBase -Command @('/LoadExternalDataProcessorOrReportFromFiles', ('"{0}"' -f $xml), ('"{0}"' -f $newFile)) `
         -LogName 'build_tool_ВыполнитьПослеОбновления.log' -TimeoutSec $timeoutLoadSec -Title 'Собрать обработку самопроверки из поставки'
     if ($result.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $newFile)) {
+        if ($RequireCurrent) { throw 'Не собрался исполнитель регистрации с проверкой версии' }
         Write-Line ("  обработка самопроверки из поставки не собралась (код {0}): {1}. Беру прежнюю." -f $result.ExitCode, $result.Text) 'Yellow'
         return
     }
@@ -3652,6 +3710,25 @@ function Invoke-GitImport {
     Initialize-GitBinaryShas -Setup $Setup -FileSets @($knownFiles, $headFiles)
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$withProcessings
     $skippedPaths = Get-GitSkippedPaths $snapshot $knownFiles
+    # ** Хлебников С.Ю. 20261124 SHA и ссылка из снимка подтверждают исходный EPF поставщика, даже если выгрузка форм отличается.
+    $manifestRefs = Get-GitManifestRefs -Setup $Setup -Files $headFiles
+    $vendorFolders = @{}
+    foreach ($folder in $manifestRefs.Keys) {
+        $card = $manifestRefs[$folder]
+        if ($vendorProcessings -notcontains (Get-UiField $card 'objectName' '')) { continue }
+        $wanted = [string](Get-UiField $card 'fileHash' '')
+        $ref = [string](Get-UiField $card 'ref' '')
+        $originals = @($snapshot.Processings | Where-Object {
+            $_.Ref -eq $ref -and $_.ObjName -eq $card.objectName -and -not $_.Deleted -and
+                ('sha256:' + ([string]$_.Hash).Replace('-', '')) -eq $wanted
+        })
+        $vendorFolders[$folder] = $wanted -match '^sha256:[0-9a-f]{64}$' -and $ref -and $originals.Count -eq 1
+        if ($vendorFolders[$folder]) {
+            $prefix = 'processings/' + $folder + '/'
+            $skippedPaths += @(@($snapshot.Files.Keys) + @($knownFiles.Keys) | Where-Object { ([string]$_).StartsWith($prefix, [StringComparison]::Ordinal) })
+        }
+    }
+    # ** Хлебников С.Ю. 20261124 конец
     # manifest.json правкой temp не считается: версия и хеш обработки меняются от самой загрузки из git. В ветку с
     # правками он идёт, если правки есть.
     $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes -Ignore (@('processings/manifest.json') + @($skippedPaths))
@@ -3716,11 +3793,21 @@ function Invoke-GitImport {
     }
     # Элемент справочника каждой папки - из manifest.json main: запись идёт в него (regepf с ref=), а не в первый
     # элемент с тем же именем объекта. Обработки, принятые файлом целиком, - из binaries/ (раздел 5.26).
-    $manifestRefs = Get-GitManifestRefs -Setup $Setup -Files $headFiles
     $binaries = Get-GitBinaries -Setup $Setup -Files $headFiles
     foreach ($name in @($headTracked.Processings)) {
         $prefix = 'processings/' + $name + '/'
         if ($binaries.ContainsKey($name)) { continue }
+        # ** Хлебников С.Ю. 20261124 Архивная карточка не обновляется и не требует оригинала для регистрации.
+        if ($vendorFolders.ContainsKey($name) -and [bool](Get-UiField $manifestRefs[$name] 'deleted' $false)) {
+            Write-Line ("  {0}: карточка помечена на удаление, пропускаю" -f $name) 'Yellow'
+            continue
+        }
+        # ** Хлебников С.Ю. 20261124 Обработку поставщика из распакованных исходников не собираем.
+        if ($vendorFolders.ContainsKey($name) -or $vendorProcessings -contains $name) {
+            if ($vendorFolders[$name]) { continue }
+            throw ("{0}: исходный EPF с SHA-256 из manifest.json не подтверждён в temp. Нужен оригинал в binaries/." -f $name)
+        }
+        # ** Хлебников С.Ю. 20261124 конец
         if ((Get-GitFolderPrint $headFiles $prefix) -eq (Get-GitFolderPrint $localShas $prefix)) { continue }
         $ref = ''
         if ($manifestRefs.ContainsKey($name)) { $ref = [string]$manifestRefs[$name].ref }
@@ -5209,6 +5296,18 @@ else {
     if ($selected.Count -eq 0 -and $selectedProcessings.Count -eq 0 -and $mode -ne 'actions') { Write-Host 'Ничего не выбрано: выход, ничего не обновлял.'; exit 0 }
     foreach ($proc in $selectedProcessings) {
         $proc | Add-Member -NotePropertyName Action -NotePropertyValue 'register' -Force
+        # ** Хлебников С.Ю. 20261124 Проверенный файл поставщика переносится из temp побайтно.
+        if ($vendorProcessings -contains $proc.ObjName) {
+            $checked = Get-JsonValue $lastVerdict 'checkedState' $null
+            $checkedFile = Get-JsonValue (Get-JsonValue $checked 'processings' $null) $proc.ObjName $null
+            $wanted = ([string](Get-JsonValue $checkedFile 'hash' '')).Replace('-', '')
+            if (-not (Get-JsonValue $checked 'ok' $false) -or $wanted -notmatch '^[0-9a-f]{64}$' -or
+                $wanted -ne ([string]$proc.TempHash).Replace('-', '') -or (Get-FileHash -LiteralPath $proc.TempFile -Algorithm SHA256).Hash -ne $wanted) {
+                throw ("{0}: SHA-256 файла поставщика не подтверждён проверенным прогоном temp" -f $proc.ObjName)
+            }
+            Update-SelfCheckEpf -RequireCurrent
+        }
+        # ** Хлебников С.Ю. 20261124 конец
         $proc | Add-Member -NotePropertyName Source -NotePropertyValue $proc.TempFile -Force
         $proc | Add-Member -NotePropertyName SourceB64 -NotePropertyValue '' -Force
         $proc | Add-Member -NotePropertyName Ref -NotePropertyValue '' -Force
@@ -5970,7 +6069,15 @@ if (-not $failed -and $selectedProcessings.Count -gt 0) {
         }
 
         if (-not (Set-DeployStage $proc 'writing')) { $failed = $true; break }
-        $session = Invoke-ProdProcessing -Mode 'regepf' -OutDir $procDir -File $proc.Source -TextFile $proc.SourceB64 -Name $proc.FileName -Title $title
+        # ** Хлебников С.Ю. 20261124 Запись под блокировкой допустима при той же версии, что была на сравнении.
+        $guardVersion = ''
+        $expectedHash = ''
+        if ($mode -ne 'rollback' -and $vendorProcessings -contains $proc.ObjName) {
+            $expectedHash = $proc.TempHash
+            $guardVersion = if ($proc.ProdVersion) { $proc.ProdVersion.Trim() } else { 'absent' }
+        }
+        $session = Invoke-ProdProcessing -Mode 'regepf' -OutDir $procDir -File $proc.Source -TextFile $proc.SourceB64 -Name $proc.FileName -Title $title -GuardVersion $guardVersion -ExpectedHash $expectedHash
+        # ** Хлебников С.Ю. 20261124 конец
         $values = $session.Values
         $proc.Ref = [string](Get-Setting $values 'ref' '')
         if ([string](Get-Setting $values 'objversion' '')) { $proc.NewVersion = [string](Get-Setting $values 'objversion' '') }
@@ -6130,6 +6237,14 @@ if ($outcome -eq 'updated' -and $null -ne $prodActions) {
             foreach ($proc in $testedProcs) {
                 $expected = Get-JsonValue $snapshot.processings $proc.objectName $null
                 $installed = @($actualProcs.Items | Where-Object { $_.ObjName -eq $proc.objectName })
+                # ** Хлебников С.Ю. 20261124 Разрешено сохранить строго более новую версию поставщика в рабочей.
+                $retained = $retainedVendorProcessings[$proc.objectName]
+                if ($retained -and $expected -and $expected.hash -and $expected.hash -eq $retained.TempHash -and
+                    $installed.Count -eq 1 -and $installed[0].Hash -eq $retained.ProdHash -and $installed[0].Version -eq $retained.Version) {
+                    Write-RunLog ("{0}: сохранена более новая версия рабочей {1}" -f $proc.objectName, $installed[0].Version)
+                    continue
+                }
+                # ** Хлебников С.Ю. 20261124 конец
                 if (-not $expected -or -not $expected.hash -or $installed.Count -ne 1 -or $installed[0].Hash -ne $expected.hash) {
                     throw ('не подтверждена проверенная версия обработки: ' + $proc.objectName)
                 }
