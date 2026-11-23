@@ -292,7 +292,9 @@ function Test-DesignerBusy {
     param([string[]]$Lines)
     foreach ($line in $Lines) {
         if ($null -eq $line) { continue }
-        if ($line.Contains('уже работает конфигуратор') -or $line.Contains('уже открыта Конфигуратором') -or $line.Contains('Ошибка блокировки информационной базы для конфигурирования')) { return $true }
+        # ** Хлебников С.Ю. 20261123 Распознавать блокировку независимо от регистра, переносов и формулировки журнала 1С.
+        if ($line -match '(?i)уже\s+работает\s+конфигуратор|уже\s+открыта\s+конфигуратором|ошибка\s+блокировки\s+информационной\s+базы\s+для\s+конфигурирования') { return $true }
+        # ** Хлебников С.Ю. 20261123 конец
     }
     return $false
 }
@@ -324,9 +326,16 @@ function Resolve-DesignerBusy {
             if (@(Get-BaseSessions $link $BaseName | Where-Object { -not $_.IsError -and $_.IsDesigner }).Count -eq 0) { break }
         }
     }
+    # ** Хлебников С.Ю. 20261123 Не объявлять сеанс закрытым, пока агент кластера не подтвердил освобождение.
+    $remaining = @(Get-BaseSessions $link $BaseName)
+    if (@($remaining | Where-Object { $_.IsError -or $_.IsDesigner }).Count -gt 0) {
+        Write-Line ("  конфигуратор {0} всё ещё открыт или сеансы не удалось проверить; повторять выгрузку нельзя" -f $BaseName) 'Red'
+        return $false
+    }
     Write-Line ("  конфигуратор {0} закрыт, повторяю: {1}" -f $BaseName, $Title) 'Green'
     Write-RunLog ("Конфигуратор {0} закрыт ({1}), повтор: {2}" -f $BaseName, $answer, $Title)
     return $true
+    # ** Хлебников С.Ю. 20261123 конец
 }
 
 function Invoke-Designer {
@@ -3558,6 +3567,21 @@ function Invoke-GitExport {
     # Колонка шагов ci.exe: выгрузки расширений видны заранее, серыми (названия - заголовки самих операций).
     Send-UiPlan -StepNames @(@($tracked.Extensions) | ForEach-Object { 'Выгрузить {0} из {1}' -f $_, $script:TempBase }) -Operations
     Initialize-GitBinaryShas -Setup $Setup -FileSets @($baseFiles)
+    # ** Хлебников С.Ю. 20261123 Перед выгрузкой temp в git спросить о завершении занятого конфигуратора.
+    # Иначе первая /DumpConfigToFiles падает, и приёмка поставки прерывается, не предложив оператору выбор.
+    if (@($tracked.Extensions).Count -gt 0 -or $tracked.HasProcessings) {
+        $exportLink = Connect-ClusterAgent
+        $exportSessions = @(Get-BaseSessions $exportLink $script:TempBase)
+        if (@($exportSessions | Where-Object { $_.IsError }).Count -gt 0) {
+            throw ("Не удалось проверить сеансы конфигуратора {0}; выгрузка не начата" -f $script:TempBase)
+        }
+        if (@($exportSessions | Where-Object { $_.IsDesigner }).Count -gt 0) {
+            if (-not (Resolve-DesignerBusy -BaseName $script:TempBase -Title 'Выгрузить temp в git')) {
+                throw ("Конфигуратор {0} занят; выгрузка не начата" -f $script:TempBase)
+            }
+        }
+    }
+    # ** Хлебников С.Ю. 20261123 конец
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$tracked.HasProcessings
     foreach ($item in $snapshot.Missing) { Write-Line ("  в {0} нет: {1} - в git остаётся как есть" -f $script:TempBase, $item) 'Yellow' }
     # Без @(): функция возвращает массив запятой, @() завернул бы его ещё раз.
