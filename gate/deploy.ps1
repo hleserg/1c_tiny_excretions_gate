@@ -603,11 +603,20 @@ function Test-ProdPlainLogin {
     if (-not (Test-Path -LiteralPath $canaryEpf)) { return [pscustomobject]@{ Status = 'WARN'; Text = "не проверял: нет обработки $canaryEpf" } }
     $plainFile = Join-Path $script:RunDir 'canary-plain.txt'
     try {
-        $client = Invoke-ProdClient -Epf $canaryEpf -Parameter ("canary;out={0};wait=3" -f $plainFile) -DoneFile $plainFile `
+        # При ручном открытии базы папка журнала общая для нескольких запусков.
+        if (Test-Path -LiteralPath $plainFile) { Remove-Item -LiteralPath $plainFile -ErrorAction Stop }
+        $user = Get-GateCanaryProfiles $cfg -Deploy | Where-Object { -not $_.Optional } | Select-Object -First 1
+        $client = Invoke-ProdClient -CanaryProfile $user -Epf $canaryEpf -Parameter ("canary;out={0};wait=3" -f $plainFile) -DoneFile $plainFile `
             -TimeoutSec $plainLoginTimeoutSec -Title 'Вход без кода разрешения' -NoUnlockCode
     }
     catch { return [pscustomobject]@{ Status = 'FAIL'; Text = ("клиент не запустился: {0}" -f $_.Exception.Message) } }
-    if ($client.Done) { return [pscustomobject]@{ Status = 'OK'; Text = ("вошёл за {0} с" -f $client.Seconds) } }
+    if ($client.Done) {
+        $lines = @(Get-Content -LiteralPath $plainFile -Encoding UTF8)
+        $identityError = Test-GateCanaryIdentity $user $lines
+        if ($identityError) { return [pscustomobject]@{ Status = 'FAIL'; Text = $identityError } }
+        if ($lines -notcontains 'status=ok') { return [pscustomobject]@{ Status = 'FAIL'; Text = 'Канарейка не подтвердила успешный вход.' } }
+        return [pscustomobject]@{ Status = 'OK'; Text = ("вошёл за {0} с {1}" -f $client.Seconds, $user.Label).Trim() }
+    }
     # Не вошёл. Снятие блокировок - ещё раз (если прошлое не подтвердилось, оно повторится), и что в свойствах сейчас.
     Clear-ProdLocks
     $now = 'свойства базы прочитать не смог'
@@ -819,6 +828,7 @@ $cfg = Read-DeployConfig
 # Меню и вопросы (ui.ps1): из ci.exe их рисует ci.exe, без него - консоль. Нужны уже здесь: если в настройках
 # чего-то не хватает, скрипт спрашивает и записывает в config.psd1.
 . (Join-Path $Root 'locks.ps1')
+. (Join-Path $Root 'canary-users.ps1')
 . (Join-Path $Root 'post-update.ps1')
 . (Join-Path $Root 'ui.ps1')
 Initialize-Ui -Channel $UiChannel
@@ -1636,11 +1646,16 @@ function Invoke-ProdClient {
     # StartFile - отметка «обработка открылась и поняла параметр запуска»: нет её за StartTimeoutSec - дальше не ждём
     # (вход не удался или сборка обработки этого режима не знает); в ответе Started.
     # NoUnlockCode - вход как у пользователя, без кода разрешения (/UC): проверка, что база открыта.
-    param([string]$Epf, [string]$Parameter, [string]$DoneFile, [int]$TimeoutSec, [string]$Title, [string]$StartFile = '', [int]$StartTimeoutSec = 0, [switch]$NoUnlockCode)
-    $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword -NoUnlockCode:$NoUnlockCode) + @(
+    param([string]$Epf, [string]$Parameter, [string]$DoneFile, [int]$TimeoutSec, [string]$Title, [string]$StartFile = '', [int]$StartTimeoutSec = 0, [switch]$NoUnlockCode, $CanaryProfile = $null)
+    if ($null -ne $CanaryProfile -and $CanaryProfile.Mode -ne 'DeployAdmin') {
+        $connection = @(Get-ConnectionArgs -BaseName $script:ProdBase -User '' -Password '' -NoUnlockCode:$NoUnlockCode) + @(Get-GateCanaryAuthArgs $CanaryProfile)
+    } else {
+        $connection = @(Get-ConnectionArgs -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword -NoUnlockCode:$NoUnlockCode)
+    }
+    $argList = @('ENTERPRISE') + $connection + @(
         '/DisableStartupDialogs', '/DisableStartupMessages', '/Execute', ('"{0}"' -f $Epf), ('/C"{0}"' -f $Parameter))
     $argLine = $argList -join ' '
-    Write-RunLog ("> 1cv8c.exe {0}" -f (Get-MaskedLine $argLine))
+    Write-RunLog ("> 1cv8c.exe {0}" -f (Format-GateCanaryCommand $argList))
     Write-Host ("  ...  {0}: начато в {1}, жду не дольше {2} мин" -f $Title, (Get-Date -Format 'HH:mm:ss'), [int]($TimeoutSec / 60)) -ForegroundColor DarkGray
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $process = Start-Process -FilePath $script:V8C -ArgumentList $argLine -PassThru
@@ -5419,7 +5434,13 @@ foreach ($planProc in $selectedProcessings) { $planSteps.Add((Get-ProcessingStep
 if ($null -ne $prodActions) { $planSteps.Add('Действия после обновления') }
 if ($selected.Count -gt 0) {
     $planSteps.Add('Проверка применимости')
-    $planSteps.Add('Канареечный вход')
+    $deployCanaries = @(Get-GateCanaryProfiles $cfg -Deploy)
+    foreach ($user in $deployCanaries) {
+        if ($user.Mode -eq 'Missing' -and $user.Optional) { continue }
+        $title = 'Канареечный вход'
+        if ($user.Label) { $title += ': ' + $user.Label }
+        $planSteps.Add($title)
+    }
     $planSteps.Add('Самопроверка на чтение')
     # После снятия блокировок (#2). Блокировку сеансов запуск мог и не ставить - тогда шаг останется непройденным.
     if ($plainLoginTimeoutSec -gt 0) { $planSteps.Add('Вход без кода разрешения') }
@@ -6166,21 +6187,38 @@ if ($outcome -eq 'updated') {
 
         # Канареечный вход: применились ли расширения в сеансе.
         if (Test-Path -LiteralPath $canaryEpf) {
-            $canaryFile = Join-Path $script:RunDir 'canary.txt'
-            $client = Invoke-ProdClient -Epf $canaryEpf -Parameter ("canary;out={0};wait=10" -f $canaryFile) -DoneFile $canaryFile -TimeoutSec $canaryTimeoutSec -Title 'Канареечный вход'
-            if (-not $client.Done) { Add-Light 'FAIL' 'Канареечный вход' ("за {0} с результата нет" -f $client.Seconds) }
-            else {
-                $content = @(Get-Content -LiteralPath $canaryFile -Encoding UTF8)
-                $notApplied = @($content | Where-Object { $_ -like 'ext=*|NOT_APPLIED' } | ForEach-Object { ($_.Substring(4) -split '\|')[0] })
-                $status = @($content | Where-Object { $_ -like 'status=*' } | Select-Object -First 1)
-                $extensionError = @($content | Where-Object { $_ -like 'exterror=*' } | Select-Object -First 1)
-                if ($status.Count -eq 0 -or ([string]$status[0]).Substring(7).Trim() -ne 'ok') { Add-Light 'FAIL' 'Канареечный вход' ($content -join ' | ') }
-                elseif ($notApplied.Count -gt 0) { Add-Light 'FAIL' 'Канареечный вход' ("не применились в сеансе: {0}" -f ($notApplied -join ', ')) }
-                elseif ($extensionError.Count -gt 0) {
-                    # Вход удался, а применились ли расширения, неизвестно: список не прочитан (#17).
-                    Add-Light 'WARN' 'Канареечный вход' ("вошёл за {0} с, но применение расширений не проверено: состав расширений не прочитан ({1})" -f $client.Seconds, ([string]$extensionError[0]).Substring(9).Trim())
+            $index = 0
+            foreach ($user in $deployCanaries) {
+                $index++
+                $title = 'Канареечный вход'
+                $fileName = 'canary.txt'
+                if ($user.Label) {
+                    $title += ': ' + $user.Label
+                    $fileName = 'canary_{0}.txt' -f $index
                 }
-                else { Add-Light 'OK' 'Канареечный вход' ("вошёл за {0} с, расширения применились" -f $client.Seconds) }
+                if ($user.Mode -eq 'Missing' -and $user.Optional) {
+                    Write-Line "$title пропущен: нет доменной учётки или сохранённого пароля для этого входа."
+                    continue
+                }
+                $canaryFile = Join-Path $script:RunDir $fileName
+                try { $client = Invoke-ProdClient -Epf $canaryEpf -Parameter ("canary;out={0};wait=10" -f $canaryFile) -DoneFile $canaryFile -TimeoutSec $canaryTimeoutSec -Title $title -CanaryProfile $user }
+                catch { Add-Light 'FAIL' $title $_.Exception.Message; continue }
+                if (-not $client.Done) { Add-Light 'FAIL' $title ("за {0} с результата нет" -f $client.Seconds) }
+                else {
+                    $content = @(Get-Content -LiteralPath $canaryFile -Encoding UTF8)
+                    $notApplied = @($content | Where-Object { $_ -like 'ext=*|NOT_APPLIED' } | ForEach-Object { ($_.Substring(4) -split '\|')[0] })
+                    $status = @($content | Where-Object { $_ -like 'status=*' } | Select-Object -First 1)
+                    $extensionError = @($content | Where-Object { $_ -like 'exterror=*' } | Select-Object -First 1)
+                    $identityError = Test-GateCanaryIdentity $user $content
+                    if ($identityError) { Add-Light 'FAIL' $title $identityError }
+                    elseif ($status.Count -eq 0 -or ([string]$status[0]).Substring(7).Trim() -ne 'ok') { Add-Light 'FAIL' $title ($content -join ' | ') }
+                    elseif ($notApplied.Count -gt 0) { Add-Light 'FAIL' $title ("не применились в сеансе: {0}" -f ($notApplied -join ', ')) }
+                    elseif ($extensionError.Count -gt 0) {
+                        # Вход удался, а применились ли расширения, неизвестно: список не прочитан (#17).
+                        Add-Light 'WARN' $title ("вошёл за {0} с, но применение расширений не проверено: состав расширений не прочитан ({1})" -f $client.Seconds, ([string]$extensionError[0]).Substring(9).Trim())
+                    }
+                    else { Add-Light 'OK' $title ("вошёл за {0} с, расширения применились" -f $client.Seconds) }
+                }
             }
         }
         else { Add-Light 'WARN' 'Канареечный вход' "нет обработки $canaryEpf" }
