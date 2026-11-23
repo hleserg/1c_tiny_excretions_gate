@@ -300,6 +300,15 @@ function Check-DeliveryCommon {
                 $answer = @{version=1; job=$key; input=$job.input; status='ok'; output=(Get-ParcelHash $original)}
                 Publish-Parcel $gh $queue $key result $answer $original
             }
+            # До создания PR ветка с таким именем могла появиться независимо от гейта.
+            $branch = 'delivery/' + $state.id
+            $foreign = (Get-GhHead $gh 'main').Sha
+            Set-GhBranch $gh $branch $foreign -Create
+            $blocked = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{dumps=$dumps} -Com $null
+            Check (($blocked.Output -join '|') -match 'чужие изменения' -and (Get-GhHead $gh $branch).Sha -ceq $foreign) 'гейт должен сохранить постороннюю ветку'
+            $refs = Read-GhFakeRefs $gh
+            $refs.Remove($branch)
+            Save-GhFakeRefs $gh $refs
             $run = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{dumps=$dumps} -Com $null
             Check-DeliveryCommon $run
             $state = @(Get-DeliveryStates $sb)[0]

@@ -1158,6 +1158,27 @@ function Add-DeliveryTextChange {
     $Changes.Add([pscustomobject]@{ Path = $Path; Kind = $kind; File = $file; Sha = $sha })
 }
 
+# ** Хлебников С.Ю. 20261123 Замена кандидата возможна только поверх известного коммита этой поставки.
+function Set-DeliveryCandidateBranch {
+    param($Gh,[string]$Branch,[string]$Before,[string]$After)
+    if ($Branch -cnotmatch '^delivery/\d{8}-\d{6}-[0-9a-f]{6}$' -or $After -cnotmatch '^[a-f0-9]{40}$') { throw 'Некорректная ветка или хеш кандидата' }
+    if (-not $Before) { Set-GhBranch $Gh $Branch $After -Create; return }
+    if ($Before -cnotmatch '^[a-f0-9]{40}$') { throw 'Некорректный прежний хеш кандидата' }
+    if ($Gh.FakeDir) {
+        if ((Get-GhHead $Gh $Branch).Sha -cne $Before) { throw 'Ветка кандидата изменилась перед обновлением' }
+        Set-GhBranch $Gh $Branch $After -Force
+        return
+    }
+    $repo = (Invoke-GhApi $Gh GET ('/repos/' + $Gh.Repo)).Text | ConvertFrom-Json
+    $update = @{name=('refs/heads/' + $Branch); beforeOid=$Before; afterOid=$After; force=$true}
+    $params = @{repositoryId=$repo.node_id; clientMutationId=$After; refUpdates=@($update)}
+    $query = 'mutation($input:UpdateRefsInput!){updateRefs(input:$input){clientMutationId}}'
+    $body = @{query=$query; variables=@{input=$params}} | ConvertTo-Json -Depth 6 -Compress
+    $answer = (Invoke-GhApi $Gh POST '/graphql' $body).Text | ConvertFrom-Json
+    if ($answer.PSObject.Properties['errors'] -or $answer.data.updateRefs.clientMutationId -cne $After) { throw 'GitHub не подтвердил условное обновление ветки кандидата. Сверьте PR.' }
+}
+# ** Хлебников С.Ю. 20261123 конец
+
 function Publish-DeliveryCandidate {
     # Кандидат: коммит поверх Base в ветку delivery/<номер> (пересборка - та же ветка), PR в main (один на поставку).
     # В коммите - объединённые объекты, журнал поставки deliveries/<номер>.json, привязки, целые файлы binaries/.
@@ -1222,10 +1243,15 @@ function Publish-DeliveryCandidate {
     $sha = New-GitVerifiedCommit -Setup $Setup -Parent $Base -Changes $changes.ToArray() -Message ("Поставка подрядчика {0}: {1}" -f $State['id'], $objectsText)
     $branch = 'delivery/' + [string]$State['id']
     # ** Хлебников С.Ю. 20261123 Сохранить ожидаемый коммит до публикации, чтобы восстановиться после обрыва.
+    $existing = (Get-GhHead -Gh $Setup.Gh -Branch $branch).Sha
+    $known = @($State['proposedSha'], $State['previousCandidate'])
+    if ($null -ne $State['pr']) { $known += $State['pr']['head'] }
+    if ($existing -and $known -cnotcontains $existing) { throw "Ветка $branch содержит чужие изменения. Сверьте кандидата до продолжения." }
+    $State['previousCandidate'] = $existing
     $State['proposedSha'] = $sha
     Save-DeliveryState $D $State
-    $existing = (Get-GhHead -Gh $Setup.Gh -Branch $branch).Sha
-    if ($existing) { Set-GhBranch -Gh $Setup.Gh -Branch $branch -Sha $sha -Force } else { Set-GhBranch -Gh $Setup.Gh -Branch $branch -Sha $sha -Create }
+    if ($existing -cne $sha) { Set-DeliveryCandidateBranch $Setup.Gh $branch $existing $sha }
+    # ** Хлебников С.Ю. 20261123 конец
     $body = Get-DeliveryReport -D $D -State $State -ForPull
     $number = Find-GhPull -Gh $Setup.Gh -Head $branch -Base $Setup.Branch
     $url = ''
