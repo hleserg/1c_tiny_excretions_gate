@@ -55,7 +55,7 @@ function New-Sandbox {
     $dir = Join-Path $workRoot $Name
     foreach ($sub in @('bin', 'tools', 'inbox', 'fake')) { New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null }
     # ** Хлебников С.Ю. 20261123 Песочница содержит полный комплект удалённой приёмки.
-    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'delivery.ps1', 'delivery-parcel.ps1', 'delivery-designer.ps1', 'delivery-worker.ps1', 'cluster-target.ps1', 'canary-users.ps1', 'locks.ps1', 'post-update.ps1', 'timeline.ps1', 'selfcheck-compare.ps1')) {
+    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'delivery.ps1', 'delivery-parcel.ps1', 'delivery-designer.ps1', 'delivery-git.ps1', 'delivery-worker.ps1', 'cluster-target.ps1', 'canary-users.ps1', 'locks.ps1', 'post-update.ps1', 'timeline.ps1', 'selfcheck-compare.ps1')) {
         Copy-Item -LiteralPath (Join-Path $ciRoot $script) -Destination $dir
     }
     # Объединение поставок (раздел 5.26): merge1c.exe рядом с fake1c.exe (собирает CI).

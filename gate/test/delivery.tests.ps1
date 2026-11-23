@@ -270,6 +270,40 @@ function Check-DeliveryCommon {
         }
     }
     # ** Хлебников С.Ю. 20261123 конец
+    # ** Хлебников С.Ю. 20261123 Один формат очереди для API завода и Git на исполнителе.
+    @{
+        Name = 'delivery-git-queue'
+        Text = 'Двоичный ответ Git читается по SHA, конкурирующая запись сохраняется'
+        Run = {
+            param($Name)
+            . (Join-Path $ciRoot 'delivery-parcel.ps1')
+            . (Join-Path $ciRoot 'delivery-git.ps1')
+            $dir = Join-Path $workRoot $Name
+            $cache = Join-Path $dir 'cache'
+            $remote = Join-Path $dir 'repository.git'
+            [void][IO.Directory]::CreateDirectory($cache)
+            $client = New-GhContext 'test/queue' ''
+            Initialize-WorkerGit $client @{GitCache=$cache}
+            $client.GitUrl=$remote
+            $null = & $client.GitExe init --bare --template= $remote
+            Check ($LASTEXITCODE -eq 0) 'не создан локальный репозиторий испытания'
+            $null = Invoke-WorkerGit $client @('init','--template=')
+            $tree = Invoke-WorkerGit $client @('write-tree')
+            $head = Invoke-WorkerGit $client @('commit-tree',$tree,'-m','queue')
+            $null = Invoke-WorkerGit $client @('push',$remote,($head+':refs/heads/gate-delivery-v1'))
+            $before = Read-GitWorkerQueue $client
+            $key = 'a' * 64
+            $bytes = [byte[]]@(0,255,1,0,13,10,128)
+            $message = @{version=1;job=$key;output=(Get-ParcelHash $bytes)}
+            Publish-Parcel $client $before $key result $message $bytes
+            $current = Read-GitWorkerQueue $client
+            $downloaded = Read-ParcelPayload $client $current "jobs/$key/result.bin" $message.output
+            Check ((Get-ParcelHash $downloaded) -ceq $message.output) 'нарушена целостность двоичного ответа'
+            $stopped = try { Publish-Parcel $client $before ('b'*64) result $message $bytes; $false } catch { $true }
+            Check ($stopped -and (Read-GitWorkerQueue $client).Head -ceq $current.Head) 'отказ конкурентной записи или потеря ответа'
+        }
+    }
+    # ** Хлебников С.Ю. 20261123 конец
     # ** Хлебников С.Ю. 20261123 Два удалённых задания, перезапуск между этапами и один PR кандидата.
     @{
         Name = 'delivery-remote'

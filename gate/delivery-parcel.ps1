@@ -60,6 +60,7 @@ function Expand-ParcelArchive {
 
 function Assert-ParcelRepo {
     param($Gh)
+    if ($Gh.PSObject.Properties['GitCache']) { Assert-PrivateWorkerGit $Gh; return }
     if ($Gh.FakeDir) { return }
     $repo = (Invoke-GhApi $Gh GET ('/repos/' + $Gh.Repo)).Text | ConvertFrom-Json
     if ($repo.private -ne $true -or $repo.full_name -ine $Gh.Repo) { throw 'Для обмена поставками нужен приватный репозиторий' }
@@ -67,21 +68,28 @@ function Assert-ParcelRepo {
 
 function Read-ParcelQueue {
     param($Gh)
+    if ($Gh.PSObject.Properties['GitCache']) { return Read-GitWorkerQueue $Gh }
     $head = (Get-GhHead $Gh 'gate-delivery-v1').Sha
     $files = @{}
     if ($head) { $files = Get-GhFiles $Gh $head }
     return @{ Head=$head; Files=$files }
 }
 
+function Get-ParcelBytes {
+    param($Gh,[string]$Sha)
+    if ($Gh.PSObject.Properties['GitCache']) { return ,(Get-GitWorkerBlob $Gh $Sha) }
+    return ,(Get-GhBlob $Gh $Sha)
+}
+
 function Get-ParcelJson {
     param($Gh,$Queue,[string]$Path)
-    $bytes = Get-GhBlob $Gh $Queue.Files[$Path]
+    $bytes = Get-ParcelBytes $Gh $Queue.Files[$Path]
     return ([Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json)
 }
 
 function Read-ParcelPayload {
     param($Gh,$Queue,[string]$Path,[string]$Hash)
-    $bytes = Get-GhBlob $Gh $Queue.Files[$Path]
+    $bytes = Get-ParcelBytes $Gh $Queue.Files[$Path]
     if ((Get-ParcelHash $bytes) -cne $Hash) { throw "Не совпал SHA-256 $Path" }
     return ,$bytes
 }
@@ -98,6 +106,7 @@ function Publish-Parcel {
         $changes += @{ Path="$prefix.bin"; Bytes=$Bytes }
     }
     if ($Queue.Files.ContainsKey("$prefix.json")) { throw 'Запись очереди уже опубликована' }
+    if ($Gh.PSObject.Properties['GitCache']) { Write-GitWorkerCommit $Gh $Queue.Head $changes "delivery v1 $Type $Key"; return }
     $sha = New-GhCommit $Gh $Queue.Head $changes ("delivery v1 $Type $Key")
     Set-GhBranch $Gh 'gate-delivery-v1' $sha -Create:(-not $Queue.Head)
 }

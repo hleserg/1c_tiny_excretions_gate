@@ -2380,13 +2380,18 @@ actions\result.txt и регистр выполненных действий. П
 При waiting-worker следующий проход «Приёмки поставок» продолжает тот же номер.
 
 На компьютере с лицензированной копией возьмите из той же сборки delivery-worker.ps1,
-delivery-parcel.ps1, delivery-designer.ps1 и github.ps1. Задайте два локальных файла psd1.
+delivery-parcel.ps1, delivery-designer.ps1, delivery-git.ps1 и github.ps1. Задайте два локальных файла psd1.
 Пример профиля обмена:
 @{
     Repo = 'владелец/приватный-репозиторий'
     TokenFile = 'D:\Exchange\secrets\github.dpapi'
     Spool = 'D:\Exchange\queue'
+    # При доступе только к github.com укажите отдельную пустую папку для локального кеша Git.
+    # GitCache = 'D:\Exchange\private\git-cache'
 }
+Если задан GitCache, учётке обмена нужен git.exe в PATH. Она проверяет закрытость репозитория
+анонимным запросом Git, затем получает и публикует данные по HTTPS с токеном из TokenFile.
+Кеш доступен учётке обмена и владельцу. На заводе этот режим установки Git не требует.
 Пример профиля исполнителя:
 @{
     GateProfile = 'D:\TestGate\config.psd1'

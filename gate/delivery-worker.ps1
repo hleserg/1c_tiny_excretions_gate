@@ -97,6 +97,10 @@ function Invoke-WorkerJob($Profile,$Job,[string]$Key,[string]$Dir) {
 
 if ($Mode -eq 'Sync') {
     $gh = New-GhContext $settings.Repo (Read-WorkerSecret $settings.TokenFile)
+    if ($settings.ContainsKey('GitCache')) {
+        . "$PSScriptRoot\delivery-git.ps1"
+        Initialize-WorkerGit $gh $settings
+    }
     $guardDir = $spool
 }
 else {
