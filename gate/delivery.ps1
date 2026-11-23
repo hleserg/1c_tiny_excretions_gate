@@ -1634,6 +1634,14 @@ function Invoke-DeliveryStep {
                 Write-DeliveryEvent $D $State 'dump' ("{0}: {1} {2}, UUID {3}{4}" -f $file['name'], $kindText, $expanded.Identity.Name, $expanded.Identity.Uuid, $mismatch)
             }
             else {
+                # ** Хлебников С.Ю. 20261123 Отсутствие лицензии не означает защищённый CFE: оставить поставку в received.
+                # Иначе после смены технической базы она не будет повторно разобрана.
+                if ([string]$expanded.Reason -match '(?i)не найдена лицензия|не обнаружен ключ защиты|software license|license not found|licen[cs]e') {
+                    Write-DeliveryEvent $D $State 'license' ("Нет лицензии для разбора {0}: {1}. Исправь техническую базу и повтори приёмку." -f $file['name'], $expanded.Reason) 'Red'
+                    Set-DeliveryStatus $D $State 'received' 'Нужен лицензированный технический конфигуратор'
+                    return
+                }
+                # ** Хлебников С.Ю. 20261123 конец
                 $file['opaque'] = $true
                 $file['opaqueReason'] = $expanded.Reason
                 if ($null -ne $expanded.Identity) {
