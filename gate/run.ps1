@@ -6002,7 +6002,11 @@ function Invoke-SelfCheckLanes {
     $first = New-SelfCheckLane -Number 1 -Extra (@($Extra) + @(("split={0}" -f $Group), 'worker=1')) -Known $Known
     $second = New-SelfCheckLane -Number 2 -Extra (@($Extra) + @(("split={0}" -f $Group), 'worker=2')) -Known ''
     $lanes = @($first, $second)
-    Write-RunLog ("Самопроверка: два исполнителя, группу «{0}» делят пополам" -f $Group)
+    # ** Хлебников С.Ю. 20261123 В полном прогоне начинают с общей очереди независимых чтений.
+    $earlyReads = ($Extra -contains 'earlyreads=1')
+    if ($earlyReads) { Write-RunLog 'Самопроверка: два исполнителя делят независимые проверки в начале прогона' }
+    else { Write-RunLog ("Самопроверка: два исполнителя, группу «{0}» делят пополам" -f $Group) }
+    # ** Хлебников С.Ю. 20261123 конец
     Start-SelfCheckLane -Lane $first -BaseDir $BaseDir -Title $Title -ExchangeSetFile $ExchangeSetFile
     $go = $false
     $secondStarted = $false
@@ -6021,7 +6025,8 @@ function Invoke-SelfCheckLanes {
             Update-SelfCheckSession $session
             if ($lane.Number -eq 1 -and -not $go -and ([string](Get-Setting $session.Header 'group' '') -eq '1' -or [string](Get-Setting $session.Header 'wait' '') -eq '1')) {
                 $go = $true
-                Write-RunLog ("Самопроверка: первый исполнитель дошёл до группы «{0}», второму - начинать" -f $Group)
+                if ($earlyReads) { Write-RunLog 'Самопроверка: начались независимые проверки, второму исполнителю - начинать' }
+                else { Write-RunLog ("Самопроверка: первый исполнитель дошёл до группы «{0}», второму - начинать" -f $Group) }
                 Write-SelfCheckLaneSignal -Lane $second -Signal 'go=1'
             }
             if (-not $session.State) { continue }
@@ -6220,6 +6225,10 @@ function Invoke-SelfCheck {
     if ($workerCount -le 0) { $workerCount = $selfCheckWorkerCount }
     $splitGroup = $selfCheckSplit
     if ($OnlyGroup) { $splitGroup = $OnlyGroup }
+    elseif ($workerCount -ge 2 -and $splitGroup -and [bool](Get-Setting $cfg 'SelfCheckEarlyReads' $false)) {
+        # ** Хлебников С.Ю. 20261123 Два сеанса делят чтения до перехода к операциям с документами.
+        $extraParts += 'earlyreads=1'
+    }
     $laneRun = $null
     # ** Хлебников С.Ю. 20261120 конец
 
