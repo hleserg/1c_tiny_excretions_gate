@@ -112,8 +112,9 @@ function Format-SelfCheckText {
 function Get-CheckRecordLines {
     # Записи лога проверки (как в run.ps1) и номера строк модуля по каждой записи.
     param([string[]]$Lines)
-    $where = @{}
-    $count = $Lines.Length
+    $where = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([System.StringComparer]::Ordinal)
+    $count = 0
+    if ($null -ne $Lines) { $count = $Lines.Length }
     $index = 0
     while ($index -lt $count) {
         $line = $Lines[$index]
@@ -137,7 +138,7 @@ function Get-CheckRecordLines {
         if (-not $where.ContainsKey($record)) { $where[$record] = New-Object System.Collections.Generic.List[int] }
         if ($position -and -not $where[$record].Contains([int]$position)) { $where[$record].Add([int]$position) }
     }
-    return $where
+    return ,$where
 }
 
 #endregion
@@ -549,13 +550,16 @@ foreach ($logFile in @(Get-ChildItem -LiteralPath $RunDir -Filter 'check*.log' -
     $newRecords = @(Read-RecordSet (Join-Path $RunDir ($fileKey + '.new.txt')))
     $currentRecords = @(Read-RecordSet (Join-Path $RunDir ($fileKey + '.norm.txt')))
     $referenceRecords = @(Read-RecordSet (Join-Path $referenceDir ($fileKey + '.norm.txt')))
-    $gone = @()
-    if ($referenceRecords.Count -gt 0 -and $currentRecords.Count -gt 0) {
+    $currentPath = Join-Path $RunDir ($fileKey + '.norm.txt')
+    if (-not (Test-Path -LiteralPath $currentPath -PathType Leaf)) { continue }
+    $missingPath = Join-Path $RunDir ($fileKey + '.missing.txt')
+    $missing = @(Read-RecordSet $missingPath)
+    if (-not (Test-Path -LiteralPath $missingPath) -and $referenceRecords.Count -gt 0) {
         $currentSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
         foreach ($record in $currentRecords) { [void]$currentSet.Add($record) }
-        $gone = @($referenceRecords | Where-Object { -not $currentSet.Contains($_) } | Sort-Object -Unique)
+        $missing = @($referenceRecords | Where-Object { -not $currentSet.Contains($_) })
     }
-    if ($newRecords.Count -eq 0 -and $gone.Count -eq 0) { continue }
+    if ($newRecords.Count -eq 0 -and $missing.Count -eq 0) { continue }
     $comparedSomething = $true
 
     $stepTitle = $fileKey
@@ -566,9 +570,15 @@ foreach ($logFile in @(Get-ChildItem -LiteralPath $RunDir -Filter 'check*.log' -
     if ($underscore -gt 0 -and -not $fileKey.StartsWith('checkcanapply')) { $stepTitle += (' ({0})' -f $fileKey.Substring($underscore + 1)) }
 
     $where = Get-CheckRecordLines @(Read-TextLines $logFile.FullName)
+    $filtered = @($missing | Where-Object { $where.ContainsKey($_) })
+    $gone = @($missing | Where-Object { -not $where.ContainsKey($_) })
     $parsed = @($newRecords | ForEach-Object { [pscustomobject]@{ Record = $_; Info = (ConvertFrom-CheckRecord $_) } })
     $redCount = @($parsed | Where-Object { $_.Info.Red }).Count
-    $body.Add(("== {0}: новых {1} (блокирующих {2}), исправлено {3}" -f $stepTitle, $newRecords.Count, $redCount, $gone.Count))
+    $body.Add(("== {0}: новых {1} (блокирующих {2}), больше нет в журнале {3}, исключено фильтром {4}" -f $stepTitle, $newRecords.Count, $redCount, $gone.Count, $filtered.Count))
+    if ($filtered.Count -gt 0) {
+        $summary.Add(("[ИНФО] {0}: фильтр исключил {1} замечаний эталона. Они остались в {2}." -f $stepTitle, $filtered.Count, $logFile.Name))
+        foreach ($record in $filtered) { $body.Add(('     Исключено фильтром: ' + $record)) }
+    }
     if ($newRecords.Count -gt 0) {
         $mark = 'ЖЁЛТ'
         if ($redCount -gt 0) { $mark = 'КРАСН' }
@@ -656,7 +666,7 @@ foreach ($logFile in @(Get-ChildItem -LiteralPath $RunDir -Filter 'check*.log' -
     }
 
     if ($gone.Count -gt 0) {
-        $body.Add(("  Исправлено (было в эталоне, теперь нет): {0}" -f $gone.Count))
+        $body.Add(("  Было в эталоне, больше нет в журнале: {0}" -f $gone.Count))
         $goneGroups = [ordered]@{}
         foreach ($record in $gone) {
             $info = ConvertFrom-CheckRecord $record
@@ -679,16 +689,38 @@ foreach ($logFile in @(Get-ChildItem -LiteralPath $RunDir -Filter 'check*.log' -
 }
 
 # Самопроверка.
+$knownErrorsNow = @()
 if ($afterRecords.Count -gt 0 -or $newSelfCheck.Count -gt 0) {
     $referenceSelfCheck = @(Read-RecordSet (Join-Path $referenceDir 'selfcheck.norm.txt'))
+    $goneOkPath = Join-Path $RunDir 'selfcheck-after.gone-ok.txt'
+    $goneOk = @(Read-RecordSet $goneOkPath)
     $fixed = @()
     if ($referenceSelfCheck.Count -gt 0 -and $afterRecords.Count -gt 0) {
         $currentSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
         foreach ($record in $afterRecords) { [void]$currentSet.Add((Format-SelfCheckText $record)) }
+        if (-not (Test-Path -LiteralPath $goneOkPath)) {
+            $goneOk = @($referenceSelfCheck | ForEach-Object { Format-SelfCheckText $_ } | Where-Object { $_.StartsWith('[ОК]') -and -not $currentSet.Contains($_) } | Sort-Object -Unique)
+        }
         $fixed = @($referenceSelfCheck | ForEach-Object { Format-SelfCheckText $_ } | Where-Object { $_.StartsWith('[ОШИБКА]') -and -not $currentSet.Contains($_) } | Sort-Object -Unique)
     }
     $errors = @($newSelfCheck | Where-Object { $_.StartsWith('[ОШИБКА]') })
     $others = @($newSelfCheck | Where-Object { -not $_.StartsWith('[ОШИБКА]') })
+    $comparisonRecorded = @($steps | Where-Object { (Get-JsonProperty $_ 'detail' '') -match '^новых ошибок: [0-9]+, новых предупреждений:' }).Count -gt 0
+    if ($referenceSelfCheck.Count -gt 0 -or $comparisonRecorded) {
+        $newErrorSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        foreach ($record in $errors) { [void]$newErrorSet.Add($record) }
+        $knownErrorsNow = @($afterRecords | Where-Object { $_.StartsWith('[ОШИБКА]') -and -not $newErrorSet.Contains($_) })
+        $summary.Add(('Самопроверка: новых ошибок {0}, известных {1}. Журнал: selfcheck-after.journal.txt' -f $errors.Count, $knownErrorsNow.Count))
+        foreach ($record in $knownErrorsNow) {
+            $summary.Add(('  Известная: ' + (Format-Short ($record.Substring('[ОШИБКА] '.Length)) 220)))
+        }
+    }
+    if ($goneOk.Count -gt 0) {
+        $summary.Add(('Самопроверка: записей «ОК» из эталона, которых больше нет: {0}. Перечень ниже.' -f $goneOk.Count))
+        $body.Add('== Самопроверка: пропавшие записи «ОК» (ключ и прежний результат)')
+        foreach ($record in $goneOk) { $body.Add(('  ' + $record)) }
+        $body.Add('')
+    }
     if ($newSelfCheck.Count -gt 0 -or $fixed.Count -gt 0) {
         $comparedSomething = $true
         $body.Add(("== Самопроверка: новых ошибок {0}, новых предупреждений и пропусков {1}, исправлено ошибок {2}" -f $errors.Count, $others.Count, $fixed.Count))
@@ -1097,7 +1129,6 @@ if ($unitSkipped.Count -gt 0) {
 }
 # 2. Известные ошибки самопроверки, которых не было в прошлом прогоне: эталон «до» мог сняться уже новым пакетом,
 # и первые запуски новых проверок сразу стали известными - что в них упало, по числу не узнать.
-$knownErrorsNow = @($afterRecords | Where-Object { $_.StartsWith('[ОШИБКА]') -and $newSelfCheck -notcontains $_ })
 $previousRun = @($script:EarlierRuns | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'selfcheck-after.norm.txt') } | Select-Object -Last 1)
 if ($knownErrorsNow.Count -gt 0 -and $previousRun.Count -gt 0) {
     $previousRecords = @(Read-RecordSet (Join-Path $previousRun[0].FullName 'selfcheck-after.norm.txt'))
