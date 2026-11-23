@@ -3797,6 +3797,11 @@ function Invoke-GitImport {
     foreach ($name in @($headTracked.Processings)) {
         $prefix = 'processings/' + $name + '/'
         if ($binaries.ContainsKey($name)) { continue }
+        # ** Хлебников С.Ю. 20261124 Архивная карточка не обновляется и не требует оригинала для регистрации.
+        if ($vendorFolders.ContainsKey($name) -and [bool](Get-UiField $manifestRefs[$name] 'deleted' $false)) {
+            Write-Line ("  {0}: карточка помечена на удаление, пропускаю" -f $name) 'Yellow'
+            continue
+        }
         # ** Хлебников С.Ю. 20261124 Обработку поставщика из распакованных исходников не собираем.
         if ($vendorFolders.ContainsKey($name) -or $vendorProcessings -contains $name) {
             if ($vendorFolders[$name]) { continue }

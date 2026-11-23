@@ -4096,7 +4096,15 @@ $tests = @(
             Check-DeployCommon $boot -LocksExpected $false
             $snapshot = (Read-GitStateFile $sb).pendingCommit
             $form = [pscustomobject]@{Path='processings/Печать/Печать/Forms/Проверочная/Ext/Form.bin'; Bytes=[byte[]](1,2,3)}
-            $head = New-GhCommit -Gh $gh -Parent $snapshot -Changes @($form) -Message 'иной вывод формы'
+            $files = Get-GhFiles -Gh $gh -Commit $snapshot
+            $rows = @($utf8.GetString((Get-GhBlob -Gh $gh -Sha $files['processings/manifest.json'])) | ConvertFrom-Json | ForEach-Object { $_ })
+            $archiveRef = '10000000-0000-4000-8000-000000000002'
+            $archivedFolder = 'Печать~' + $archiveRef
+            $rows += @{folder=$archivedFolder;objectName='Печать';ref=$archiveRef;deleted=$true;fileHash=('sha256:' + ('f'*64))}
+            $manifestText = ConvertTo-Json -InputObject @($rows) -Depth 8
+            $cards = [pscustomobject]@{Path='processings/manifest.json';Bytes=$utf8.GetBytes($manifestText)}
+            $archived = [pscustomobject]@{Path=("processings/{0}/Печать.xml" -f $archivedFolder);Bytes=$utf8.GetBytes('<archive/>')}
+            $head = New-GhCommit -Gh $gh -Parent $snapshot -Changes @($form,$cards,$archived) -Message 'иной вывод формы и архивная карточка'
             Set-GhBranch -Gh $gh -Branch 'main' -Sha $head
             $load = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake $fake -Com $com
             Check ($load.ExitCode -eq 0 -and ($load.Output -match 'загружать нечего')) 'совпадающий EPF был предложен к пересборке'
