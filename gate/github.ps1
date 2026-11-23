@@ -575,17 +575,19 @@ function Get-GhPull {
 }
 
 function Find-GhPull {
-    # Открытый PR из ветки Head в Base. 0 - нет.
-    param($Gh, [string]$Head, [string]$Base)
+    # ** Хлебников С.Ю. 20261123 Для восстановления поставки ищем также слитый или закрытый PR.
+    param($Gh, [string]$Head, [string]$Base, [switch]$IncludeClosed)
     if ($Gh.FakeDir) {
         foreach ($pull in @(Read-GhFakePulls $Gh | Where-Object { $_.Head -eq $Head -and $_.Base -eq $Base } | Sort-Object Number -Descending)) {
-            if ((Get-GhPull -Gh $Gh -Number $pull.Number).State -eq 'open') { return [int]$pull.Number }
+            if ($IncludeClosed -or (Get-GhPull -Gh $Gh -Number $pull.Number).State -eq 'open') { return [int]$pull.Number }
         }
         return 0
     }
     $owner = $Gh.Repo.Split('/')[0]
-    $answer = Invoke-GhApi -Gh $Gh -Method 'GET' -Path ('/repos/{0}/pulls?state=open&base={1}&head={2}' -f $Gh.Repo, [uri]::EscapeDataString($Base), [uri]::EscapeDataString($owner + ':' + $Head))
-    $list = @($answer.Text | ConvertFrom-Json)
+    $stateFilter = 'open'
+    if ($IncludeClosed) { $stateFilter = 'all' }
+    $answer = Invoke-GhApi -Gh $Gh -Method 'GET' -Path ('/repos/{0}/pulls?state={3}&base={1}&head={2}' -f $Gh.Repo, [uri]::EscapeDataString($Base), [uri]::EscapeDataString($owner + ':' + $Head), $stateFilter)
+    $list = ConvertFrom-Json -InputObject $answer.Text
     if ($list.Count -gt 0) { return [int]$list[0].number }
     return 0
 }

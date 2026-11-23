@@ -230,6 +230,140 @@ function Check-DeliveryCommon {
 }
 
 @(
+    # ** Хлебников С.Ю. 20261123 Отказы до публикации результата и владение служебным расширением.
+    @{
+        Name='delivery-worker-isolation'
+        Text='Очистка только своего имени, остановка при подмене и отклонение путей вне ZIP'
+        Run={
+            param($Name)
+            . (Join-Path $ciRoot 'delivery-designer.ps1')
+            . (Join-Path $ciRoot 'delivery-parcel.ps1')
+            $work = Join-Path $workRoot $Name
+            [void][IO.Directory]::CreateDirectory($work)
+            $profile = @{ WorkRoot=$work; Server='localhost'; Base='worker_test' }
+            $inventory = [Collections.ArrayList]@('UserExt','Поставка1','Сборка1')
+            $deleted = [Collections.ArrayList]@()
+            function Get-WorkerInventory { param($Profile,$Log) foreach ($n in $inventory) { $n } }
+            function Invoke-WorkerDesigner {
+                param($Profile,$Command,$Log)
+                $slot = $Command[-1]
+                if ($slot -cnotmatch '^GateJob[a-f0-9]{32}$' -or $Command[-2] -cne '-Extension') { throw 'Недопустимая команда' }
+                switch ($Command[0]) {
+                    '/LoadCfg' { [void]$inventory.Add($slot); if ($ambiguous) { [void]$inventory.Add('Unexpected') } }
+                    '/DumpConfigToFiles' { [IO.File]::WriteAllText((Join-Path $Command[1].Trim('"') 'Configuration.xml'),'<root/>') }
+                    '/DeleteCfg' { $inventory.Remove($slot); [void]$deleted.Add($slot) }
+                    default { throw 'Лишний вызов 1С' }
+                }
+            }
+            $ambiguous = $false
+            Invoke-WorkerExtension $profile expand 'sample.cfe' (Join-Path $work 'result') $work
+            Check ($deleted.Count -eq 1 -and ($inventory -join '|') -eq 'UserExt|Поставка1|Сборка1') 'изменилось чужое расширение'
+            $ambiguous = $true
+            $stopped = try { Invoke-WorkerExtension $profile expand 'sample.cfe' (Join-Path $work 'result2') $work; $false } catch { $true }
+            Check ($stopped -and $deleted.Count -eq 1 -and [IO.File]::Exists((Join-Path $work 'active-extension.json'))) 'после неоднозначной загрузки очистка должна остановиться'
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $path = Join-Path $work 'bad.zip'
+            $zip = [IO.Compression.ZipFile]::Open($path,'Create')
+            try { [void]$zip.CreateEntry('../outside.bsl') } finally { $zip.Dispose() }
+            $stopped = try { Expand-ParcelArchive $path (Join-Path $work 'tree'); $false } catch { $true }
+            Check ($stopped -and -not [IO.File]::Exists((Join-Path $work 'outside.bsl'))) 'выход из каталога результата'
+        }
+    }
+    # ** Хлебников С.Ю. 20261123 конец
+    # ** Хлебников С.Ю. 20261123 Один формат очереди для API завода и Git на исполнителе.
+    @{
+        Name = 'delivery-git-queue'
+        Text = 'Двоичный ответ Git читается по SHA, конкурирующая запись сохраняется'
+        Run = {
+            param($Name)
+            . (Join-Path $ciRoot 'delivery-parcel.ps1')
+            . (Join-Path $ciRoot 'delivery-git.ps1')
+            $dir = Join-Path $workRoot $Name
+            $cache = Join-Path $dir 'cache'
+            $remote = Join-Path $dir 'repository.git'
+            [void][IO.Directory]::CreateDirectory($cache)
+            $client = New-GhContext 'test/queue' ''
+            Initialize-WorkerGit $client @{GitCache=$cache}
+            $client.GitUrl=$remote
+            $null = & $client.GitExe init --bare --template= $remote
+            Check ($LASTEXITCODE -eq 0) 'не создан локальный репозиторий испытания'
+            $null = Invoke-WorkerGit $client @('init','--template=')
+            $tree = Invoke-WorkerGit $client @('write-tree')
+            $head = Invoke-WorkerGit $client @('commit-tree',$tree,'-m','queue')
+            $null = Invoke-WorkerGit $client @('push',$remote,($head+':refs/heads/gate-delivery-v1'))
+            $before = Read-GitWorkerQueue $client
+            $key = 'a' * 64
+            $bytes = [byte[]]@(0,255,1,0,13,10,128)
+            $message = @{version=1;job=$key;output=(Get-ParcelHash $bytes)}
+            Publish-Parcel $client $before $key result $message $bytes
+            $current = Read-GitWorkerQueue $client
+            $downloaded = Read-ParcelPayload $client $current "jobs/$key/result.bin" $message.output
+            Check ((Get-ParcelHash $downloaded) -ceq $message.output) 'нарушена целостность двоичного ответа'
+            $stopped = try { Publish-Parcel $client $before ('b'*64) result $message $bytes; $false } catch { $true }
+            Check ($stopped -and (Read-GitWorkerQueue $client).Head -ceq $current.Head) 'отказ конкурентной записи или потеря ответа'
+        }
+    }
+    # ** Хлебников С.Ю. 20261123 конец
+    # ** Хлебников С.Ю. 20261123 Два удалённых задания, перезапуск между этапами и один PR кандидата.
+    @{
+        Name = 'delivery-remote'
+        Text = 'Удалённая приёмка CFE: ожидание, проверка двух ответов, PR, CI и загрузка в temp'
+        Run = {
+            param($Name)
+            . (Join-Path $ciRoot 'delivery-parcel.ps1')
+            $dumps = New-DDumps
+            $sb = New-DeliverySandbox $Name -Com (New-ComState) -Dumps $dumps -Extra @{DeliveryWorkerRepo='test/queue'; DeliveryWorkerWaitMin=0}
+            $gh = Get-FakeGh $sb
+            $inputFile = New-DZip -Path (Join-Path $sb 'Входящие\test.cfe') -Files (New-DExtFiles -Module (New-DModule -Extra '42'))
+            $original = [IO.File]::ReadAllBytes($inputFile)
+            foreach ($op in @('expand-cfe','build-cfe')) {
+                $run = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{dumps=$dumps} -Com $null
+                $state = @(Get-DeliveryStates $sb)[0]
+                Check ($run.ExitCode -eq 0 -and $state.status -eq 'waiting-worker') ("нет ожидания $op : " + ($run.Output -join '|'))
+                Check (@($run.Calls | Where-Object { $_.Line -match 'CREATEINFOBASE|/F"' }).Count -eq 0) 'задействована файловая база'
+                $queue = Read-ParcelQueue $gh
+                $pending = @($queue.Files.Keys | Where-Object { $_ -like 'jobs/*/job.json' -and -not $queue.Files.ContainsKey($_.Replace('job.json','result.json')) })
+                Check ($pending.Count -eq 1) 'ожидали одно задание'
+                $job = Get-ParcelJson $gh $queue $pending[0]
+                $key = Get-ParcelId $job
+                Check ($job.operation -eq $op -and $pending[0] -eq "jobs/$key/job.json") 'другая операция или ключ'
+                $bytes = Read-ParcelPayload $gh $queue "jobs/$key/job.bin" $job.input
+                $badHash = try { $null = Read-ParcelPayload $gh $queue "jobs/$key/job.bin" ('0'*64); $false } catch { $true }
+                Check $badHash 'повреждение SHA-256 не обнаружено'
+                if ($op -eq 'expand-cfe') { Check ((Get-ParcelHash $bytes) -eq (Get-ParcelHash $original)) 'отправлен другой оригинал' }
+                $answer = @{version=1; job=$key; input=$job.input; status='ok'; output=(Get-ParcelHash $original)}
+                Publish-Parcel $gh $queue $key result $answer $original
+            }
+            # До создания PR ветка с таким именем могла появиться независимо от гейта.
+            $branch = 'delivery/' + $state.id
+            $foreign = (Get-GhHead $gh 'main').Sha
+            Set-GhBranch $gh $branch $foreign -Create
+            $blocked = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{dumps=$dumps} -Com $null
+            Check (($blocked.Output -join '|') -match 'чужие изменения' -and (Get-GhHead $gh $branch).Sha -ceq $foreign) 'гейт должен сохранить постороннюю ветку'
+            $refs = Read-GhFakeRefs $gh
+            $refs.Remove($branch)
+            Save-GhFakeRefs $gh $refs
+            $run = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{dumps=$dumps} -Com $null
+            Check-DeliveryCommon $run
+            $state = @(Get-DeliveryStates $sb)[0]
+            Check ($run.ExitCode -eq 0 -and $state.verdict -eq 'GREEN') ("загрузка после ответа: " + ($run.Output | Select-Object -Last 5))
+            Check (@((Get-DPulls $sb) | Where-Object { $_ -match 'delivery/' }).Count -eq 1) 'должен быть один PR поставки'
+            # Ответ GitHub дошёл, а локальная запись PR потеряна: продолжаем уже слитый PR.
+            $saved = Join-Path $sb ('deliveries\' + $state.id + '\state.json')
+            $state.status = 'received'
+            $state.verdict = ''
+            $state.pr = $null
+            $state.ci = $null
+            $state.merged = $null
+            [IO.File]::WriteAllText($saved,($state | ConvertTo-Json -Depth 20),$utf8Bom)
+            $dumps = New-DDumps -Ext (Get-DMainExt $gh)
+            $resumed = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{dumps=$dumps} -Com $null
+            $state = @(Get-DeliveryStates $sb)[0]
+            Check ($resumed.ExitCode -eq 0 -and $state.verdict -eq 'GREEN') ('сбой восстановления: ' + ($resumed.Output | Select-Object -Last 5))
+            Check (@((Get-DPulls $sb) | Where-Object { $_ -match 'delivery/' }).Count -eq 1) 'повторный PR после слияния'
+        }
+    }
+    # ** Хлебников С.Ю. 20261123 конец
     @{
         Name = 'delivery-cfe-first'
         Text = 'Приёмка: первый CFE без истории. Правка temp (новый реквизит) - штатно PR и слиянием по CI; реквизит сохранён, замена процедуры - один вопрос с разницей, новая функция принята; кандидат - PR, CI, merge_checked по точному SHA, загрузка этого SHA, GREEN. Тот же файл под другим именем - повторная подача без PR; поставка из «Входящих» прямой загрузкой не берётся. Следующая поставка с другими процедурами - без вопросов: изменение подрядчика принято, отклонённое не вернулось, наш реквизит цел. Старый файл с другим номером версии - нового нет, без PR и загрузки.'

@@ -2,8 +2,9 @@
 # Проверка скриптов гейта самим PowerShell: разбор без запуска. Ничего не запускает и в базы не ходит.
 # Запуск: .\check.cmd в папке C:\ci после распаковки архива.
 $ErrorActionPreference = 'Stop'
+# ** Хлебников С.Ю. 20261123 Скрипты протокола и исполнителя входят в проверку сборки.
 $failed = 0
-foreach ($name in @('run.ps1', 'report.ps1', 'deploy.ps1', 'nightly.ps1', 'ui.ps1', 'stats.ps1', 'settings.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'delivery.ps1', 'cluster-target.ps1', 'canary-users.ps1', 'locks.ps1', 'post-update.ps1', 'timeline.ps1', 'selfcheck-compare.ps1', 'test\tests.ps1', 'test\fakecom.ps1', 'test\deploy-contract.tests.ps1', 'test\delivery.tests.ps1')) {
+foreach ($name in @('run.ps1', 'report.ps1', 'deploy.ps1', 'nightly.ps1', 'ui.ps1', 'stats.ps1', 'settings.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'delivery.ps1', 'delivery-parcel.ps1', 'delivery-worker.ps1', 'delivery-designer.ps1', 'delivery-git.ps1', 'cluster-target.ps1', 'canary-users.ps1', 'locks.ps1', 'post-update.ps1', 'timeline.ps1', 'selfcheck-compare.ps1', 'test\tests.ps1', 'test\fakecom.ps1', 'test\deploy-contract.tests.ps1', 'test\delivery.tests.ps1')) {
     $path = Join-Path $PSScriptRoot $name
     if (-not (Test-Path -LiteralPath $path)) { Write-Host ("[----] {0}: нет файла" -f $name) -ForegroundColor Yellow; continue }
     $tokens = $null
