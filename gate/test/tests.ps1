@@ -1474,6 +1474,32 @@ $tests = @(
         }
     },
     @{
+        # ** Хлебников С.Ю. 20261123 Первый и второй начинают с чтений, смешанная группа ждёт.
+        Name = 'gate-selfcheck-lanes-early'
+        Text = 'ранние чтения: два плана совпали, смешанная группа и проведение выполняются первым после чтений'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{SelfCheckWorkers=2; SelfCheckSplitGroup=$laneGroup; SelfCheckEarlyReads=$true}
+            $file = Add-InboxFile $sb $cfeName
+            $tasks = @($laneTasks[0],
+                @{key='КомпиляцияМодулей/Первый'; title='Первый'; step='Модули'; lines=@('[ОК] Первый')},
+                @{key='КомпиляцияМодулей/Второй'; title='Второй'; step='Модули'; lines=@('[ОК] Второй')},
+                @{key='Форма/Смешанная'; title='Смешанная'; step='Смешанная группа'; lines=@('[ОК] Смешанная')},
+                @{key='Сценарии/Запись'; title='Запись'; step='Смешанная группа'; lines=@('[ОК] Запись')}) + @($laneTasks[1..5])
+            $fake = @{selfcheck=@(@{tasks=$tasks},@{tasks=$tasks;fingerprint='после'})}
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $r; Check-Verdict $r 'GREEN' 0
+            Check ((Get-Calls $r @('selfcheck','worker=2','earlyreads=1')).Count -eq 2) 'второму не передан режим ранних чтений'
+            $first = @(Get-Content -Encoding UTF8 -LiteralPath (Join-Path $r.RunDir 'selfcheck-after\w1-try1\plan.txt'))
+            $second = @(Get-Content -Encoding UTF8 -LiteralPath (Join-Path $r.RunDir 'selfcheck-after\w2-try1\plan.txt'))
+            Check (($first -join '|') -ceq ($second -join '|') -and $first.Count -eq 10) 'планы исполнителей различаются'
+            $sep = [char]9
+            Check ($first[1].Split($sep)[1] -eq '2' -and $first[1].EndsWith('КомпиляцияМодулей/Второй')) 'второму не назначена ранняя компиляция'
+            Check (@($first[6..9] | Where-Object { $_.Split($sep)[1] -ne '1' }).Count -eq 0) 'смешанная группа ушла второму'
+            Check ($first[7].EndsWith('Форма/Смешанная') -and $first[9].Contains('ПерепроведениеДокументов/')) 'нарушен порядок последовательных заданий'
+        }
+    },
+    @{
         # ** Хлебников С.Ю. 20261120
         Name = 'gate-selfcheck-lanes-crash'
         Text = 'два исполнителя, второй оборвался после первого задания: задание, на котором он оборвался, - ошибка, его невыполненное задание названо в итоге шага, первый дождался и закончил, вердикт не зелёный'
