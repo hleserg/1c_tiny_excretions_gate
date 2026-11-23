@@ -5523,6 +5523,8 @@ function Add-CheckStep {
     [System.IO.File]::WriteAllLines((Join-Path $RunDir ($FileKey + '.norm.txt')), [string[]]$records, $Utf8Bom)
 
     $comparison = Compare-WithBaseline -Current $records -BaselineFile (Join-Path $baselineDir ($FileKey + '.norm.txt'))
+    # Сохраняем и пустую разницу: другой локальный эталон не должен менять отчёт по архиву.
+    [System.IO.File]::WriteAllLines((Join-Path $RunDir ($FileKey + '.missing.txt')), [string[]]$comparison.Missing, $Utf8Bom)
 
     if (-not $comparison.HasBaseline) {
         if ($records.Count -eq 0) {
@@ -5551,7 +5553,6 @@ function Add-CheckStep {
         $absent = $comparison.Missing.Count - $filtered.Count
         if ($filtered.Count -gt 0) { $tail += (", исключено фильтром: {0}" -f $filtered.Count) }
         if ($absent -gt 0) { $tail += (", больше нет в журнале: {0}" -f $absent) }
-        [System.IO.File]::WriteAllLines((Join-Path $RunDir ($FileKey + '.missing.txt')), [string[]]$comparison.Missing, $Utf8Bom)
     }
 
     if ($comparison.NewLines.Count -eq 0) {
@@ -8262,6 +8263,8 @@ else {
             Copy-Item -LiteralPath $selfCheckReferenceFile -Destination $referenceCopyDir -Force
         }
         $comparison = Compare-SelfCheck -Current $after.Records -ReferenceFile $selfCheckReferenceFile
+        # Сохраняем и пустую разницу: другой локальный эталон не должен менять отчёт по архиву.
+        [System.IO.File]::WriteAllLines((Join-Path $RunDir 'selfcheck-after.gone-ok.txt'), [string[]]$comparison.GoneOkRecords, $Utf8Bom)
         $newAll = @($comparison.NewErrors) + @($comparison.NewWarnings) + @($comparison.NewSkips)
         if ($newAll.Count -gt 0) {
             [System.IO.File]::WriteAllLines((Join-Path $RunDir 'selfcheck-after.new.txt'), [string[]]$newAll, $Utf8Bom)
@@ -8310,7 +8313,6 @@ else {
             $detail = "новых ошибок: {0}, новых предупреждений: {1}, новых пропусков: {2}; известных ошибок: {3}" -f $comparison.NewErrors.Count, $comparison.NewWarnings.Count, $comparison.NewSkips.Count, $knownErrors
             if ($comparison.FixedErrors -gt 0) { $detail += (", ошибок эталона, которых больше нет: {0}" -f $comparison.FixedErrors) }
             if ($comparison.GoneOk -gt 0) {
-                [System.IO.File]::WriteAllLines((Join-Path $RunDir 'selfcheck-after.gone-ok.txt'), [string[]]$comparison.GoneOkRecords, $Utf8Bom)
                 $detail += (", проверок «ОК» из эталона, которых больше нет: {0} (selfcheck-after.gone-ok.txt)" -f $comparison.GoneOk)
             }
             $detail += ('; ' + $tail)

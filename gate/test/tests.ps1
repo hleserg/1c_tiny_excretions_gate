@@ -818,6 +818,16 @@ $tests = @(
             [IO.File]::WriteAllText((Join-Path $dir 'selfcheck-after.norm.txt'), '', $utf8Bom)
             & $scriptPath -RunDir $dir -Quiet
             Check ([IO.File]::ReadAllText((Join-Path $dir 'report.txt')).Contains($lost)) 'пропал ОК при пустом результате завершённой проверки'
+            $later = Join-Path $sb 'baseline/unit'
+            $null = New-Item -ItemType Directory -Path $later -Force
+            [IO.File]::WriteAllText((Join-Path $later 'checkconfig.norm.txt'), $filtered, $utf8Bom)
+            [IO.File]::WriteAllText((Join-Path $later 'selfcheck.norm.txt'), $lost, $utf8Bom)
+            [IO.File]::WriteAllText((Join-Path $dir 'checkconfig.missing.txt'), '', $utf8Bom)
+            [IO.File]::WriteAllText((Join-Path $dir 'selfcheck-after.gone-ok.txt'), '', $utf8Bom)
+            & $scriptPath -RunDir $dir -Quiet
+            $result = [IO.File]::ReadAllText((Join-Path $dir 'report.txt'))
+            Check (-not $result.Contains($lost) -and -not $result.Contains('Исключено фильтром: ')) 'поздний эталон изменил пустую разницу архива'
+            [IO.File]::WriteAllText((Join-Path $dir 'checkconfig.missing.txt'), $filtered, $utf8Bom)
             Remove-Item -LiteralPath (Join-Path $dir 'checkconfig.norm.txt')
             & $scriptPath -RunDir $dir -Quiet
             Check (-not [IO.File]::ReadAllText((Join-Path $dir 'report.txt')).Contains('Исключено фильтром: ')) 'сравнили незавершённую проверку'

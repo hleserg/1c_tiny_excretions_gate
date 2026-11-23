@@ -464,7 +464,7 @@ if (-not (Test-Path -LiteralPath $referenceDir)) {
     $baselineName = $baseKey
     if (-not $baselineName) { $baselineName = '_' }
     $referenceDir = Join-Path (Join-Path (Split-Path -Parent (Split-Path -Parent $RunDir)) 'baseline') $baselineName
-    $referenceNote = 'Копии эталона на момент прогона в папке нет (прогон старой версии гейта): исправленное считается по нынешнему эталону базы.'
+    $referenceNote = 'В папке нет копии эталона. Отчёт использует сохранённые разницы прогона. Если разница не сохранена, для сравнения берётся доступный локальный эталон базы.'
 }
 
 $summary = New-Object System.Collections.Generic.List[string]
