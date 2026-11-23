@@ -813,6 +813,11 @@ $tests = @(
                 Check ($result.Contains('новых ошибок 0, известных 1') -and $result.Contains('Известная: Печать ::')) 'в коротком итоге нет известной ошибки'
                 Check ($result.Contains($lost)) 'не виден ключ пропавшей записи ОК'
             }
+            $step.detail = 'новых ошибок: 0, новых предупреждений: 0, новых пропусков: 0; известных ошибок: 0'
+            [IO.File]::WriteAllText((Join-Path $dir 'verdict.json'), ($meta | ConvertTo-Json -Depth 5), $utf8Bom)
+            [IO.File]::WriteAllText((Join-Path $dir 'selfcheck-after.norm.txt'), '', $utf8Bom)
+            & $scriptPath -RunDir $dir -Quiet
+            Check ([IO.File]::ReadAllText((Join-Path $dir 'report.txt')).Contains($lost)) 'пропал ОК при пустом результате завершённой проверки'
             Remove-Item -LiteralPath (Join-Path $dir 'checkconfig.norm.txt')
             & $scriptPath -RunDir $dir -Quiet
             Check (-not [IO.File]::ReadAllText((Join-Path $dir 'report.txt')).Contains('Исключено фильтром: ')) 'сравнили незавершённую проверку'

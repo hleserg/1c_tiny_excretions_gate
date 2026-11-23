@@ -690,12 +690,14 @@ foreach ($logFile in @(Get-ChildItem -LiteralPath $RunDir -Filter 'check*.log' -
 
 # Самопроверка.
 $knownErrorsNow = @()
-if ($afterRecords.Count -gt 0 -or $newSelfCheck.Count -gt 0) {
+$goneOkPath = Join-Path $RunDir 'selfcheck-after.gone-ok.txt'
+$hasSelfCheckRecords = Test-Path -LiteralPath (Join-Path $RunDir 'selfcheck-after.norm.txt') -PathType Leaf
+$comparisonRecorded = @($steps | Where-Object { (Get-JsonProperty $_ 'detail' '') -match '^новых ошибок: [0-9]+, новых предупреждений:' }).Count -gt 0
+if ($afterRecords.Count -gt 0 -or $newSelfCheck.Count -gt 0 -or ($hasSelfCheckRecords -and $comparisonRecorded)) {
     $referenceSelfCheck = @(Read-RecordSet (Join-Path $referenceDir 'selfcheck.norm.txt'))
-    $goneOkPath = Join-Path $RunDir 'selfcheck-after.gone-ok.txt'
     $goneOk = @(Read-RecordSet $goneOkPath)
     $fixed = @()
-    if ($referenceSelfCheck.Count -gt 0 -and $afterRecords.Count -gt 0) {
+    if ($referenceSelfCheck.Count -gt 0 -and $hasSelfCheckRecords -and ($afterRecords.Count -gt 0 -or $comparisonRecorded)) {
         $currentSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
         foreach ($record in $afterRecords) { [void]$currentSet.Add((Format-SelfCheckText $record)) }
         if (-not (Test-Path -LiteralPath $goneOkPath)) {
@@ -705,8 +707,7 @@ if ($afterRecords.Count -gt 0 -or $newSelfCheck.Count -gt 0) {
     }
     $errors = @($newSelfCheck | Where-Object { $_.StartsWith('[ОШИБКА]') })
     $others = @($newSelfCheck | Where-Object { -not $_.StartsWith('[ОШИБКА]') })
-    $comparisonRecorded = @($steps | Where-Object { (Get-JsonProperty $_ 'detail' '') -match '^новых ошибок: [0-9]+, новых предупреждений:' }).Count -gt 0
-    if ($referenceSelfCheck.Count -gt 0 -or $comparisonRecorded) {
+    if ($hasSelfCheckRecords -and ($referenceSelfCheck.Count -gt 0 -or $comparisonRecorded)) {
         $newErrorSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
         foreach ($record in $errors) { [void]$newErrorSet.Add($record) }
         $knownErrorsNow = @($afterRecords | Where-Object { $_.StartsWith('[ОШИБКА]') -and -not $newErrorSet.Contains($_) })
@@ -724,7 +725,7 @@ if ($afterRecords.Count -gt 0 -or $newSelfCheck.Count -gt 0) {
     }
     if ($newSelfCheck.Count -gt 0 -or $fixed.Count -gt 0) {
         $comparedSomething = $true
-        $body.Add(("== Самопроверка: новых ошибок {0}, новых предупреждений и пропусков {1}, исправлено ошибок {2}" -f $errors.Count, $others.Count, $fixed.Count))
+        $body.Add(("== Самопроверка: новых ошибок {0}, новых предупреждений и пропусков {1}, ошибок эталона, которых больше нет в результатах: {2}" -f $errors.Count, $others.Count, $fixed.Count))
         if ($newSelfCheck.Count -gt 0) {
             $mark = 'ЖЁЛТ'
             if ($errors.Count -gt 0) { $mark = 'КРАСН' }
@@ -771,7 +772,7 @@ if ($afterRecords.Count -gt 0 -or $newSelfCheck.Count -gt 0) {
             if ($others.Count -gt 10) { $body.Add(("     и ещё {0} - в selfcheck-after.new.txt" -f ($others.Count - 10))) }
         }
         if ($fixed.Count -gt 0) {
-            $body.Add('  Исправлено (ошибка была в эталоне, теперь нет):')
+            $body.Add('  Ошибки эталона, которые не встретились в этом прогоне:')
             foreach ($record in @($fixed | Select-Object -First 10)) {
                 $info = ConvertFrom-SelfCheckRecord $record
                 if ($null -eq $info) { $body.Add(('     ' + (Format-Short $record 200))) } else { $body.Add(('     ' + $info.Key)) }

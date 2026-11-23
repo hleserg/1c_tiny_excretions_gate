@@ -490,6 +490,7 @@ function Compare-WithBaseline {
         HasBaseline = $hasBaseline
         NewLines    = $new.ToArray()
         KnownCount  = $known.Count
+        GoneCount   = $missing.Count
         Missing     = @($missing)
     }
 }
@@ -919,7 +920,8 @@ function Compare-SelfCheck {
         NewSkips     = $newSkips.ToArray()
         ErrorsTotal  = $errorsTotal
         FixedErrors  = $fixedErrors
-        GoneOk       = @($goneOk)
+        GoneOk       = $goneOk.Count
+        GoneOkRecords = @($goneOk)
     }
 }
 
@@ -8307,9 +8309,9 @@ else {
             $knownErrors = $comparison.ErrorsTotal - $comparison.NewErrors.Count
             $detail = "новых ошибок: {0}, новых предупреждений: {1}, новых пропусков: {2}; известных ошибок: {3}" -f $comparison.NewErrors.Count, $comparison.NewWarnings.Count, $comparison.NewSkips.Count, $knownErrors
             if ($comparison.FixedErrors -gt 0) { $detail += (", ошибок эталона, которых больше нет: {0}" -f $comparison.FixedErrors) }
-            if ($comparison.GoneOk.Count -gt 0) {
-                [System.IO.File]::WriteAllLines((Join-Path $RunDir 'selfcheck-after.gone-ok.txt'), [string[]]$comparison.GoneOk, $Utf8Bom)
-                $detail += (", проверок «ОК» из эталона, которых больше нет: {0} (selfcheck-after.gone-ok.txt)" -f $comparison.GoneOk.Count)
+            if ($comparison.GoneOk -gt 0) {
+                [System.IO.File]::WriteAllLines((Join-Path $RunDir 'selfcheck-after.gone-ok.txt'), [string[]]$comparison.GoneOkRecords, $Utf8Bom)
+                $detail += (", проверок «ОК» из эталона, которых больше нет: {0} (selfcheck-after.gone-ok.txt)" -f $comparison.GoneOk)
             }
             $detail += ('; ' + $tail)
             if ($newAll.Count -gt 0) {
