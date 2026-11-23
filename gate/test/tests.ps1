@@ -4782,7 +4782,7 @@ $tests = @(
         }
     },
     @{
-        Name = 'gate-priority-canary-order'
+        Name = 'review-gate-priority-canary-order'
         Text = 'именованные входы площадки идут раньше локальных; пароль и доменный токен выбираются по профилю'
         Run = {
             param($Name)
@@ -4792,7 +4792,7 @@ $tests = @(
                 @{ Name = 'Основной'; WindowsAccount = [Security.Principal.WindowsIdentity]::GetCurrent().Name }
             )
             [IO.File]::WriteAllText((Join-Path $sb 'config.site.psd1'), (ConvertTo-Psd1 @{ PriorityCanaryUsers = $users }), $utf8Bom)
-            $secret = 'test"tail\'
+            $secret = 'test"CanarySecretMarker93\'
             ConvertTo-SecureString $secret -AsPlainText -Force | ConvertFrom-SecureString | Set-Content -LiteralPath (Join-Path $sb 'reader.txt')
             $fake = @{ canary = @(@{ status = 'ok'; user = 'Читатель' }, @{ status = 'ok'; user = 'Основной' }, @{ status = 'ok' }) }
             $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake $fake
@@ -4806,11 +4806,11 @@ $tests = @(
             }
             Check-Step $r 'Канареечный вход: Читатель' 'OK'
             Check-Step $r 'Канареечный вход: Основной' 'OK'
-            Check (-not [IO.File]::ReadAllText((Join-Path $r.RunDir 'run.log')).Contains('tail')) 'часть пароля попала в журнал'
+            Check (-not [IO.File]::ReadAllText((Join-Path $r.RunDir 'run.log')).Contains('CanarySecretMarker93')) 'часть пароля попала в журнал'
         }
     },
     @{
-        Name = 'gate-priority-canary-identity'
+        Name = 'review-gate-priority-canary-identity'
         Text = 'необязательный без пароля пропущен, отсутствующее и чужое имя ИБ не подтверждают вход'
         Run = {
             param($Name)
@@ -4832,7 +4832,7 @@ $tests = @(
         }
     },
     @{
-        Name = 'deploy-priority-canary'
+        Name = 'review-deploy-priority-canary'
         Text = 'лёгкий прогон сверяет имя ИБ; после открытия базы проверяет обязательный профиль без кода'
         Run = {
             param($Name)
