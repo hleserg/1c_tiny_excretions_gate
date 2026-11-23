@@ -716,7 +716,8 @@ if ($afterRecords.Count -gt 0 -or $newSelfCheck.Count -gt 0) {
         }
     }
     if ($goneOk.Count -gt 0) {
-        $summary.Add(('Самопроверка: записей «ОК» из эталона, которых больше нет: {0}. Перечень ниже.' -f $goneOk.Count))
+        $sampleKeys = @($goneOk | ForEach-Object { ($_ -split ' :: ', 2)[0] -replace '^\[ОК\] ', '' } | Select-Object -Unique -First 3)
+        $summary.Add(('Самопроверка: записей «ОК» из эталона, которых больше нет: {0}. Ключи: {1}. Полный перечень ниже.' -f $goneOk.Count, ($sampleKeys -join ', ')))
         $body.Add('== Самопроверка: пропавшие записи «ОК» (ключ и прежний результат)')
         foreach ($record in $goneOk) { $body.Add(('  ' + $record)) }
         $body.Add('')
