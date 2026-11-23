@@ -3127,6 +3127,65 @@ $tests = @(
             Check (@($r.Output | Where-Object { $_ -match 'НЕ СРАВНИЛИСЬ' }).Count -eq 0) 'после закрытия конфигуратора сравнение всё равно не прошло'
         }
     },
+    # ** Хлебников С.Ю. 20261124 Более свежая рабочая версия, неоднозначная карточка и окно площадки.
+    @{
+        Name = 'deploy-vendor-processing'
+        Text = 'файл поставщика обновляется по числовой версии, сохраняется более новая версия и учитывается окно площадки'
+        Run = {
+            param($Name)
+            $module = New-ContractDeployModule
+            $sb = New-Sandbox $Name -Config @{ DeployDeniedFrom = 2; DeployDeniedTo = 22 }
+            [IO.File]::WriteAllText((Join-Path $sb 'config.site.psd1'), '@{DeployDeniedFrom=6; DeployDeniedTo=22; DeployWindowFromSite=$true}', $utf8Bom)
+            & $module {
+                param($Root)
+                function Write-Line { param($Text, $Color) }
+                $vendorProcessings = @('Образец')
+                $retainedVendorProcessings = @{}
+                $candidate = [pscustomobject]@{ ObjName='Образец'; Version='4.9.1'; Title='Образец'; File='Образец.epf'; Hash='a' }
+                $live = [pscustomobject]@{ ObjName='Образец'; Version='4.10'; Title='Образец'; File='Образец.epf'; Hash='b' }
+                $temp = @{Items=@($candidate)}
+                $prod = @{Items=@($live)}
+                if ((Compare-Processings $temp $prod).Count -ne 0) { throw 'план понижает рабочую версию' }
+                $live.Version = '4.9.1.0'
+                if ((Compare-Processings $temp $prod).Count -ne 1) { throw 'пропущен другой файл той же версии' }
+                $live.Version = '4.8'
+                if ((Compare-Processings $temp $prod)[0].TempHash -ne 'a') { throw 'утерян хеш оригинала' }
+                $live.Version = 'версия неизвестна'
+                $reason = ''
+                try { $null = Compare-Processings $temp $prod } catch { $reason = $_.Exception.Message }
+                if ($reason -notlike '*не удалось сравнить*') { throw 'неизвестная версия разрешена' }
+                $prod.Items = @($live,$live)
+                $reason = ''
+                try { $null = Compare-Processings $temp $prod } catch { $reason = $_.Exception.Message }
+                if ($reason -notlike '*несколько карточек*') { throw 'неоднозначная карточка разрешена' }
+                # Проверяем пакет для настоящего клиента. Старая обработка не увидит обычного file=.
+                function Get-BaseInfo { }
+                function Get-Setting($Map,$Key,$Default) { if ($Map.ContainsKey($Key)) { return $Map[$Key] }; return $Default }
+                function Invoke-ProdClient { param($Epf,$Parameter,$DoneFile,$TimeoutSec,$Title)
+                    if ($Parameter -notmatch ';guardfile=4\.8\|([^;]+)' -or $Parameter -match ';file=') { throw 'регистрация без защиты' }
+                    if ([IO.File]::ReadAllText($Matches[1]) -cne 'AQID') { throw 'исходные байты изменились' }
+                    return @{Done=$true;Seconds=1}
+                }
+                $file = Join-Path $Root 'Образец.epf'
+                [IO.File]::WriteAllBytes($file,[byte[]](1,2,3))
+                $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+                $out = Join-Path $Root 'guarded'
+                $null = Invoke-ProdProcessing -Mode regepf -OutDir $out -File $file -Name 'Образец.epf' -GuardVersion '4.8' -ExpectedHash $hash
+                $reason = ''
+                try { $null = Invoke-ProdProcessing -Mode regepf -OutDir $out -File $file -Name 'Образец.epf' -GuardVersion '4.8' -ExpectedHash ('0'*64) } catch { $reason = $_.Exception.Message }
+                if ($reason -notlike '*файл изменился*') { throw 'подмена файла поставщика разрешена' }
+                $configPath = Join-Path $Root 'config.psd1'
+                $profile = Read-DeployConfig
+                $deniedFrom = $profile.DeployDeniedFrom
+                $deniedTo = $profile.DeployDeniedTo
+                if ((Test-DeployHourDenied ([datetime]'2026-11-24 05:59')) -or
+                    -not (Test-DeployHourDenied ([datetime]'2026-11-24 06:00')) -or
+                    -not (Test-DeployHourDenied ([datetime]'2026-11-24 21:59')) -or
+                    (Test-DeployHourDenied ([datetime]'2026-11-24 22:00'))) { throw 'ошибка границ окна' }
+            } $sb
+        }
+    },
+    # ** Хлебников С.Ю. 20261124 конец
     @{
         Name = 'deploy-epf-only'
         Text = 'только внешние обработки: новая обработка записана, блокировок нет, чужая блокировка регламентных заданий не снята'
@@ -4023,6 +4082,37 @@ $tests = @(
             Check (@($load.Output | Where-Object { $_ -match 'теперь на main' }).Count -eq 1) 'не сказано, что temp на main'
         }
     },
+    # ** Хлебников С.Ю. 20261124 Совпавший оригинальный EPF не пересобирается даже при отличающихся файлах форм.
+    @{
+        Name = 'git-import-vendor-processing'
+        Text = 'загрузка из git оставляет исходный файл поставщика по SHA и останавливается без оригинала'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name -Extra @{VendorProcessings=@('Печать')}
+            $gh = Get-FakeGh $sb
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '4.71.1' $printOld))
+            $fake = @{dumps=(New-GitDumps)}
+            $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake $fake -Com $com -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            $snapshot = (Read-GitStateFile $sb).pendingCommit
+            $form = [pscustomobject]@{Path='processings/Печать/Печать/Forms/Проверочная/Ext/Form.bin'; Bytes=[byte[]](1,2,3)}
+            $head = New-GhCommit -Gh $gh -Parent $snapshot -Changes @($form) -Message 'иной вывод формы'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $head
+            $load = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake $fake -Com $com
+            Check ($load.ExitCode -eq 0 -and ($load.Output -match 'загружать нечего')) 'совпадающий EPF был предложен к пересборке'
+            $files = Get-GhFiles -Gh $gh -Commit $head
+            $old = $utf8.GetString((Get-GhBlob -Gh $gh -Sha $files['processings/manifest.json']))
+            $other = $old -replace 'sha256:[0-9a-fA-F]{64}', ('sha256:' + ('0' * 64))
+            Check ($other -ne $old) 'в исходном манифесте нет SHA-256'
+            $manifest = [pscustomobject]@{Path='processings/manifest.json'; Bytes=$utf8.GetBytes($other)}
+            $next = New-GhCommit -Gh $gh -Parent $head -Changes @($manifest) -Message 'другой оригинал'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $next
+            $bad = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake $fake -Com $com -Answers @(
+                @{Kind='one'; Header='правки после прошлой загрузки'; Item='Загрузить main всё равно'})
+            Check (($bad.Output -match 'Нужен оригинал в binaries') -and $bad.ExitCode -ne 0) 'без оригинального файла началась сборка'
+        }
+    },
+    # ** Хлебников С.Ю. 20261124 конец
     @{
         Name = 'git-import-actions'
         Text = '«Загрузить из git» и действия после обновления (actions/*.bsl в main): только новые действия - прогон без комплекта с -ActionsDir и -KitBranch, выполненные - в state.json, повтор - «загружать нечего»; с правкой расширения - действия папкой actions в комплекте, все; упавшее не записано выполненным и запускается следующей загрузкой'
