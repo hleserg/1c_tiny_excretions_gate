@@ -92,6 +92,46 @@ function New-ActionsKit {
 }
 
 @(
+    # ** Хлебников С.Ю. 20261124 Кластер может вернуть закрывающийся сеанс после успешного TerminateSession.
+    @{
+        Name = 'deploy-contract-session-drain'
+        Text = 'Ожидание пустого списка, диагностика ошибки чтения и оставшейся консоли'
+        Run = {
+            $catalog = [pscustomobject]@{ Name = 'prod'; HostName = 'fake'; ClusterId = [guid]::NewGuid(); BaseId = [guid]::NewGuid() }
+            $link = New-ContractCatalogLink @($catalog)
+            $module = New-ContractDeployModule
+            & $module {
+                param($Link)
+                function Write-Line { param($Text, $Color) }
+                $script:ProdBase = 'prod'; $script:ProdUser = ''; $script:ProdPassword = ''
+                $prepLink = $Link; $deployLink = $Link; $script:WarnLink = $null
+                $before = Get-SessionTarget $Link $script:ProdBase
+                $address = Get-ProdSessionAddress $Link
+                if ($null -ne $before.Process -or $null -ne $before.InfoBase -or $Link.Targets.ContainsKey('prod')) { throw 'соединение консоли осталось открытым' }
+                $Link.Agent | Add-Member NoteProperty Reads 0
+                $Link.Agent | Add-Member NoteProperty Scenario 'delayed'
+                $Link.Agent | Add-Member ScriptMethod GetInfoBaseSessions {
+                    param($Cluster, $ShortBase)
+                    if ($ShortBase.UUID -ne $this.Catalogs[0].BaseId) { throw 'другая база' }
+                    $this.Reads++
+                    if ($this.Scenario -eq 'error') { throw 'fixture-agent-failure' }
+                    if ($this.Scenario -eq 'stuck' -or $this.Reads -le 2) {
+                        return [pscustomobject]@{ SessionID=51; AppID='COMConsole'; StartedAt='03:19'; userName='fixture'; Host='host01' }
+                    }
+                } -Force
+                Wait-DeploySessions $Link 'prod' $address 8
+                if ($Link.Agent.Reads -ne 3 -or $Link.Targets.ContainsKey('prod')) { throw 'ожидание не подтвердило освобождение базы через агент' }
+                foreach ($case in 'stuck','error') {
+                    $Link.Agent.Scenario = $case
+                    $message = ''
+                    try { Wait-DeploySessions $Link 'prod' $address 0 } catch { $message = $_.Exception.Message }
+                    if ($case -eq 'error' -and $message -notmatch 'fixture-agent-failure') { throw 'потеряна причина ошибки чтения' }
+                    if ($case -eq 'stuck' -and $message -notmatch '51.+COMConsole.+host01') { throw 'потеряны данные оставшегося сеанса' }
+                }
+            } $link
+        }
+    },
+    # ** Хлебников С.Ю. 20261124 конец
     @{
         Name = 'deploy-contract-prepared-profile'
         Text = 'чужой профиль не передаёт подготовку на отмену и сохраняет исходный манифест'
