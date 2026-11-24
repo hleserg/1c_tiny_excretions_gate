@@ -4363,6 +4363,51 @@ $tests = @(
             Check (@($load.Output | Where-Object { $_ -match 'теперь на main' }).Count -eq 1) 'не сказано, что temp на main'
         }
     },
+    @{
+        Name = 'git-import-xml-roundtrip'
+        Text = 'Повторная выгрузка XML проходит без PR. Изменённые типы и реквизиты сохраняются, принудительная загрузка снимает ожидание PR.'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
+            $dumps = New-GitDumps
+            $files = $dumps['Адаптация']
+            $form = 'Catalogs/Items/Forms/List/Ext/Form.xml'
+            $criterion = 'FilterCriteria/Links.xml'
+            $document = 'Documents/Order.xml'
+            $files[$form] = '<Form xmlns="http://v8.1c.ru/8.3/xcf/logform"><AutoCommandBar/><BaseForm><AutoCommandBar/></BaseForm></Form>'
+            $files[$criterion] = '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core"><FilterCriterion><Properties><Type><v8:Type>A</v8:Type><v8:Type>B</v8:Type></Type></Properties></FilterCriterion></MetaDataObject>'
+            $files[$document] = '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:r="http://v8.1c.ru/8.3/xcf/readable"><Document><InternalInfo><r:GeneratedType/></InternalInfo><Properties><ObjectBelonging>Adopted</ObjectBelonging></Properties></Document></MetaDataObject>'
+            $files['Documents/Order/Ext/ObjectModule.bsl'] = 'Процедура Обработчик() КонецПроцедуры'
+            $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{dumps=$dumps} -Com $com -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            $head = (Read-GitStateFile $sb).pendingCommit
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $head
+            [IO.File]::WriteAllText((Join-Path $sb 'run.ps1'), $gitRunStub, $utf8Bom)
+            $files[$form] = $files[$form].Replace('<AutoCommandBar/>','<AutoCommandBar/><Attributes/>')
+            $files[$criterion] = $files[$criterion].Replace('>A<','>TEMP<').Replace('>B<','>A<').Replace('>TEMP<','>B<')
+            $files[$document] = $files[$document].Replace('</InternalInfo>','<r:PropertyState><r:Property>ObjectModule</r:Property><r:State>Extended</r:State></r:PropertyState></InternalInfo>')
+            $same = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport -GitUnattended' -Fake @{dumps=$dumps} -Com $com
+            Check ($same.ExitCode -eq 0 -and ($same.Output -match 'загружать нечего')) 'служебный XML вызвал PR или повторную загрузку'
+            $unchanged = $files[$criterion]
+            $files[$criterion] = $unchanged.Replace('>B<','>C<')
+            $files[$form] = $files[$form].Replace('<Attributes/>','<Attributes><Attribute name="Item"/></Attributes>')
+            $changed = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport -GitUnattended' -Fake @{dumps=$dumps} -Com $com
+            $pending = (Read-GitStateFile $sb).pendingCommit
+            Check ($changed.ExitCode -eq 0 -and $pending -and $pending -ne $head) 'реальные изменения не попали в PR'
+            Check (($changed.Output -match [regex]::Escape($form)) -and ($changed.Output -match [regex]::Escape($criterion))) 'правки реквизита и типа не указаны вместе'
+            Check (-not ($changed.Output -match [regex]::Escape('~ extensions/Адаптация/' + $document))) 'с реальными правками в PR вернулся служебный маркер'
+            $cancel = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{dumps=$dumps} -Com $com -Answers @(
+                @{Kind='one'; Header='ещё не в main'; Item='Отмена'})
+            Check ($cancel.ExitCode -eq 0 -and (Read-GitStateFile $sb).pendingCommit -eq $pending) 'отмена сняла ожидание PR'
+            $load = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{dumps=$dumps} -Com $com -Answers @(
+                @{Kind='one'; Header='ещё не в main'; Item='Загрузить main всё равно'},
+                @{Kind='confirm'; Header='Загрузить в erp_temp_test из main'; Yes=$true})
+            $state = Read-GitStateFile $sb
+            Check ($load.ExitCode -eq 0 -and $state.commit -eq $head -and -not $state.pendingCommit) 'после загрузки main гейт продолжает ждать PR'
+        }
+    },
     # ** Хлебников С.Ю. 20261124 Совпавший оригинальный EPF не пересобирается даже при отличающихся файлах форм.
     @{
         Name = 'git-import-vendor-processing'
