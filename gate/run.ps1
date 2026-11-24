@@ -3097,6 +3097,11 @@ function Resolve-ResumeKitSource {
     if ($path -and (Test-Path -LiteralPath $path)) { $current = $path }
     elseif ($inboxItem -and $path -and $path.StartsWith($inboxItem, [System.StringComparison]::OrdinalIgnoreCase)) {
         $moved = Join-Path (Join-Path $PrevDir 'inbox') ((Split-Path -Leaf $inboxItem) + $path.Substring($inboxItem.Length))
+        $ref = [string](Get-UiField $Entry 'targetRef' '')
+        if ($Processing -and $ref -match '^[a-fA-F0-9-]{36}$') {
+            $scoped = Join-Path (Join-Path (Join-Path $PrevDir 'inbox') $ref) (Split-Path -Leaf $moved)
+            if (Test-Path -LiteralPath $scoped) { $moved = $scoped }
+        }
         if (Test-Path -LiteralPath $moved) { $current = $moved }
     }
     $kinds = @('cfe', 'files')
@@ -3107,7 +3112,16 @@ function Resolve-ResumeKitSource {
         # ** Хлебников С.Ю. 20261124 Идентичность адресной поставки сохраняется и при повторе.
         $savedRef = [string](Get-UiField $Entry 'targetRef' '')
         $savedGuard = [string](Get-UiField $Entry 'expectedTargetHash' '')
-        if ($savedGuard -and $current -and -not (Test-Path -LiteralPath ($current + '.gate.json'))) { throw ("Утеряна ссылка и условие записи {0}, повторите сравнение" -f $name) }
+        if ($current -and (Test-Path -LiteralPath ($current + '.gate.json'))) {
+            $proof = [IO.File]::ReadAllText($current + '.gate.json') | ConvertFrom-Json
+            $ref = [string](Get-UiField $proof 'ref' '')
+            $guard = [string](Get-UiField $proof 'expectedTargetHash' '')
+            if (($savedRef -and $ref -ne $savedRef) -or ($savedGuard -and ($guard -ne $savedGuard -or [string]$proof.sha256 -ne [string]$Entry.expectSha256))) {
+                throw ("Изменились ссылка, файл или условие записи {0}, повторите сравнение" -f $name)
+            }
+            $savedRef = $ref
+            $savedGuard = $guard
+        } elseif ($savedGuard -and $current) { throw ("Утеряна ссылка и условие записи {0}, повторите сравнение" -f $name) }
         $candidates = @($candidates | Where-Object {
             $proof = $_.Path + '.gate.json'
             $ref = ''
@@ -3479,6 +3493,7 @@ function Set-ResumeKitFields {
             $proc.IsNew = [string](Get-UiField $old 'isNew' 'unknown')
             $proc.Ref = [string](Get-UiField $old 'ref' '')
             $proc.ObjectName = [string](Get-UiField $old 'objectName' '')
+            $proc.AppliedSha256 = [string](Get-UiField $old 'appliedSha256' '')
             $proc | Add-Member -NotePropertyName KeepRoot -NotePropertyValue $true -Force
         }
         if ($script:ResumeRun.Reused.ContainsKey('load')) {
@@ -3503,7 +3518,7 @@ function Save-RunState {
             [ordered]@{
                 name = $_.Name; kind = $_.Kind; path = $_.Path; hash = [string]$_.Hash; inboxItem = [string]$_.InboxItem; file = [string]$_.File
                 fileName = [string]$_.FileName; objectName = [string]$_.ObjectName; ref = [string]$_.Ref; isNew = [string]$_.IsNew
-                targetRef = [string]$_.TargetRef; expectedTargetHash = [string]$_.ExpectedTargetHash; expectSha256 = [string]$_.ExpectSha256
+                targetRef = [string]$_.TargetRef; expectedTargetHash = [string]$_.ExpectedTargetHash; expectSha256 = [string]$_.ExpectSha256; appliedSha256 = [string]$_.AppliedSha256
                 oldVersion = [string]$_.OldVersion; newVersion = [string]$_.NewVersion; oldB64 = [string]$_.OldB64; oldFile = [string]$_.OldFile
                 tried = [bool]$_.Tried; touched = [bool]$_.Touched; loaded = [bool]$_.Loaded
             } })
@@ -6483,13 +6498,22 @@ function Invoke-KitRollback {
             # снимается режимом unregepf - по имени объекта и ссылке элемента вместе, чужой элемент не заденет.
             $proc = $entry.Processing
             $rollbackDir = Join-Path (Get-ProcessingDirectory $proc) 'rollback'
+            $guard = ''
+            if ($proc.ExpectedTargetHash) {
+                $guard = $proc.AppliedSha256
+                if (-not $guard) {
+                    $allDone = $false
+                    $lines.Add(("[FAIL] {0}: нет подтверждения записанного файла, перед откатом нужна сверка" -f $proc.Name))
+                    continue
+                }
+            }
             if ($entry.Action -eq 'epfrestore') {
                 $done = 'прежняя версия записана в справочник'
-                $session = Invoke-ProcessingSession -Mode 'regepf' -OutDir $rollbackDir -TextFile $entry.Backup -Name $proc.FileName -Ref $proc.TargetRef -Title ("Вернуть в справочник прежнюю {0}" -f $proc.Name)
+                $session = Invoke-ProcessingSession -Mode 'regepf' -OutDir $rollbackDir -TextFile $entry.Backup -Name $proc.FileName -Ref $proc.TargetRef -ExpectedTargetHash $guard -Title ("Вернуть в справочник прежнюю {0}" -f $proc.Name)
             }
             else {
                 $done = 'снята из справочника: публикация «Отключена», помечена на удаление'
-                $session = Invoke-ProcessingSession -Mode 'unregepf' -OutDir $rollbackDir -Name $proc.ObjectName -Ref $proc.Ref -Title ("Снять из справочника {0}" -f $proc.Name)
+                $session = Invoke-ProcessingSession -Mode 'unregepf' -OutDir $rollbackDir -Name $proc.ObjectName -Ref $proc.Ref -ExpectedTargetHash $guard -Title ("Снять из справочника {0}" -f $proc.Name)
             }
             if ($session.State -eq 'result' -and $session.Status -eq 'done') {
                 $line = "[OK  ] {0}: {1}" -f $entry.Name, $done
@@ -6876,7 +6900,8 @@ function Invoke-ProcessingSession {
         if ($ExpectedTargetHash) { $launch.Add(("casfile={0}||{1}" -f $ExpectedTargetHash, $newB64)) }
         else { $launch.Add(("file={0}" -f $newB64)) }
     }
-    if ($Ref) { $launch.Add(("ref={0}" -f $Ref)) }
+    if ($Mode -eq 'unregepf' -and $ExpectedTargetHash) { $launch.Add(("casref={0}|{1}" -f $ExpectedTargetHash, $Ref)) }
+    elseif ($Ref) { $launch.Add(("ref={0}" -f $Ref)) }
 
     $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -User $adminUser -Password $adminPassword) + @(
         '/DisableStartupDialogs',
@@ -7099,7 +7124,7 @@ function New-KitProcessing {
         Name = $name; Kind = [string]$Entry.Kind; Path = $path; Xml = $xml; FileName = $fileName; File = $source
         IsReport = $isReport; What = $what; Tried = $false; Touched = $false; Loaded = $false; IsNew = 'unknown'; Ref = ''; ObjectName = ''
         OldVersion = ''; NewVersion = ''; OldB64 = ''; OldFile = ''; InboxItem = (Get-EntryInboxItem $Entry)
-        TargetRef = $targetRef; ExpectSha256 = $expectSha; ExpectedTargetHash = $expectedTargetHash; Registration = ''
+        TargetRef = $targetRef; ExpectSha256 = $expectSha; ExpectedTargetHash = $expectedTargetHash; AppliedSha256 = ''; Registration = ''
     }
 }
 
@@ -7900,7 +7925,9 @@ for ($procIndex = 0; $procIndex -lt $kitProcessings.Count; $procIndex++) {
         }
     }
     $proc.Tried = $true
-    $session = Invoke-ProcessingSession -Mode 'regepf' -OutDir (Join-Path $procDir 'register') -File $proc.File -Name $proc.FileName -Ref $targetRef -Title $registerName -ExpectedTargetHash $proc.ExpectedTargetHash -ExpectedSha256 $proc.ExpectSha256
+    $guard = $proc.ExpectedTargetHash
+    if ($guard -and $proc.AppliedSha256) { $guard = $proc.AppliedSha256 }
+    $session = Invoke-ProcessingSession -Mode 'regepf' -OutDir (Join-Path $procDir 'register') -File $proc.File -Name $proc.FileName -Ref $targetRef -Title $registerName -ExpectedTargetHash $guard -ExpectedSha256 $proc.ExpectSha256
     $values = $session.Values
     $proc.ObjectName = [string](Get-Setting $values 'objname' '')
     $proc.Ref = [string](Get-Setting $values 'ref' '')
@@ -7942,6 +7969,8 @@ for ($procIndex = 0; $procIndex -lt $kitProcessings.Count; $procIndex++) {
         $proceed = $false
         continue
     }
+    # ** Хлебников С.Ю. 20261124 Подтверждённый хеш нужен для повтора и отката под той же блокировкой.
+    if ($session.Status -eq 'done' -and $proc.ExpectedTargetHash -and $proc.Ref -eq $targetRef) { $proc.AppliedSha256 = $proc.ExpectSha256 }
     # Что поменяла запись в карточке (команды, назначение, публикация) - отдельно, для отчёта приёмки (раздел 5.26).
     $registration = @()
     foreach ($pair in @(@('commandsold', 'команды были'), @('commandsnew', 'команды стали'), @('targetsold', 'назначение было'), @('targetsnew', 'назначение стало'), @('publication', 'публикация'), @('targetskept', 'назначение сохранено'))) {
@@ -8771,10 +8800,17 @@ if ($decision -ne 'rolledBack' -and $decision -ne 'rollbackFailed') {
                 $parent = Split-Path -Parent $source
                 # ** Хлебников С.Ю. 20261124 При продолжении из runs применяются те же ссылка и ограничения записи.
                 $proof = $source + '.gate.json'
+                $destination = $movedDir
                 if (Test-Path -LiteralPath $proof -PathType Leaf) {
-                    Copy-Item -LiteralPath $proof -Destination $movedDir -Force -ErrorAction Stop
+                    $target = [IO.File]::ReadAllText($proof) | ConvertFrom-Json
+                    $ref = [string](Get-UiField $target 'ref' '')
+                    if ($ref) {
+                        $destination = Join-Path $movedDir ([guid]::Parse($ref).ToString())
+                        New-Item -ItemType Directory -Path $destination -Force -ErrorAction Stop | Out-Null
+                    }
+                    Copy-Item -LiteralPath $proof -Destination $destination -Force -ErrorAction Stop
                 }
-                Move-Item -LiteralPath $source -Destination $movedDir -Force -ErrorAction Stop
+                Move-Item -LiteralPath $source -Destination $destination -Force -ErrorAction Stop
                 if (Test-Path -LiteralPath $proof -PathType Leaf) { Remove-Item -LiteralPath $proof -ErrorAction Stop }
                 Write-Host ("Перенёс из inbox в папку прогона: {0}" -f $source)
                 Write-RunLog ("Перенесено из inbox: {0}" -f $source)

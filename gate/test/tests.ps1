@@ -1258,6 +1258,31 @@ $tests = @(
             }
         }
     },
+    # ** Хлебников С.Ю. 20261124 Повтор после подтверждённой записи сохраняет исходный откат.
+    @{
+        Name = 'gate-processing-resume-hash'
+        Text = 'Повтор адресной загрузки сверяет ранее записанные байты под блокировкой'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb 'Печать.epf'
+            $ref = '11111111-2222-3333-4444-555555555555'
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            $proof = @{ ref=$ref; sha256=$hash; expectedTargetHash='absent' } | ConvertTo-Json
+            [IO.File]::WriteAllText($file + '.gate.json', $proof, $utf8)
+            $fake = @{ regepf = @(@{ status='done'; isnew='1'; formerror=@('форма не открылась') }) }
+            $first = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake $fake
+            Check-Common $first
+            Check-Verdict $first 'RED' 1
+            Check ((Get-Calls $first @('regepf','casfile=absent||', ('ref=' + $ref))).Count -eq 1) 'новая карточка не защищена'
+            Start-Sleep -Seconds 1
+            $second = Invoke-Script -Sandbox $sb -Arguments '-Resume last -FromStep load -OnNotGreen Keep' -Fake @{ regepf=@(@{status='done'}) }
+            Check-Common $second
+            Check-Verdict $second 'GREEN' 0
+            Check ((Get-Calls $second @('regepf', ('casfile=' + $hash + '||'), ('ref=' + $ref))).Count -eq 1) 'повтор без проверки записанного хеша'
+        }
+    },
+    # ** Хлебников С.Ю. 20261124 конец
     @{
         Name = 'gate-processing-target-rollback'
         Text = 'откат обновления карточки по ref возвращает файл именно в выбранную карточку'
