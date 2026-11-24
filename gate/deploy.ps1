@@ -1576,10 +1576,10 @@ function Export-Processings {
     # с File = ''.
     # Внешнее соединение - в фоне, со строкой хода и таймаутом (ComTimeoutSec, втрое: файлов бывает много):
     # раньше синхронный вызов вешал экран, и до кнопки остановки скрипт не доходил.
-    param([string]$BaseName, [string]$User, [string]$Password, [string]$Dir, [switch]$All)
+    param([string]$BaseName, [string]$User, [string]$Password, [string]$Dir, [switch]$All, [switch]$WithDates)
     New-Item -ItemType Directory -Path $Dir -Force | Out-Null
     $reader = {
-        param([string]$Line, [string]$Dir, [string]$FakeScript, [string]$FakeFile, [bool]$All)
+        param([string]$Line, [string]$Dir, [string]$FakeScript, [string]$FakeFile, [bool]$All, [bool]$ReadDates)
         if ($FakeScript) { . $FakeScript; $connector = New-FakeComConnector $FakeFile }
         else { $connector = New-Object -ComObject V83.COMConnector }
         $connection = $null
@@ -1593,14 +1593,10 @@ function Export-Processings {
             }
             $query = $connection.NewObject('Query')
             $query.Text = 'ВЫБРАТЬ Спр.Наименование КАК Title, Спр.ИмяОбъекта КАК ObjName, Спр.Версия КАК Version, ' +
-                'ПРЕДСТАВЛЕНИЕ(Спр.Вид) КАК Kind, Спр.ХранилищеОбработки КАК Storage ' +
-                'ИЗ Справочник.ДополнительныеОтчетыИОбработки КАК Спр ГДЕ НЕ Спр.ПометкаУдаления'
-            if ($All) {
-                $query.Text = 'ВЫБРАТЬ Спр.Наименование КАК Title, Спр.ИмяОбъекта КАК ObjName, Спр.Версия КАК Version, ' +
-                    'ПРЕДСТАВЛЕНИЕ(Спр.Вид) КАК Kind, Спр.ХранилищеОбработки КАК Storage, Спр.ПометкаУдаления КАК Deleted, ' +
-                    'ПРЕДСТАВЛЕНИЕ(Спр.Публикация) КАК Use, Спр.БезопасныйРежим КАК SafeMode, Спр.Ссылка КАК Ref ' +
-                    'ИЗ Справочник.ДополнительныеОтчетыИОбработки КАК Спр'
-            }
+                'ПРЕДСТАВЛЕНИЕ(Спр.Вид) КАК Kind, Спр.ХранилищеОбработки КАК Storage, Спр.ПометкаУдаления КАК Deleted, ' +
+                'ПРЕДСТАВЛЕНИЕ(Спр.Публикация) КАК Use, Спр.БезопасныйРежим КАК SafeMode, Спр.Ссылка КАК Ref ' +
+                'ИЗ Справочник.ДополнительныеОтчетыИОбработки КАК Спр'
+            if (-not $All) { $query.Text += ' ГДЕ НЕ Спр.ПометкаУдаления' }
             $selection = $query.Execute().Select()
             $sha = [System.Security.Cryptography.SHA256]::Create()
             while ($selection.Next()) {
@@ -1613,21 +1609,18 @@ function Export-Processings {
                 if (-not $objName) { continue }
                 $extension = '.epf'
                 if ($kind -match 'тч[её]т') { $extension = '.erf' }
-                $file = Join-Path $Dir ($objName + $extension)
-                $entry = $null
-                if ($All) {
-                    $refId = [string]$connection.String($selection.Get(8).UUID())
-                    $entry = [pscustomobject]@{
-                        ObjName = $objName; Title = $title; Version = $version; File = ''; Hash = ''; Kind = $kind
-                        Deleted = [bool]$selection.Get(5); Use = [string]$selection.Get(6); SafeMode = [bool]$selection.Get(7); Ref = $refId
-                        Targets = @(); TargetsError = ''
-                    }
-                    $found.Add($entry)
-                    # Имена объектов у элементов справочника бывают одинаковые: каждый файл - в папке своей ссылки.
-                    $refDir = Join-Path $Dir $refId
-                    New-Item -ItemType Directory -Path $refDir -Force | Out-Null
-                    $file = Join-Path $refDir ($objName + $extension)
+                # ** Хлебников С.Ю. 20261124 Одно имя может относиться к нескольким карточкам.
+                $refId = [guid]::Parse([string]$connection.String($selection.Get(8).UUID())).ToString()
+                $refDir = Join-Path $Dir $refId
+                New-Item -ItemType Directory -Path $refDir -Force | Out-Null
+                $file = Join-Path $refDir ($objName + $extension)
+                $entry = [pscustomobject]@{
+                    ObjName = $objName; Title = $title; Version = $version; File = ''; Hash = ''; Kind = $kind
+                    Deleted = [bool]$selection.Get(5); Use = [string]$selection.Get(6); SafeMode = [bool]$selection.Get(7); Ref = $refId
+                    Targets = @(); TargetsError = ''; CardUpdatedAt = ''; CardDateSource = ''; FileUpdatedAt = ''
                 }
+                if ($All) { $found.Add($entry) }
+                # ** Хлебников С.Ю. 20261124 конец
                 $storage = $selection.Get(4)
                 if ($null -eq $storage) { continue }
                 $data = $storage.Get()
@@ -1635,9 +1628,85 @@ function Export-Processings {
                 $data.Write($file)
                 if (-not (Test-Path -LiteralPath $file)) { continue }
                 $hash = [System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($file)))
-                if ($All) { $entry.File = $file; $entry.Hash = $hash }
-                else { $found.Add([pscustomobject]@{ ObjName = $objName; Title = $title; Version = $version; File = $file; Hash = $hash }) }
+                $entry.File = $file
+                $entry.Hash = $hash
+                if (-not $All) { $found.Add($entry) }
             }
+            # ** Хлебников С.Ю. 20261124 Читаем даты в той же базе, что и файлы; отсутствие права на ЖР допустимо.
+            if ($ReadDates -and $found.Count) {
+                $byRef = @{}
+                foreach ($entry in $found) { $byRef[$entry.Ref] = $entry }
+                try {
+                    $dates = $connection.NewObject('Query')
+                    $dates.Text = 'ВЫБРАТЬ В.Объект, МАКСИМУМ(В.ДатаВерсии) КАК ДатаКарточки ИЗ РегистрСведений.ВерсииОбъектов КАК В ' +
+                        'ГДЕ В.Объект ССЫЛКА Справочник.ДополнительныеОтчетыИОбработки СГРУППИРОВАТЬ ПО В.Объект'
+                    $rows = $dates.Execute().Select()
+                    while ($rows.Next()) {
+                        $id = [string]$connection.String($rows.Get(0).UUID())
+                        if ($byRef.ContainsKey($id)) {
+                            $byRef[$id].CardUpdatedAt = ([datetime]$rows.Get(1)).ToString('yyyy-MM-ddTHH:mm:ss')
+                            $byRef[$id].CardDateSource = 'БСП'
+                        }
+                    }
+                } catch { } # Регистр необязателен для других конфигураций.
+                try {
+                    $events = $connection.NewObject('ValueTable')
+                    $filter = $connection.NewObject('Structure')
+                    $kinds = $connection.NewObject('Array')
+                    foreach ($kindName in @('_$Data$_.Update','_$Data$_.New','Gate.ProcessingFileChanged')) { [void]$kinds.Add($kindName) }
+                    $filter.Insert('Событие', $kinds)
+                    # PowerShell 5.1 получает свойства глобального контекста 1С через IDispatch.
+                    if ($FakeScript) {
+                        $meta = $connection.Metadata
+                        $committed = 'Зафиксирована'
+                    } else {
+                        $comType = [type]::GetType('System.__ComObject')
+                        $metadata = $comType.InvokeMember('Metadata','GetProperty',$null,$connection,$null)
+                        $meta = $metadata.FindByFullName('Справочник.ДополнительныеОтчетыИОбработки')
+                        $statuses = $comType.InvokeMember('СтатусТранзакцииЗаписиЖурналаРегистрации','GetProperty',$null,$connection,$null)
+                        $committed = $comType.InvokeMember('Зафиксирована','GetProperty',$null,$statuses,$null)
+                    }
+                    $filter.Insert('Метаданные', $meta)
+                    $filter.Insert('СтатусТранзакции', $committed)
+                    # При большой истории читаем ближайший целиком попавший интервал.
+                    foreach ($days in 365, 30, 7, 1) {
+                        $filter.Insert('ДатаНачала', [datetime]::Today.AddDays(-$days))
+                        $connection.UnloadEventLog($events, $filter, 'Дата,Событие,Данные,Комментарий', [Type]::Missing, 5001)
+                        $count = $events.Count()
+                        if ($count -le 5000) { break }
+                    }
+                    $journal = @{}
+                    if ($count -le 5000) {
+                        for ($i = 0; $i -lt $count; $i++) {
+                            $eventRow = $events.Get($i)
+                            $id = [string]$connection.String($eventRow.Get(2).UUID())
+                            if (-not $byRef.ContainsKey($id)) { continue }
+                            if (-not $journal.ContainsKey($id)) { $journal[$id] = @{ FileAt=''; Hash=''; CardAt='' } }
+                            $at = ([datetime]$eventRow.Get(0)).ToString('yyyy-MM-ddTHH:mm:ss')
+                            $record = $journal[$id]
+                            if ($eventRow.Get(1) -eq 'Gate.ProcessingFileChanged') {
+                                $hash = [string]$eventRow.Get(3)
+                                if ($at -gt $record.FileAt) { $record.FileAt = $at; $record.Hash = $hash }
+                                elseif ($at -eq $record.FileAt -and $record.Hash -ne $hash) { $record.Hash = '' }
+                            } elseif ($at -gt $record.CardAt) { $record.CardAt = $at }
+                        }
+                        foreach ($id in $journal.Keys) {
+                            $entry = $byRef[$id]
+                            if ($entry.Hash -and $entry.Hash.Replace('-', '') -eq $journal[$id].Hash) {
+                                $entry.FileUpdatedAt = $journal[$id].FileAt
+                            }
+                            if ($journal[$id].CardAt -gt $entry.CardUpdatedAt) {
+                                $entry.CardUpdatedAt = $journal[$id].CardAt
+                                $entry.CardDateSource = 'ЖР'
+                            }
+                        }
+                    }
+                } catch { } # У пользователя сравнения может отсутствовать право на ЖР.
+                foreach ($entry in $found) {
+                    if ($entry.CardUpdatedAt -gt $entry.FileUpdatedAt) { $entry.FileUpdatedAt = '' }
+                }
+            }
+            # ** Хлебников С.Ю. 20261124 конец
             if ($All -and $found.Count -gt 0) {
                 # Назначение (для каких объектов) - отдельным запросом: не прочиталось - остальное всё равно нужно.
                 $targets = @{}
@@ -1671,7 +1740,7 @@ function Export-Processings {
         }
         return , @($found.ToArray())
     }
-    $call = Invoke-UiBackground -Script $reader -Arguments @((Get-ComConnectionLine $BaseName $User $Password), $Dir, $script:FakeComScript, [string]$env:CI_FAKE_COM, [bool]$All) `
+    $call = Invoke-UiBackground -Script $reader -Arguments @((Get-ComConnectionLine $BaseName $User $Password), $Dir, $script:FakeComScript, [string]$env:CI_FAKE_COM, [bool]$All, [bool]($All -or $WithDates)) `
         -Title ("Выгрузить обработки {0}" -f $BaseName) -TimeoutSec ($comTimeoutSec * 3)
     $message = $call.Error
     if ($Password -and $message) { $message = $message.Replace($Password, '***') }
@@ -1757,7 +1826,7 @@ function Invoke-ProdProcessing {
     # именем объекта обновляется, иначе добавляется новый); прежняя версия до записи ложится в old.b64 папки
     # OutDir, без неё обработка не заменяется. File - сам .epf/.erf, TextFile - уже base64 (откат из old.b64).
     # unregepf: снять обработку - по имени объекта и ссылке элемента вместе.
-    param([string]$Mode, [string]$OutDir, [string]$File = '', [string]$TextFile = '', [string]$Name, [string]$Ref = '', [string]$Title, [string]$GuardVersion = '', [string]$ExpectedHash = '')
+    param([string]$Mode, [string]$OutDir, [string]$File = '', [string]$TextFile = '', [string]$Name, [string]$Ref = '', [string]$Title, [string]$GuardVersion = '', [string]$ExpectedHash = '', [string]$ExpectedTargetHash = '')
     $null = Get-BaseInfo $deployLink $script:ProdBase $script:ProdUser $script:ProdPassword
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
     $parts = New-Object System.Collections.Generic.List[string]
@@ -1770,7 +1839,7 @@ function Invoke-ProdProcessing {
         else {
             $bytes = [System.IO.File]::ReadAllBytes($File)
             # ** Хлебников С.Ю. 20261124 Сверяем именно те байты, которые отдаём на регистрацию.
-            if ($GuardVersion) {
+            if ($GuardVersion -or $ExpectedTargetHash) {
                 $sha = [Security.Cryptography.SHA256]::Create()
                 try { $actual = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '') } finally { $sha.Dispose() }
                 if ($actual -ne $ExpectedHash.Replace('-', '')) { throw ("{0}: файл изменился перед записью" -f $Name) }
@@ -1779,7 +1848,8 @@ function Invoke-ProdProcessing {
             [System.IO.File]::WriteAllText($newB64, [Convert]::ToBase64String($bytes), [System.Text.Encoding]::ASCII)
         }
         # ** Хлебников С.Ю. 20261124 Старый клиент не получает file= и не сможет выполнить запись без сравнения.
-        if ($GuardVersion) { $parts.Add(("guardfile={0}|{1}" -f $GuardVersion, $newB64)) }
+        if ($ExpectedTargetHash) { $parts.Add(("casfile={0}|{1}|{2}" -f $ExpectedTargetHash, $GuardVersion, $newB64)) }
+        elseif ($GuardVersion) { $parts.Add(("guardfile={0}|{1}" -f $GuardVersion, $newB64)) }
         else { $parts.Add(("file={0}" -f $newB64)) }
         # ** Хлебников С.Ю. 20261124 конец
     }
@@ -1822,16 +1892,24 @@ function ConvertTo-VendorVersion {
 }
 # ** Хлебников С.Ю. 20261124 конец
 
+# ** Хлебников С.Ю. 20261124 Дату изменения карточки показываем с источником.
+function Format-ProcessingDate {
+    param($Item)
+    if (Get-JsonValue $Item 'FileUpdatedAt' '') { return ('{0} (файл, ЖР)' -f $Item.FileUpdatedAt.Replace('T',' ')) }
+    if (Get-JsonValue $Item 'CardUpdatedAt' '') { return ('{0} (карточка, {1})' -f $Item.CardUpdatedAt.Replace('T',' '), $Item.CardDateSource) }
+    return 'дата неизвестна'
+}
+# ** Хлебников С.Ю. 20261124 конец
+
 function Compare-Processings {
     # Внешние обработки temp против рабочей: изменённые в temp и новые. Те, что есть только в рабочей,
     # не трогаются: скрипт обновления обработки из рабочей не удаляет.
     param($TempExport, $ProdExport)
-    $prodByName = @{}
-    foreach ($item in $ProdExport.Items) { $prodByName[$item.ObjName] = $item }
+    $prodByRef = @{}
+    foreach ($item in $ProdExport.Items) { $prodByRef[$item.Ref] = $item }
     $list = New-Object System.Collections.Generic.List[object]
-    foreach ($item in @($TempExport.Items | Sort-Object ObjName)) {
-        $prodItem = $null
-        if ($prodByName.ContainsKey($item.ObjName)) { $prodItem = $prodByName[$item.ObjName] }
+    foreach ($item in @($TempExport.Items | Sort-Object ObjName, Ref)) {
+        $prodItem = $prodByRef[$item.Ref]
         # ** Хлебников С.Ю. 20261124 Совпадение имён карточек или непонятная версия требуют решения.
         if ($vendorProcessings -contains $item.ObjName) {
             if (@($TempExport.Items | Where-Object ObjName -eq $item.ObjName).Count -ne 1 -or
@@ -1848,8 +1926,19 @@ function Compare-Processings {
                 continue
             }
         }
+        if (@($TempExport.Items | Where-Object ObjName -eq $item.ObjName).Count -gt 1 -or
+            @($ProdExport.Items | Where-Object { $_.ObjName -eq $item.ObjName -and $_.Ref -ne $item.Ref }).Count -gt 0 -or
+            ($prodItem -and $prodItem.ObjName -ne $item.ObjName)) {
+            Write-Line ("  {0} [{1}]: расходятся ссылки или имена карточек; пропускаю до сверки" -f $item.ObjName, $item.Ref) 'Yellow'
+            continue
+        }
+        if ($prodItem -and $prodItem.FileUpdatedAt -and $item.FileUpdatedAt -and $prodItem.FileUpdatedAt -gt $item.FileUpdatedAt) {
+            Write-Line ("  {0}: оставляю более свежий файл рабочей. Рабочая {1}, temp {2}" -f $item.ObjName, (Format-ProcessingDate $prodItem), (Format-ProcessingDate $item)) 'Yellow'
+            continue
+        }
         # ** Хлебников С.Ю. 20261124 конец
         $entry = [pscustomobject]@{
+            RefAtComparison = $item.Ref; ExpectedTargetHash = 'absent'; Preselect = ($null -eq $prodItem)
             ObjName = $item.ObjName; Title = $item.Title; FileName = (Split-Path -Leaf $item.File); TempFile = $item.File
             TempHash = $item.Hash; TempVersion = $item.Version; ProdVersion = ''; ProdFile = ''; Status = 'new'; Text = 'новая: в рабочей её нет'
         }
@@ -1857,7 +1946,9 @@ function Compare-Processings {
             $entry.ProdVersion = $prodItem.Version
             $entry.ProdFile = $prodItem.File
             $entry.Status = 'changed'
-            $entry.Text = ("отличается (рабочая {0}, temp {1})" -f $prodItem.Version, $item.Version)
+            $entry.ExpectedTargetHash = $prodItem.Hash.Replace('-', '').ToLowerInvariant()
+            $entry.Preselect = [bool]($prodItem.FileUpdatedAt -and $item.FileUpdatedAt -and $item.FileUpdatedAt -gt $prodItem.FileUpdatedAt)
+            $entry.Text = ("обновление: рабочая {0}, temp {1}" -f (Format-ProcessingDate $prodItem), (Format-ProcessingDate $item))
         }
         $list.Add($entry)
     }
@@ -3011,38 +3102,40 @@ if ($CompareProcessings) {
     # по модулям и формам. Было - рабочая, стало - temp.
     Write-Line ("СРАВНЕНИЕ ВНЕШНИХ ОБРАБОТОК: {0} (было) и {1} (стало), {2}" -f $script:ProdBase, $script:TempBase, (Get-Date -Format 'dd.MM.yyyy HH:mm')) 'Cyan'
     foreach ($side in @('temp', 'prod', 'dump')) { $sideDir = Join-Path $script:RunDir $side; if (Test-Path -LiteralPath $sideDir) { Remove-Item -LiteralPath $sideDir -Recurse -Force } }
-    $tempList = Export-Processings -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword -Dir (Join-Path $script:RunDir 'temp')
-    $prodList = Export-Processings -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword -Dir (Join-Path $script:RunDir 'prod')
+    $tempList = Export-Processings -WithDates -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword -Dir (Join-Path $script:RunDir 'temp')
+    $prodList = Export-Processings -WithDates -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword -Dir (Join-Path $script:RunDir 'prod')
     if (-not $tempList.Ok) { Write-Line ("  {0}: не выгрузил - {1}" -f $script:TempBase, $tempList.Error) 'Red' }
     if (-not $prodList.Ok) { Write-Line ("  {0}: не выгрузил - {1}" -f $script:ProdBase, $prodList.Error) 'Red' }
     if (-not $tempList.Ok -or -not $prodList.Ok) { exit 1 }
-    $tempByName = @{}; foreach ($item in @($tempList.Items)) { $tempByName[[string]$item.ObjName] = $item }
-    $prodByName = @{}; foreach ($item in @($prodList.Items)) { $prodByName[[string]$item.ObjName] = $item }
+    $tempByRef = @{}; foreach ($item in @($tempList.Items)) { $tempByRef[[string]$item.Ref] = $item }
+    $prodByRef = @{}; foreach ($item in @($prodList.Items)) { $prodByRef[[string]$item.Ref] = $item }
     $cmpHtml = New-Object System.Text.StringBuilder
     [void]$cmpHtml.Append('<html><head><meta charset="utf-8"></head><body>')
     [void]$cmpHtml.Append(('<h1>Внешние обработки: {0} и {1}, {2}</h1><p>Было - рабочая, стало - temp.</p>' -f (ConvertTo-Html $script:ProdBase), (ConvertTo-Html $script:TempBase), (Get-Date -Format 'dd.MM.yyyy HH:mm')))
     $same = 0; $differ = 0
-    foreach ($name in @(@($tempByName.Keys) + @($prodByName.Keys) | Sort-Object -Unique)) {
-        $inTemp = $tempByName.ContainsKey($name); $inProd = $prodByName.ContainsKey($name)
-        if ($inTemp -and $inProd -and $tempByName[$name].Hash -eq $prodByName[$name].Hash) { $same++; continue }
+    foreach ($ref in @(@($tempByRef.Keys) + @($prodByRef.Keys) | Sort-Object -Unique)) {
+        $inTemp = $tempByRef.ContainsKey($ref); $inProd = $prodByRef.ContainsKey($ref)
+        $card = if ($inTemp) { $tempByRef[$ref] } else { $prodByRef[$ref] }
+        $name = ('{0} [{1}]' -f $card.ObjName, $ref)
+        if ($inTemp -and $inProd -and $tempByRef[$ref].Hash -eq $prodByRef[$ref].Hash) { $same++; continue }
         $differ++
         Write-Host ''
         if (-not $inProd) {
-            Write-Line ("  {0} ({1}, версия {2}): есть только в temp" -f $name, $tempByName[$name].Title, (Get-NonEmpty $tempByName[$name].Version '-')) 'Yellow'
-            [void]$cmpHtml.Append(('<h2>{0}: есть только в temp</h2><p>{1}, версия {2}</p>' -f (ConvertTo-Html $name), (ConvertTo-Html $tempByName[$name].Title), (ConvertTo-Html $tempByName[$name].Version)))
+            Write-Line ("  {0} ({1}, {2}): есть только в temp" -f $name, $tempByRef[$ref].Title, (Format-ProcessingDate $tempByRef[$ref])) 'Yellow'
+            [void]$cmpHtml.Append(('<h2>{0}: есть только в temp</h2><p>{1}, {2}</p>' -f (ConvertTo-Html $name), (ConvertTo-Html $tempByRef[$ref].Title), (ConvertTo-Html (Format-ProcessingDate $tempByRef[$ref]))))
             continue
         }
         if (-not $inTemp) {
-            Write-Line ("  {0} ({1}, версия {2}): есть только в рабочей" -f $name, $prodByName[$name].Title, (Get-NonEmpty $prodByName[$name].Version '-')) 'Yellow'
-            [void]$cmpHtml.Append(('<h2>{0}: есть только в рабочей</h2><p>{1}, версия {2}</p>' -f (ConvertTo-Html $name), (ConvertTo-Html $prodByName[$name].Title), (ConvertTo-Html $prodByName[$name].Version)))
+            Write-Line ("  {0} ({1}, {2}): есть только в рабочей" -f $name, $prodByRef[$ref].Title, (Format-ProcessingDate $prodByRef[$ref])) 'Yellow'
+            [void]$cmpHtml.Append(('<h2>{0}: есть только в рабочей</h2><p>{1}, {2}</p>' -f (ConvertTo-Html $name), (ConvertTo-Html $prodByRef[$ref].Title), (ConvertTo-Html (Format-ProcessingDate $prodByRef[$ref]))))
             continue
         }
-        $versions = "temp {0}, рабочая {1}" -f (Get-NonEmpty $tempByName[$name].Version '-'), (Get-NonEmpty $prodByName[$name].Version '-')
-        Write-Line ("  {0} ({1}): отличается, {2}" -f $name, $tempByName[$name].Title, $versions) 'Yellow'
-        [void]$cmpHtml.Append(('<h2>{0}: отличается</h2><p>{1}, {2}</p>' -f (ConvertTo-Html $name), (ConvertTo-Html $tempByName[$name].Title), (ConvertTo-Html $versions)))
+        $dates = "temp {0}, рабочая {1}" -f (Format-ProcessingDate $tempByRef[$ref]), (Format-ProcessingDate $prodByRef[$ref])
+        Write-Line ("  {0} ({1}): отличается, {2}" -f $name, $tempByRef[$ref].Title, $dates) 'Yellow'
+        [void]$cmpHtml.Append(('<h2>{0}: отличается</h2><p>{1}, {2}</p>' -f (ConvertTo-Html $name), (ConvertTo-Html $tempByRef[$ref].Title), (ConvertTo-Html $dates)))
         $dumpRoot = Join-Path $script:RunDir 'dump'
-        $newDump = Get-ProcessingDump -File $tempByName[$name].File -Dir (Join-Path $dumpRoot ($name + '-temp')) -Title ("Выгрузить в файлы {0} из temp" -f $name)
-        $oldDump = Get-ProcessingDump -File $prodByName[$name].File -Dir (Join-Path $dumpRoot ($name + '-prod')) -Title ("Выгрузить в файлы {0} из рабочей" -f $name)
+        $newDump = Get-ProcessingDump -File $tempByRef[$ref].File -Dir (Join-Path $dumpRoot ($ref + '-temp')) -Title ("Выгрузить в файлы {0} из temp" -f $name)
+        $oldDump = Get-ProcessingDump -File $prodByRef[$ref].File -Dir (Join-Path $dumpRoot ($ref + '-prod')) -Title ("Выгрузить в файлы {0} из рабочей" -f $name)
         if (-not $newDump -or -not $oldDump) { Write-Line '    в файлы не выгрузилась: разницы по модулям нет, см. run.log' 'Red'; continue }
         $changes = Get-ExtensionChanges -OldDir $oldDump -NewDir $newDump -KeyPrefix 'DataProcessors/'
         if (@($changes.Objects).Count -eq 0) { Write-Line '    по выгрузке отличий нет: разница в самом файле (служебные данные)' 'DarkGray'; continue }
@@ -3112,35 +3205,66 @@ if ($PullExtensions -or $PullProcessings) {
     Write-Host ''
     Write-Host ("ПОДТЯНУТЬ ВНЕШНИЕ ОБРАБОТКИ ИЗ {0}" -f $script:ProdBase) -ForegroundColor Cyan
     Write-Host '  Выгружаю обработки и отчёты справочника «Дополнительные отчёты и обработки» обеих баз (только чтение).' -ForegroundColor DarkGray
-    $prodExport = Export-Processings -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword -Dir (Join-Path $script:RunDir 'processings\prod')
-    $tempExport = Export-Processings -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword -Dir (Join-Path $script:RunDir 'processings\temp')
+    $prodExport = Export-Processings -WithDates -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword -Dir (Join-Path $script:RunDir 'processings\prod')
+    $tempExport = Export-Processings -WithDates -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword -Dir (Join-Path $script:RunDir 'processings\temp')
     if (-not $prodExport.Ok) { throw ("обработки {0} не выгрузил: {1}" -f $script:ProdBase, $prodExport.Error) }
-    if (-not $tempExport.Ok) { Write-Line ("  {0} не выгрузил ({1}): покажу все обработки рабочей" -f $script:TempBase, $tempExport.Error) 'Yellow' }
-    $tempByName = @{}
-    foreach ($item in $tempExport.Items) { $tempByName[$item.ObjName] = $item }
+    if (-not $tempExport.Ok) { throw ("Не удалось сравнить {0}: {1}" -f $script:TempBase, $tempExport.Error) }
+    # ** Хлебников С.Ю. 20261124 В inbox переносим исходные байты и ссылку карточки. Дата выгрузки ничего не говорит о возрасте файла.
+    $tempByRef = @{}
+    foreach ($item in $tempExport.Items) { $tempByRef[$item.Ref] = $item }
     $differ = New-Object System.Collections.Generic.List[object]
-    foreach ($item in @($prodExport.Items | Sort-Object ObjName)) {
-        $text = ''
-        if (-not $tempExport.Ok) { $text = 'сравнить не удалось' }
-        elseif (-not $tempByName.ContainsKey($item.ObjName)) { $text = "в $($script:TempBase) нет" }
-        elseif ($tempByName[$item.ObjName].Hash -ne $item.Hash) { $text = ("в рабочей другая (рабочая {0}, temp {1})" -f $item.Version, $tempByName[$item.ObjName].Version) }
-        else { continue }
-        $differ.Add([pscustomobject]@{ Item = $item; Text = $text })
+    $defaults = New-Object System.Collections.Generic.List[int]
+    foreach ($item in @($prodExport.Items | Sort-Object ObjName, Ref)) {
+        $other = $tempByRef[$item.Ref]
+        if ($other -and $other.Hash -eq $item.Hash) { continue }
+        if (($other -and $other.ObjName -ne $item.ObjName) -or
+            @($tempExport.Items | Where-Object { $_.ObjName -eq $item.ObjName -and $_.Ref -ne $item.Ref }).Count -or
+            @($prodExport.Items | Where-Object { $_.ObjName -eq $item.ObjName -and $_.Ref -ne $item.Ref }).Count) {
+            Write-Line ("  {0} [{1}]: несколько карточек или изменено имя, требуется сверка" -f $item.ObjName, $item.Ref) 'Yellow'
+            continue
+        }
+        $expected = 'absent'
+        if ($null -eq $other) {
+            $text = ("в temp нет; рабочая {0}" -f (Format-ProcessingDate $item))
+        } else {
+            if ($vendorProcessings -contains $item.ObjName -and (ConvertTo-VendorVersion $other.Version $item.ObjName) -gt (ConvertTo-VendorVersion $item.Version $item.ObjName)) {
+                Write-Line ("  {0}: в temp более новая версия поставщика, пропускаю" -f $item.ObjName) 'Yellow'
+                continue
+            }
+            $expected = $other.Hash.Replace('-', '').ToLowerInvariant()
+            $text = ("рабочая {0}, temp {1}" -f (Format-ProcessingDate $item), (Format-ProcessingDate $other))
+            if ($item.FileUpdatedAt -and $other.FileUpdatedAt) {
+                if ($item.FileUpdatedAt -lt $other.FileUpdatedAt) { Write-Line ("  {0}: в temp файл новее; {1}" -f $item.ObjName, $text); continue }
+                if ($item.FileUpdatedAt -gt $other.FileUpdatedAt) { $defaults.Add($differ.Count) }
+            }
+        }
+        $differ.Add([pscustomobject]@{ Item = $item; Text = $text; Expected = $expected })
     }
-    Write-Line ("  обработок в рабочей: {0}, отличаются от temp: {1}" -f $prodExport.Items.Count, $differ.Count)
-    if ($differ.Count -eq 0) { Write-Line 'Все обработки рабочей такие же, как в temp: подтягивать нечего.' 'Green'; exit 0 }
-    $labels = @($differ | ForEach-Object { '{0} ({1})  {2}' -f $_.Item.ObjName, $_.Item.Title, $_.Text })
-    $picked = Select-UiMany -Header ("Какие обработки взять из {0} в inbox" -f $script:ProdBase) -Items $labels -Preselected @(0..($differ.Count - 1))
-    if ($null -eq $picked) { Write-Host 'Выход, ничего не брал.'; exit 0 }
+    if (-not $differ.Count) { Write-Line 'Нет обработок для переноса из рабочей.'; exit 0 }
+    $labels = @($differ | ForEach-Object { '{0} [{1}]  {2}' -f $_.Item.ObjName, $_.Item.Ref, $_.Text })
+    $picked = Select-UiMany -Header ("Какие обработки взять из {0} в inbox" -f $script:ProdBase) -Items $labels -Preselected $defaults.ToArray() -AllowEmpty
+    if ($null -eq $picked -or -not @($picked).Count) { Write-Host 'Выход, ничего не брал.'; exit 0 }
     $targetDir = Join-Path $inboxRoot ("обработки_из_рабочей_{0}" -f $pullStamp)
-    New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+    # Публикуем комплект одной операцией в том же томе. Незавершённое копирование не видно меню inbox.
+    $stage = Join-Path (Split-Path -Parent $inboxRoot) ('gate-pull-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $stage -ErrorAction Stop | Out-Null
     foreach ($index in $picked) {
-        $item = $differ[$index].Item
-        Copy-Item -LiteralPath $item.File -Destination $targetDir -Force
-        Write-Line ("[OK]   Взять {0} из {1}" -f $item.ObjName, $script:ProdBase) 'Green'
+        $choice = $differ[$index]
+        $item = $choice.Item
+        $folder = Join-Path $stage $item.Ref
+        New-Item -ItemType Directory -Path $folder | Out-Null
+        $file = Join-Path $folder (Split-Path -Leaf $item.File)
+        Copy-Item -LiteralPath $item.File -Destination $file -ErrorAction Stop
+        $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($hash -ne $item.Hash.Replace('-', '')) { throw ("Изменился файл {0} при копировании" -f $item.ObjName) }
+        $proof = [ordered]@{ ref = $item.Ref; sha256 = $hash; expectedTargetHash = $choice.Expected }
+        [IO.File]::WriteAllText($file + '.gate.json', ($proof | ConvertTo-Json -Compress), $Utf8Bom)
     }
+    New-Item -ItemType Directory -Path $inboxRoot -Force -ErrorAction Stop | Out-Null
+    [IO.Directory]::Move($stage, $targetDir)
+    # ** Хлебников С.Ю. 20261124 конец
     Write-Host ''
-    Write-Line ("Положил в inbox: {0}, папка {1}." -f $picked.Count, $targetDir)
+    Write-Line ("Положил в inbox: {0}, папка {1}." -f @($picked).Count, $targetDir)
     Write-Line 'Дальше: меню гейта, «Прогон с обновлением из inbox» - гейт запишет их в справочник temp и проверит.'
     exit 0
 }
@@ -3259,6 +3383,10 @@ function Get-GitProcessingManifest {
         $fields.Add(('"objectName": ' + (ConvertTo-GhJsonString ([string]$item.ObjName))))
         $fields.Add(('"title": ' + (ConvertTo-GhJsonString ([string]$item.Title))))
         $fields.Add(('"kind": ' + (ConvertTo-GhJsonString ([string]$item.Kind))))
+        $fields.Add(('"fileUpdatedAt": ' + $(if ($item.FileUpdatedAt) { ConvertTo-GhJsonString $item.FileUpdatedAt } else { 'null' })))
+        $fields.Add(('"fileDateSource": ' + $(if ($item.FileUpdatedAt) { '"Gate.ProcessingFileChanged"' } else { 'null' })))
+        $fields.Add(('"cardUpdatedAt": ' + $(if ($item.CardUpdatedAt) { ConvertTo-GhJsonString $item.CardUpdatedAt } else { 'null' })))
+        $fields.Add(('"cardDateSource": ' + $(if ($item.CardDateSource) { ConvertTo-GhJsonString $item.CardDateSource } else { 'null' })))
         $fields.Add(('"version": ' + (ConvertTo-GhJsonString ([string]$item.Version))))
         $fields.Add(('"use": ' + (ConvertTo-GhJsonString ([string]$item.Use))))
         $fields.Add(('"safeMode": ' + ([string][bool]$item.SafeMode).ToLowerInvariant()))
@@ -5146,8 +5274,8 @@ else {
     Write-Host ("ВНЕШНИЕ ОБРАБОТКИ: {0} ПРОТИВ {1}" -f $script:TempBase, $script:ProdBase) -ForegroundColor Cyan
     Write-Host '  Выгружаю обработки и отчёты справочника «Дополнительные отчёты и обработки» обеих баз (только чтение).' -ForegroundColor DarkGray
     $processingsPending = @()
-    $tempProcExport = Export-Processings -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword -Dir (Join-Path $script:RunDir 'processings\temp')
-    $prodProcExport = Export-Processings -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword -Dir (Join-Path $script:RunDir 'processings\prod')
+    $tempProcExport = Export-Processings -WithDates -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword -Dir (Join-Path $script:RunDir 'processings\temp')
+    $prodProcExport = Export-Processings -WithDates -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword -Dir (Join-Path $script:RunDir 'processings\prod')
     if (-not $tempProcExport.Ok) { Write-Line ("  {0}: не выгрузил - {1}" -f $script:TempBase, $tempProcExport.Error) 'Yellow' }
     if (-not $prodProcExport.Ok) { Write-Line ("  {0}: не выгрузил - {1}" -f $script:ProdBase, $prodProcExport.Error) 'Yellow' }
     if ($tempProcExport.Ok -and $prodProcExport.Ok) {
@@ -5317,8 +5445,10 @@ else {
     if ($mode -notin @('asis','actions') -and -not $Prepare -and $processingsPending.Count -gt 0) {
         $procLabels = @($processingsPending | ForEach-Object { '{0} ({1})  {2}' -f $_.ObjName, $_.Title, $_.Text })
         $procPreselected = @()
-        if ($mode -eq '1' -or $mode -eq 'epf') { $procPreselected = @(0..($processingsPending.Count - 1)) }
-        $procNotes = @(('Отмеченное запишется в {0} поверх того, что там есть: «изменена» значит «отличается», в рабочей версия может быть новее - сверь версии.' -f $script:ProdBase),
+        if ($mode -eq '1' -or $mode -eq 'epf') {
+            $procPreselected = @(for ($i = 0; $i -lt $processingsPending.Count; $i++) { if ($processingsPending[$i].Preselect) { $i } })
+        }
+        $procNotes = @(('Отмеченное запишется в {0} поверх того, что там есть: галочки по умолчанию стоят у новых карточек и файлов с подтверждённой более поздней датой. Если есть только дата карточки, реши вручную.' -f $script:ProdBase),
             'Enter без отметок - обработки не трогать.')
         $procPicked = Select-UiMany -Header ("Какие внешние обработки записать в {0}" -f $script:ProdBase) -Items $procLabels -Preselected $procPreselected -Notes $procNotes -AllowEmpty
         if ($null -eq $procPicked) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
@@ -5326,6 +5456,10 @@ else {
         $selectedProcessings = @($procPicked | Sort-Object | ForEach-Object { $processingsPending[$_] })
     }
     if ($selected.Count -eq 0 -and $selectedProcessings.Count -eq 0 -and $mode -ne 'actions') { Write-Host 'Ничего не выбрано: выход, ничего не обновлял.'; exit 0 }
+    if ($selectedProcessings.Count) {
+        $hasVendor = @($selectedProcessings | Where-Object { $vendorProcessings -contains $_.ObjName }).Count -gt 0
+        Update-SelfCheckEpf -RequireCurrent:$hasVendor
+    }
     foreach ($proc in $selectedProcessings) {
         $proc | Add-Member -NotePropertyName Action -NotePropertyValue 'register' -Force
         # ** Хлебников С.Ю. 20261124 Проверенный файл поставщика переносится из temp побайтно.
@@ -5337,7 +5471,6 @@ else {
                 $wanted -ne ([string]$proc.TempHash).Replace('-', '') -or (Get-FileHash -LiteralPath $proc.TempFile -Algorithm SHA256).Hash -ne $wanted) {
                 throw ("{0}: SHA-256 файла поставщика не подтверждён проверенным прогоном temp" -f $proc.ObjName)
             }
-            Update-SelfCheckEpf -RequireCurrent
         }
         # ** Хлебников С.Ю. 20261124 конец
         $proc | Add-Member -NotePropertyName Source -NotePropertyValue $proc.TempFile -Force
@@ -6108,7 +6241,14 @@ if (-not $failed -and $selectedProcessings.Count -gt 0) {
             $expectedHash = $proc.TempHash
             $guardVersion = if ($proc.ProdVersion) { $proc.ProdVersion.Trim() } else { 'absent' }
         }
-        $session = Invoke-ProdProcessing -Mode 'regepf' -OutDir $procDir -File $proc.Source -TextFile $proc.SourceB64 -Name $proc.FileName -Title $title -GuardVersion $guardVersion -ExpectedHash $expectedHash
+        $targetHash = ''
+        $targetRef = ''
+        if ($mode -ne 'rollback') {
+            $expectedHash = $proc.TempHash
+            $targetHash = $proc.ExpectedTargetHash
+            $targetRef = $proc.RefAtComparison
+        }
+        $session = Invoke-ProdProcessing -Mode 'regepf' -OutDir $procDir -File $proc.Source -TextFile $proc.SourceB64 -Name $proc.FileName -Ref $targetRef -Title $title -GuardVersion $guardVersion -ExpectedHash $expectedHash -ExpectedTargetHash $targetHash
         # ** Хлебников С.Ю. 20261124 конец
         $values = $session.Values
         $proc.Ref = [string](Get-Setting $values 'ref' '')

@@ -3002,6 +3002,43 @@ $tests = @(
             Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\compare-ext\compare.html')) 'нет compare.html'
         }
     },
+    # ** Хлебников С.Ю. 20261124 Дата замены привязана к хешу, время правки карточки служит подсказкой.
+    @{
+        Name = 'deploy-pull-processing-dates'
+        Text = 'Рабочая → inbox: исходный файл, ссылка, SHA-256 и даты из журнала'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $ref = '11111111-2222-3333-4444-555555555555'
+            $prod = New-PrintProcessing '1' 'prod'
+            $temp = New-PrintProcessing '99' 'temp'
+            $prod.ref = $ref; $temp.ref = $ref
+            $state = New-ComState -TempProcessings @($temp) -ProdProcessings @($prod)
+            $hasher = [Security.Cryptography.SHA256]::Create()
+            $oldHash = [BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes('temp'))).Replace('-','').ToLowerInvariant()
+            $newHash = [BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes('prod'))).Replace('-','').ToLowerInvariant()
+            $hasher.Dispose()
+            $state.bases.erp_base.processingEvents = @(@{ref=$ref; at='2026-11-23T15:00:00'; event='Gate.ProcessingFileChanged'; comment=$newHash})
+            $state.bases.erp_temp_test.processingEvents = @(@{ref=$ref; at='2026-11-22T10:00:00'; event='Gate.ProcessingFileChanged'; comment=$oldHash})
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-PullProcessings' -Com $state -Answers @(
+                @{ Kind='many'; Header='Какие обработки'; Indexes=@(0) })
+            Check ($r.ExitCode -eq 0) ('перенос в inbox: ' + ($r.Output -join ' '))
+            $question = @($r.Output | Where-Object { $_ -like '@@ui:*Какие обработки*' } | ForEach-Object { $_.Substring(5) | ConvertFrom-Json })[0]
+            Check (@($question.preselected).Count -eq 1 -and $question.preselected[0] -eq 0) 'свежий файл рабочей не предложен'
+            Check ($question.items[0] -match '2026-11-23 15:00:00.*2026-11-22 10:00:00') 'нет обеих подтверждённых дат'
+            $proof = @(Get-ChildItem -LiteralPath (Join-Path $sb 'inbox') -Filter '*.gate.json' -Recurse)
+            Check ($proof.Count -eq 1) 'нет адресной поставки'
+            $json = [IO.File]::ReadAllText($proof[0].FullName) | ConvertFrom-Json
+            Check ($json.ref -eq $ref -and $json.sha256 -eq $newHash -and $json.expectedTargetHash -eq $oldHash) 'утеряна привязка к файлам и карточке'
+            Check ((Get-Calls $r @('ENTERPRISE','regepf')).Count -eq 0) 'сравнение меняло базу'
+            $state.bases.erp_base.processingEvents += @{ref=$ref; at='2026-11-24T12:00:00'; event='_$Data$_.Update'; comment=''}
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-PullProcessings' -Com $state -Answers @(
+                @{ Kind='many'; Header='Какие обработки'; Indexes=@() })
+            $q = @($r.Output | Where-Object { $_ -like '@@ui:*Какие обработки*' } | ForEach-Object { $_.Substring(5) | ConvertFrom-Json })[0]
+            Check (@($q.preselected).Count -eq 0 -and $q.items[0] -match '2026-11-24 12:00:00 \(карточка, ЖР\)') 'правка карточки ошибочно стала датой файла'
+        }
+    },
+    # ** Хлебников С.Ю. 20261124 конец
     @{
         Name = 'deploy-compare-processings'
         Text = '«Сравнить внешние обработки»: отличающаяся обработка - версии и разница по модулю; в базах ничего не меняется'
@@ -3013,7 +3050,7 @@ $tests = @(
             Check-DeployCommon $r -LocksExpected $false
             Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
             $text = $r.Output -join "`n"
-            Check ($text -match 'Печать \(Печать актов\): отличается, temp 2, рабочая 1') 'нет строки об отличающейся обработке'
+            Check ($text -match 'Печать \[.+?\] \(Печать актов\): отличается, temp дата неизвестна, рабочая дата неизвестна') 'нет строки об отличающейся обработке'
             Check ($text -match '\+ НоваяПроцедура') 'нет новой процедуры в разнице обработки'
             Check ((Get-Calls $r @('ENTERPRISE', 'regepf')).Count -eq 0) 'сравнение записывало обработку'
         }
@@ -3156,8 +3193,8 @@ $tests = @(
                 function Write-Line { param($Text, $Color) }
                 $vendorProcessings = @('Образец')
                 $retainedVendorProcessings = @{}
-                $candidate = [pscustomobject]@{ ObjName='Образец'; Version='4.9.1'; Title='Образец'; File='Образец.epf'; Hash='a' }
-                $live = [pscustomobject]@{ ObjName='Образец'; Version='4.10'; Title='Образец'; File='Образец.epf'; Hash='b' }
+                $candidate = [pscustomobject]@{ ObjName='Образец'; Ref='00000000-0000-0000-0000-000000000001'; FileUpdatedAt=''; CardUpdatedAt=''; Version='4.9.1'; Title='Образец'; File='Образец.epf'; Hash='a' }
+                $live = [pscustomobject]@{ ObjName='Образец'; Ref='00000000-0000-0000-0000-000000000001'; FileUpdatedAt=''; CardUpdatedAt=''; Version='4.10'; Title='Образец'; File='Образец.epf'; Hash='b' }
                 $temp = @{Items=@($candidate)}
                 $prod = @{Items=@($live)}
                 if ((Compare-Processings $temp $prod).Count -ne 0) { throw 'план понижает рабочую версию' }
