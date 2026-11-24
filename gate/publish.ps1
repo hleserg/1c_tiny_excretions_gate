@@ -750,6 +750,7 @@ if (-not (Test-Path -LiteralPath $configFile)) { return }
 $cfg = Read-PublishConfig $configFile
 # ** Хлебников С.Ю. 20261124 Отдельная ветка журнала операций работает и без issue для итогов.
 if ($WatchOperations -or $Pending) {
+    . (Join-Path $Root 'post-update.ps1') # ** Хлебников С.Ю. 20261124 Краткое описание ошибки действия.
     . (Join-Path $Root 'operations.ps1')
     if ($WatchOperations) { Watch-GateOperations $cfg; return }
     Start-OperationSender $cfg $configFile

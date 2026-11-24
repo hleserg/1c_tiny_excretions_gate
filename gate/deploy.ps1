@@ -6987,7 +6987,10 @@ if ($null -ne $plainLogin) { $record['plainLogin'] = [ordered]@{ status = $plain
 
 Write-Host ''
 $finalColor = 'Green'
-if ($outcome -ne 'updated') { $finalColor = 'Red' }
+if ($outcome -ne 'updated') {
+    $finalColor = 'Red'
+    if ($script:GateOperation) { $script:GateOperation.FinalStatus = 'failed' } # ** Хлебников С.Ю. 20261124 Результат внутреннего запуска для журнала и ci.exe.
+}
 # План и факт по шагам: насколько прогноз длительности совпал (stats.ps1).
 $statLines = @(Get-StatRunLines)
 if ($statLines.Count -gt 0) {
@@ -6996,6 +6999,13 @@ if ($statLines.Count -gt 0) {
     foreach ($line in $statLines) { Write-Host $line -ForegroundColor DarkGray }
 }
 Write-Line ("ИТОГ: {0}. Резервные копии: {1}" -f $outcomeNames[$outcome], $beforeDir) $finalColor
+# ** Хлебников С.Ю. 20261124 Причина частичного выпуска рядом с итогом, когда оператор вернулся к экрану.
+if ($outcome -eq 'actionsFailed') {
+    $errorStep = $light | Where-Object { $_.Name -eq 'Действия после обновления' -and $_.Status -eq 'FAIL' } | Select-Object -First 1
+    if ($errorStep) { Write-Line (Get-ActionErrorSummary $errorStep.Text) 'Red' }
+    Write-Line 'После исправления выбери «Выполнить только проверенные действия». Выполненные ранее действия пропускаются.' 'Yellow'
+}
+# ** Хлебников С.Ю. 20261124 конец
 if ($null -ne $plainLogin -and $plainLogin.Status -eq 'FAIL') {
     Write-Line ("ВХОД В {0} БЕЗ КОДА РАЗРЕШЕНИЯ НЕ ПРОШЁЛ: {1}." -f $script:ProdBase, $plainLogin.Text) 'Red'
 }
