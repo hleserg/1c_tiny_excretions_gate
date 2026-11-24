@@ -348,6 +348,7 @@ function Invoke-Designer {
     while ($true) {
         if ($BaseName -ieq $script:ProdBase -and $Command[0] -in @('/LoadCfg', '/LoadConfigFromFiles', '/DeleteCfg', '/UpdateDBCfg')) {
             $null = Get-BaseInfo $deployLink $BaseName $user $password
+            Close-DeployWorkerConnection $deployLink $BaseName
         }
         $result = Invoke-V8 -Exe $script:V8 -Arguments $argList -TimeoutSec $TimeoutSec -Title $Title -NoResultLine
         $lines = @(Read-V8Log $logPath)
@@ -501,11 +502,12 @@ function Get-SessionTarget {
 
 function Get-BaseSessions {
     # Сеансы базы по данным агента: имя базы сравнивается целиком.
-    param($Link, [string]$BaseName)
+    param($Link, [string]$BaseName, $Target = $null)
     $list = New-Object System.Collections.Generic.List[object]
     try {
-        $target = Get-SessionTarget $Link $BaseName
+        if ($null -eq $Target) { $Target = Get-SessionTarget $Link $BaseName }
         foreach ($session in @($Link.Agent.GetInfoBaseSessions($target.Cluster, $target.ShortBase))) {
+            if ($null -eq $session) { continue }
             $list.Add([pscustomobject]@{ Text = (Format-ClusterSession $session); IsDesigner = ([string]$session.AppID -eq 'Designer'); IsError = $false })
         }
     }
@@ -515,19 +517,72 @@ function Get-BaseSessions {
 
 function Stop-BaseSessions {
     # Завершает сеансы базы. Без -Designers конфигураторы не трогаются, с -Designers - только они.
-    param($Link, [string]$BaseName, [switch]$Designers)
+    param($Link, [string]$BaseName, [switch]$Designers, $Target = $null)
     $lines = New-Object System.Collections.Generic.List[string]
-    $target = Get-SessionTarget $Link $BaseName
+    if ($null -eq $Target) { $Target = Get-SessionTarget $Link $BaseName }
     foreach ($session in @($Link.Agent.GetInfoBaseSessions($target.Cluster, $target.ShortBase))) {
+        if ($null -eq $session) { continue }
         $isDesigner = ([string]$session.AppID -eq 'Designer')
         if ([bool]$Designers -ne $isDesigner) { continue }
         $description = Format-ClusterSession $session
-        try { $Link.Agent.TerminateSession($target.Cluster, $session); $lines.Add(("{0} - завершён" -f $description)) }
+        try { $Link.Agent.TerminateSession($target.Cluster, $session); $lines.Add(("{0} - команда завершения принята" -f $description)) }
         catch { $lines.Add(("{0} - не завершился: {1}" -f $description, $_.Exception.Message)) }
     }
     foreach ($line in $lines) { Write-RunLog ('Завершение сеансов: ' + $line) }
     return $lines.ToArray()
 }
+
+# ** Хлебников С.Ю. 20261124 Свои соединения с рабочим процессом закрываем до проверки монопольного доступа.
+function Close-DeployWorkerConnection {
+    param($Link, [string]$BaseName)
+    if ($null -eq $Link -or -not $Link.PSObject.Properties['Targets'] -or -not $Link.Targets.ContainsKey($BaseName)) { return }
+    $target = $Link.Targets[$BaseName]
+    $Link.Targets.Remove($BaseName)
+    foreach ($key in 'InfoBase', 'Process') {
+        $value = $target.$key
+        $target.$key = $null
+        if ($null -ne $value -and [Runtime.InteropServices.Marshal]::IsComObject($value)) {
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($value)
+        }
+    }
+}
+
+function Get-ProdSessionAddress {
+    param($Link)
+    $target = Get-SessionTarget $Link $script:ProdBase
+    $address = [pscustomobject]@{ Cluster = $target.Cluster; ShortBase = $target.ShortBase }
+    foreach ($owner in @($Link, $deployLink, $prepLink, $script:WarnLink)) { Close-DeployWorkerConnection $owner $script:ProdBase }
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    return $address
+}
+
+function Stop-ProdSessionsForDeploy {
+    param($Link)
+    $address = Get-ProdSessionAddress $Link
+    foreach ($line in @(Stop-BaseSessions -Link $Link -BaseName $script:ProdBase -Target $address)) { Write-Line ('  ' + $line) }
+    $script:AwaitProdSessions = $true
+}
+
+function Wait-DeploySessions {
+    param($Link, [string]$BaseName, $Target, [int]$TimeoutSec = 60)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $nextReport = 0
+    do {
+        $sessions = @(Get-BaseSessions $Link $BaseName -Target $Target)
+        $errors = @($sessions | Where-Object IsError)
+        if ($errors.Count) { throw ("Не удалось прочитать сеансы {0}: {1}" -f $BaseName, ($errors.Text -join '; ')) }
+        if (-not $sessions.Count) { Write-Line ("  В {0} сеансов не осталось" -f $BaseName) 'Green'; return }
+        if ($clock.Elapsed.TotalSeconds -ge $nextReport) {
+            Write-Line ("  Жду завершения сеансов {0}, осталось {1}" -f $BaseName, $sessions.Count) 'Yellow'
+            $nextReport += 10
+        }
+        if ($clock.Elapsed.TotalSeconds -ge $TimeoutSec) { break }
+        Start-Sleep -Milliseconds 500
+    } while ($true)
+    throw ("В {0} остались сеансы через {1} с: {2}" -f $BaseName, $TimeoutSec, ($sessions.Text -join '; '))
+}
+# ** Хлебников С.Ю. 20261124 конец
 
 function Get-BaseInfo {
     param($Link, [string]$BaseName, [string]$User, [string]$Password)
@@ -594,7 +649,7 @@ function Wait-ProdWarnLock {
         }
         else { $script:ProdClosedAt = $lockAt }
     }
-    foreach ($line in @(Stop-BaseSessions -Link $script:WarnLink -BaseName $script:ProdBase)) { Write-Line ('  ' + $line) }
+    Stop-ProdSessionsForDeploy $script:WarnLink
 }
 
 function Test-ProdPlainLogin {
@@ -981,6 +1036,8 @@ function Get-DeployWindowEnd {
     return $end
 }
 # ** Хлебников С.Ю. 20261120 конец
+$script:WarnLink = $null
+$script:AwaitProdSessions = $false
 $sessionLockHours = [int](Get-Setting $cfg 'SessionLockHours' 2)
 if ($sessionLockHours -lt 1) { $sessionLockHours = 1 }
 # Предупреждение пользователей рабочей перед обновлением: за сколько минут до начала блокировки сеансов.
@@ -1221,13 +1278,15 @@ function Get-ComConnectionLine {
 
 function Assert-ProdActionLock {
     if ($null -eq $prepTarget) { throw 'для действий нужен доступ к свойствам рабочей базы' }
-    $live = Read-BaseInfoAgain $prepTarget $script:ProdBase
-    $now = Get-Date
-    if (-not $live.SessionsDenied -or $live.PermissionCode -cne $script:UnlockCode -or
-        ($live.DeniedFrom -and [datetime]$live.DeniedFrom -gt $now) -or
-        ($live.DeniedTo -and ([datetime]$live.DeniedTo).Year -ge 1900 -and ([datetime]$live.DeniedTo -lt $now))) {
-        throw 'блокировка входа в рабочую базу не подтверждена'
-    }
+    try {
+        $live = (Get-BaseInfo $prepLink $script:ProdBase $script:ProdUser $script:ProdPassword).InfoBase
+        $now = Get-Date
+        if (-not $live.SessionsDenied -or $live.PermissionCode -cne $script:UnlockCode -or
+            ($live.DeniedFrom -and [datetime]$live.DeniedFrom -gt $now) -or
+            ($live.DeniedTo -and ([datetime]$live.DeniedTo).Year -ge 1900 -and ([datetime]$live.DeniedTo -lt $now))) {
+            throw 'блокировка входа в рабочую базу не подтверждена'
+        }
+    } finally { Close-DeployWorkerConnection $prepLink $script:ProdBase }
 }
 
 function Get-ExtensionStates {
@@ -2580,7 +2639,7 @@ function Invoke-CloseBase {
                 try {
                     foreach ($line in @(Stop-BaseSessions -Link $link -BaseName $baseName)) {
                         Write-Line ('  ' + $line)
-                        if ($line.EndsWith(' - завершён')) { $stopped++ }
+                        if ($line.EndsWith(' - команда завершения принята')) { $stopped++ }
                     }
                 }
                 catch { Write-Line ('  завершить сеансы не смог: ' + $_.Exception.Message) 'Yellow' }
@@ -5899,7 +5958,7 @@ if ($needExclusive) {
         if ($answer -eq 'empty') { Write-Line '  сеансы закончились сами' 'Green'; Set-ProdSessionLock $prepTarget }
         if ($answer -eq '3') {
             Set-ProdSessionLock $prepTarget
-            foreach ($line in @(Stop-BaseSessions -Link $prepLink -BaseName $script:ProdBase)) { Write-Line ('  ' + $line) }
+            Stop-ProdSessionsForDeploy $prepLink
         }
         if ($answer -eq '4') {
             if ($null -eq $prepTarget) {
@@ -6071,9 +6130,10 @@ if ($Prepare -and -not $failed) {
 }
 # Дальше рабочая меняется: при предупреждении пользователей - дождаться закрытия базы.
 if (-not $failed -and $null -ne $script:WarnLockAt) { Wait-ProdWarnLock }
-if (-not $failed -and $null -ne $prodActions) {
-    Assert-ProdActionLock
-    if (@(Get-BaseSessions $prepLink $script:ProdBase).Count -gt 0) { throw 'перед действиями должны завершиться сеансы рабочей базы' }
+if (-not $failed -and ($script:AwaitProdSessions -or $null -ne $prodActions)) {
+    $address = Get-ProdSessionAddress $prepLink
+    Wait-DeploySessions $prepLink $script:ProdBase $address
+    if ($null -ne $prodActions -or $null -ne $prepTarget) { Assert-ProdActionLock }
 }
 # ** Хлебников С.Ю. 20261120 Пока шли вопросы и выгрузки, temp могли поменять: хеш-суммы - ещё раз, после того как
 # расширения взяты из temp. Не совпали с теми, по которым сверялся проверенный прогон, - в рабочую не грузим.
