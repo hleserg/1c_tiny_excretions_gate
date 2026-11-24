@@ -65,17 +65,56 @@ function Send-OperationBatch {
     foreach ($entry in $Batch) { [IO.File]::Move($entry.File, $entry.File + '.sent') }
 }
 
+# ** Хлебников С.Ю. 20261124 Для старого выпуска тоже читаем результат действий из его собственного каталога.
+function Get-OperationActionDetail {
+    param($Record, [string]$Directory, [string[]]$Secrets = @())
+    $detail = [ordered]@{ run = [IO.Path]::GetFileName($Directory); outcome = $Record.outcome; report = 'missing' }
+    $result = Join-Path $Directory 'actions\result.txt'
+    $reason = ''
+    if ([IO.File]::Exists($result)) {
+        $detail.report = 'present'
+        $rows = foreach ($line in [IO.File]::ReadLines($result, [Text.Encoding]::UTF8)) {
+            if ($line -cmatch '^user=(.{1,150})$') { $detail.user = $Matches[1] }
+            elseif ($line -cmatch '^error=(.+)$') { $reason = $Matches[1] }
+            elseif ($line -cmatch '^action=([\p{L}0-9_-]{1,150})\|(done|already|notrun|failed)(?:\|(.*))?$') {
+                $id = $Matches[1]; $state = $Matches[2]; $message = $Matches[3]
+                if ($Record.actions.ids -ccontains $id) {
+                    [ordered]@{ id = $id; status = $state }
+                    if ($state -eq 'failed' -and $message) { $reason = $message }
+                }
+            }
+        }
+        $detail.actions = @($rows | Where-Object { $_ })
+    }
+    if (-not $reason -and $Record.outcome -eq 'actionsFailed' -and $Record.PSObject.Properties['light']) {
+        $failure = $Record.light | Where-Object { $_.name -eq 'Действия после обновления' -and $_.status -eq 'FAIL' } | Select-Object -First 1
+        if ($failure -and $failure.PSObject.Properties['text']) { $reason = [string]$failure.text }
+    }
+    if ($reason) {
+        $detail.reason = Get-ActionErrorSummary $reason $Secrets
+    }
+    return $detail
+}
+# ** Хлебников С.Ю. 20261124 конец
+
 function Get-OperationHistory {
     # Формируется и для выпуска, который прошёл на предыдущей версии гейта.
-    param([string]$Spool)
+    param([string]$Spool, [string[]]$Secrets = @())
     $root = Split-Path -Parent $Spool
     foreach ($dir in @(Get-ChildItem -LiteralPath $root -Directory | Where-Object Name -match '^\d{8}-\d{6}$')) {
         $source = Join-Path $dir.FullName 'deploy.json'
         $out = Join-Path $Spool ('history-' + $dir.Name)
         $file = Join-Path $out '00000-release.json'
-        if ([IO.File]::Exists($file) -or [IO.File]::Exists($file + '.sent')) { continue }
+        # ** Хлебников С.Ю. 20261124 Подробности действий досылаются отдельно от неизменяемого итога выпуска.
+        $haveRelease = [IO.File]::Exists($file) -or [IO.File]::Exists($file + '.sent')
+        $detailFile = Join-Path $out '00001-result.json'
+        $needDetail = [IO.Directory]::Exists((Join-Path $dir.FullName 'actions')) -and
+            -not ([IO.File]::Exists($detailFile) -or [IO.File]::Exists($detailFile + '.sent'))
+        if ($haveRelease -and -not $needDetail) { continue }
+        # ** Хлебников С.Ю. 20261124 конец
         try {
             if (-not [IO.File]::Exists($source)) {
+                if ($haveRelease) { continue } # ** Хлебников С.Ю. 20261124
                 $logPath = Join-Path $dir.FullName 'run.log'
                 if (-not [IO.File]::Exists($logPath)) { continue }
                 $tail = @(Get-Content -LiteralPath $logPath -Encoding UTF8 -Tail 12 | Where-Object { $_ -match '^\d\d:\d\d:\d\d ИТОГ: подготов' })
@@ -85,6 +124,14 @@ function Get-OperationHistory {
             } else {
                 $record = (Read-TextFile $source) | ConvertFrom-Json
                 if ($record.outcome -notin @('updated','failed','rolledBack','rollbackFailed','actionsFailed')) { continue }
+                # ** Хлебников С.Ю. 20261124 В т.ч. для выпуска, уже отправленного прежней версией.
+                if ($needDetail -and $record.PSObject.Properties['actions'] -and $record.actions -and $record.actions.PSObject.Properties['ids']) {
+                    $null = [IO.Directory]::CreateDirectory($out)
+                    $detail = Get-OperationActionDetail $record $dir.FullName $Secrets
+                    Write-OperationEvent ([pscustomobject]@{Dir=$out;Name='deploy';Next=1}) 'result' $detail
+                }
+                if ($haveRelease) { continue }
+                # ** Хлебников С.Ю. 20261124 конец
                 $content = [ordered]@{ operation='deploy'; event='release'; run=$dir.Name; outcome=$record.outcome; mode=$record.mode; time=$record.time; base=$record.base }
                 if ($record.PSObject.Properties['gate'] -and $record.gate) {
                     $content.gate = $record.gate | Select-Object run,verdict,kitSource
@@ -129,7 +176,7 @@ function Watch-GateOperations {
             if ($encoded -cne $plain) { $secretPatterns.Add($encoded) }
         }
         do {
-            Get-OperationHistory $spoolPath
+            Get-OperationHistory $spoolPath $secretPatterns.ToArray()
             $active = $false
             $batch = New-Object System.Collections.Generic.List[object]
             foreach ($dir in @(Get-ChildItem -LiteralPath $spoolPath -Directory | Where-Object Name -match '^(?:\d{8}-\d{6}-[0-9a-f]{32}|history-\d{8}-\d{6})$')) {

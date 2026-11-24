@@ -5696,6 +5696,7 @@ if ($ApplyPrepared -and $null -ne $prepared -and $null -ne $prepared.PSObject.Pr
     if ($preparedHash -ne $runHash) { throw 'проверенный исполнитель изменился или утрачен после подготовки' }
 }
 # Подготовка сохраняет ссылку на проверенный прогон. Его EPF копируем при применении до первой записи.
+$actionsWithTargets = $prodActions # ** Хлебников С.Ю. 20261124 Подготовка тоже проверяет данные до загрузки.
 if ($Prepare -or $mode -in @('asis','epf','rollback')) { $prodActions = $null }
 elseif ($null -ne $lastRun -and (-not $ApplyPrepared -or (Get-JsonValue $prepared 'gate' ''))) {
     $requested = @(Get-JsonValue $lastVerdict 'requestedActionIds' @() | Where-Object { $_ })
@@ -5719,6 +5720,41 @@ if ($null -ne $prodActions) {
     $deployActionEpf = Join-Path $workActions 'ДействияПослеОбновления.epf'
     Copy-VerifiedActionEpf $lastRun.FullName $deployActionEpf $prodActions.sha256
 }
+
+# ** Хлебников С.Ю. 20261124 Чтение до подготовки, блокировок, завершения сеансов и обновления.
+if ($null -ne $actionsWithTargets -and $mode -notin @('asis','epf','rollback')) {
+    $targetRules = Get-Setting $cfg 'DeployActionTargets' @{}
+    $targetIds = @($actionsWithTargets.ids | Where-Object { $targetRules.ContainsKey($_) })
+    if ($targetIds.Count) {
+        $checkTargets = {
+            param($Line, $Register, $Rules, $Ids, $Library, $FakeScript, $FakeFile)
+            . $Library
+            if ($FakeScript) { . $FakeScript; $connector = New-FakeComConnector $FakeFile }
+            else { $connector = New-Object -ComObject V83.COMConnector }
+            $connection = $null
+            try {
+                $connection = $connector.Connect($Line)
+                Assert-GateActionTargets $connection $Register $Rules $Ids
+            } finally {
+                foreach ($obj in @($connection, $connector)) {
+                    if ($null -ne $obj -and [Runtime.InteropServices.Marshal]::IsComObject($obj)) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($obj) }
+                }
+                [GC]::Collect()
+                [GC]::WaitForPendingFinalizers()
+            }
+        }
+        $argsForCheck = @((Get-ComConnectionLine $script:ProdBase $script:ProdUser $script:ProdPassword), [string](Get-Setting $cfg 'ActionsRegister' ''),
+            $targetRules, $targetIds, (Join-Path $Root 'post-update.ps1'), $script:FakeComScript, [string]$env:CI_FAKE_COM)
+        $precheck = Invoke-UiBackground -Script $checkTargets -Arguments $argsForCheck -Title 'Проверить условия действий в рабочей базе' -TimeoutSec $comTimeoutSec
+        if (-not $precheck.Ok) {
+            $problem = Get-ActionErrorSummary (Get-MaskedLine $precheck.Error)
+            Write-OperationEvent $script:GateOperation 'result' @{stage='actionPrecheck';status='failed'; reason=$problem}
+            throw ("Проверка перед выпуском: {0} В этом запуске рабочая база не изменена." -f $problem)
+        }
+        Write-OperationEvent $script:GateOperation 'result' @{stage='actionPrecheck';status='ok';ids=$targetIds}
+    }
+}
+# ** Хлебников С.Ю. 20261124 конец
 
 if ((Test-DeployHourDenied (Get-Date)) -and -not $Prepare) { throw ("сейчас {0} - обновлять рабочую в это время запрещено (DeployDeniedFrom/To): рабочую базу обновляем только {1}" -f (Get-Date -Format 'HH:mm'), (Get-DeployWindowText)) }
 
@@ -6987,7 +7023,10 @@ if ($null -ne $plainLogin) { $record['plainLogin'] = [ordered]@{ status = $plain
 
 Write-Host ''
 $finalColor = 'Green'
-if ($outcome -ne 'updated') { $finalColor = 'Red' }
+if ($outcome -ne 'updated') {
+    $finalColor = 'Red'
+    if ($script:GateOperation) { $script:GateOperation.FinalStatus = 'failed' } # ** Хлебников С.Ю. 20261124 Результат внутреннего запуска для журнала и ci.exe.
+}
 # План и факт по шагам: насколько прогноз длительности совпал (stats.ps1).
 $statLines = @(Get-StatRunLines)
 if ($statLines.Count -gt 0) {
@@ -6996,6 +7035,13 @@ if ($statLines.Count -gt 0) {
     foreach ($line in $statLines) { Write-Host $line -ForegroundColor DarkGray }
 }
 Write-Line ("ИТОГ: {0}. Резервные копии: {1}" -f $outcomeNames[$outcome], $beforeDir) $finalColor
+# ** Хлебников С.Ю. 20261124 Причина частичного выпуска рядом с итогом, когда оператор вернулся к экрану.
+if ($outcome -eq 'actionsFailed') {
+    $errorStep = $light | Where-Object { $_.Name -eq 'Действия после обновления' -and $_.Status -eq 'FAIL' } | Select-Object -First 1
+    if ($errorStep) { Write-Line (Get-ActionErrorSummary $errorStep.Text) 'Red' }
+    Write-Line 'После исправления выбери «Выполнить только проверенные действия». Выполненные ранее действия пропускаются.' 'Yellow'
+}
+# ** Хлебников С.Ю. 20261124 конец
 if ($null -ne $plainLogin -and $plainLogin.Status -eq 'FAIL') {
     Write-Line ("ВХОД В {0} БЕЗ КОДА РАЗРЕШЕНИЯ НЕ ПРОШЁЛ: {1}." -f $script:ProdBase, $plainLogin.Text) 'Red'
 }

@@ -42,7 +42,13 @@ function ConvertTo-Psd1 {
     if ($Value -is [bool]) { if ($Value) { return '$true' } else { return '$false' } }
     if ($Value -is [int] -or $Value -is [long] -or $Value -is [double]) { return [string]$Value }
     if ($Value -is [hashtable]) {
-        $parts = @($Value.Keys | ForEach-Object { '{0} = {1}' -f $_, (ConvertTo-Psd1 $Value[$_]) })
+        # ** Хлебников С.Ю. 20261124 Идентификаторы действий в ключах PSD1 начинаются с даты и содержат дефисы.
+        $parts = @($Value.Keys | ForEach-Object {
+            $key = [string]$_
+            if ($key -notmatch '^[\p{L}_][\p{L}\p{Nd}_]*$') { $key = "'" + $key.Replace("'","''") + "'" }
+            '{0} = {1}' -f $key, (ConvertTo-Psd1 $Value[$_])
+        })
+        # ** Хлебников С.Ю. 20261124 конец
         return '@{ ' + ($parts -join '; ') + ' }'
     }
     if ($Value -is [array]) { return '@(' + (@($Value | ForEach-Object { ConvertTo-Psd1 $_ }) -join ', ') + ')' }
@@ -2338,6 +2344,14 @@ $tests = @(
             $config = $deployConfig.Clone()
             $config['ActionsRegister'] = 'ВыполненныеДействия'
             $config['HistoryRegister'] = 'ЖурналОбновлений'
+            # ** Хлебников С.Ю. 20261124 Частичный выпуск возвращает ошибку также через обёртку журнала.
+            $config['DeployActionTargets'] = @{
+                '20261117-01-Первое' = @{Catalog='Профили';NameContains='Продажи'}
+                '20261117-02-Второе' = @{Catalog='Профили';NameEquals='Кладовщик';ParentName='2026';Unique=$true}
+            }
+            $config['PublishOperations'] = $true
+            $config['RunFilesRepo'] = 'owner/ext'
+            # ** Хлебников С.Ю. 20261124 конец
             $sb = New-Sandbox $Name -Config $config
             $runDir = Join-Path $sb 'runs\20261117-090000'
             $actionDir = Join-Path $runDir 'actions'
@@ -2353,9 +2367,18 @@ $tests = @(
             [IO.File]::WriteAllText((Join-Path $runDir 'verdict.json'), ($verdict | ConvertTo-Json -Depth 6), $utf8)
             $answers = @(@{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Выполнить только проверенные действия' }, $deployNameAnswer)
             $com = New-ComState -ProdHash 'h2'
+            $sales = @{ name='Опт ПРОДАЖИ'; parent=''; deleted=$false; folder=$false }
+            $keeper = @{ name='Кладовщик'; parent='2026'; deleted=$false; folder=$false }
+            $com.bases.erp_base.actionTargets = @($sales,$keeper) # ** Хлебников С.Ю. 20261124
             $failedRun = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers $answers -Fake @{ actions = @(@{ fail = $ids[1] }) }
             Check-DeployCommon $failedRun
             Check ($failedRun.ExitCode -ne 0) 'частичное выполнение вернуло успех'
+            # ** Хлебников С.Ю. 20261124 Проверяем окончательный статус и явную подсказку без повторной загрузки.
+            $ends = @(Get-ChildItem -LiteralPath (Join-Path $sb 'deploy\operations') -Recurse -Filter '*-finish.json*' |
+                ForEach-Object { [IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json })
+            Check (@($ends | Where-Object { $_.status -eq 'failed' -and $_.exitCode -ne 0 }).Count -eq 1) 'ошибка действий отмечена как успешное завершение'
+            Check (($failedRun.Output -join ' ') -match 'После исправления выбери') 'нет подсказки о повторе только действий'
+            # ** Хлебников С.Ю. 20261124 конец
             $record = Get-DeployRecord $sb
             Check ($null -ne $record -and $record.outcome -eq 'actionsFailed') 'не сохранён исход действий'
             Check (-not (Test-Path -LiteralPath (Join-Path $runDir 'released.txt'))) 'частичное выполнение принято как выпуск'
@@ -2368,6 +2391,21 @@ $tests = @(
                 $result = [IO.File]::ReadAllText((Join-Path $record.Dir 'actions\result.txt'))
                 Check ($result.Contains(($ids[0] + '|already')) -and $result.Contains(($ids[1] + '|done'))) 'итог повтора не совпал'
             }
+            # ** Хлебников С.Ю. 20261124 Данные расходятся: остановка раньше подтверждения, блокировок и записи.
+            $com.bases.erp_base.actionTargets = @(@{ name='Продажи'; parent=''; deleted=$true; folder=$false })
+            Reset-FakeState $sb
+            $absent = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @($answers[0])
+            Check ($absent.ExitCode -ne 0 -and ($absent.Output -join ' ') -match 'нет подходящих элементов') 'пустая выборка прошла проверку'
+            Check (@($absent.Calls | Where-Object { $_.Line -match 'actions;in=|/UpdateDBCfg|/LoadCfg' }).Count -eq 0) 'при отсутствии карточки началось применение'
+            Check ((@($absent.ComLog | Select-Object -Skip @($retry.ComLog).Count) -join ' ') -notmatch 'UpdateInfoBase|TerminateSession') 'до проверки завершались сеансы'
+            $com.bases.erp_base.actionTargets = @($sales,$keeper,$keeper)
+            $many = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @($answers[0])
+            Check ($many.ExitCode -ne 0 -and ($many.Output -join ' ') -match 'вместо одного') 'неоднозначный точный отбор прошёл'
+            $com.bases.erp_base.doneActions = $ids
+            $com.bases.erp_base.actionTargets = @()
+            $skipped = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers $answers -Fake @{ actions = @(@{ already = $ids }) }
+            Check ($skipped.ExitCode -eq 0) 'условие ранее выполненного действия помешало выпуску'
+            # ** Хлебников С.Ю. 20261124 конец
             [IO.File]::WriteAllBytes($epf, [byte[]]@(67))
             Reset-FakeState $sb
             $changed = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @($answers[0])
@@ -4016,6 +4054,20 @@ $tests = @(
             $dep = Join-Path $sb 'deploy\20010101-120000'
             $null = [IO.Directory]::CreateDirectory($dep)
             [IO.File]::WriteAllText((Join-Path $dep 'deploy.json'), '{"runId":"20010101-120000","base":"erp_base","time":"2001-01-01T12:00:00","mode":"prepared","outcome":"updated","riskReason":"private-text","gate":{"run":"20010101-100000","verdict":"GREEN","kitSource":"git test"},"extensions":[{"name":"Demo","newVersion":"20261124.030000"}]}')
+            # ** Хлебников С.Ю. 20261124 У прежней версии итог уже отправлен, подробности остаются на диске завода.
+            $prior = Join-Path $sb 'deploy\20010101-125900'
+            $previous = Join-Path $sb 'deploy\operations\history-20010101-125900'
+            $null = [IO.Directory]::CreateDirectory((Join-Path $prior 'actions'))
+            $null = [IO.Directory]::CreateDirectory($previous)
+            [IO.File]::WriteAllText((Join-Path $previous '00000-release.json.sent'), '{}')
+            $oldFailure = @{ outcome='actionsFailed'; base='erp_base'; mode='prepared'; time='2001-01-01T12:59:00'
+                actions=@{ids=@('20010101-01-Тест');result='..\secrets\github.txt'}
+                riskReason='private-text' }
+            [IO.File]::WriteAllText((Join-Path $prior 'deploy.json'), ($oldFailure | ConvertTo-Json -Depth 4),$utf8)
+            [IO.File]::WriteAllLines((Join-Path $prior 'actions\result.txt'), [string[]]@(
+                'user=Пользователь теста','log=private-text','action=20010101-01-Тест|failed|Профиль не найден (tok-git) {Модуль(15)}:private-text',
+                'action=20010101-02-Чужое|notrun','status=failed'),$utf8)
+            # ** Хлебников С.Ю. 20261124 конец
             $orphan = Join-Path $sb ('deploy\operations\20010101-100000-' + ('a' * 32))
             $null = [IO.Directory]::CreateDirectory($orphan)
             [IO.File]::WriteAllText((Join-Path $orphan 'pid.txt'), '2147483646|unknown')
@@ -4050,6 +4102,12 @@ $tests = @(
                 Check (@($finish | Where-Object status -eq 'interrupted').Count -eq 1) 'нет состояния оборвавшейся операции'
                 $waiting = @($events | Where-Object { $_.event -eq 'step' -and $_.operation -eq 'settings' -and $_.PSObject.Properties['status'] -and $_.status -eq 'waitingForOperator' })
                 Check ($waiting.Count -gt 0) 'дочерние настройки не показали ожидание оператора'
+                # ** Хлебников С.Ю. 20261124 Публикуется результат действий из старого выпуска без служебного стека.
+                $actionDetail = @($events | Where-Object { $_.event -eq 'result' -and $_.PSObject.Properties['actions'] })
+                Check ($actionDetail.Count -eq 1) 'не досланы подробности уже отправленного выпуска'
+                Check ($actionDetail[0].user -ceq 'Пользователь теста' -and $actionDetail[0].reason -ceq 'Профиль не найден (***)') 'нет фактического пользователя или причины'
+                Check (@($actionDetail[0].actions).Count -eq 1 -and $actionDetail[0].actions[0].status -eq 'failed') 'подмешан результат незаявленного действия'
+                # ** Хлебников С.Ю. 20261124 конец
                 $history = @($events | Where-Object event -eq 'release')
                 Check ($history.Count -eq 1 -and $history[0].outcome -eq 'updated' -and $history[0].gate.verdict -eq 'GREEN' -and $history[0].extensions[0].newVersion -eq '20261124.030000') 'старый выпуск не восстановлен из deploy.json'
                 & (Join-Path $sb 'publish.ps1') -WatchOperations
