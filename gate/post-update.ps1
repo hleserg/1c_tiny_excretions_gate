@@ -37,6 +37,58 @@ function Assert-ActionResult {
     }
 }
 
+# ** Хлебников С.Ю. 20261124 Проверяем зависимость действия от существующих карточек до изменений в рабочей.
+function Assert-GateActionTargets {
+    param($Connection, [string]$Register, [hashtable]$Rules, [string[]]$Ids)
+    if ($Register -cnotmatch '^[\p{L}_][\p{L}\p{Nd}_]*$') { throw 'Условия действий: неверное имя регистра выполненных действий.' }
+    if ([Runtime.InteropServices.Marshal]::IsComObject($Connection)) {
+        . (Join-Path $PSScriptRoot 'delivery-designer.ps1')
+        $member = ${function:Get-WorkerMember}
+    } else {
+        $member = {
+            param($Object, [string]$Name, [object[]]$Arguments = $null)
+            if ($null -ne $Arguments) { return , ($Object.$Name.Invoke($Arguments)) }
+            return , ($Object.$Name)
+        }
+    }
+    $metadata = & $member $Connection 'Metadata'
+    $registers = & $member $metadata 'InformationRegisters'
+    $hasRegister = $null -ne (& $member $registers 'Find' @($Register))
+    foreach ($id in $Ids) {
+        if (-not $Rules.ContainsKey($id)) { continue }
+        $rule = $Rules[$id]
+        $catalog = [string]$rule['Catalog']
+        $exact = [string]$rule['NameEquals']
+        $contains = [string]$rule['NameContains']
+        if ($catalog -cnotmatch '^[\p{L}_][\p{L}\p{Nd}_]*$' -or ([bool]$exact -eq [bool]$contains)) {
+            throw ("Действие {0}: проверь Catalog и один отбор NameEquals или NameContains в DeployActionTargets." -f $id)
+        }
+        if ($hasRegister) {
+            $text = "ВЫБРАТЬ ПЕРВЫЕ 1 Выполненные.Действие ИЗ РегистрСведений.$Register КАК Выполненные ГДЕ Выполненные.Действие = &Действие"
+            $query = & $member $Connection 'NewObject' @('Query', $text)
+            $null = & $member $query 'SetParameter' @('Действие', $id)
+            $result = & $member $query 'Execute' @()
+            if (-not (& $member $result 'IsEmpty' @())) { continue }
+        }
+        $filter = 'Цель.Наименование = &Имя'
+        $value = $exact
+        if ($contains) {
+            $filter = 'ВРЕГ(Цель.Наименование) ПОДОБНО ВРЕГ(&Имя) СПЕЦСИМВОЛ "~"'
+            $value = '%' + $contains.Replace('~','~~').Replace('%','~%').Replace('_','~_').Replace('[','~[').Replace(']','~]') + '%'
+        }
+        $text = "ВЫБРАТЬ ПЕРВЫЕ 2 Цель.Ссылка ИЗ Справочник.$catalog КАК Цель ГДЕ НЕ Цель.ЭтоГруппа И НЕ Цель.ПометкаУдаления И $filter"
+        if ($rule['ParentName']) { $text += ' И Цель.Родитель.Наименование = &Папка' }
+        $query = & $member $Connection 'NewObject' @('Query', $text)
+        $null = & $member $query 'SetParameter' @('Имя', $value)
+        if ($rule['ParentName']) { $null = & $member $query 'SetParameter' @('Папка', [string]$rule['ParentName']) }
+        $result = & $member $query 'Execute' @()
+        $rows = & $member $result 'Select' @()
+        if (-not (& $member $rows 'Next' @())) { throw ("Действие {0}: в рабочей базе нет подходящих элементов справочника {1} (имя: {2}{3}, папка: {4})." -f $id,$catalog,$exact,$contains,$rule['ParentName']) }
+        if ($rule['Unique'] -and (& $member $rows 'Next' @())) { throw ("Действие {0}: в справочнике {1} найдено несколько подходящих элементов вместо одного." -f $id,$catalog) }
+    }
+}
+# ** Хлебников С.Ю. 20261124 конец
+
 function Copy-VerifiedActionEpf {
     param([string]$RunDirectory, [string]$Destination, [string]$Hash)
     $source = Join-Path $RunDirectory 'actions\ДействияПослеОбновления.epf'

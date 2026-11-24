@@ -5696,6 +5696,7 @@ if ($ApplyPrepared -and $null -ne $prepared -and $null -ne $prepared.PSObject.Pr
     if ($preparedHash -ne $runHash) { throw 'проверенный исполнитель изменился или утрачен после подготовки' }
 }
 # Подготовка сохраняет ссылку на проверенный прогон. Его EPF копируем при применении до первой записи.
+$actionsWithTargets = $prodActions # ** Хлебников С.Ю. 20261124 Подготовка тоже проверяет данные до загрузки.
 if ($Prepare -or $mode -in @('asis','epf','rollback')) { $prodActions = $null }
 elseif ($null -ne $lastRun -and (-not $ApplyPrepared -or (Get-JsonValue $prepared 'gate' ''))) {
     $requested = @(Get-JsonValue $lastVerdict 'requestedActionIds' @() | Where-Object { $_ })
@@ -5719,6 +5720,38 @@ if ($null -ne $prodActions) {
     $deployActionEpf = Join-Path $workActions 'ДействияПослеОбновления.epf'
     Copy-VerifiedActionEpf $lastRun.FullName $deployActionEpf $prodActions.sha256
 }
+
+# ** Хлебников С.Ю. 20261124 Чтение до подготовки, блокировок, завершения сеансов и обновления.
+if ($null -ne $actionsWithTargets -and $mode -notin @('asis','epf','rollback')) {
+    $targetRules = Get-Setting $cfg 'DeployActionTargets' @{}
+    $targetIds = @($actionsWithTargets.ids | Where-Object { $targetRules.ContainsKey($_) })
+    if ($targetIds.Count) {
+        $checkTargets = {
+            param($Line, $Register, $Rules, $Ids, $Library, $FakeScript, $FakeFile)
+            . $Library
+            if ($FakeScript) { . $FakeScript; $connector = New-FakeComConnector $FakeFile }
+            else { $connector = New-Object -ComObject V83.COMConnector }
+            $connection = $null
+            try {
+                $connection = $connector.Connect($Line)
+                Assert-GateActionTargets $connection $Register $Rules $Ids
+            } finally {
+                foreach ($obj in @($connection, $connector)) {
+                    if ($null -ne $obj -and [Runtime.InteropServices.Marshal]::IsComObject($obj)) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($obj) }
+                }
+            }
+        }
+        $argsForCheck = @((Get-ComConnectionLine $script:ProdBase $script:ProdUser $script:ProdPassword), [string](Get-Setting $cfg 'ActionsRegister' ''),
+            $targetRules, $targetIds, (Join-Path $Root 'post-update.ps1'), $script:FakeComScript, [string]$env:CI_FAKE_COM)
+        $precheck = Invoke-UiBackground -Script $checkTargets -Arguments $argsForCheck -Title 'Проверить условия действий в рабочей базе' -TimeoutSec $comTimeoutSec
+        if (-not $precheck.Ok) {
+            $problem = Get-ActionErrorSummary (Get-MaskedLine $precheck.Error)
+            Write-OperationEvent $script:GateOperation 'result' @{stage='actionPrecheck';status='failed'; reason=$problem}
+            throw ("Проверка перед выпуском: {0} В этом запуске рабочая база не изменена." -f $problem)
+        }
+    }
+}
+# ** Хлебников С.Ю. 20261124 конец
 
 if ((Test-DeployHourDenied (Get-Date)) -and -not $Prepare) { throw ("сейчас {0} - обновлять рабочую в это время запрещено (DeployDeniedFrom/To): рабочую базу обновляем только {1}" -f (Get-Date -Format 'HH:mm'), (Get-DeployWindowText)) }
 

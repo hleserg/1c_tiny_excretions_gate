@@ -42,7 +42,13 @@ function ConvertTo-Psd1 {
     if ($Value -is [bool]) { if ($Value) { return '$true' } else { return '$false' } }
     if ($Value -is [int] -or $Value -is [long] -or $Value -is [double]) { return [string]$Value }
     if ($Value -is [hashtable]) {
-        $parts = @($Value.Keys | ForEach-Object { '{0} = {1}' -f $_, (ConvertTo-Psd1 $Value[$_]) })
+        # ** Хлебников С.Ю. 20261124 Идентификаторы действий в ключах PSD1 начинаются с даты и содержат дефисы.
+        $parts = @($Value.Keys | ForEach-Object {
+            $key = [string]$_
+            if ($key -notmatch '^[\p{L}_][\p{L}\p{Nd}_]*$') { $key = "'" + $key.Replace("'","''") + "'" }
+            '{0} = {1}' -f $key, (ConvertTo-Psd1 $Value[$_])
+        })
+        # ** Хлебников С.Ю. 20261124 конец
         return '@{ ' + ($parts -join '; ') + ' }'
     }
     if ($Value -is [array]) { return '@(' + (@($Value | ForEach-Object { ConvertTo-Psd1 $_ }) -join ', ') + ')' }
@@ -2339,6 +2345,10 @@ $tests = @(
             $config['ActionsRegister'] = 'ВыполненныеДействия'
             $config['HistoryRegister'] = 'ЖурналОбновлений'
             # ** Хлебников С.Ю. 20261124 Частичный выпуск возвращает ошибку также через обёртку журнала.
+            $config['DeployActionTargets'] = @{
+                '20261117-01-Первое' = @{Catalog='Профили';NameContains='Продажи'}
+                '20261117-02-Второе' = @{Catalog='Профили';NameEquals='Кладовщик';ParentName='2026';Unique=$true}
+            }
             $config['PublishOperations'] = $true
             $config['RunFilesRepo'] = 'owner/ext'
             # ** Хлебников С.Ю. 20261124 конец
@@ -2357,6 +2367,9 @@ $tests = @(
             [IO.File]::WriteAllText((Join-Path $runDir 'verdict.json'), ($verdict | ConvertTo-Json -Depth 6), $utf8)
             $answers = @(@{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Выполнить только проверенные действия' }, $deployNameAnswer)
             $com = New-ComState -ProdHash 'h2'
+            $sales = @{ name='Опт ПРОДАЖИ'; parent=''; deleted=$false; folder=$false }
+            $keeper = @{ name='Кладовщик'; parent='2026'; deleted=$false; folder=$false }
+            $com.bases.erp_base.actionTargets = @($sales,$keeper) # ** Хлебников С.Ю. 20261124
             $failedRun = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers $answers -Fake @{ actions = @(@{ fail = $ids[1] }) }
             Check-DeployCommon $failedRun
             Check ($failedRun.ExitCode -ne 0) 'частичное выполнение вернуло успех'
@@ -2378,6 +2391,21 @@ $tests = @(
                 $result = [IO.File]::ReadAllText((Join-Path $record.Dir 'actions\result.txt'))
                 Check ($result.Contains(($ids[0] + '|already')) -and $result.Contains(($ids[1] + '|done'))) 'итог повтора не совпал'
             }
+            # ** Хлебников С.Ю. 20261124 Данные расходятся: остановка раньше подтверждения, блокировок и записи.
+            $com.bases.erp_base.actionTargets = @(@{ name='Продажи'; parent=''; deleted=$true; folder=$false })
+            Reset-FakeState $sb
+            $absent = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @($answers[0])
+            Check ($absent.ExitCode -ne 0 -and ($absent.Output -join ' ') -match 'нет подходящих элементов') 'пустая выборка прошла проверку'
+            Check (@($absent.Calls | Where-Object { $_.Line -match 'actions;in=|/UpdateDBCfg|/LoadCfg' }).Count -eq 0) 'при отсутствии карточки началось применение'
+            Check ((@($absent.ComLog | Select-Object -Skip @($retry.ComLog).Count) -join ' ') -notmatch 'UpdateInfoBase|TerminateSession') 'до проверки завершались сеансы'
+            $com.bases.erp_base.actionTargets = @($sales,$keeper,$keeper)
+            $many = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @($answers[0])
+            Check ($many.ExitCode -ne 0 -and ($many.Output -join ' ') -match 'вместо одного') 'неоднозначный точный отбор прошёл'
+            $com.bases.erp_base.doneActions = $ids
+            $com.bases.erp_base.actionTargets = @()
+            $skipped = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers $answers -Fake @{ actions = @(@{ already = $ids }) }
+            Check ($skipped.ExitCode -eq 0) 'условие ранее выполненного действия помешало выпуску'
+            # ** Хлебников С.Ю. 20261124 конец
             [IO.File]::WriteAllBytes($epf, [byte[]]@(67))
             Reset-FakeState $sb
             $changed = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @($answers[0])

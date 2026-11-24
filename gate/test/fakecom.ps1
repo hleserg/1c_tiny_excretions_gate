@@ -222,6 +222,11 @@ function New-FakeComConnection {
             if ($null -ne $property -and $property.Value) { $metadata.$field = [string]$property.Value }
         }
     }
+    # ** Хлебников С.Ю. 20261124 Подставные регистр и выборка профилей до выпуска.
+    $registers = [pscustomobject]@{}
+    $registers | Add-Member ScriptMethod Find { param($Name) return $Name }
+    $metadata | Add-Member -NotePropertyName InformationRegisters -NotePropertyValue $registers
+    # ** Хлебников С.Ю. 20261124 конец
     $connection | Add-Member -NotePropertyName Metadata -NotePropertyValue $metadata
     $connection | Add-Member -MemberType ScriptMethod -Name Base64String -Value { param($Value) return [string]$Value }
     $connection | Add-Member -MemberType ScriptMethod -Name String -Value { param($Value) return [string]$Value }
@@ -239,7 +244,7 @@ function New-FakeComConnection {
         })
     }
     $connection | Add-Member -MemberType ScriptMethod -Name NewObject -Value {
-        param($TypeName)
+        param($TypeName, $QueryText = '')
         # ** Хлебников С.Ю. 20261124 Минимальные коллекции для чтения журнала регистрации.
         if ($TypeName -eq 'Array') { return ,(New-Object System.Collections.ArrayList) }
         if ($TypeName -eq 'Structure') {
@@ -254,11 +259,40 @@ function New-FakeComConnection {
             return $table
         }
         if ([string]$TypeName -ne 'Query') { return [pscustomobject]@{ TypeName = [string]$TypeName } }
-        $query = [pscustomobject]@{ StateFile = $this.StateFile; Base = $this.Base; Text = '' }
+        $query = [pscustomobject]@{ StateFile = $this.StateFile; Base = $this.Base; Text = $QueryText; Parameters = @{} }
+        $query | Add-Member ScriptMethod SetParameter { param($Key,$Value) $this.Parameters[$Key]=$Value } # ** Хлебников С.Ю. 20261124
         $query | Add-Member -MemberType ScriptMethod -Name Execute -Value {
             # Запросы к справочнику обработок: из текста смотрится только отбор помеченных и табличная часть Назначение.
             $state = Read-FakeComState $this.StateFile
-            $all = Get-FakeComList (Get-FakeComBase $state $this.Base) 'processings'
+            # ** Хлебников С.Ю. 20261124 Только читающие запросы проверки данных перед выпуском.
+            $baseState = Get-FakeComBase $state $this.Base
+            if ($this.Text -match 'Выполненные\.Действие = &Действие') {
+                $done = Get-FakeComList $baseState 'doneActions'
+                $result = [pscustomobject]@{ Empty = $done -cnotcontains $this.Parameters['Действие'] }
+                $result | Add-Member ScriptMethod IsEmpty { return $this.Empty }
+                return $result
+            }
+            if ($this.Text -match 'Цель\.Ссылка ИЗ Справочник\.') {
+                $hits = 0
+                foreach ($row in (Get-FakeComList $baseState 'actionTargets')) {
+                    if ($row.deleted -or $row.folder) { continue }
+                    if ($this.Parameters.ContainsKey('Папка') -and $row.parent -ine $this.Parameters['Папка']) { continue }
+                    $name = [string]$this.Parameters['Имя']
+                    if ($this.Text -match 'ПОДОБНО') {
+                        if (([string]$row.name).IndexOf($name.Trim('%'),[StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+                    } elseif ($row.name -ine $name) { continue }
+                    $hits++
+                }
+                $result = [pscustomobject]@{ CountRows=$hits }
+                $result | Add-Member ScriptMethod Select {
+                    $rows = [pscustomobject]@{ Left=$this.CountRows }
+                    $rows | Add-Member ScriptMethod Next { $this.Left--; return $this.Left -ge 0 }
+                    return $rows
+                }
+                return $result
+            }
+            # ** Хлебников С.Ю. 20261124 конец
+            $all = Get-FakeComList $baseState 'processings'
             $numbered = New-Object System.Collections.Generic.List[object]
             for ($index = 0; $index -lt @($all).Count; $index++) {
                 $row = @($all)[$index]
