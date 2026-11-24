@@ -123,7 +123,8 @@ param(
     [switch]$DeliveryUnattended,
     [string]$DeliveryId = '',
     # Папка канала интерфейса ci.exe: его задаёт сам ci.exe (или run.ps1 из ci.exe), руками не нужен.
-    [string]$UiChannel = ''
+    [string]$UiChannel = '',
+    [Parameter(DontShow)]$OperationContext = $null # ** Хлебников С.Ю. 20261124 Локальный журнал этого запуска.
 )
 
 Set-StrictMode -Version 2.0
@@ -147,6 +148,9 @@ trap {
     Write-Host ("Остановлено: {0}" -f $_.Exception.Message) -ForegroundColor Red
     if ([string]$_.FullyQualifiedErrorId -ne [string]$_.Exception.Message -and $null -ne $_.InvocationInfo) {
         Write-Host ("  {0}" -f ($_.InvocationInfo.PositionMessage -split "`r?`n")[0]) -ForegroundColor DarkGray
+    }
+    if ((Get-Variable -Name GateOperation -Scope Script -ErrorAction SilentlyContinue) -and $script:GateOperation) {
+        Write-OperationEvent $script:GateOperation 'result' @{status='failed';category=[string]$_.CategoryInfo.Category} # ** Хлебников С.Ю. 20261124
     }
     if ($null -ne $script:ProdLockState) {
         try { Clear-ProdLocks } catch { Write-Host ("Блокировки снять не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Yellow }
@@ -193,6 +197,8 @@ function Write-Line {
     $Text = Get-MaskedLine $Text
     Write-Host $Text -ForegroundColor $Color
     Write-RunLog $Text
+    # ** Хлебников С.Ю. 20261124 Итог операции, в том числе подготовки, без сырых команд и их аргументов.
+    if ($script:GateOperation -and $Text -match '^ИТОГ:') { Write-OperationEvent $script:GateOperation 'result' @{summary=$Text} }
 }
 
 function Get-PlainPassword {
@@ -833,6 +839,29 @@ function Read-DeployConfig {
 }
 
 $cfg = Read-DeployConfig
+# ** Хлебников С.Ю. 20261124 Один журнал на вызов из меню, CMD или планировщика. Код возврата сохраняется.
+. (Join-Path $Root 'operations.ps1')
+$script:GateOperation = $OperationContext
+if (-not $OperationContext -and $cfg['PublishOperations'] -and -not $SnapshotTemp) {
+    $kind = 'Deploy'
+    foreach ($flag in 'Prepare','ApplyPrepared','CancelPrepared','Rollback','StatusOnly','CompareExtensions','CompareProcessings','BaseState','ProdPreCheck','ComCheck','ManualLocks','CloseBase','OpenBase','PullExtensions','PullProcessings','GitExport','GitImport','GitProd','GitTypical','Delivery') {
+        if ($PSBoundParameters[$flag]) { $kind = $flag; break }
+    }
+    $operation = Start-GateOperation $cfg $configPath $kind
+    if ($operation) {
+        $code = 1
+        try {
+            $LASTEXITCODE = 0
+            & $PSCommandPath @PSBoundParameters -OperationContext $operation
+            $code = $LASTEXITCODE
+        } finally {
+            $status = if ($code -eq 0) { 'completed' } else { 'failed' }
+            Write-OperationEvent $operation 'finish' @{status=$status;exitCode=$code}
+        }
+        exit $code
+    }
+}
+# ** Хлебников С.Ю. 20261124 конец
 
 # Меню и вопросы (ui.ps1): из ci.exe их рисует ci.exe, без него - консоль. Нужны уже здесь: если в настройках
 # чего-то не хватает, скрипт спрашивает и записывает в config.psd1.
@@ -1012,6 +1041,7 @@ else {
     $script:RunLogPath = Join-Path $script:RunDir 'run.log'
     Set-StatRun $runId
 }
+if ($script:GateOperation) { Write-OperationEvent $script:GateOperation 'step' @{run=$runId; base=$script:ProdBase; tempBase=$script:TempBase} } # ** Хлебников С.Ю. 20261124
 $runsRoot = Resolve-RootPath ([string](Get-Setting $cfg 'RunsDir' 'runs'))
 
 if (-not $viewOnly) {

@@ -266,7 +266,7 @@ function Invoke-RunPublish {
     param([string]$Stage = 'final', [string]$Message = '', [switch]$Pending)
     try {
         if ($null -eq (Get-Variable -Name cfg -Scope Script -ErrorAction SilentlyContinue)) { return }
-        if (-not [string](Get-Setting $cfg 'RunReportRepo' '')) { return }
+        if (-not [string](Get-Setting $cfg 'RunReportRepo' '') -and -not ($Pending -and $cfg['PublishOperations'])) { return } # ** Хлебников С.Ю. 20261124
         $publishScript = Join-Path $Root 'publish.ps1'
         if (-not (Test-Path -LiteralPath $publishScript)) { return }
         if ($Pending) { & $publishScript -Pending -Config $configPath; return }
@@ -4359,6 +4359,7 @@ function Show-UtMenu {
 
 #endregion
 
+. (Join-Path $Root 'operations.ps1') # ** Хлебников С.Ю. 20261124 Журнал действий основного меню.
 # Итоги прежних прогонов, которые не ушли в GitHub (прогон оборвался, не было связи), - до всего остального.
 if (-not ($Tests -or $SelfCheckGroup)) { Invoke-RunPublish -Pending } # ** Хлебников С.Ю. 20261120 служебные запуски не публикуются
 
@@ -4545,6 +4546,14 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         if ($choice -eq 'exit') { Write-Host 'Выход.'; exit 0 }
         # Экран ci.exe - с чистого листа: шаги и вердикт прошлого действия не должны висеть над следующим.
         Send-UiReset
+        # ** Хлебников С.Ю. 20261124 Прогоны уже публикует run.ps1, действия с базами и Git — deploy.ps1.
+        $menuOperation = $null
+        $menuStatus = 'closed'
+        if ($choice -in @('update','settings','accept','stats','tests','runs')) {
+            $menuOperation = Start-GateOperation $cfg $configPath $choice
+        }
+        try {
+        # ** Хлебников С.Ю. 20261124 конец
         if ($choice -eq 'deploy') {
             if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') }
             exit $LASTEXITCODE
@@ -4693,6 +4702,10 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         if ($choice -ne 'runs') { break }
         Show-RecentRuns
         if ($null -ne $script:ResumeRequest) { $choice = 'resume'; break }
+        # ** Хлебников С.Ю. 20261124 Записываем также выход из пункта меню и исключение.
+        } catch { $menuStatus = 'failed'; throw }
+        finally { if ($menuOperation) { Write-OperationEvent $menuOperation 'finish' @{status=$menuStatus} } }
+        # ** Хлебников С.Ю. 20261124 конец
     }
 
     if ($choice -eq 'kit') {

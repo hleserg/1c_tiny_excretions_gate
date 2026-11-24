@@ -55,7 +55,7 @@ function New-Sandbox {
     $dir = Join-Path $workRoot $Name
     foreach ($sub in @('bin', 'tools', 'inbox', 'fake')) { New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null }
     # ** Хлебников С.Ю. 20261123 Песочница содержит полный комплект удалённой приёмки.
-    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'delivery.ps1', 'delivery-parcel.ps1', 'delivery-designer.ps1', 'delivery-git.ps1', 'delivery-worker.ps1', 'cluster-target.ps1', 'canary-users.ps1', 'locks.ps1', 'post-update.ps1', 'timeline.ps1', 'selfcheck-compare.ps1')) {
+    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'operations.ps1', 'delivery.ps1', 'delivery-parcel.ps1', 'delivery-designer.ps1', 'delivery-git.ps1', 'delivery-worker.ps1', 'cluster-target.ps1', 'canary-users.ps1', 'locks.ps1', 'post-update.ps1', 'timeline.ps1', 'selfcheck-compare.ps1')) {
         Copy-Item -LiteralPath (Join-Path $ciRoot $script) -Destination $dir
     }
     # Объединение поставок (раздел 5.26): merge1c.exe рядом с fake1c.exe (собирает CI).
@@ -3835,6 +3835,98 @@ $tests = @(
             }
         }
     },
+    # ** Хлебников С.Ю. 20261124 Полный путь от двух вызовов deploy.ps1 до закрытой ветки и досылки.
+    @{
+        Name = 'gate-operation-live'
+        Text = 'начало подготовки видно в GitHub до завершения процесса, итог публикуется автоматически'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name -Extra @{PublishOperations=$true;RunFilesRepo='owner/ext'}
+            $gh = Get-FakeGh $sb
+            . (Join-Path $sb 'operations.ps1')
+            $config = Join-Path $sb 'config.psd1'
+            $env:CI_FAKE_GITHUB = Join-Path $sb 'fake-github'
+            try {
+                $operation = Start-GateOperation (Import-PowerShellDataFile $config) $config 'Prepare'
+                $id = Split-Path -Leaf $operation.Dir
+                $remotePath = 'operations/' + $id
+                $deadline = (Get-Date).AddSeconds(30)
+                do {
+                    Start-Sleep -Milliseconds 250
+                    $head = (Get-GhHead $gh 'gate-runs').Sha
+                    if ($head) { $tree = Get-GhFiles $gh $head; if ($tree.ContainsKey($remotePath + '/00000-start.json')) { break } }
+                } while ((Get-Date) -lt $deadline)
+                Check ([bool]$head -and $tree.ContainsKey($remotePath + '/00000-start.json')) 'начало не пришло при живом процессе'
+            } finally {
+                if ($operation) { Write-OperationEvent $operation 'finish' @{status='completed';exitCode=0} }
+                Remove-Item -LiteralPath env:CI_FAKE_GITHUB -ErrorAction SilentlyContinue
+            }
+            $deadline = (Get-Date).AddSeconds(30)
+            do {
+                Start-Sleep -Milliseconds 250
+                $tree = Get-GhFiles $gh (Get-GhHead $gh 'gate-runs').Sha
+                if ($tree.ContainsKey($remotePath + '/00001-finish.json')) { break }
+            } while ((Get-Date) -lt $deadline)
+            Check ($tree.ContainsKey($remotePath + '/00001-finish.json')) 'итог не пришёл после завершения'
+            & {
+                . (Join-Path $sb 'publish.ps1') -Config (Join-Path $sb 'unused-config')
+                $RunFilesMaxCount = 1
+                $dir = Join-Path $sb 'many-files'
+                $null = [IO.Directory]::CreateDirectory($dir)
+                [IO.File]::WriteAllText((Join-Path $dir 'aaa.log'), 'первый по алфавиту')
+                [IO.File]::WriteAllText((Join-Path $dir 'verdict.json'), '{}')
+                $list = Get-RunFileList -Dir $dir -Id '20010101-000000' -Secrets @()
+                Check ($list.Files.Count -eq 1 -and $list.Files[0].Path -like '*/verdict.json') 'вердикт потерялся при лимите публикации'
+            }
+        }
+    }
+    @{
+        Name = 'gate-operation-journal'
+        Text = 'операции из deploy.ps1: отправка успешного чтения и отказа, обрыв, повтор, старый результат применения и защита пароля'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name -Extra @{PublishOperations=$true; RunFilesRepo='owner/ext'}
+            $gh = Get-FakeGh $sb
+            $main = (Get-GhHead $gh 'main').Sha
+            $pass = Join-Path $sb 'secrets\github.txt'
+            [IO.File]::Move($pass, $pass + '.offline')
+            $ok = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-BaseState'
+            Check ($ok.ExitCode -eq 0) ('чтение состояния: ' + $ok.Output)
+            $bad = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CloseBase -OpenBase'
+            Check ($bad.ExitCode -ne 0) 'операция с противоречащими ключами стала успешной'
+            $dep = Join-Path $sb 'deploy\20010101-120000'
+            $null = [IO.Directory]::CreateDirectory($dep)
+            [IO.File]::WriteAllText((Join-Path $dep 'deploy.json'), '{"runId":"20010101-120000","base":"erp_base","time":"2001-01-01T12:00:00","mode":"prepared","outcome":"updated","riskReason":"private-text","gate":{"run":"20010101-100000","verdict":"GREEN","kitSource":"git test"},"extensions":[{"name":"Demo","newVersion":"20261124.030000"}]}')
+            $orphan = Join-Path $sb ('deploy\operations\20010101-100000-' + ('a' * 32))
+            $null = [IO.Directory]::CreateDirectory($orphan)
+            [IO.File]::WriteAllText((Join-Path $orphan 'pid.txt'), '2147483646|unknown')
+            [IO.File]::WriteAllText((Join-Path $orphan '00000-start.json'), '{"operation":"Prepare","event":"start"}')
+            [IO.File]::WriteAllText((Join-Path $orphan '00001-step.json'), '{"title":"tok-git"}')
+            [IO.File]::Move($pass + '.offline', $pass)
+            $env:CI_FAKE_GITHUB = Join-Path $sb 'fake-github'
+            try {
+                & (Join-Path $sb 'publish.ps1') -WatchOperations
+                $head = (Get-GhHead $gh 'gate-runs').Sha
+                Check ([bool]$head) 'ветка журнала не создана'
+                $files = Get-GhFiles -Gh $gh -Commit $head
+                $events = @(foreach ($path in $files.Keys) {
+                    Check ($path.StartsWith('operations/')) 'журнал изменил файл другой операции гейта'
+                    $body = $utf8.GetString((Get-GhBlob $gh $files[$path]))
+                    Check (-not ($body.Contains('tok-git') -or $body.Contains('private-text'))) 'в Git попал секрет или причина выпуска'
+                    $body | ConvertFrom-Json
+                })
+                $finish = @($events | Where-Object { $_.PSObject.Properties['event'] -and $_.event -eq 'finish' })
+                Check (@($finish | Where-Object { $_.operation -eq 'BaseState' -and $_.status -eq 'completed' }).Count -eq 1) 'нет результата чтения'
+                Check (@($finish | Where-Object { $_.operation -eq 'CloseBase' -and $_.status -eq 'failed' }).Count -eq 1) 'нет результата ошибки'
+                Check (@($finish | Where-Object status -eq 'interrupted').Count -eq 1) 'нет состояния оборвавшейся операции'
+                $history = @($events | Where-Object event -eq 'release')
+                Check ($history.Count -eq 1 -and $history[0].outcome -eq 'updated' -and $history[0].gate.verdict -eq 'GREEN' -and $history[0].extensions[0].newVersion -eq '20261124.030000') 'старый выпуск не восстановлен из deploy.json'
+                & (Join-Path $sb 'publish.ps1') -WatchOperations
+                Check ((Get-GhHead $gh 'gate-runs').Sha -eq $head) 'досылка продублировала события'
+                Check ((Get-GhHead $gh 'main').Sha -eq $main) 'изменился main'
+            } finally { Remove-Item -LiteralPath env:CI_FAKE_GITHUB -ErrorAction SilentlyContinue }
+        }
+    }
     @{
         Name = 'gate-publish-run-files'
         Text = 'файлы прогона в git (RunFilesRepo): текстовые файлы папки прогона - в ветку-сироту gate-runs, папка runs/<прогон>, README.md и latest.txt, ссылка в итоге, main не тронут; файлы не ушли - досылаются следующим запуском; двоичные и файл с токеном не выкладываются, README.md говорит почему'
