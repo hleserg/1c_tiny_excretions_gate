@@ -4380,14 +4380,19 @@ $tests = @(
             $files = $dumps['Адаптация']
             $form = 'Catalogs/Items/Forms/List/Ext/Form.xml'
             $criterion = 'FilterCriteria/Links.xml'
+            $single = 'FilterCriteria/Single.xml'
             $document = 'Documents/Order.xml'
             $files[$form] = '<Form xmlns="http://v8.1c.ru/8.3/xcf/logform"><AutoCommandBar/><BaseForm><AutoCommandBar/></BaseForm></Form>'
             $files[$criterion] = '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core"><FilterCriterion><Properties><Type><v8:Type>A</v8:Type><v8:Type>B</v8:Type></Type></Properties></FilterCriterion></MetaDataObject>'
             $files[$document] = '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:r="http://v8.1c.ru/8.3/xcf/readable"><Document><InternalInfo><r:GeneratedType/></InternalInfo><Properties><ObjectBelonging>Adopted</ObjectBelonging></Properties></Document></MetaDataObject>'
             $files['Documents/Order/Ext/ObjectModule.bsl'] = 'Процедура Обработчик() КонецПроцедуры'
+            $files[$single] = $files[$criterion].Replace('<v8:Type>B</v8:Type>','').Replace('<Type>', "<Type>`n")
             $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{dumps=$dumps} -Com $com -Answers $gitBootstrapAnswers
             Check-DeployCommon $boot -LocksExpected $false
             $head = (Read-GitStateFile $sb).pendingCommit
+            # Подставной конфигуратор пишет CRLF. В git этот XML хранится с LF.
+            $lfSource = [pscustomobject]@{Path=('extensions/Адаптация/' + $single); Bytes=$utf8.GetBytes(([string][char]0xFEFF) + $files[$single])}
+            $head = New-GhCommit -Gh $gh -Parent $head -Changes @($lfSource) -Message 'XML критерия с LF'
             Set-GhBranch -Gh $gh -Branch 'main' -Sha $head
             [IO.File]::WriteAllText((Join-Path $sb 'run.ps1'), $gitRunStub, $utf8Bom)
             $files[$form] = $files[$form].Replace('<AutoCommandBar/>','<AutoCommandBar/><Attributes/>')
@@ -4397,11 +4402,13 @@ $tests = @(
             Check ($same.ExitCode -eq 0 -and ($same.Output -match 'загружать нечего')) 'служебный XML вызвал PR или повторную загрузку'
             $unchanged = $files[$criterion]
             $files[$criterion] = $unchanged.Replace('>B<','>C<')
+            $files[$single] = $files[$single].Replace('>A<','>C<')
             $files[$form] = $files[$form].Replace('<Attributes/>','<Attributes><Attribute name="Item"/></Attributes>')
             $changed = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport -GitUnattended' -Fake @{dumps=$dumps} -Com $com
             $pending = (Read-GitStateFile $sb).pendingCommit
             Check ($changed.ExitCode -eq 0 -and $pending -and $pending -ne $head) 'реальные изменения не попали в PR'
             Check (($changed.Output -match [regex]::Escape($form)) -and ($changed.Output -match [regex]::Escape($criterion))) 'правки реквизита и типа не указаны вместе'
+            Check ([bool]($changed.Output -match [regex]::Escape($single))) 'замена единственного типа не попала в PR'
             Check (-not ($changed.Output -match [regex]::Escape('~ extensions/Адаптация/' + $document))) 'с реальными правками в PR вернулся служебный маркер'
             $cancel = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{dumps=$dumps} -Com $com -Answers @(
                 @{Kind='one'; Header='ещё не в main'; Item='Отмена'})

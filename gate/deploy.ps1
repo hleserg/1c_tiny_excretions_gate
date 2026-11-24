@@ -3931,7 +3931,7 @@ function Get-GitDumpComparisonXml {
     $ns.AddNamespace('r', 'http://v8.1c.ru/8.3/xcf/readable')
     if ($Kind -eq 'criterion') {
         $nodes = $xml.SelectNodes('/m:MetaDataObject/m:FilterCriterion/m:Properties/m:Type/v:Type', $ns)
-        if ($nodes.Count -lt 2) { return $null }
+        if ($nodes.Count -eq 0) { return $null }
         $names = New-Object 'System.Collections.Generic.List[string]'
         foreach ($node in $nodes) {
             if ($node.HasAttributes -or $node.ChildNodes.Count -ne 1 -or $node.FirstChild.NodeType -ne 'Text') { return $null }
