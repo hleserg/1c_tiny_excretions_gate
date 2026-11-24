@@ -1258,6 +1258,38 @@ $tests = @(
             }
         }
     },
+    # ** Хлебников С.Ю. 20261124 Повтор после подтверждённой записи сохраняет исходный откат.
+    @{
+        Name = 'gate-processing-resume-hash'
+        Text = 'Повтор адресной загрузки сверяет ранее записанные байты под блокировкой'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $file = Add-InboxFile $sb 'Печать.epf'
+            $ref = '11111111-2222-3333-4444-555555555555'
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            $proof = @{ ref=$ref; sha256=$hash; expectedTargetHash='absent' } | ConvertTo-Json
+            [IO.File]::WriteAllText($file + '.gate.json', $proof, $utf8)
+            $fake = @{ regepf = @(@{ status='done'; isnew='1'; formerror=@('форма не открылась') }) }
+            $first = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake $fake
+            Check-Common $first
+            Check-Verdict $first 'RED' 1
+            Check ((Get-Calls $first @('regepf','casfile=absent||', ('ref=' + $ref))).Count -eq 1) 'новая карточка не защищена'
+            # ** Хлебников С.Ю. 20261124 Старый отчёт может хранить другое написание того же пути из inbox.
+            $saved = @(Get-ChildItem -LiteralPath (Join-Path $sb 'runs') -Recurse -Filter 'resume.json')
+            Check ($saved.Count -eq 1) 'нет единственного состояния первого прогона'
+            $state = [IO.File]::ReadAllText($saved[0].FullName) | ConvertFrom-Json
+            $state.kit.processings[0].path = Join-Path (Split-Path -Parent $file) ('.\' + (Split-Path -Leaf $file))
+            [IO.File]::WriteAllText($saved[0].FullName, ($state | ConvertTo-Json -Depth 12), $utf8Bom)
+            # ** Хлебников С.Ю. 20261124 конец
+            Start-Sleep -Seconds 1
+            $second = Invoke-Script -Sandbox $sb -Arguments '-Resume last -FromStep load -OnNotGreen Keep' -Fake @{ regepf=@(@{status='done'}) }
+            Check-Common $second
+            Check-Verdict $second 'GREEN' 0
+            Check ((Get-Calls $second @('regepf', ('casfile=' + $hash + '||'), ('ref=' + $ref))).Count -eq 1) 'повтор без проверки записанного хеша'
+        }
+    },
+    # ** Хлебников С.Ю. 20261124 конец
     @{
         Name = 'gate-processing-target-rollback'
         Text = 'откат обновления карточки по ref возвращает файл именно в выбранную карточку'
@@ -2848,7 +2880,9 @@ $tests = @(
         Text = '«обновить подготовленным», а обработки temp и рабочей различаются: в вопросе ничего не отмечено и пустой выбор разрешён; Enter без отметок - расширение обновлено, ни одна обработка не записана'
         Run = {
             param($Name)
-            $sb = New-Sandbox $Name -Config $deployConfig
+            $sb = New-GitSandbox $Name -Extra @{PublishOperations=$true; RunFilesRepo='owner/ext'} # ** Хлебников С.Ю. 20261124
+            $pass = Join-Path $sb 'secrets\github.txt'
+            [IO.File]::Move($pass, $pass + '.offline') # проверяем локальные события до отправки
             $com = New-ComState -TempProcessings @((New-PrintProcessing '2' $printNew)) -ProdProcessings @((New-PrintProcessing '1' $printOld))
             $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Prepare' -Com $com -Answers @(
                 @{ Kind = 'one'; Header = 'Подготовка обновления erp_base'; Item = '^Подготовить все' },
@@ -2858,6 +2892,28 @@ $tests = @(
             Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\prepared.json')) 'подготовка не записала deploy\prepared.json'
             Start-Sleep -Seconds 2
             Reset-FakeState $sb
+            # ** Хлебников С.Ю. 20261124 Сверяем возврат к выбору обработок и ошибку подтверждения на том же комплекте.
+            $spool = Join-Path $sb 'deploy\operations'
+            $emptyPick = @{ Kind='many'; Header='Какие внешние обработки записать'; Indexes=@() }
+            foreach ($attempt in @(
+                @{ answer=@{ Kind='text'; Header='Это рабочая база'; Cancel=$true }; status='cancelled'; code=0 },
+                @{ answer=@{ Kind='text'; Header='Это рабочая база'; Text='другая база' }; status='failed'; code=1 }
+            )) {
+                $beforeOps = @(Get-ChildItem -LiteralPath $spool -Directory | ForEach-Object Name)
+                $stopped = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ApplyPrepared' -Com $com -Answers @($emptyPick, $deployRiskAnswer, $attempt.answer)
+                Check ($stopped.ExitCode -eq $attempt.code) ('неверный код при ' + $attempt.status)
+                Check ((Get-Calls $stopped @('/UpdateDBCfg')).Count -eq 0) 'до подтверждения обновили БД'
+                Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\prepared.json')) 'при выходе утрачена подготовка'
+                $newOp = @(Get-ChildItem -LiteralPath $spool -Directory | Where-Object { $_.Name -notlike 'history-*' -and $_.Name -notin $beforeOps })
+                Check ($newOp.Count -eq 1) 'нет отдельного журнала попытки'
+                if ($newOp.Count -eq 1) {
+                    $end = Get-ChildItem -LiteralPath $newOp[0].FullName -Filter '*-finish.json' | Select-Object -First 1
+                    $finish = [IO.File]::ReadAllText($end.FullName) | ConvertFrom-Json
+                    Check ($finish.status -eq $attempt.status -and $finish.exitCode -eq $attempt.code) ('статус в GitHub и код запуска разошлись: ' + $attempt.status)
+                }
+                Reset-FakeState $sb
+            }
+            # ** Хлебников С.Ю. 20261124 конец
             # Пустой выбор обработок: Enter без отметок.
             $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ApplyPrepared' -Com $com -Answers @(
                 @{ Kind = 'many'; Header = 'Какие внешние обработки записать'; Indexes = @() },
@@ -3002,6 +3058,43 @@ $tests = @(
             Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\compare-ext\compare.html')) 'нет compare.html'
         }
     },
+    # ** Хлебников С.Ю. 20261124 Дата замены привязана к хешу, время правки карточки служит подсказкой.
+    @{
+        Name = 'deploy-pull-processing-dates'
+        Text = 'Рабочая → inbox: исходный файл, ссылка, SHA-256 и даты из журнала'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $ref = '11111111-2222-3333-4444-555555555555'
+            $prod = New-PrintProcessing '1' 'prod'
+            $temp = New-PrintProcessing '99' 'temp'
+            $prod.ref = $ref; $temp.ref = $ref
+            $state = New-ComState -TempProcessings @($temp) -ProdProcessings @($prod)
+            $hasher = [Security.Cryptography.SHA256]::Create()
+            $oldHash = [BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes('temp'))).Replace('-','').ToLowerInvariant()
+            $newHash = [BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes('prod'))).Replace('-','').ToLowerInvariant()
+            $hasher.Dispose()
+            $state.bases.erp_base.processingEvents = @(@{ref=$ref; at='2026-11-23T15:00:00'; event='Gate.ProcessingFileChanged'; comment=$newHash})
+            $state.bases.erp_temp_test.processingEvents = @(@{ref=$ref; at='2026-11-22T10:00:00'; event='Gate.ProcessingFileChanged'; comment=$oldHash})
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-PullProcessings' -Com $state -Answers @(
+                @{ Kind='many'; Header='Какие обработки'; Indexes=@(0) })
+            Check ($r.ExitCode -eq 0) ('перенос в inbox: ' + ($r.Output -join ' '))
+            $question = @($r.Output | Where-Object { $_ -like '@@ui:*Какие обработки*' } | ForEach-Object { $_.Substring(5) | ConvertFrom-Json })[0]
+            Check (@($question.preselected).Count -eq 1 -and $question.preselected[0] -eq 0) 'свежий файл рабочей не предложен'
+            Check ($question.items[0] -match '2026-11-23 15:00:00.*2026-11-22 10:00:00') 'нет обеих подтверждённых дат'
+            $proof = @(Get-ChildItem -LiteralPath (Join-Path $sb 'inbox') -Filter '*.gate.json' -Recurse)
+            Check ($proof.Count -eq 1) 'нет адресной поставки'
+            $json = [IO.File]::ReadAllText($proof[0].FullName) | ConvertFrom-Json
+            Check ($json.ref -eq $ref -and $json.sha256 -eq $newHash -and $json.expectedTargetHash -eq $oldHash) 'утеряна привязка к файлам и карточке'
+            Check ((Get-Calls $r @('ENTERPRISE','regepf')).Count -eq 0) 'сравнение меняло базу'
+            $state.bases.erp_base.processingEvents += @{ref=$ref; at='2026-11-24T12:00:00'; event='_$Data$_.Update'; comment=''}
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-PullProcessings' -Com $state -Answers @(
+                @{ Kind='many'; Header='Какие обработки'; Indexes=@() })
+            $q = @($r.Output | Where-Object { $_ -like '@@ui:*Какие обработки*' } | ForEach-Object { $_.Substring(5) | ConvertFrom-Json })[0]
+            Check (@($q.preselected).Count -eq 0 -and $q.items[0] -match '2026-11-24 12:00:00 \(карточка, ЖР\)') 'правка карточки ошибочно стала датой файла'
+        }
+    },
+    # ** Хлебников С.Ю. 20261124 конец
     @{
         Name = 'deploy-compare-processings'
         Text = '«Сравнить внешние обработки»: отличающаяся обработка - версии и разница по модулю; в базах ничего не меняется'
@@ -3013,7 +3106,7 @@ $tests = @(
             Check-DeployCommon $r -LocksExpected $false
             Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
             $text = $r.Output -join "`n"
-            Check ($text -match 'Печать \(Печать актов\): отличается, temp 2, рабочая 1') 'нет строки об отличающейся обработке'
+            Check ($text -match 'Печать \[.+?\] \(Печать актов\): отличается, temp дата неизвестна, рабочая дата неизвестна') 'нет строки об отличающейся обработке'
             Check ($text -match '\+ НоваяПроцедура') 'нет новой процедуры в разнице обработки'
             Check ((Get-Calls $r @('ENTERPRISE', 'regepf')).Count -eq 0) 'сравнение записывало обработку'
         }
@@ -3156,8 +3249,8 @@ $tests = @(
                 function Write-Line { param($Text, $Color) }
                 $vendorProcessings = @('Образец')
                 $retainedVendorProcessings = @{}
-                $candidate = [pscustomobject]@{ ObjName='Образец'; Version='4.9.1'; Title='Образец'; File='Образец.epf'; Hash='a' }
-                $live = [pscustomobject]@{ ObjName='Образец'; Version='4.10'; Title='Образец'; File='Образец.epf'; Hash='b' }
+                $candidate = [pscustomobject]@{ ObjName='Образец'; Ref='00000000-0000-0000-0000-000000000001'; FileUpdatedAt=''; CardUpdatedAt=''; Version='4.9.1'; Title='Образец'; File='Образец.epf'; Hash='a' }
+                $live = [pscustomobject]@{ ObjName='Образец'; Ref='00000000-0000-0000-0000-000000000001'; FileUpdatedAt=''; CardUpdatedAt=''; Version='4.10'; Title='Образец'; File='Образец.epf'; Hash='b' }
                 $temp = @{Items=@($candidate)}
                 $prod = @{Items=@($live)}
                 if ((Compare-Processings $temp $prod).Count -ne 0) { throw 'план понижает рабочую версию' }
@@ -3932,7 +4025,16 @@ $tests = @(
             [IO.File]::Move($pass + '.offline', $pass)
             $env:CI_FAKE_GITHUB = Join-Path $sb 'fake-github'
             try {
-                & (Join-Path $sb 'publish.ps1') -WatchOperations
+                # ** Хлебников С.Ю. 20261124 Фоновый отправитель может уже владеть блокировкой после восстановления доступа.
+                $deadline = [Diagnostics.Stopwatch]::StartNew()
+                $delivered = Join-Path $sb 'deploy\operations\history-20010101-120000\00000-release.json.sent'
+                do {
+                    & (Join-Path $sb 'publish.ps1') -WatchOperations
+                    if ([IO.File]::Exists($delivered)) { break }
+                    Start-Sleep -Milliseconds 150
+                } while ($deadline.Elapsed.TotalSeconds -lt 30)
+                Check ([IO.File]::Exists($delivered)) 'отправитель не подтвердил публикацию истории'
+                # ** Хлебников С.Ю. 20261124 конец
                 $head = (Get-GhHead $gh 'gate-runs').Sha
                 Check ([bool]$head) 'ветка журнала не создана'
                 $files = Get-GhFiles -Gh $gh -Commit $head

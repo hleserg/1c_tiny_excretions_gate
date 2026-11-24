@@ -225,8 +225,34 @@ function New-FakeComConnection {
     $connection | Add-Member -NotePropertyName Metadata -NotePropertyValue $metadata
     $connection | Add-Member -MemberType ScriptMethod -Name Base64String -Value { param($Value) return [string]$Value }
     $connection | Add-Member -MemberType ScriptMethod -Name String -Value { param($Value) return [string]$Value }
+    $connection | Add-Member ScriptMethod UnloadEventLog {
+        param($Table, $Filter, $Columns, $File, $Limit)
+        $state = Read-FakeComState $this.StateFile
+        $events = Get-FakeComList (Get-FakeComBase $state $this.Base) 'processingEvents'
+        $Table.Rows = @(foreach ($entry in $events | Select-Object -First $Limit) {
+            if ($Filter.Values['Событие'] -notcontains $entry.event) { continue }
+            $ref = [pscustomobject]@{ Id = $entry.ref }
+            $ref | Add-Member ScriptMethod UUID { return $this.Id }
+            $item = [pscustomobject]@{ Values = @([datetime]$entry.at, $entry.event, $ref, [string]$entry.comment) }
+            $item | Add-Member ScriptMethod Get { param($Index) return $this.Values[$Index] }
+            $item
+        })
+    }
     $connection | Add-Member -MemberType ScriptMethod -Name NewObject -Value {
         param($TypeName)
+        # ** Хлебников С.Ю. 20261124 Минимальные коллекции для чтения журнала регистрации.
+        if ($TypeName -eq 'Array') { return ,(New-Object System.Collections.ArrayList) }
+        if ($TypeName -eq 'Structure') {
+            $filter = [pscustomobject]@{ Values = @{} }
+            $filter | Add-Member ScriptMethod Insert { param($Key,$Value) $this.Values[$Key] = $Value }
+            return $filter
+        }
+        if ($TypeName -eq 'ValueTable') {
+            $table = [pscustomobject]@{ Rows = @() }
+            $table | Add-Member ScriptMethod Count { return $this.Rows.Length }
+            $table | Add-Member ScriptMethod Get { param($Index) return $this.Rows[$Index] }
+            return $table
+        }
         if ([string]$TypeName -ne 'Query') { return [pscustomobject]@{ TypeName = [string]$TypeName } }
         $query = [pscustomobject]@{ StateFile = $this.StateFile; Base = $this.Base; Text = '' }
         $query | Add-Member -MemberType ScriptMethod -Name Execute -Value {
@@ -240,9 +266,13 @@ function New-FakeComConnection {
                 if ($null -ne $row.PSObject.Properties['ref'] -and $row.ref) { $ref = [string]$row.ref }
                 $numbered.Add([pscustomobject]@{ Row = $row; Ref = $ref })
             }
-            if ([string]$this.Text -match '\.Назначение') {
+            if ([string]$this.Text -match '\.Назначение|РегистрСведений\.ВерсииОбъектов') {
                 $targetRows = New-Object System.Collections.Generic.List[object]
                 foreach ($entry in $numbered) {
+                    if ($this.Text -match 'РегистрСведений\.ВерсииОбъектов') {
+                        if ($entry.Row.PSObject.Properties['cardDate']) { $targetRows.Add([pscustomobject]@{ Ref=$entry.Ref; Target=[datetime]$entry.Row.cardDate }) }
+                        continue
+                    }
                     if ($null -eq $entry.Row.PSObject.Properties['targets']) { continue }
                     foreach ($target in @($entry.Row.targets)) { $targetRows.Add([pscustomobject]@{ Ref = $entry.Ref; Target = [string]$target }) }
                 }

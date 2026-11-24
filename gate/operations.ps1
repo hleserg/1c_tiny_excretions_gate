@@ -41,7 +41,7 @@ function Start-GateOperation {
         $id = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N')
         $dir = Join-Path (Get-OperationRoot $Settings) $id
         $null = [IO.Directory]::CreateDirectory($dir)
-        $op = [pscustomobject]@{ Dir = $dir; Name = $Name; Next = 0; LastTitle = '' }
+        $op = [pscustomobject]@{ Dir = $dir; Name = $Name; Next = 0; LastTitle = ''; FinalStatus = '' }
         [IO.File]::WriteAllText((Join-Path $dir 'pid.txt'), ('{0}|{1:o}' -f $PID, (Get-Process -Id $PID).StartTime))
         Write-OperationEvent $op 'start'
         Start-OperationSender $Settings $ConfigPath
