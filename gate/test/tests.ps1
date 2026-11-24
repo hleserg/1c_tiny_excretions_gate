@@ -2324,7 +2324,11 @@ $tests = @(
             param($Name)
             $sb = New-Sandbox $Name -Config $deployConfig
             $file = Join-Path $sb 'snap.json'
-            $com = New-ComState -TempProcessings @((New-PrintProcessing '2' $printNew))
+            $deleted = New-PrintProcessing '1' $printOld
+            $deleted.objName = 'СтараяПечать'
+            $deleted.deleted = $true
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '2' $printNew), $deleted)
+            $com['singleQueryTextWrite'] = $true
             $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments ('-SnapshotTemp "{0}"' -f $file) -Com $com
             Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
             Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
@@ -2333,6 +2337,7 @@ $tests = @(
             Check ([bool]$snap.ok) ("снимок не снялся: {0}" -f $snap.error)
             Check ([string]$snap.extensions.'Адаптация'.hash -eq 'h2') ("хеш Адаптация в снимке: {0}" -f $snap.extensions.'Адаптация'.hash)
             Check ($null -ne $snap.processings.'Печать' -and [string]$snap.processings.'Печать'.hash) 'в снимке нет обработки Печать'
+            Check ($null -eq $snap.processings.PSObject.Properties['СтараяПечать']) 'в снимок попала карточка с пометкой удаления'
             Check (@($r.ComLog | Where-Object { $_ -match 'erp_base' }).Count -eq 0) 'снимок temp обращался к рабочей'
         }
     },

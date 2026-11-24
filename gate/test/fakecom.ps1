@@ -259,11 +259,19 @@ function New-FakeComConnection {
             return $table
         }
         if ([string]$TypeName -ne 'Query') { return [pscustomobject]@{ TypeName = [string]$TypeName } }
-        $query = [pscustomobject]@{ StateFile = $this.StateFile; Base = $this.Base; Text = $QueryText; Parameters = @{} }
+        $query = [pscustomobject]@{ StateFile = $this.StateFile; Base = $this.Base; QueryText = $QueryText; TextWrites = 0; Parameters = @{} }
+        $query | Add-Member ScriptProperty Text { $this.QueryText } {
+            param($Value)
+            $this.QueryText = $Value
+            $this.TextWrites++
+        }
         $query | Add-Member ScriptMethod SetParameter { param($Key,$Value) $this.Parameters[$Key]=$Value } # ** Хлебников С.Ю. 20261124
         $query | Add-Member -MemberType ScriptMethod -Name Execute -Value {
             # Запросы к справочнику обработок: из текста смотрится только отбор помеченных и табличная часть Назначение.
             $state = Read-FakeComState $this.StateFile
+            if ($state.PSObject.Properties['singleQueryTextWrite'] -and $state.singleQueryTextWrite -and $this.TextWrites -gt 1) {
+                throw 'COM: повторная запись свойства Text перед выполнением запроса'
+            }
             # ** Хлебников С.Ю. 20261124 Только читающие запросы проверки данных перед выпуском.
             $baseState = Get-FakeComBase $state $this.Base
             if ($this.Text -match 'Выполненные\.Действие = &Действие') {
