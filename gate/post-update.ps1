@@ -2,7 +2,8 @@
 # Протокол общей обработки действий в тестовой и рабочей базах.
 # ** Хлебников С.Ю. 20261124 Основная ошибка и её причина. Полный стек остаётся в исходном файле 1С.
 function Get-ActionErrorSummary {
-    param([string]$Reason)
+    param([string]$Reason, [string[]]$Secrets = @())
+    foreach ($secret in $Secrets) { if ($secret) { $Reason = $Reason.Replace($secret, '***') } }
     if ($Reason -match '(?i)/(?:P|UC)\s*"|\b(?:PWD|PASSWORD|TOKEN|UC)\s*=') { return 'Подробности в локальном отчёте действий.' }
     $parts = $Reason -split '(?i)\s+по причине:\s*'
     $lines = foreach ($part in @($parts[0], $parts[-1]) | Select-Object -Unique) {

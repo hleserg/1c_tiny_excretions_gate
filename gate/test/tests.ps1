@@ -4065,7 +4065,7 @@ $tests = @(
                 riskReason='private-text' }
             [IO.File]::WriteAllText((Join-Path $prior 'deploy.json'), ($oldFailure | ConvertTo-Json -Depth 4),$utf8)
             [IO.File]::WriteAllLines((Join-Path $prior 'actions\result.txt'), [string[]]@(
-                'user=Пользователь теста','log=private-text','action=20010101-01-Тест|failed|Профиль не найден {Модуль(15)}:private-text',
+                'user=Пользователь теста','log=private-text','action=20010101-01-Тест|failed|Профиль не найден (tok-git) {Модуль(15)}:private-text',
                 'action=20010101-02-Чужое|notrun','status=failed'),$utf8)
             # ** Хлебников С.Ю. 20261124 конец
             $orphan = Join-Path $sb ('deploy\operations\20010101-100000-' + ('a' * 32))
@@ -4105,7 +4105,7 @@ $tests = @(
                 # ** Хлебников С.Ю. 20261124 Публикуется результат действий из старого выпуска без служебного стека.
                 $actionDetail = @($events | Where-Object { $_.event -eq 'result' -and $_.PSObject.Properties['actions'] })
                 Check ($actionDetail.Count -eq 1) 'не досланы подробности уже отправленного выпуска'
-                Check ($actionDetail[0].user -ceq 'Пользователь теста' -and $actionDetail[0].reason -ceq 'Профиль не найден') 'нет фактического пользователя или причины'
+                Check ($actionDetail[0].user -ceq 'Пользователь теста' -and $actionDetail[0].reason -ceq 'Профиль не найден (***)') 'нет фактического пользователя или причины'
                 Check (@($actionDetail[0].actions).Count -eq 1 -and $actionDetail[0].actions[0].status -eq 'failed') 'подмешан результат незаявленного действия'
                 # ** Хлебников С.Ю. 20261124 конец
                 $history = @($events | Where-Object event -eq 'release')

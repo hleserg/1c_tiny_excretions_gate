@@ -67,7 +67,7 @@ function Send-OperationBatch {
 
 # ** Хлебников С.Ю. 20261124 Для старого выпуска тоже читаем результат действий из его собственного каталога.
 function Get-OperationActionDetail {
-    param($Record, [string]$Directory)
+    param($Record, [string]$Directory, [string[]]$Secrets = @())
     $detail = [ordered]@{ run = [IO.Path]::GetFileName($Directory); outcome = $Record.outcome; report = 'missing' }
     $result = Join-Path $Directory 'actions\result.txt'
     $reason = ''
@@ -91,7 +91,7 @@ function Get-OperationActionDetail {
         if ($failure -and $failure.PSObject.Properties['text']) { $reason = [string]$failure.text }
     }
     if ($reason) {
-        $detail.reason = Get-ActionErrorSummary $reason
+        $detail.reason = Get-ActionErrorSummary $reason $Secrets
     }
     return $detail
 }
@@ -99,7 +99,7 @@ function Get-OperationActionDetail {
 
 function Get-OperationHistory {
     # Формируется и для выпуска, который прошёл на предыдущей версии гейта.
-    param([string]$Spool)
+    param([string]$Spool, [string[]]$Secrets = @())
     $root = Split-Path -Parent $Spool
     foreach ($dir in @(Get-ChildItem -LiteralPath $root -Directory | Where-Object Name -match '^\d{8}-\d{6}$')) {
         $source = Join-Path $dir.FullName 'deploy.json'
@@ -127,7 +127,7 @@ function Get-OperationHistory {
                 # ** Хлебников С.Ю. 20261124 В т.ч. для выпуска, уже отправленного прежней версией.
                 if ($needDetail -and $record.PSObject.Properties['actions'] -and $record.actions -and $record.actions.PSObject.Properties['ids']) {
                     $null = [IO.Directory]::CreateDirectory($out)
-                    $detail = Get-OperationActionDetail $record $dir.FullName
+                    $detail = Get-OperationActionDetail $record $dir.FullName $Secrets
                     Write-OperationEvent ([pscustomobject]@{Dir=$out;Name='deploy';Next=1}) 'result' $detail
                 }
                 if ($haveRelease) { continue }
@@ -176,7 +176,7 @@ function Watch-GateOperations {
             if ($encoded -cne $plain) { $secretPatterns.Add($encoded) }
         }
         do {
-            Get-OperationHistory $spoolPath
+            Get-OperationHistory $spoolPath $secretPatterns.ToArray()
             $active = $false
             $batch = New-Object System.Collections.Generic.List[object]
             foreach ($dir in @(Get-ChildItem -LiteralPath $spoolPath -Directory | Where-Object Name -match '^(?:\d{8}-\d{6}-[0-9a-f]{32}|history-\d{8}-\d{6})$')) {

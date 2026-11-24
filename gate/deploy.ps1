@@ -5739,6 +5739,8 @@ if ($null -ne $actionsWithTargets -and $mode -notin @('asis','epf','rollback')) 
                 foreach ($obj in @($connection, $connector)) {
                     if ($null -ne $obj -and [Runtime.InteropServices.Marshal]::IsComObject($obj)) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($obj) }
                 }
+                [GC]::Collect()
+                [GC]::WaitForPendingFinalizers()
             }
         }
         $argsForCheck = @((Get-ComConnectionLine $script:ProdBase $script:ProdUser $script:ProdPassword), [string](Get-Setting $cfg 'ActionsRegister' ''),
@@ -5749,6 +5751,7 @@ if ($null -ne $actionsWithTargets -and $mode -notin @('asis','epf','rollback')) 
             Write-OperationEvent $script:GateOperation 'result' @{stage='actionPrecheck';status='failed'; reason=$problem}
             throw ("Проверка перед выпуском: {0} В этом запуске рабочая база не изменена." -f $problem)
         }
+        Write-OperationEvent $script:GateOperation 'result' @{stage='actionPrecheck';status='ok';ids=$targetIds}
     }
 }
 # ** Хлебников С.Ю. 20261124 конец
