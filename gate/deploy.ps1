@@ -832,7 +832,7 @@ function Read-DeployConfig {
             if ($site[$key] -isnot [int] -or $site[$key] -lt 0 -or $site[$key] -gt 23) { throw ("Неверная граница окна площадки: {0}" -f $key) }
             $read[$key] = $site[$key]
         }
-        if ($read.DeployDeniedFrom -eq $read.DeployDeniedTo) { throw 'Границы управляемого окна площадки совпадают' }
+        # ** Хлебников С.Ю. 20261124 Равные границы отключают запрет и в управляемом профиле площадки.
     }
     # ** Хлебников С.Ю. 20261124 конец
     return $read
@@ -5060,7 +5060,9 @@ else {
             $advice.Add([pscustomobject]@{ Kind = 'note'; Text = ("прогону {0} ч: если temp с тех пор меняли, сначала новый прогон гейта" -f $ageHours) })
         }
     }
-    $advice.Add([pscustomobject]@{ Kind = 'dont'; Text = ("обновлять {0} только {1} (DeployDeniedFrom/To): обновлению нужен монопольный доступ" -f $script:ProdBase, (Get-DeployWindowText)) })
+    if ($deniedFrom -ne $deniedTo) {
+        $advice.Add([pscustomobject]@{ Kind = 'dont'; Text = ("обновлять {0} только {1} (DeployDeniedFrom/To): обновлению нужен монопольный доступ" -f $script:ProdBase, (Get-DeployWindowText)) })
+    } # ** Хлебников С.Ю. 20261124
 
     #endregion
 
@@ -5527,7 +5529,7 @@ elseif ($mode -ne 'rollback') { $confirmLines.Add('Гейт: прогонов н
 if ($riskReason) { $confirmLines.Add(("Выпуск с красным гейтом, причина: {0}" -f $riskReason)) }
 if ($mode -ne 'rollback' -and $checkedNote) { $confirmLines.Add(("Проверка: {0}" -f $checkedNote)) }
 if ($null -ne $prodActions) { $confirmLines.Add(('Действия прогона {0}: {1}' -f $lastRun.Name, ($prodActions.ids -join ', '))) }
-if (-not $Prepare) { $confirmLines.Add(("Окно обновления: {0}" -f (Get-DeployWindowText))) }
+if (-not $Prepare -and $deniedFrom -ne $deniedTo) { $confirmLines.Add(("Окно обновления: {0}" -f (Get-DeployWindowText))) } # ** Хлебников С.Ю. 20261124
 Show-UiTitle -Text ("Перед записью в {0}" -f $script:ProdBase) -Kind 'warn' -More $confirmLines.ToArray()
 Write-RunLog ('Сводка перед подтверждением: ' + ($confirmLines -join ' | '))
 # ** Хлебников С.Ю. 20261120 конец

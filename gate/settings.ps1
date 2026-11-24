@@ -401,6 +401,9 @@ if (Test-Path -LiteralPath $siteConfigPath) {
     try { $siteConfig = Import-PowerShellDataFile -LiteralPath $siteConfigPath }
     catch { Write-Host ("  config.site.psd1 не читается: {0}" -f $_.Exception.Message) -ForegroundColor Yellow; $siteConfig = @{} }
 }
+# ** Хлебников С.Ю. 20261124 Часы, которыми управляет площадка, нельзя изменить через локальные настройки.
+if ($siteConfig['DeployWindowFromSite']) { $catalog = @($catalog | Where-Object { $_[1] -notin @('DeployDeniedFrom','DeployDeniedTo') }) }
+# ** Хлебников С.Ю. 20261124 конец
 $cfgStart = Read-SettingsConfig
 $freed = @()
 foreach ($siteKey in @($siteConfig.Keys)) {

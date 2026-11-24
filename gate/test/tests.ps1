@@ -3197,6 +3197,13 @@ $tests = @(
                     -not (Test-DeployHourDenied ([datetime]'2026-11-24 06:00')) -or
                     -not (Test-DeployHourDenied ([datetime]'2026-11-24 21:59')) -or
                     (Test-DeployHourDenied ([datetime]'2026-11-24 22:00'))) { throw 'ошибка границ окна' }
+                [IO.File]::WriteAllText((Join-Path $Root 'config.site.psd1'), '@{DeployDeniedFrom=0; DeployDeniedTo=0; DeployWindowFromSite=$true}')
+                $profile = Read-DeployConfig
+                $deniedFrom = $profile.DeployDeniedFrom
+                $deniedTo = $profile.DeployDeniedTo
+                foreach ($hour in 0..23) {
+                    if (Test-DeployHourDenied ([datetime]::Today.AddHours($hour))) { throw 'установленный профиль запрещает выпуск по часам' }
+                }
             } $sb
         }
     },
