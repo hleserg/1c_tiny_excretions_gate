@@ -2785,7 +2785,7 @@ $tests = @(
         Text = 'обновление в два приёма: подготовка - копии и загрузка без блокировок, сеансов и обновления БД; «подготовленным» - без загрузки, БД обновлена, блокировки сняты, подготовки больше нет'
         Run = {
             param($Name)
-            $sb = New-Sandbox $Name -Config $deployConfig
+            $sb = New-GitSandbox $Name -Extra @{PublishOperations=$true;RunFilesRepo='owner/ext'} # ** Хлебников С.Ю. 20261124
             $com = New-ComState -Sessions @(@{ id = 5; base = 'erp_base'; app = '1CV8C'; user = 'Пользователь'; host = 'pc1' })
             $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Prepare' -Com $com -Answers @(
                 @{ Kind = 'one'; Header = 'Подготовка обновления erp_base'; Item = '^Подготовить все' },
@@ -2823,6 +2823,21 @@ $tests = @(
             if ($null -eq $record) { Check $false 'нет deploy.json'; return }
             Check ($record.mode -eq 'prepared' -and $record.outcome -eq 'updated') ("режим {0}, итог {1}, ждали prepared, updated" -f $record.mode, $record.outcome)
             Check ($record.preparedRun -eq $state.runId) ("подготовка в deploy.json {0}, ждали {1}" -f $record.preparedRun, $state.runId)
+            # ** Хлебников С.Ю. 20261124 На GitHub должны различаться подготовка и фактическое применение.
+            $gh = Get-FakeGh $sb
+            $limit = (Get-Date).AddSeconds(35)
+            $historyPath = 'operations/history-' + $record.runId + '/00000-release.json'
+            do {
+                Start-Sleep -Milliseconds 400
+                $head = (Get-GhHead $gh 'gate-runs').Sha
+                if ($head) { $tree = Get-GhFiles $gh $head; if ($tree.ContainsKey($historyPath)) { break } }
+            } while ((Get-Date) -lt $limit)
+            Check ($head -and $tree.ContainsKey($historyPath)) 'не опубликовано фактическое применение'
+            if ($head -and $tree.ContainsKey($historyPath)) {
+                $applied = $utf8.GetString((Get-GhBlob $gh $tree[$historyPath])) | ConvertFrom-Json
+                Check ($applied.mode -eq 'prepared' -and $applied.outcome -eq 'updated') 'итог применения подменён подготовкой'
+            }
+            # ** Хлебников С.Ю. 20261124 конец
             $ext = @($record.extensions)
             Check ($ext.Count -eq 1 -and $ext[0].name -eq 'Адаптация') 'в deploy.json нет Адаптация'
             if ($ext.Count -eq 1) { Check ($ext[0].backup -and (Test-Path -LiteralPath (Join-Path $record.Dir $ext[0].backup))) ("резервной копии нет в папке запуска (откату нечем): {0}" -f $ext[0].backup) }
@@ -3885,13 +3900,17 @@ $tests = @(
         Text = 'операции из deploy.ps1: отправка успешного чтения и отказа, обрыв, повтор, старый результат применения и защита пароля'
         Run = {
             param($Name)
-            $sb = New-GitSandbox $Name -Extra @{PublishOperations=$true; RunFilesRepo='owner/ext'}
+            $sb = New-GitSandbox $Name -Extra @{PublishOperations=$true; RunFilesRepo='owner/ext'; UnlockCode='night"gate-password'}
             $gh = Get-FakeGh $sb
             $main = (Get-GhHead $gh 'main').Sha
             $pass = Join-Path $sb 'secrets\github.txt'
             [IO.File]::Move($pass, $pass + '.offline')
             $ok = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-BaseState'
             Check ($ok.ExitCode -eq 0) ('чтение состояния: ' + $ok.Output)
+            $menu = Invoke-Script -Sandbox $sb -Answers @(
+                @{Kind='one';Header='Гейт расширений';Item='Настройки гейта'},
+                @{Kind='one';Header='^Настройки: ';Item='^Готово$'})
+            Check ($menu.ExitCode -eq 0 -and $menu.Unexpected.Count -eq 0) 'из главного меню не отработали настройки'
             $bad = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-CloseBase -OpenBase'
             Check ($bad.ExitCode -ne 0) 'операция с противоречащими ключами стала успешной'
             $dep = Join-Path $sb 'deploy\20010101-120000'
@@ -3902,6 +3921,7 @@ $tests = @(
             [IO.File]::WriteAllText((Join-Path $orphan 'pid.txt'), '2147483646|unknown')
             [IO.File]::WriteAllText((Join-Path $orphan '00000-start.json'), '{"operation":"Prepare","event":"start"}')
             [IO.File]::WriteAllText((Join-Path $orphan '00001-step.json'), '{"title":"tok-git"}')
+            [IO.File]::WriteAllText((Join-Path $orphan '00002-step.json'), (ConvertTo-Json @{title='night"gate-password'} -Compress))
             [IO.File]::Move($pass + '.offline', $pass)
             $env:CI_FAKE_GITHUB = Join-Path $sb 'fake-github'
             try {
@@ -3912,13 +3932,15 @@ $tests = @(
                 $events = @(foreach ($path in $files.Keys) {
                     Check ($path.StartsWith('operations/')) 'журнал изменил файл другой операции гейта'
                     $body = $utf8.GetString((Get-GhBlob $gh $files[$path]))
-                    Check (-not ($body.Contains('tok-git') -or $body.Contains('private-text'))) 'в Git попал секрет или причина выпуска'
+                    Check (-not ($body.Contains('tok-git') -or $body.Contains('gate-password') -or $body.Contains('private-text'))) 'в Git попал секрет или причина выпуска'
                     $body | ConvertFrom-Json
                 })
                 $finish = @($events | Where-Object { $_.PSObject.Properties['event'] -and $_.event -eq 'finish' })
                 Check (@($finish | Where-Object { $_.operation -eq 'BaseState' -and $_.status -eq 'completed' }).Count -eq 1) 'нет результата чтения'
                 Check (@($finish | Where-Object { $_.operation -eq 'CloseBase' -and $_.status -eq 'failed' }).Count -eq 1) 'нет результата ошибки'
                 Check (@($finish | Where-Object status -eq 'interrupted').Count -eq 1) 'нет состояния оборвавшейся операции'
+                $waiting = @($events | Where-Object { $_.event -eq 'step' -and $_.operation -eq 'settings' -and $_.PSObject.Properties['status'] -and $_.status -eq 'waitingForOperator' })
+                Check ($waiting.Count -gt 0) 'дочерние настройки не показали ожидание оператора'
                 $history = @($events | Where-Object event -eq 'release')
                 Check ($history.Count -eq 1 -and $history[0].outcome -eq 'updated' -and $history[0].gate.verdict -eq 'GREEN' -and $history[0].extensions[0].newVersion -eq '20261124.030000') 'старый выпуск не восстановлен из deploy.json'
                 & (Join-Path $sb 'publish.ps1') -WatchOperations

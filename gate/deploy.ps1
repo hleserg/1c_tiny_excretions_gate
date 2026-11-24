@@ -198,7 +198,7 @@ function Write-Line {
     Write-Host $Text -ForegroundColor $Color
     Write-RunLog $Text
     # ** Хлебников С.Ю. 20261124 Итог операции, в том числе подготовки, без сырых команд и их аргументов.
-    if ($script:GateOperation -and $Text -match '^ИТОГ:') { Write-OperationEvent $script:GateOperation 'result' @{summary=$Text} }
+    if ($script:GateOperation -and $Text -match '^ИТОГ:|: в рабочей новее \(') { Write-OperationEvent $script:GateOperation 'result' @{summary=$Text} }
 }
 
 function Get-PlainPassword {

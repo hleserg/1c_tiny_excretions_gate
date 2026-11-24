@@ -89,6 +89,10 @@ function Get-OperationHistory {
                 if ($record.PSObject.Properties['gate'] -and $record.gate) {
                     $content.gate = $record.gate | Select-Object run,verdict,kitSource
                 }
+                foreach ($key in 'preparedRun','rollbackOf','riskAccepted') {
+                    if ($record.PSObject.Properties[$key]) { $content[$key] = $record.$key }
+                }
+                if ($record.PSObject.Properties['light']) { $content.checks = @($record.light | Select-Object name,status) }
                 foreach ($key in 'extensions','processings') {
                     if ($record.PSObject.Properties[$key]) { $content[$key] = @($record.$key | Select-Object name,oldVersion,newVersion,status) }
                 }
@@ -116,7 +120,14 @@ function Watch-GateOperations {
             $info = (Invoke-GhApi -Gh $gh -Method GET -Path ('/repos/' + $repo)).Text | ConvertFrom-Json
             if (-not $info.private -or $info.default_branch -eq $branch) { throw 'Журналу нужна отдельная ветка закрытого репозитория' }
         }
-        $secrets = @(Get-PublishSecrets -Settings $Settings -Token $token)
+        $secretPatterns = New-Object System.Collections.Generic.List[string]
+        foreach ($secret in (Get-PublishSecrets -Settings $Settings -Token $token)) {
+            $plain = [string]$secret.Value
+            $secretPatterns.Add($plain)
+            $quoted = ConvertTo-Json -InputObject $plain -Compress
+            $encoded = $quoted.Substring(1, $quoted.Length - 2)
+            if ($encoded -cne $plain) { $secretPatterns.Add($encoded) }
+        }
         do {
             Get-OperationHistory $spoolPath
             $active = $false
@@ -134,8 +145,8 @@ function Watch-GateOperations {
                 }
                 foreach ($file in @(Get-ChildItem -LiteralPath $dir.FullName -File -Filter '*.json' | Where-Object Name -match '^\d{5}-(start|step|result|finish|release)\.json$' | Sort-Object Name)) {
                     $value = Read-TextFile $file.FullName
-                    foreach ($secret in $secrets) {
-                        if ($value.Contains([string]$secret.Value)) {
+                    foreach ($pattern in $secretPatterns) {
+                        if ($value.Contains($pattern)) {
                             $value = '{"event":"redacted"}'
                             break
                         }
@@ -149,7 +160,7 @@ function Watch-GateOperations {
             if ($batch.Count) { Send-OperationBatch -Gh $gh -Branch $branch -Batch $batch.ToArray() }
             if ($batch.Count -ge 100) { continue }
             if ($active) { Start-Sleep -Seconds 10 }
-        } while ($active -or $batch.Count -ge 100)
+        } while ($active -or $batch.Count -gt 0)
     } finally { $lock.Dispose() }
 }
 # ** Хлебников С.Ю. 20261124 конец

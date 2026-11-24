@@ -15,7 +15,7 @@
 # {"kind":"close","restart":..} - просьба к ci.exe закрыться, когда скрипт кончится без ошибки, а с restart - и
 # сразу открыться заново (после обновления гейта: в папке уже новый ci.exe).
 
-$script:UiOperation = Get-Variable -Scope Script -Name GateOperation -ValueOnly -ErrorAction SilentlyContinue # ** Хлебников С.Ю. 20261124
+$script:UiOperation = Get-Variable -Name GateOperation -ValueOnly -ErrorAction SilentlyContinue # ** Хлебников С.Ю. 20261124
 $script:UiChannelDir = ''
 $script:UiQuestionId = 0
 $script:UiSubPlanSent = ''
@@ -69,6 +69,7 @@ function Write-UiOperationResult {
     param([string]$Title, [string]$Status = 'OK', [double]$Seconds = 0, [string]$Problem = '')
     if (-not $Title) { return }
     $whole = [int][Math]::Floor($Seconds)
+    if ($script:UiOperation) { Write-OperationEvent $script:UiOperation 'step' @{title=$Title;status=$Status;seconds=$whole} } # ** Хлебников С.Ю. 20261124
     $time = '{0}:{1:00}' -f [int][Math]::Floor($whole / 60), ($whole % 60)
     if ($whole -ge 3600) { $time = '{0}:{1:00}:{2:00}' -f [int][Math]::Floor($whole / 3600), [int][Math]::Floor(($whole % 3600) / 60), ($whole % 60) }
     $detail = ''

@@ -4547,10 +4547,13 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         # Экран ci.exe - с чистого листа: шаги и вердикт прошлого действия не должны висеть над следующим.
         Send-UiReset
         # ** Хлебников С.Ю. 20261124 Прогоны уже публикует run.ps1, действия с базами и Git — deploy.ps1.
+        $previousOperation = $script:UiOperation
         $menuOperation = $null
         $menuStatus = 'closed'
         if ($choice -in @('update','settings','accept','stats','tests','runs')) {
             $menuOperation = Start-GateOperation $cfg $configPath $choice
+            $script:GateOperation = $menuOperation
+            $script:UiOperation = $menuOperation
         }
         try {
         # ** Хлебников С.Ю. 20261124 конец
@@ -4704,7 +4707,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         if ($null -ne $script:ResumeRequest) { $choice = 'resume'; break }
         # ** Хлебников С.Ю. 20261124 Записываем также выход из пункта меню и исключение.
         } catch { $menuStatus = 'failed'; throw }
-        finally { if ($menuOperation) { Write-OperationEvent $menuOperation 'finish' @{status=$menuStatus} } }
+        finally {
+            if ($menuOperation) { Write-OperationEvent $menuOperation 'finish' @{status=$menuStatus} }
+            $script:GateOperation = $previousOperation
+            $script:UiOperation = $previousOperation
+        }
         # ** Хлебников С.Ю. 20261124 конец
     }
 
