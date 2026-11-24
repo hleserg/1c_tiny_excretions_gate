@@ -1675,11 +1675,12 @@ function Export-Processings {
                 throw ([string]$connectError.Message)
             }
             $query = $connection.NewObject('Query')
-            $query.Text = 'ВЫБРАТЬ Спр.Наименование КАК Title, Спр.ИмяОбъекта КАК ObjName, Спр.Версия КАК Version, ' +
+            $queryText = 'ВЫБРАТЬ Спр.Наименование КАК Title, Спр.ИмяОбъекта КАК ObjName, Спр.Версия КАК Version, ' +
                 'ПРЕДСТАВЛЕНИЕ(Спр.Вид) КАК Kind, Спр.ХранилищеОбработки КАК Storage, Спр.ПометкаУдаления КАК Deleted, ' +
                 'ПРЕДСТАВЛЕНИЕ(Спр.Публикация) КАК Use, Спр.БезопасныйРежим КАК SafeMode, Спр.Ссылка КАК Ref ' +
                 'ИЗ Справочник.ДополнительныеОтчетыИОбработки КАК Спр'
-            if (-not $All) { $query.Text += ' ГДЕ НЕ Спр.ПометкаУдаления' }
+            if (-not $All) { $queryText += ' ГДЕ НЕ Спр.ПометкаУдаления' }
+            $query.Text = $queryText
             $selection = $query.Execute().Select()
             $sha = [System.Security.Cryptography.SHA256]::Create()
             while ($selection.Next()) {
@@ -3930,7 +3931,7 @@ function Get-GitDumpComparisonXml {
     $ns.AddNamespace('r', 'http://v8.1c.ru/8.3/xcf/readable')
     if ($Kind -eq 'criterion') {
         $nodes = $xml.SelectNodes('/m:MetaDataObject/m:FilterCriterion/m:Properties/m:Type/v:Type', $ns)
-        if ($nodes.Count -lt 2) { return $null }
+        if ($nodes.Count -eq 0) { return $null }
         $names = New-Object 'System.Collections.Generic.List[string]'
         foreach ($node in $nodes) {
             if ($node.HasAttributes -or $node.ChildNodes.Count -ne 1 -or $node.FirstChild.NodeType -ne 'Text') { return $null }
