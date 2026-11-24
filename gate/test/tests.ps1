@@ -2880,7 +2880,9 @@ $tests = @(
         Text = '«обновить подготовленным», а обработки temp и рабочей различаются: в вопросе ничего не отмечено и пустой выбор разрешён; Enter без отметок - расширение обновлено, ни одна обработка не записана'
         Run = {
             param($Name)
-            $sb = New-Sandbox $Name -Config $deployConfig
+            $sb = New-GitSandbox $Name -Extra @{PublishOperations=$true; RunFilesRepo='owner/ext'} # ** Хлебников С.Ю. 20261124
+            $pass = Join-Path $sb 'secrets\github.txt'
+            [IO.File]::Move($pass, $pass + '.offline') # проверяем локальные события до отправки
             $com = New-ComState -TempProcessings @((New-PrintProcessing '2' $printNew)) -ProdProcessings @((New-PrintProcessing '1' $printOld))
             $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Prepare' -Com $com -Answers @(
                 @{ Kind = 'one'; Header = 'Подготовка обновления erp_base'; Item = '^Подготовить все' },
@@ -2890,6 +2892,28 @@ $tests = @(
             Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\prepared.json')) 'подготовка не записала deploy\prepared.json'
             Start-Sleep -Seconds 2
             Reset-FakeState $sb
+            # ** Хлебников С.Ю. 20261124 Сверяем возврат к выбору обработок и ошибку подтверждения на том же комплекте.
+            $spool = Join-Path $sb 'deploy\operations'
+            $emptyPick = @{ Kind='many'; Header='Какие внешние обработки записать'; Indexes=@() }
+            foreach ($attempt in @(
+                @{ answer=@{ Kind='text'; Header='Это рабочая база'; Cancel=$true }; status='cancelled'; code=0 },
+                @{ answer=@{ Kind='text'; Header='Это рабочая база'; Text='другая база' }; status='failed'; code=1 }
+            )) {
+                $beforeOps = @(Get-ChildItem -LiteralPath $spool -Directory | ForEach-Object Name)
+                $stopped = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ApplyPrepared' -Com $com -Answers @($emptyPick, $deployRiskAnswer, $attempt.answer)
+                Check ($stopped.ExitCode -eq $attempt.code) ('неверный код при ' + $attempt.status)
+                Check ((Get-Calls $stopped @('/UpdateDBCfg')).Count -eq 0) 'до подтверждения обновили БД'
+                Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\prepared.json')) 'при выходе утрачена подготовка'
+                $newOp = @(Get-ChildItem -LiteralPath $spool -Directory | Where-Object { $_.Name -notlike 'history-*' -and $_.Name -notin $beforeOps })
+                Check ($newOp.Count -eq 1) 'нет отдельного журнала попытки'
+                if ($newOp.Count -eq 1) {
+                    $end = Get-ChildItem -LiteralPath $newOp[0].FullName -Filter '*-finish.json' | Select-Object -First 1
+                    $finish = [IO.File]::ReadAllText($end.FullName) | ConvertFrom-Json
+                    Check ($finish.status -eq $attempt.status -and $finish.exitCode -eq $attempt.code) ('статус в GitHub и код запуска разошлись: ' + $attempt.status)
+                }
+                Reset-FakeState $sb
+            }
+            # ** Хлебников С.Ю. 20261124 конец
             # Пустой выбор обработок: Enter без отметок.
             $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ApplyPrepared' -Com $com -Answers @(
                 @{ Kind = 'many'; Header = 'Какие внешние обработки записать'; Indexes = @() },

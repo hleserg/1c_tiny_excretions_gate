@@ -150,7 +150,16 @@ trap {
         Write-Host ("  {0}" -f ($_.InvocationInfo.PositionMessage -split "`r?`n")[0]) -ForegroundColor DarkGray
     }
     if ((Get-Variable -Name GateOperation -Scope Script -ErrorAction SilentlyContinue) -and $script:GateOperation) {
-        Write-OperationEvent $script:GateOperation 'result' @{status='failed';category=[string]$_.CategoryInfo.Category} # ** Хлебников С.Ю. 20261124
+        # ** Хлебников С.Ю. 20261124 Фиксируем место сбоя без текста с путями, паролями и ответами оператора.
+        $status = if ($_.Exception -is [OperationCanceledException]) { 'cancelled' } else { 'failed' }
+        $script:GateOperation.FinalStatus = $status
+        $fields = @{status=$status; category=[string]$_.CategoryInfo.Category}
+        if ($_.InvocationInfo -and $_.InvocationInfo.ScriptName) {
+            $fields.script = [IO.Path]::GetFileName($_.InvocationInfo.ScriptName)
+            $fields.line = $_.InvocationInfo.ScriptLineNumber
+        }
+        Write-OperationEvent $script:GateOperation 'result' $fields
+        # ** Хлебников С.Ю. 20261124 конец
     }
     if ($null -ne $script:ProdLockState) {
         try { Clear-ProdLocks } catch { Write-Host ("Блокировки снять не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Yellow }
@@ -893,6 +902,17 @@ function Read-DeployConfig {
     return $read
 }
 
+# ** Хлебников С.Ю. 20261124 Возврат из диалога до начала записи сохраняет подготовленный комплект.
+function Write-DeployCancellation {
+    param([string]$Stage)
+    if ($script:GateOperation) {
+        $script:GateOperation.FinalStatus = 'cancelled'
+        Write-OperationEvent $script:GateOperation 'result' @{status='cancelled'; stage=$Stage}
+    }
+    Write-Host 'Оператор отменил обновление до записи.'
+}
+# ** Хлебников С.Ю. 20261124 конец
+
 $cfg = Read-DeployConfig
 # ** Хлебников С.Ю. 20261124 Один журнал на вызов из меню, CMD или планировщика. Код возврата сохраняется.
 . (Join-Path $Root 'operations.ps1')
@@ -910,7 +930,11 @@ if (-not $OperationContext -and $cfg['PublishOperations'] -and -not $SnapshotTem
             & $PSCommandPath @PSBoundParameters -OperationContext $operation
             $code = $LASTEXITCODE
         } finally {
-            $status = if ($code -eq 0) { 'completed' } else { 'failed' }
+            # ** Хлебников С.Ю. 20261124 Вложенный запуск мог записать результат до возврата управления в меню.
+            $status = $operation.FinalStatus
+            if (-not $status) { $status = if ($code -eq 0) { 'completed' } else { 'failed' } }
+            if ($status -eq 'failed' -and $code -eq 0) { $code = 1 }
+            # ** Хлебников С.Ю. 20261124 конец
             Write-OperationEvent $operation 'finish' @{status=$status;exitCode=$code}
         }
         exit $code
@@ -5510,7 +5534,7 @@ else {
         $procNotes = @(('Отмеченное запишется в {0} поверх того, что там есть: галочки по умолчанию стоят у новых карточек и файлов с подтверждённой более поздней датой. Если есть только дата карточки, реши вручную.' -f $script:ProdBase),
             'Enter без отметок - обработки не трогать.')
         $procPicked = Select-UiMany -Header ("Какие внешние обработки записать в {0}" -f $script:ProdBase) -Items $procLabels -Preselected $procPreselected -Notes $procNotes -AllowEmpty
-        if ($null -eq $procPicked) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
+        if ($null -eq $procPicked) { Write-DeployCancellation 'SelectProcessings'; exit 0 } # ** Хлебников С.Ю. 20261124
         if (@($procPicked).Count -eq 0) { Write-Line '  внешние обработки: не отмечено ни одной - не трогаю' }
         $selectedProcessings = @($procPicked | Sort-Object | ForEach-Object { $processingsPending[$_] })
     }
@@ -5727,7 +5751,8 @@ Write-RunLog ('Сводка перед подтверждением: ' + ($confi
 # ** Хлебников С.Ю. 20261120 конец
 
 Write-Host ("  Это рабочая база. Чтобы продолжить, набери её имя ({0}) и Enter:" -f $script:ProdBase) -ForegroundColor Yellow
-$typedName = Read-UiText -Prompt ("Это рабочая база. Чтобы продолжить, набери её имя ({0})" -f $script:ProdBase)
+$typedName = Read-UiText -Prompt ("Это рабочая база. Чтобы продолжить, набери её имя ({0})" -f $script:ProdBase) -CancelAsNull
+if ([string]::IsNullOrWhiteSpace($typedName)) { Write-DeployCancellation 'ConfirmBase'; exit 0 } # ** Хлебников С.Ю. 20261124
 if ($typedName -cne $script:ProdBase) { throw 'имя базы набрано не так: обновление отменено' }
 Write-RunLog 'Подтверждено именем базы'
 # ** Хлебников С.Ю. 20261120 Пока ждали ввода имени, могло наступить запретное время: сверка ещё раз перед первой записью.

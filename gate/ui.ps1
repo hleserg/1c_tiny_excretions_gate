@@ -139,7 +139,7 @@ function Test-UiStop {
     $stopFile = Join-Path $script:UiChannelDir 'stop'
     if (Test-Path -LiteralPath $stopFile) {
         Remove-Item -LiteralPath $stopFile -Force -ErrorAction SilentlyContinue
-        throw 'остановлено из интерфейса ci.exe'
+        throw [OperationCanceledException]::new('остановлено из интерфейса ci.exe') # ** Хлебников С.Ю. 20261124
     }
 }
 
