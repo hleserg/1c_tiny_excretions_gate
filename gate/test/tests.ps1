@@ -1275,6 +1275,13 @@ $tests = @(
             Check-Common $first
             Check-Verdict $first 'RED' 1
             Check ((Get-Calls $first @('regepf','casfile=absent||', ('ref=' + $ref))).Count -eq 1) 'новая карточка не защищена'
+            # ** Хлебников С.Ю. 20261124 Старый отчёт может хранить другое написание того же пути из inbox.
+            $saved = @(Get-ChildItem -LiteralPath (Join-Path $sb 'runs') -Recurse -Filter 'resume.json')
+            Check ($saved.Count -eq 1) 'нет единственного состояния первого прогона'
+            $state = [IO.File]::ReadAllText($saved[0].FullName) | ConvertFrom-Json
+            $state.kit.processings[0].path = Join-Path (Split-Path -Parent $file) ('.\' + (Split-Path -Leaf $file))
+            [IO.File]::WriteAllText($saved[0].FullName, ($state | ConvertTo-Json -Depth 12), $utf8Bom)
+            # ** Хлебников С.Ю. 20261124 конец
             Start-Sleep -Seconds 1
             $second = Invoke-Script -Sandbox $sb -Arguments '-Resume last -FromStep load -OnNotGreen Keep' -Fake @{ regepf=@(@{status='done'}) }
             Check-Common $second
@@ -3994,7 +4001,16 @@ $tests = @(
             [IO.File]::Move($pass + '.offline', $pass)
             $env:CI_FAKE_GITHUB = Join-Path $sb 'fake-github'
             try {
-                & (Join-Path $sb 'publish.ps1') -WatchOperations
+                # ** Хлебников С.Ю. 20261124 Фоновый отправитель может уже владеть блокировкой после восстановления доступа.
+                $deadline = [Diagnostics.Stopwatch]::StartNew()
+                $delivered = Join-Path $sb 'deploy\operations\history-20010101-120000\00000-release.json.sent'
+                do {
+                    & (Join-Path $sb 'publish.ps1') -WatchOperations
+                    if ([IO.File]::Exists($delivered)) { break }
+                    Start-Sleep -Milliseconds 150
+                } while ($deadline.Elapsed.TotalSeconds -lt 30)
+                Check ([IO.File]::Exists($delivered)) 'отправитель не подтвердил публикацию истории'
+                # ** Хлебников С.Ю. 20261124 конец
                 $head = (Get-GhHead $gh 'gate-runs').Sha
                 Check ([bool]$head) 'ветка журнала не создана'
                 $files = Get-GhFiles -Gh $gh -Commit $head

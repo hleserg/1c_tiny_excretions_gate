@@ -3092,10 +3092,14 @@ function Resolve-ResumeKitSource {
     $kind = [string](Get-UiField $Entry 'kind' '')
     $path = [string](Get-UiField $Entry 'path' '')
     $inboxItem = [string](Get-UiField $Entry 'inboxItem' '')
+    # ** Хлебников С.Ю. 20261124 В прежнем прогоне path мог содержать короткое имя Windows, а inboxItem полное.
+    if ($path) { $path = [IO.Path]::GetFullPath($path).TrimEnd('\') }
+    if ($inboxItem) { $inboxItem = [IO.Path]::GetFullPath($inboxItem).TrimEnd('\') }
+    # ** Хлебников С.Ю. 20261124 конец
     $prevHash = [string](Get-UiField $Entry 'hash' '')
     $current = ''
     if ($path -and (Test-Path -LiteralPath $path)) { $current = $path }
-    elseif ($inboxItem -and $path -and $path.StartsWith($inboxItem, [System.StringComparison]::OrdinalIgnoreCase)) {
+    elseif ($inboxItem -and $path -and ($path -eq $inboxItem -or $path.StartsWith($inboxItem + '\', [System.StringComparison]::OrdinalIgnoreCase))) { # ** Хлебников С.Ю. 20261124
         $moved = Join-Path (Join-Path $PrevDir 'inbox') ((Split-Path -Leaf $inboxItem) + $path.Substring($inboxItem.Length))
         $ref = [string](Get-UiField $Entry 'targetRef' '')
         if ($Processing -and $ref -match '^[a-fA-F0-9-]{36}$') {
@@ -7152,7 +7156,7 @@ elseif ($script:MenuItems.Count -gt 0) {
 }
 if (-not [string]::IsNullOrWhiteSpace($Kit)) {
     if ($script:MenuItems.Count -eq 0 -and $script:ResumeKitFound.Count -eq 0) {
-    $kitPath = Resolve-RootPath $Kit
+    $kitPath = [IO.Path]::GetFullPath((Resolve-RootPath $Kit)) # ** Хлебников С.Ю. 20261124 Сохраняем путь, пока исходный файл существует.
     if (Test-DeliveryPath $kitPath) {
         throw ("{0} - поставка подрядчика («Входящие» или реестр поставок): в temp она идёт только через git - приёмкой поставок (меню «Приёмка поставок», deploy.ps1 -Delivery), а не прямой загрузкой." -f $kitPath)
     }
