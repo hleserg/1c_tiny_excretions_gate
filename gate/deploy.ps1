@@ -123,7 +123,8 @@ param(
     [switch]$DeliveryUnattended,
     [string]$DeliveryId = '',
     # Папка канала интерфейса ci.exe: его задаёт сам ci.exe (или run.ps1 из ci.exe), руками не нужен.
-    [string]$UiChannel = ''
+    [string]$UiChannel = '',
+    [Parameter(DontShow)]$OperationContext = $null # ** Хлебников С.Ю. 20261124 Локальный журнал этого запуска.
 )
 
 Set-StrictMode -Version 2.0
@@ -147,6 +148,9 @@ trap {
     Write-Host ("Остановлено: {0}" -f $_.Exception.Message) -ForegroundColor Red
     if ([string]$_.FullyQualifiedErrorId -ne [string]$_.Exception.Message -and $null -ne $_.InvocationInfo) {
         Write-Host ("  {0}" -f ($_.InvocationInfo.PositionMessage -split "`r?`n")[0]) -ForegroundColor DarkGray
+    }
+    if ((Get-Variable -Name GateOperation -Scope Script -ErrorAction SilentlyContinue) -and $script:GateOperation) {
+        Write-OperationEvent $script:GateOperation 'result' @{status='failed';category=[string]$_.CategoryInfo.Category} # ** Хлебников С.Ю. 20261124
     }
     if ($null -ne $script:ProdLockState) {
         try { Clear-ProdLocks } catch { Write-Host ("Блокировки снять не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Yellow }
@@ -193,6 +197,8 @@ function Write-Line {
     $Text = Get-MaskedLine $Text
     Write-Host $Text -ForegroundColor $Color
     Write-RunLog $Text
+    # ** Хлебников С.Ю. 20261124 Итог операции, в том числе подготовки, без сырых команд и их аргументов.
+    if ($script:GateOperation -and $Text -match '^ИТОГ:|: в рабочей новее \(') { Write-OperationEvent $script:GateOperation 'result' @{summary=$Text} }
 }
 
 function Get-PlainPassword {
@@ -342,6 +348,7 @@ function Invoke-Designer {
     while ($true) {
         if ($BaseName -ieq $script:ProdBase -and $Command[0] -in @('/LoadCfg', '/LoadConfigFromFiles', '/DeleteCfg', '/UpdateDBCfg')) {
             $null = Get-BaseInfo $deployLink $BaseName $user $password
+            Close-DeployWorkerConnection $deployLink $BaseName
         }
         $result = Invoke-V8 -Exe $script:V8 -Arguments $argList -TimeoutSec $TimeoutSec -Title $Title -NoResultLine
         $lines = @(Read-V8Log $logPath)
@@ -495,11 +502,12 @@ function Get-SessionTarget {
 
 function Get-BaseSessions {
     # Сеансы базы по данным агента: имя базы сравнивается целиком.
-    param($Link, [string]$BaseName)
+    param($Link, [string]$BaseName, $Target = $null)
     $list = New-Object System.Collections.Generic.List[object]
     try {
-        $target = Get-SessionTarget $Link $BaseName
+        if ($null -eq $Target) { $Target = Get-SessionTarget $Link $BaseName }
         foreach ($session in @($Link.Agent.GetInfoBaseSessions($target.Cluster, $target.ShortBase))) {
+            if ($null -eq $session) { continue }
             $list.Add([pscustomobject]@{ Text = (Format-ClusterSession $session); IsDesigner = ([string]$session.AppID -eq 'Designer'); IsError = $false })
         }
     }
@@ -509,19 +517,72 @@ function Get-BaseSessions {
 
 function Stop-BaseSessions {
     # Завершает сеансы базы. Без -Designers конфигураторы не трогаются, с -Designers - только они.
-    param($Link, [string]$BaseName, [switch]$Designers)
+    param($Link, [string]$BaseName, [switch]$Designers, $Target = $null)
     $lines = New-Object System.Collections.Generic.List[string]
-    $target = Get-SessionTarget $Link $BaseName
+    if ($null -eq $Target) { $Target = Get-SessionTarget $Link $BaseName }
     foreach ($session in @($Link.Agent.GetInfoBaseSessions($target.Cluster, $target.ShortBase))) {
+        if ($null -eq $session) { continue }
         $isDesigner = ([string]$session.AppID -eq 'Designer')
         if ([bool]$Designers -ne $isDesigner) { continue }
         $description = Format-ClusterSession $session
-        try { $Link.Agent.TerminateSession($target.Cluster, $session); $lines.Add(("{0} - завершён" -f $description)) }
+        try { $Link.Agent.TerminateSession($target.Cluster, $session); $lines.Add(("{0} - команда завершения принята" -f $description)) }
         catch { $lines.Add(("{0} - не завершился: {1}" -f $description, $_.Exception.Message)) }
     }
     foreach ($line in $lines) { Write-RunLog ('Завершение сеансов: ' + $line) }
     return $lines.ToArray()
 }
+
+# ** Хлебников С.Ю. 20261124 Свои соединения с рабочим процессом закрываем до проверки монопольного доступа.
+function Close-DeployWorkerConnection {
+    param($Link, [string]$BaseName)
+    if ($null -eq $Link -or -not $Link.PSObject.Properties['Targets'] -or -not $Link.Targets.ContainsKey($BaseName)) { return }
+    $target = $Link.Targets[$BaseName]
+    $Link.Targets.Remove($BaseName)
+    foreach ($key in 'InfoBase', 'Process') {
+        $value = $target.$key
+        $target.$key = $null
+        if ($null -ne $value -and [Runtime.InteropServices.Marshal]::IsComObject($value)) {
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($value)
+        }
+    }
+}
+
+function Get-ProdSessionAddress {
+    param($Link)
+    $target = Get-SessionTarget $Link $script:ProdBase
+    $address = [pscustomobject]@{ Cluster = $target.Cluster; ShortBase = $target.ShortBase }
+    foreach ($owner in @($Link, $deployLink, $prepLink, $script:WarnLink)) { Close-DeployWorkerConnection $owner $script:ProdBase }
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    return $address
+}
+
+function Stop-ProdSessionsForDeploy {
+    param($Link)
+    $address = Get-ProdSessionAddress $Link
+    foreach ($line in @(Stop-BaseSessions -Link $Link -BaseName $script:ProdBase -Target $address)) { Write-Line ('  ' + $line) }
+    $script:AwaitProdSessions = $true
+}
+
+function Wait-DeploySessions {
+    param($Link, [string]$BaseName, $Target, [int]$TimeoutSec = 60)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $nextReport = 0
+    do {
+        $sessions = @(Get-BaseSessions $Link $BaseName -Target $Target)
+        $errors = @($sessions | Where-Object IsError)
+        if ($errors.Count) { throw ("Не удалось прочитать сеансы {0}: {1}" -f $BaseName, ($errors.Text -join '; ')) }
+        if (-not $sessions.Count) { Write-Line ("  В {0} сеансов не осталось" -f $BaseName) 'Green'; return }
+        if ($clock.Elapsed.TotalSeconds -ge $nextReport) {
+            Write-Line ("  Жду завершения сеансов {0}, осталось {1}" -f $BaseName, $sessions.Count) 'Yellow'
+            $nextReport += 10
+        }
+        if ($clock.Elapsed.TotalSeconds -ge $TimeoutSec) { break }
+        Start-Sleep -Milliseconds 500
+    } while ($true)
+    throw ("В {0} остались сеансы через {1} с: {2}" -f $BaseName, $TimeoutSec, ($sessions.Text -join '; '))
+}
+# ** Хлебников С.Ю. 20261124 конец
 
 function Get-BaseInfo {
     param($Link, [string]$BaseName, [string]$User, [string]$Password)
@@ -588,7 +649,7 @@ function Wait-ProdWarnLock {
         }
         else { $script:ProdClosedAt = $lockAt }
     }
-    foreach ($line in @(Stop-BaseSessions -Link $script:WarnLink -BaseName $script:ProdBase)) { Write-Line ('  ' + $line) }
+    Stop-ProdSessionsForDeploy $script:WarnLink
 }
 
 function Test-ProdPlainLogin {
@@ -826,13 +887,36 @@ function Read-DeployConfig {
             if ($site[$key] -isnot [int] -or $site[$key] -lt 0 -or $site[$key] -gt 23) { throw ("Неверная граница окна площадки: {0}" -f $key) }
             $read[$key] = $site[$key]
         }
-        if ($read.DeployDeniedFrom -eq $read.DeployDeniedTo) { throw 'Границы управляемого окна площадки совпадают' }
+        # ** Хлебников С.Ю. 20261124 Равные границы отключают запрет и в управляемом профиле площадки.
     }
     # ** Хлебников С.Ю. 20261124 конец
     return $read
 }
 
 $cfg = Read-DeployConfig
+# ** Хлебников С.Ю. 20261124 Один журнал на вызов из меню, CMD или планировщика. Код возврата сохраняется.
+. (Join-Path $Root 'operations.ps1')
+$script:GateOperation = $OperationContext
+if (-not $OperationContext -and $cfg['PublishOperations'] -and -not $SnapshotTemp) {
+    $kind = 'Deploy'
+    foreach ($flag in 'Prepare','ApplyPrepared','CancelPrepared','Rollback','StatusOnly','CompareExtensions','CompareProcessings','BaseState','ProdPreCheck','ComCheck','ManualLocks','CloseBase','OpenBase','PullExtensions','PullProcessings','GitExport','GitImport','GitProd','GitTypical','Delivery') {
+        if ($PSBoundParameters[$flag]) { $kind = $flag; break }
+    }
+    $operation = Start-GateOperation $cfg $configPath $kind
+    if ($operation) {
+        $code = 1
+        try {
+            $LASTEXITCODE = 0
+            & $PSCommandPath @PSBoundParameters -OperationContext $operation
+            $code = $LASTEXITCODE
+        } finally {
+            $status = if ($code -eq 0) { 'completed' } else { 'failed' }
+            Write-OperationEvent $operation 'finish' @{status=$status;exitCode=$code}
+        }
+        exit $code
+    }
+}
+# ** Хлебников С.Ю. 20261124 конец
 
 # Меню и вопросы (ui.ps1): из ci.exe их рисует ci.exe, без него - консоль. Нужны уже здесь: если в настройках
 # чего-то не хватает, скрипт спрашивает и записывает в config.psd1.
@@ -952,6 +1036,8 @@ function Get-DeployWindowEnd {
     return $end
 }
 # ** Хлебников С.Ю. 20261120 конец
+$script:WarnLink = $null
+$script:AwaitProdSessions = $false
 $sessionLockHours = [int](Get-Setting $cfg 'SessionLockHours' 2)
 if ($sessionLockHours -lt 1) { $sessionLockHours = 1 }
 # Предупреждение пользователей рабочей перед обновлением: за сколько минут до начала блокировки сеансов.
@@ -1012,6 +1098,7 @@ else {
     $script:RunLogPath = Join-Path $script:RunDir 'run.log'
     Set-StatRun $runId
 }
+if ($script:GateOperation) { Write-OperationEvent $script:GateOperation 'step' @{run=$runId; base=$script:ProdBase; tempBase=$script:TempBase} } # ** Хлебников С.Ю. 20261124
 $runsRoot = Resolve-RootPath ([string](Get-Setting $cfg 'RunsDir' 'runs'))
 
 if (-not $viewOnly) {
@@ -1191,13 +1278,15 @@ function Get-ComConnectionLine {
 
 function Assert-ProdActionLock {
     if ($null -eq $prepTarget) { throw 'для действий нужен доступ к свойствам рабочей базы' }
-    $live = Read-BaseInfoAgain $prepTarget $script:ProdBase
-    $now = Get-Date
-    if (-not $live.SessionsDenied -or $live.PermissionCode -cne $script:UnlockCode -or
-        ($live.DeniedFrom -and [datetime]$live.DeniedFrom -gt $now) -or
-        ($live.DeniedTo -and ([datetime]$live.DeniedTo).Year -ge 1900 -and ([datetime]$live.DeniedTo -lt $now))) {
-        throw 'блокировка входа в рабочую базу не подтверждена'
-    }
+    try {
+        $live = (Get-BaseInfo $prepLink $script:ProdBase $script:ProdUser $script:ProdPassword).InfoBase
+        $now = Get-Date
+        if (-not $live.SessionsDenied -or $live.PermissionCode -cne $script:UnlockCode -or
+            ($live.DeniedFrom -and [datetime]$live.DeniedFrom -gt $now) -or
+            ($live.DeniedTo -and ([datetime]$live.DeniedTo).Year -ge 1900 -and ([datetime]$live.DeniedTo -lt $now))) {
+            throw 'блокировка входа в рабочую базу не подтверждена'
+        }
+    } finally { Close-DeployWorkerConnection $prepLink $script:ProdBase }
 }
 
 function Get-ExtensionStates {
@@ -2459,7 +2548,7 @@ function Invoke-CloseBase {
                 try {
                     foreach ($line in @(Stop-BaseSessions -Link $link -BaseName $baseName)) {
                         Write-Line ('  ' + $line)
-                        if ($line.EndsWith(' - завершён')) { $stopped++ }
+                        if ($line.EndsWith(' - команда завершения принята')) { $stopped++ }
                     }
                 }
                 catch { Write-Line ('  завершить сеансы не смог: ' + $_.Exception.Message) 'Yellow' }
@@ -5030,7 +5119,9 @@ else {
             $advice.Add([pscustomobject]@{ Kind = 'note'; Text = ("прогону {0} ч: если temp с тех пор меняли, сначала новый прогон гейта" -f $ageHours) })
         }
     }
-    $advice.Add([pscustomobject]@{ Kind = 'dont'; Text = ("обновлять {0} только {1} (DeployDeniedFrom/To): обновлению нужен монопольный доступ" -f $script:ProdBase, (Get-DeployWindowText)) })
+    if ($deniedFrom -ne $deniedTo) {
+        $advice.Add([pscustomobject]@{ Kind = 'dont'; Text = ("обновлять {0} только {1} (DeployDeniedFrom/To): обновлению нужен монопольный доступ" -f $script:ProdBase, (Get-DeployWindowText)) })
+    } # ** Хлебников С.Ю. 20261124
 
     #endregion
 
@@ -5497,7 +5588,7 @@ elseif ($mode -ne 'rollback') { $confirmLines.Add('Гейт: прогонов н
 if ($riskReason) { $confirmLines.Add(("Выпуск с красным гейтом, причина: {0}" -f $riskReason)) }
 if ($mode -ne 'rollback' -and $checkedNote) { $confirmLines.Add(("Проверка: {0}" -f $checkedNote)) }
 if ($null -ne $prodActions) { $confirmLines.Add(('Действия прогона {0}: {1}' -f $lastRun.Name, ($prodActions.ids -join ', '))) }
-if (-not $Prepare) { $confirmLines.Add(("Окно обновления: {0}" -f (Get-DeployWindowText))) }
+if (-not $Prepare -and $deniedFrom -ne $deniedTo) { $confirmLines.Add(("Окно обновления: {0}" -f (Get-DeployWindowText))) } # ** Хлебников С.Ю. 20261124
 Show-UiTitle -Text ("Перед записью в {0}" -f $script:ProdBase) -Kind 'warn' -More $confirmLines.ToArray()
 Write-RunLog ('Сводка перед подтверждением: ' + ($confirmLines -join ' | '))
 # ** Хлебников С.Ю. 20261120 конец
@@ -5734,7 +5825,7 @@ if ($needExclusive) {
         if ($answer -eq 'empty') { Write-Line '  сеансы закончились сами' 'Green'; Set-ProdSessionLock $prepTarget }
         if ($answer -eq '3') {
             Set-ProdSessionLock $prepTarget
-            foreach ($line in @(Stop-BaseSessions -Link $prepLink -BaseName $script:ProdBase)) { Write-Line ('  ' + $line) }
+            Stop-ProdSessionsForDeploy $prepLink
         }
         if ($answer -eq '4') {
             if ($null -eq $prepTarget) {
@@ -5906,9 +5997,10 @@ if ($Prepare -and -not $failed) {
 }
 # Дальше рабочая меняется: при предупреждении пользователей - дождаться закрытия базы.
 if (-not $failed -and $null -ne $script:WarnLockAt) { Wait-ProdWarnLock }
-if (-not $failed -and $null -ne $prodActions) {
-    Assert-ProdActionLock
-    if (@(Get-BaseSessions $prepLink $script:ProdBase).Count -gt 0) { throw 'перед действиями должны завершиться сеансы рабочей базы' }
+if (-not $failed -and ($script:AwaitProdSessions -or $null -ne $prodActions)) {
+    $address = Get-ProdSessionAddress $prepLink
+    Wait-DeploySessions $prepLink $script:ProdBase $address
+    if ($null -ne $prodActions -or $null -ne $prepTarget) { Assert-ProdActionLock }
 }
 # ** Хлебников С.Ю. 20261120 Пока шли вопросы и выгрузки, temp могли поменять: хеш-суммы - ещё раз, после того как
 # расширения взяты из temp. Не совпали с теми, по которым сверялся проверенный прогон, - в рабочую не грузим.

@@ -176,6 +176,7 @@
     # (раздел 5.22). Только вместе с RunReportRepo; тот же токен с Contents: write.
     # RunFilesRepo = 'владелец/репозиторий'
     RunFilesBranch = 'gate-runs'
+    # PublishOperations = $true  # ** Хлебников С.Ю. 20261124 Журнал операций в отдельной ветке закрытого RunFilesRepo.
     # RunProgressToGit = $false  # промежуточный журнал live/<номер>.txt в той же ветке
     # Расширения и обработки через git (раздел 5.23): «Загрузить из git», «Выгрузить temp в git». Токен - тот же,
     # с правами Contents и Pull requests: чтение и запись.
