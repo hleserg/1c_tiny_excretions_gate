@@ -15,7 +15,7 @@
                     Fake = @{ precheck = @(@{ lines = @('12:05:00 [ОШИБКА]   Проверка не прошла', ((' ' * 20) + 'подробность в последней строке')) }) } },
                 @{ Args = '-PullExtensions'; Kind = 'pull-extensions'; Outcome = 'cancelled'; Detail = 'ничего не брал'
                     Answers = @(@{ Kind = 'many'; Header = 'Какие расширения'; Cancel = $true }) },
-                @{ Args = '-PullProcessings'; Kind = 'pull-processings'; Outcome = 'unchanged'; Detail = 'подтягивать нечего' },
+                @{ Args = '-PullProcessings'; Kind = 'pull-processings'; Outcome = 'unchanged'; Detail = 'Нет обработок для переноса' },
                 @{ Args = '-Prepare'; Kind = 'prepare'; Outcome = 'cancelled'; Detail = 'ничего не обновлял'
                     Answers = @(@{ Kind = 'one'; Header = 'Подготовка обновления'; Item = '^Выход$' }) },
                 @{ Args = '-ApplyPrepared'; Kind = 'apply-prepared'; Outcome = 'failed'; Detail = 'подготовленного обновления нет'; Code = 1 },

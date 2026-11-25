@@ -110,7 +110,7 @@ function Get-GateReportRoot {
     return $path
 }
 
-function Start-GateOperation {
+function Start-GateOperationReport {
     param([string]$Operation, [string]$Config = '', $Launch = $null)
     try {
         if (-not $Config) { $Config = Join-Path $PSScriptRoot 'config.psd1' }

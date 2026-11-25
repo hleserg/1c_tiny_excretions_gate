@@ -15,6 +15,7 @@
 # {"kind":"close","restart":..} - просьба к ci.exe закрыться, когда скрипт кончится без ошибки, а с restart - и
 # сразу открыться заново (после обновления гейта: в папке уже новый ci.exe).
 
+$script:UiOperation = Get-Variable -Name GateOperation -ValueOnly -ErrorAction SilentlyContinue # ** Хлебников С.Ю. 20261124
 $script:UiChannelDir = ''
 $script:UiQuestionId = 0
 $script:UiSubPlanSent = ''
@@ -68,6 +69,7 @@ function Write-UiOperationResult {
     param([string]$Title, [string]$Status = 'OK', [double]$Seconds = 0, [string]$Problem = '')
     if (-not $Title) { return }
     $whole = [int][Math]::Floor($Seconds)
+    if ($script:UiOperation) { Write-OperationEvent $script:UiOperation 'step' @{title=$Title;status=$Status;seconds=$whole} } # ** Хлебников С.Ю. 20261124
     $time = '{0}:{1:00}' -f [int][Math]::Floor($whole / 60), ($whole % 60)
     if ($whole -ge 3600) { $time = '{0}:{1:00}:{2:00}' -f [int][Math]::Floor($whole / 3600), [int][Math]::Floor(($whole % 3600) / 60), ($whole % 60) }
     $detail = ''
@@ -137,7 +139,7 @@ function Test-UiStop {
     $stopFile = Join-Path $script:UiChannelDir 'stop'
     if (Test-Path -LiteralPath $stopFile) {
         Remove-Item -LiteralPath $stopFile -Force -ErrorAction SilentlyContinue
-        throw 'остановлено из интерфейса ci.exe'
+        throw [OperationCanceledException]::new('остановлено из интерфейса ci.exe') # ** Хлебников С.Ю. 20261124
     }
 }
 
@@ -154,6 +156,7 @@ function Test-UiCanAsk {
 # гейта. Polled - вопрос снят без ответа (дождались сами, Poll).
 function Start-UiAskLog {
     param([string]$Header)
+    if ($script:UiOperation) { Write-OperationEvent $script:UiOperation 'step' @{status='waitingForOperator'} } # ** Хлебников С.Ю. 20261124
     $askState = [pscustomobject]@{ Watch = [System.Diagnostics.Stopwatch]::StartNew(); Logged = $false }
     if ($null -ne (Get-Command -Name 'Write-RunLog' -CommandType Function -ErrorAction SilentlyContinue)) {
         try { Write-RunLog ('Вопрос оператору: ' + $Header); $askState.Logged = $true } catch { $askState.Logged = $false }
@@ -163,6 +166,7 @@ function Start-UiAskLog {
 
 function Stop-UiAskLog {
     param($State, [switch]$Polled)
+    if ($script:UiOperation) { Write-OperationEvent $script:UiOperation 'step' @{status='resumed'} } # ** Хлебников С.Ю. 20261124
     if ($null -eq $State -or -not $State.Logged) { return }
     $State.Logged = $false
     $askText = 'Ответ оператора через {0} с'
@@ -542,6 +546,12 @@ function Write-UiProgress {
     # Title - что идёт; Elapsed - секунд с начала; Expected - сколько шло обычно (0 - неизвестно);
     # Done и Total - сделано и всего (Total 0 - неизвестно); Detail - что именно сейчас.
     param([string]$Title, [double]$Elapsed, [double]$Expected = 0, [int]$Done = -1, [int]$Total = 0, [string]$Detail = '')
+    # ** Хлебников С.Ю. 20261124 В Git уходит смена шага. Значения полей и ответы оператора не записываются.
+    if ($script:UiOperation -and $script:UiOperation.LastTitle -ne $Title) {
+        $script:UiOperation.LastTitle = $Title
+        Write-OperationEvent $script:UiOperation 'step' @{title=$Title}
+    }
+    # ** Хлебников С.Ю. 20261124 конец
     if ($script:UiChannelDir) {
         Test-UiStop
         # ci.exe рисует сам; строка - не чаще раза в секунду или когда поменялись шаг, задание, пояснение.

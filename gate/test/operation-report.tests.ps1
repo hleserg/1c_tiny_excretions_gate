@@ -22,7 +22,7 @@
                 $http = (New-Item -ItemType Directory -Path (Join-Path $sb 'fake-http')).FullName
                 $env:CI_FAKE_HTTP = $http
                 $cfg = Join-Path $sb 'config.psd1'
-                $op = Start-GateOperation -Operation 'compare-extensions' -Config $cfg
+                $op = Start-GateOperationReport -Operation 'compare-extensions' -Config $cfg
                 $marker = ('строка "изменено" ' + [char]0x5C + [char]::ConvertFromUtf32(0x1F680) + "`r`n") * 6000 + 'КОНЕЦ РАЗНИЦЫ'
                 Add-GateOperationLine $op $marker
                 $extras = 'token-marker k! read-marker u-7 /P"unknown-one" UC="unknown-two"; Authorization: Bearer unknown-three'
@@ -66,7 +66,7 @@
             $sb = New-Sandbox $Name
             . (Join-Path $sb 'operation-report.ps1')
             $cfg = Join-Path $sb 'config.psd1'
-            $empty = Start-GateOperation 'compare-processings' $cfg
+            $empty = Start-GateOperationReport 'compare-processings' $cfg
             Check ($null -eq $empty -and -not (Test-Path (Join-Path $sb 'runs\operations'))) 'выключенная отправка завела очередь'
             $sb2 = New-Sandbox ($Name + '-enabled') -Config @{ RunReportRepo = 'owner/reports'; GitHubTokenPassFile = 'token.dat' }
             . (Join-Path $sb2 'operation-report.ps1')
@@ -76,7 +76,7 @@
             $oldHttp = $env:CI_FAKE_HTTP
             try {
                 $env:CI_FAKE_HTTP = (New-Item -ItemType Directory -Path (Join-Path $sb2 'fake-http')).FullName
-                $op = Start-GateOperation 'compare-processings' $cfg
+                $op = Start-GateOperationReport 'compare-processings' $cfg
                 Add-GateOperationLine $op 'До остановки сравнили две обработки.'
                 & (Join-Path $sb2 'publish.ps1') -Pending -Config $cfg
                 Check (@(Get-ChildItem $env:CI_FAKE_HTTP -Filter 'dispatch-*.json').Count -eq 0) 'живой процесс принят за оборвавшийся'

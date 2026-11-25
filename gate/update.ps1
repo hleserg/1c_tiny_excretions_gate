@@ -269,7 +269,7 @@ $installedText = 'неизвестно'
 $targetVersion = $Tag
 # Просмотр релизов и проверка при старте, если обновления нет, - без отдельного итога.
 if ($Startup) { $startupLaunch = New-GateLaunchMetadata -Operation 'update-gate' }
-elseif (-not $List) { $updateReport = Start-GateOperation -Operation 'update-gate' -Config $configPath }
+elseif (-not $List) { $updateReport = Start-GateOperationReport -Operation 'update-gate' -Config $configPath }
 try {
     $installed = Get-InstalledVersion
     if ($installed) { $installedText = $installed }
@@ -287,7 +287,7 @@ try {
 
     if ($Startup) {
         if ($installed -and $newest.Version -gt $installed) {
-            $updateReport = Start-GateOperation -Operation 'update-gate' -Config $configPath -Launch $startupLaunch
+            $updateReport = Start-GateOperationReport -Operation 'update-gate' -Config $configPath -Launch $startupLaunch
             $targetVersion = $newest.Version
             if (Confirm-Ui -Question ("Доступен гейт {0}, установлен {1}. Обновить сейчас?" -f $newest.Version, $installed) -Yes 'Обновить' -No 'Продолжить' -DefaultNo) { $chosen = $newest }
         }
@@ -348,7 +348,7 @@ try {
 }
 catch {
     $reason = $_.Exception.Message
-    if ($Startup -and $null -eq $updateReport) { $updateReport = Start-GateOperation -Operation 'update-gate' -Config $configPath -Launch $startupLaunch }
+    if ($Startup -and $null -eq $updateReport) { $updateReport = Start-GateOperationReport -Operation 'update-gate' -Config $configPath -Launch $startupLaunch }
     if ($reason -ne 'остановлено из интерфейса ci.exe') { $updateOutcome = 'failed' }
     $updateResult = 'Обновление не вышло: {0}' -f $reason
     Write-Host $updateResult -ForegroundColor Red

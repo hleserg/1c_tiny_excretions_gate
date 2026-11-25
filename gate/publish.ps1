@@ -29,6 +29,7 @@ param(
     [switch]$OperationHelpersLoaded,
     [switch]$Pending,
     [switch]$WatchProgress,
+    [switch]$WatchOperations, # ** Хлебников С.Ю. 20261124
     [string]$Config = ''
 )
 
@@ -324,7 +325,10 @@ function Get-RunFileList {
     $secretHits = New-Object System.Collections.Generic.List[string]
     $other = 0
     $total = [long]0
-    foreach ($file in @(Get-ChildItem -LiteralPath $rootFull -Recurse -File -Force -ErrorAction SilentlyContinue | Sort-Object FullName)) {
+    # ** Хлебников С.Ю. 20261124 При лимите файлов первыми сохраняем вердикт, проверенное состояние и итог.
+    $keyFiles = @('verdict.json','checked-state.json','summary.txt','report.txt','timeline.txt','released.txt','publish.json')
+    $rank = @{ Expression = { if ($_.DirectoryName -eq $rootFull -and $keyFiles -contains $_.Name) { 0 } else { 1 } } }
+    foreach ($file in @(Get-ChildItem -LiteralPath $rootFull -Recurse -File -Force -ErrorAction SilentlyContinue | Sort-Object $rank, FullName)) {
         if (-not $file.FullName.StartsWith($rootFull + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
         $parts = @($file.FullName.Substring($rootFull.Length + 1) -split '[\\/]')
         $relative = $parts -join '/'
@@ -816,6 +820,14 @@ $configFile = $Config
 if ([string]::IsNullOrWhiteSpace($configFile)) { $configFile = Join-Path $Root 'config.psd1' }
 if (-not (Test-Path -LiteralPath $configFile)) { return }
 $cfg = Read-PublishConfig $configFile
+# ** Хлебников С.Ю. 20261124 Отдельная ветка журнала операций работает и без issue для итогов.
+if ($WatchOperations -or $Pending) {
+    . (Join-Path $Root 'post-update.ps1') # ** Хлебников С.Ю. 20261124 Краткое описание ошибки действия.
+    . (Join-Path $Root 'operations.ps1')
+    if ($WatchOperations) { Watch-GateOperations $cfg; return }
+    Start-OperationSender $cfg $configFile
+}
+# ** Хлебников С.Ю. 20261124 конец
 $repoName = [string](Get-PublishSetting $cfg 'RunReportRepo' '')
 if (-not $repoName) { return }
 $tokenFile = [string](Get-PublishSetting $cfg 'GitHubTokenPassFile' '')

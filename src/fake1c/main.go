@@ -84,6 +84,7 @@ type selfcheck struct {
 }
 
 type canary struct {
+	User     *string  `json:"user"`
 	Status   string   `json:"status"`
 	Ext      []string `json:"ext"`
 	Sessions []string `json:"sessions"`
@@ -490,7 +491,12 @@ func client(sc scenario, args []string, state map[string]int) int {
 		if c.NoResult {
 			time.Sleep(time.Hour)
 		}
-		lines := []string{"canary=20261117.999999", "status=" + c.Status, "user=Тест"}
+		lines := []string{"canary=20261117.999999", "status=" + c.Status}
+		if c.User == nil {
+			lines = append(lines, "user=Тест")
+		} else if *c.User != "" {
+			lines = append(lines, "user="+*c.User)
+		}
 		for _, e := range c.Ext {
 			lines = append(lines, "ext="+e)
 		}
@@ -587,6 +593,42 @@ func laneTasks(tasks []task, dir string, p map[string]string) []task {
 		}
 	}
 	inGroup := func(t task) bool { return split != "" && t.Step == split && !strings.HasPrefix(t.Key, "Запись/") }
+	// ** Хлебников С.Ю. 20261123 Подставная 1С составляет общий план ранних чтений для двух сеансов.
+	if only == "" && p["earlyreads"] == "1" {
+		readSteps := map[string]bool{}
+		for _, t := range picked {
+			kind, _, _ := strings.Cut(t.Key, "/")
+			if kind == "Запись" {
+				continue
+			}
+			if allowed, seen := readSteps[t.Step]; seen && !allowed {
+				continue
+			}
+			switch kind {
+			case "Форма", "КлиентскийМодуль", "КомпиляцияМодулей", "ПечатныеФормы", "Отчеты":
+				readSteps[t.Step] = true
+			default:
+				readSteps[t.Step] = false
+			}
+		}
+		inGroup = func(t task) bool { return readSteps[t.Step] && !strings.HasPrefix(t.Key, "Запись/") }
+		early, later := []task{}, []task{}
+		reads := 0
+		for _, t := range picked {
+			if readSteps[t.Step] {
+				early = append(early, t)
+			} else {
+				later = append(later, t)
+			}
+			if inGroup(t) {
+				reads++
+			}
+		}
+		if reads > 1 {
+			picked = append(early, later...)
+		}
+	}
+	// ** Хлебников С.Ю. 20261123 конец
 	last, count := -1, 0
 	for i, t := range picked {
 		if inGroup(t) {
