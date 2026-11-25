@@ -4347,6 +4347,32 @@ $tests = @(
         }
     },
     @{
+        Name = 'git-export-busy-designer'
+        Text = 'До первого снимка temp можно отменить выгрузку или закрыть конфигуратор выбранной базы.'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $com = New-ComState -Sessions @(
+                @{ id = 7; base = 'erp_temp_test'; app = 'Designer'; user = 'Тест'; host = 'pc1' },
+                @{ id = 8; base = 'erp_base'; app = 'Designer'; user = 'Тест'; host = 'pc2' },
+                @{ id = 9; base = 'erp_temp_test'; app = '1CV8C'; user = 'Тест'; host = 'pc3' })
+            $pick = @{ Kind = 'many'; Header = 'Первая выгрузка'; Indexes = @(0) }
+            $busy = 'Открыт конфигуратор erp_temp_test'
+            $cancel = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Com $com -Answers @(
+                $pick, @{ Kind = 'one'; Header = $busy; Item = '^Отмена' })
+            Check ($cancel.ExitCode -ne 0 -and $cancel.Unexpected.Count -eq 0 -and $cancel.UnusedAnswers -eq 0) 'выгрузка не отреагировала на отмену до первого снимка'
+            Check ((Get-Calls $cancel @('/DumpConfigToFiles')).Count -eq 0) 'выгрузка началась до согласия'
+            Check (@($cancel.ComLog | Where-Object { $_ -match 'TerminateSession' }).Count -eq 0) 'при отмене завершился сеанс'
+            $save = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{ dumps = (New-GitDumps) } -Com $com -Answers @(
+                $pick, @{ Kind = 'one'; Header = $busy; Item = '^Закрыть отсюда' },
+                @{ Kind = 'confirm'; Header = 'веткой temp/'; Yes = $true })
+            Check-DeployCommon $save -LocksExpected $false
+            Check ($save.ExitCode -eq 0 -and (Get-Calls $save @('/DumpConfigToFiles')).Count -gt 0) 'после закрытия конфигуратора снимок не сделан'
+            $stopped = @($save.ComLog | Where-Object { $_ -match 'TerminateSession' })
+            Check ($stopped.Count -eq 1 -and $stopped[0] -match 'TerminateSession 7$') 'завершены посторонние сеансы'
+        }
+    },
+    @{
         Name = 'git-export-guards'
         Text = 'Выгрузка в пустой репозиторий и ошибка создания PR останавливаются без записи в main и без принятого состояния.'
         Run = {
