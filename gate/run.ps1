@@ -193,6 +193,7 @@ $script:GateActionsNeeded = $false
 $script:PlanActionsDir = ''
 # Итог прогона в GitHub (publish.ps1, настройка RunReportRepo): папка прогона, когда она есть и отправка включена.
 $script:PublishRunDir = ''
+$script:ResumeReport = $null
 
 # Скрипт остановился: причина одной строкой. Место в скрипте показывается только для неожиданной
 # ошибки. У остановки по throw с текстом оно ничего не объясняет; отличить её можно по тому,
@@ -206,12 +207,19 @@ trap {
         Write-Host ("  {0}" -f ($_.InvocationInfo.PositionMessage -split "`r?`n")[0]) -ForegroundColor DarkGray
     }
     # Итог остановленного прогона - в GitHub: причина, шаги, что успели, конец run.log.
-    if ($script:PublishRunDir) { Invoke-RunPublish -Stage 'crash' -Message $_.Exception.Message }
+    $reason = $_.Exception.Message
+    if ($script:PublishRunDir) { Invoke-RunPublish -Stage 'crash' -Message $reason }
+    elseif ($null -ne $script:ResumeReport) {
+        $outcome = 'failed'
+        if ($reason -eq 'остановлено из интерфейса ci.exe' -or $reason -like 'Продолжение отменено:*') { $outcome = 'cancelled' }
+        Complete-GateOperation -Context $script:ResumeReport -Outcome $outcome -Text $reason
+    }
     exit 1
 }
 
 $Root = $PSScriptRoot
 . (Join-Path $Root 'cluster-target.ps1')
+. (Join-Path $Root 'operation-report.ps1')
 # Версия гейта - из заголовка этого файла (её ставит сборщик); показывается в меню у «Обновить гейт».
 $script:GateVersion = 'неизвестна'
 $gateVersionFound = [regex]::Match((@(Get-Content -LiteralPath $PSCommandPath -Encoding UTF8 -TotalCount 80) -join "`n"), 'Версия (\d{8}\.\d{6})\.')
@@ -247,11 +255,7 @@ function Get-MaskedLine {
     # само значение UnlockCode, где бы оно ни встретилось, - если в нём шесть знаков и больше (короткий код вроде
     # «0» совпал бы с обычными цифрами текста; он закрыт в ключах и строке соединения).
     param([string]$Line)
-    if (-not $Line) { return $Line }
-    $masked = [regex]::Replace([regex]::Replace($Line, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"')
-    $masked = [regex]::Replace($masked, '(?i)\b(Pwd|UC)="(?:[^"]|"")*"', '$1="***"')
-    foreach ($secret in @($script:MaskValues)) { if ($secret) { $masked = $masked.Replace([string]$secret, '***') } }
-    return $masked
+    return (Protect-GateReportText -Text $Line -LiteralValues $script:MaskValues)
 }
 
 function Write-RunLog {
@@ -270,7 +274,14 @@ function Invoke-RunPublish {
         $publishScript = Join-Path $Root 'publish.ps1'
         if (-not (Test-Path -LiteralPath $publishScript)) { return }
         if ($Pending) { & $publishScript -Pending -Config $configPath; return }
-        if (-not $script:PublishRunDir) { return }
+        if (-not $script:PublishRunDir) {
+            # Не удалось записать метку передачи: итог останется в исходной папке операции.
+            if ($Stage -eq 'final' -and $null -ne $script:ResumeReport) {
+                $text = Get-Content -LiteralPath (Join-Path $RunDir 'summary.txt') -Encoding UTF8 -Raw
+                Complete-GateOperation -Context $script:ResumeReport -Outcome $verdict -Text $text
+            }
+            return
+        }
         & $publishScript -RunDir $script:PublishRunDir -Stage $Stage -Message $Message -Config $configPath
     }
     catch { Write-Host ("Итог прогона в GitHub не ушёл: {0}" -f $_.Exception.Message) -ForegroundColor Yellow }
@@ -2201,12 +2212,18 @@ function Get-AcceptKeepFailures {
 }
 # ** Хлебников С.Ю. 20261120 конец
 
-function Invoke-AcceptBaseline {
+function Write-AcceptResult {
+    param($Report, [string]$Text, [switch]$Warning)
+    if ($Warning) { Write-Host $Text -ForegroundColor Yellow } else { Write-Host $Text }
+    Add-GateOperationLine -Context $Report -Text $Text
+}
+
+function Set-AcceptedBaseline {
     # Принять замечания прогона как известные: записать их в эталон базы. Зовут ключ -AcceptBaseline
     # и пункт меню «Принять новое последнего прогона в эталон». Ошибка - исключением.
     # ** Хлебников С.Ю. 20261120 KeepFailures - частичное принятие: в эталон тестов из прогона идут только OK,
     # у падений, пропусков и пропавших тестов остаётся прежняя запись (новое падение остаётся новым).
-    param([string]$RunPath, [switch]$KeepFailures)
+    param([string]$RunPath, [switch]$KeepFailures, $Report)
     $acceptDir = $RunPath
     $verdictFile = Join-Path $acceptDir 'verdict.json'
     if (-not (Test-Path -LiteralPath $verdictFile)) { throw "Не нашёл verdict.json в $acceptDir" }
@@ -2250,28 +2267,28 @@ function Invoke-AcceptBaseline {
                 elseif ($parts[0] -eq 'FAIL' -or $parts[0] -eq 'ERROR') { $leftFailed++ }
             }
             [System.IO.File]::WriteAllLines($unitTarget, [string[]]@($kept.Values), $Utf8Bom)
-            Write-Host ("Принято как известное: прошедшие модульные тесты ({0}); падения ({1}) не приняты - останутся новыми" -f $takenOk, $leftFailed)
+            Write-AcceptResult $Report ("Принято как известное: прошедшие модульные тесты ({0}); падения ({1}) не приняты - останутся новыми" -f $takenOk, $leftFailed)
         }
         else {
             # Результаты модульных тестов того прогона: его падения становятся известными.
             Copy-Item -LiteralPath $acceptUnit -Destination $unitTarget -Force
-            Write-Host 'Принято как известное: результаты модульных тестов'
+            Write-AcceptResult $Report 'Принято как известное: результаты модульных тестов'
         }
     }
     # ** Хлебников С.Ю. 20261120 конец
     foreach ($file in $logFiles) {
         $acceptLines = @(Read-V8Log $file.FullName)
         if (Test-DesignerBusy $acceptLines) {
-            Write-Host ("Пропущено: {0} - в том прогоне конфигуратор был занят, проверка не выполнялась" -f $file.Name) -ForegroundColor Yellow
+            Write-AcceptResult $Report ("Пропущено: {0} - в том прогоне конфигуратор был занят, проверка не выполнялась" -f $file.Name) -Warning
             continue
         }
         $acceptRecords = @(ConvertTo-CheckRecords $acceptLines)
         if ($acceptRecords.Count -eq 0 -and -not (Test-Path -LiteralPath (Join-Path $acceptDir ($file.BaseName + '.norm.txt')))) {
-            Write-Host ("Пропущено: {0} - в прогоне нет подтверждённого результата проверки" -f $file.Name) -ForegroundColor Yellow
+            Write-AcceptResult $Report ("Пропущено: {0} - в прогоне нет подтверждённого результата проверки" -f $file.Name) -Warning
             continue
         }
         [System.IO.File]::WriteAllLines((Join-Path $baselineTarget ($file.BaseName + '.norm.txt')), [string[]]$acceptRecords, $Utf8Bom)
-        Write-Host ("Принято как известное: {0}, записей {1}" -f $file.BaseName, $acceptRecords.Count)
+        Write-AcceptResult $Report ("Принято как известное: {0}, записей {1}" -f $file.BaseName, $acceptRecords.Count)
     }
     if (Test-Path -LiteralPath $acceptSelfCheck) {
         # Состояние базы после того прогона становится эталоном самопроверки.
@@ -2284,24 +2301,24 @@ function Invoke-AcceptBaseline {
             ("time={0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
         )
         [System.IO.File]::WriteAllLines((Join-Path $baselineTarget 'selfcheck.info.txt'), [string[]]$acceptInfo, $Utf8Bom)
-        Write-Host ("Принято как известное: самопроверка, записей {0}" -f $acceptRecords.Count)
+        Write-AcceptResult $Report ("Принято как известное: самопроверка, записей {0}" -f $acceptRecords.Count)
         # Снимки того прогона (сообщения обмена) становятся эталонными.
         # Карта покрытия того прогона становится эталоном: её непокрытое больше не новое.
         $acceptCoverage = Join-Path $acceptDir 'coverage.txt'
         if (Test-Path -LiteralPath $acceptCoverage) {
             Copy-Item -LiteralPath $acceptCoverage -Destination (Join-Path $baselineTarget 'coverage.txt') -Force
-            Write-Host 'Принято как известное: карта покрытия'
+            Write-AcceptResult $Report 'Принято как известное: карта покрытия'
         }
         $acceptSnapshots = Join-Path $acceptDir 'selfcheck-after.snapshots.txt'
         if (Test-Path -LiteralPath $acceptSnapshots) {
             Copy-Item -LiteralPath $acceptSnapshots -Destination (Join-Path $baselineTarget 'selfcheck.snapshots.txt') -Force
-            Write-Host 'Принято как известное: снимки самопроверки'
+            Write-AcceptResult $Report 'Принято как известное: снимки самопроверки'
         }
         # Итоги пробной выгрузки шага «Обмены» того прогона становятся эталонными.
         $acceptExchange = Join-Path $acceptDir 'selfcheck-after.exchange.txt'
         if (Test-Path -LiteralPath $acceptExchange) {
             Copy-Item -LiteralPath $acceptExchange -Destination (Join-Path $baselineTarget 'selfcheck.exchange.txt') -Force
-            Write-Host 'Принято как известное: итоги выгрузки шага «Обмены»'
+            Write-AcceptResult $Report 'Принято как известное: итоги выгрузки шага «Обмены»'
         }
     }
     # Проверка правил обмена того прогона: перехваты и замечания R2/R4 становятся известными (R1 эталоном не снимается).
@@ -2309,16 +2326,52 @@ function Invoke-AcceptBaseline {
         $acceptFile = Join-Path $acceptDir $acceptPair[0]
         if (Test-Path -LiteralPath $acceptFile) {
             Copy-Item -LiteralPath $acceptFile -Destination (Join-Path $baselineTarget $acceptPair[1]) -Force
-            Write-Host ("Принято как известное: {0}" -f $acceptPair[0])
+            Write-AcceptResult $Report ("Принято как известное: {0}" -f $acceptPair[0])
         }
     }
     # Отметка в папке прогона: в списке прогонов он виден как принятый, второй раз его не предлагают.
     [System.IO.File]::WriteAllLines((Join-Path $acceptDir 'accepted.txt'), [string[]]@(('time={0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')), ('scope={0}' -f $acceptScope)), $Utf8Bom)
-    Write-Host "Эталон базы «$($acceptMeta.baseKey)» обновлён: $baselineTarget"
+    Write-AcceptResult $Report "Эталон базы «$($acceptMeta.baseKey)» обновлён: $baselineTarget"
 }
 
+function Invoke-AcceptBaseline {
+    param([string]$RunPath, [switch]$KeepFailures, [switch]$AskKeepFailures, $MenuRun)
+    $report = Start-GateOperationReport -Operation 'accept-baseline' -Config $configPath
+    $outcome = 'cancelled'
+    $detail = 'Принятие в эталон отменено.'
+    try {
+        Add-GateOperationLine -Context $report -Text ('Прогон: {0}' -f $RunPath)
+        $RunPath = Resolve-RootPath $RunPath
+        if ($null -ne $MenuRun -and -not (Confirm-AcceptFromMenu -Run $MenuRun)) {
+            Write-Host '  Не принято.'
+            return
+        }
+        if ($AskKeepFailures) { $KeepFailures = Get-AcceptKeepFailures -RunPath $RunPath -RunName (Split-Path -Leaf $RunPath) }
+        Set-AcceptedBaseline -RunPath $RunPath -KeepFailures:$KeepFailures -Report $report
+        $outcome = 'accepted'
+        $detail = ''
+        if ($null -ne $MenuRun) { Write-Host ('  Принято: новое прогона {0} теперь известное.' -f $MenuRun.Dir.Name) -ForegroundColor Green }
+    }
+    catch {
+        $detail = $_.Exception.Message
+        if ($detail -ne 'остановлено из интерфейса ci.exe') { $outcome = 'failed' }
+        if ($null -eq $MenuRun -or $outcome -eq 'cancelled') { throw }
+        Write-Host ('  Не принято: {0}' -f $detail) -ForegroundColor Red
+    }
+    finally { Complete-GateOperation -Context $report -Outcome $outcome -Text $detail }
+}
+
+$configPath = $Config
+if ([string]::IsNullOrWhiteSpace($configPath)) { $configPath = Join-Path $Root 'config.psd1' }
+elseif (-not [IO.Path]::IsPathRooted($configPath)) { $configPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($configPath) }
+
+if ($Resume) {
+    $script:ResumeReport = Start-GateOperationReport -Operation 'resume' -Config $configPath
+    Add-GateOperationLine -Context $script:ResumeReport -Text ('Продолжение прогона {0}' -f $Resume)
+    if ($FromStep) { Add-GateOperationLine -Context $script:ResumeReport -Text ('Выбран шаг: {0}' -f $FromStep) }
+}
 if ($PSCmdlet.ParameterSetName -eq 'Accept') {
-    Invoke-AcceptBaseline -RunPath (Resolve-RootPath $AcceptBaseline) -KeepFailures:$KeepFailures
+    Invoke-AcceptBaseline -RunPath $AcceptBaseline -KeepFailures:$KeepFailures
     exit 0
 }
 
@@ -2326,8 +2379,6 @@ if ($PSCmdlet.ParameterSetName -eq 'Accept') {
 
 #region Подготовка прогона
 
-$configPath = $Config
-if ([string]::IsNullOrWhiteSpace($configPath)) { $configPath = Join-Path $Root 'config.psd1' }
 if (-not (Test-Path -LiteralPath $configPath)) { throw "Нет файла настроек: $configPath" }
 $configPath = (Get-Item -LiteralPath $configPath).FullName
 $cfg = Import-PowerShellDataFile -LiteralPath $configPath
@@ -2642,8 +2693,8 @@ function Get-AcceptableRun {
     return [pscustomobject]@{ Dir = $last[0]; Verdict = $verdict }
 }
 
-function Invoke-AcceptFromMenu {
-    # Пункт меню: показать, что станет известным, переспросить и принять. $true - принято.
+function Confirm-AcceptFromMenu {
+    # Показать, что именно станет известным, и переспросить перед записью эталона.
     param($Run)
     $runName = $Run.Dir.Name
     $red = ([string]$Run.Verdict.verdict -eq 'RED')
@@ -2660,17 +2711,7 @@ function Invoke-AcceptFromMenu {
     $yesText = 'Принять в эталон'
     if ($red) { $yesText = 'Принять, хотя прогон красный' }
     $sure = Confirm-Ui -Question ('Принять новое прогона {0} в эталон? Что внутри - report.txt и *.new.txt в папке прогона.' -f $runName) -Yes $yesText -No 'Не принимать'
-    if ($sure -ne $true) { Write-Host '  Не принято.'; return $false }
-    $keepFailures = Get-AcceptKeepFailures -RunPath $Run.Dir.FullName -RunName $runName
-    try {
-        Invoke-AcceptBaseline -RunPath $Run.Dir.FullName -KeepFailures:$keepFailures
-        Write-Host ('  Принято: новое прогона {0} теперь известное.' -f $runName) -ForegroundColor Green
-        return $true
-    }
-    catch {
-        Write-Host ('  Не принято: {0}' -f $_.Exception.Message) -ForegroundColor Red
-        return $false
-    }
+    return ($sure -eq $true)
 }
 
 function Show-RecentRuns {
@@ -2765,18 +2806,11 @@ function Show-RecentRuns {
                 }
                 'report' { Show-UiPager -Lines @([System.IO.File]::ReadAllLines($reportFile, [System.Text.Encoding]::UTF8)) -Header ('report.txt, прогон ' + $row.Dir.Name) }
                 'folder' { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $runPath) }
-                'accept' { $null = Invoke-AcceptFromMenu -Run $acceptable }
+                'accept' { Invoke-AcceptBaseline -RunPath $acceptable.Dir.FullName -AskKeepFailures -MenuRun $acceptable }
                 'resume' {
                     # Продолжение выбрано - карточка и список закрываются, гейт идёт продолжать (запрос - в $script:ResumeRequest).
-                    $resumePlan = Get-ResumePlan -Dir $runPath -InboxList (Get-InboxList)
-                    if (-not $resumePlan.Ok) {
-                        Write-Host ('  Продолжить нельзя: {0}' -f $resumePlan.Reason) -ForegroundColor Yellow
-                        Wait-UiAcknowledge -Label 'Вернуться к прогону'
-                    }
-                    else {
-                        $script:ResumeRequest = Select-ResumeStart -Plan $resumePlan
-                        if ($null -ne $script:ResumeRequest) { return }
-                    }
+                    $script:ResumeRequest = Read-MenuResumeRequest -Dir $runPath
+                    if ($null -ne $script:ResumeRequest) { return }
                 }
                 'update' {
                     $target = Copy-RunFiles -Sources $updateFiles -FolderName ('из_прогона_' + $row.Dir.Name)
@@ -3390,6 +3424,28 @@ function Select-ResumeStart {
         if ($sure -eq $true) { return $request }
         if ($null -eq $sure) { return $null }
     }
+}
+
+function Read-MenuResumeRequest {
+    param([string]$Dir, $InboxList)
+    $script:ResumeReport = Start-GateOperationReport -Operation 'resume' -Config $configPath
+    Add-GateOperationLine -Context $script:ResumeReport -Text ('Продолжение прогона {0}' -f $Dir)
+    if (-not $PSBoundParameters.ContainsKey('InboxList')) { $InboxList = Get-InboxList }
+    $plan = Get-ResumePlan -Dir $Dir -InboxList $InboxList
+    if (-not $plan.Ok) {
+        $reason = 'Продолжить прогон {0} нельзя: {1}' -f (Split-Path -Leaf $Dir), $plan.Reason
+        Complete-GateOperation -Context $script:ResumeReport -Outcome 'failed' -Text $reason
+        $script:ResumeReport = $null
+        Write-Host ('  ' + $reason) -ForegroundColor Yellow
+        Wait-UiAcknowledge
+        return $null
+    }
+    $request = Select-ResumeStart -Plan $plan
+    if ($null -eq $request) {
+        Complete-GateOperation -Context $script:ResumeReport -Outcome 'cancelled' -Text 'Выбор шага для продолжения отменён.'
+        $script:ResumeReport = $null
+    }
+    return $request
 }
 
 function Resolve-ResumeFromStep {
@@ -4161,7 +4217,7 @@ function Get-UtLastResults {
     $files = New-Object System.Collections.Generic.List[object]
     foreach ($root in @((Resolve-RootPath ([string](Get-Setting $cfg 'RunsDir' 'runs'))), (Resolve-RootPath 'tests-runs'))) {
         if (-not (Test-Path -LiteralPath $root)) { continue }
-        foreach ($dir in @(Get-ChildItem -LiteralPath $root -Directory | Sort-Object Name -Descending | Select-Object -First 30)) {
+        foreach ($dir in @(Get-ChildItem -LiteralPath $root -Directory | Where-Object { $_.Name -ne 'operations' } | Sort-Object Name -Descending | Select-Object -First 30)) {
             $file = Join-Path $dir.FullName 'unittests.txt'
             if (Test-Path -LiteralPath $file) { $files.Add([pscustomobject]@{ Path = $file; Run = $dir.Name; Time = (Get-Item -LiteralPath $file).LastWriteTime }) }
         }
@@ -4404,7 +4460,7 @@ if (-not ($Tests -or $SelfCheckGroup)) { Invoke-RunPublish -Pending } # ** Хл�
 
 function Invoke-MenuUpdate {
     param([switch]$Startup)
-    $updateArgs = @{ Startup = $Startup.IsPresent }
+    $updateArgs = @{ Startup = $Startup.IsPresent; Config = $configPath }
     if ($UiChannel) { $updateArgs['UiChannel'] = $UiChannel }
     & (Join-Path $Root 'update.ps1') @updateArgs
     $updateCode = $LASTEXITCODE
@@ -4718,7 +4774,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             exit 0
         }
         if ($choice -eq 'accept') {
-            $null = Invoke-AcceptFromMenu -Run $acceptable
+            Invoke-AcceptBaseline -RunPath $acceptable.Dir.FullName -AskKeepFailures -MenuRun $acceptable
             Wait-UiAcknowledge
             continue
         }
@@ -4731,13 +4787,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             continue
         }
         if ($choice -eq 'resume') {
-            $resumePlan = Get-ResumePlan -Dir $resumeDir -InboxList $inboxList.ToArray()
-            if (-not $resumePlan.Ok) {
-                Write-Host ("  Продолжить прогон {0} нельзя: {1}" -f (Split-Path -Leaf $resumeDir), $resumePlan.Reason) -ForegroundColor Yellow
-                Wait-UiAcknowledge
-                continue
-            }
-            $script:ResumeRequest = Select-ResumeStart -Plan $resumePlan
+            $script:ResumeRequest = Read-MenuResumeRequest -Dir $resumeDir -InboxList $inboxList.ToArray()
             if ($null -eq $script:ResumeRequest) { continue }
             break
         }
@@ -4836,13 +4886,31 @@ if (-not ($Tests -or $SelfCheckGroup)) {
         phases = [ordered]@{}; kit = $null
         referenceSnapshotDir = ''; exchangeBefore = ''; metricsBeforeSaved = $false; accepted = $false
     }
-    if ($null -ne $script:ResumeRequest) { Initialize-Resume -Request $script:ResumeRequest }
     # Итог в GitHub: какой процесс ведёт прогон - чтобы потом отличить живой прогон от оборвавшегося.
     if ([string](Get-Setting $cfg 'RunReportRepo' '')) {
-        $selfProcess = Get-Process -Id $PID
-        [System.IO.File]::WriteAllText((Join-Path $RunDir 'pid.txt'), ('{0}|{1}' -f $PID, $selfProcess.StartTime.ToString('o')), $Utf8Bom)
-        $script:PublishRunDir = $RunDir
-        if ((Get-Setting $cfg 'RunProgressToGit' $false) -and [string](Get-Setting $cfg 'RunFilesRepo' '')) {
+        try {
+            if ($null -ne $script:ResumeReport) {
+                Move-GateOperationToRun -Context $script:ResumeReport -RunDir $RunDir
+                if (-not $script:ResumeReport.Done) { throw 'Не удалось передать отчёт в папку продолжения.' }
+            }
+            else {
+                $operation = 'run'
+                if ($null -ne $script:ResumeRequest) { $operation = 'resume' }
+                $launch = New-GateLaunchMetadata -Operation $operation
+                $launch['repo'] = [string]$cfg.RunReportRepo
+                Save-GateReportJson -Path (Join-Path $RunDir 'run-launch.json') -Value $launch
+            }
+            # pid.txt появляется последним: до этого оборванное продолжение досылается как отдельная операция.
+            $selfProcess = Get-Process -Id $PID
+            [System.IO.File]::WriteAllText((Join-Path $RunDir 'pid.txt'), ('{0}|{1}' -f $PID, $selfProcess.StartTime.ToString('o')), $Utf8Bom)
+            $script:PublishRunDir = $RunDir
+            $script:ResumeReport = $null
+        }
+        catch {
+            if ($null -ne $script:ResumeReport) { $script:ResumeReport.Done = $false }
+            Write-Host ('Не записаны сведения о запуске гейта: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+        }
+        if ($script:PublishRunDir -and (Get-Setting $cfg 'RunProgressToGit' $false) -and [string](Get-Setting $cfg 'RunFilesRepo' '')) {
             try {
                 # Задание принадлежит процессу прогона. Сетевое ожидание не задерживает проверки 1С.
                 $null = Start-Job -ArgumentList (Join-Path $Root 'publish.ps1'), $configPath, $RunDir -ScriptBlock {
@@ -4852,6 +4920,7 @@ if (-not ($Tests -or $SelfCheckGroup)) {
             } catch { Write-RunLog ('Не запущена промежуточная публикация: ' + $_.Exception.Message) }
         }
     }
+    if ($null -ne $script:ResumeRequest) { Initialize-Resume -Request $script:ResumeRequest }
 }
 if ($script:SiteSettingKeys.Count -gt 0) { Write-RunLog ("Настройки площадки из config.site.psd1: {0}" -f ($script:SiteSettingKeys -join ', ')) }
 $baselineDir = Join-Path (Join-Path $Root 'baseline') $baseKey
@@ -8779,9 +8848,7 @@ elseif ($anyTouched -gt 0) {
     }
     if ($acceptAfterDecision -and $decision -eq 'kept') {
         try {
-            $keepFailuresNow = $false
-            if (Test-UiCanAsk) { $keepFailuresNow = Get-AcceptKeepFailures -RunPath $RunDir -RunName $runId }
-            Invoke-AcceptBaseline -RunPath $RunDir -KeepFailures:$keepFailuresNow
+            Invoke-AcceptBaseline -RunPath $RunDir -AskKeepFailures:(Test-UiCanAsk)
             $aftermath.Add('Новое этого прогона принято в эталон.')
             Write-Host 'Новое этого прогона принято в эталон.' -ForegroundColor Green
         }

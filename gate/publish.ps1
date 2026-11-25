@@ -25,6 +25,8 @@ param(
     [ValidateSet('verdict', 'final', 'crash')]
     [string]$Stage = 'final',
     [string]$Message = '',
+    [string]$OperationDir = '',
+    [switch]$OperationHelpersLoaded,
     [switch]$Pending,
     [switch]$WatchProgress,
     [switch]$WatchOperations, # ** Хлебников С.Ю. 20261124
@@ -41,42 +43,17 @@ $PayloadLimitBytes = 60000
 # Файлы прогона в git (RunFilesRepo): какие берём и пределы. Двоичные (комплект, сохранённые расширения,
 # обработки) не берём: им место в папке прогона, в git они раздувают историю.
 $RunFilesExtensions = @('.txt', '.log', '.json', '.jsonl', '.md', '.csv', '.tsv')
-$RunFilesSkipDirs = @('kit', 'inbox', 'before', 'reference', 'epf')
+$RunFilesSkipDirs = @('kit', 'inbox', 'before', 'reference', 'epf', 'dispatch')
 $RunFilesMaxFileBytes = 20MB
 $RunFilesMaxTotalBytes = 100MB
 $RunFilesMaxCount = 1000
-# Секрет короче этого не ищем: короткие гейт сам прячет в журналах («***»), а короткая строка находится где попало.
-$RunFilesMinSecretLength = 6
-
 # Клиент GitHub: голова ветки, коммит, ветка; подставной GitHub для тестов - CI_FAKE_GITHUB.
-. (Join-Path $Root 'github.ps1')
+if (-not $OperationHelpersLoaded) {
+    . (Join-Path $Root 'github.ps1')
+    . (Join-Path $Root 'operation-report.ps1')
+}
 
 #region Настройки и токен
-
-function Read-PublishConfig {
-    # config.psd1 и config.site.psd1 - как в run.ps1: ключа нет в config.psd1 или он там пустой - из config.site.psd1.
-    param([string]$Path)
-    $read = Import-PowerShellDataFile -LiteralPath $Path
-    $sitePath = Join-Path $Root 'config.site.psd1'
-    if (Test-Path -LiteralPath $sitePath) {
-        $site = Import-PowerShellDataFile -LiteralPath $sitePath
-        foreach ($siteKey in @($site.Keys)) {
-            $ownEmpty = $false
-            if ($read.ContainsKey($siteKey)) {
-                $own = $read[$siteKey]
-                $ownEmpty = ($null -eq $own) -or (($own -is [array]) -and @($own).Count -eq 0) -or (($own -is [string]) -and $own -eq '')
-            }
-            if (-not $read.ContainsKey($siteKey) -or $ownEmpty) { $read[$siteKey] = $site[$siteKey] }
-        }
-    }
-    return $read
-}
-
-function Get-PublishSetting {
-    param([hashtable]$Settings, [string]$Key, $Default)
-    if ($Settings.ContainsKey($Key) -and $null -ne $Settings[$Key] -and [string]$Settings[$Key] -ne '') { return $Settings[$Key] }
-    return $Default
-}
 
 function Get-PublishToken {
     # Токен GitHub из файла DPAPI (как пароли гейта). В вывод и журналы не попадает.
@@ -105,12 +82,12 @@ function Get-PublishState {
     # Что хотели отправить (wanted) и что ушло (sent): verdict, final, crash, broken; message - причина остановки.
     # filesWanted, filesSent, filesError - то же для файлов прогона в git (RunFilesRepo).
     param([string]$Dir)
-    $state = [ordered]@{ wanted = ''; sent = ''; message = ''; error = ''; time = ''; filesWanted = ''; filesSent = ''; filesError = '' }
+    $state = [ordered]@{ wanted = ''; sent = ''; message = ''; error = ''; time = ''; filesWanted = ''; filesSent = ''; filesError = ''; sentPart = 0 }
     $text = Read-TextFile (Join-Path $Dir 'publish.json')
     if ($text) {
         try {
             $read = $text | ConvertFrom-Json
-            foreach ($name in @('wanted', 'sent', 'message', 'error', 'time', 'filesWanted', 'filesSent', 'filesError')) {
+            foreach ($name in @('wanted', 'sent', 'message', 'error', 'time', 'filesWanted', 'filesSent', 'filesError', 'sentPart')) {
                 if ($null -ne $read.PSObject.Properties[$name]) { $state[$name] = [string]$read.$name }
             }
         }
@@ -122,7 +99,7 @@ function Get-PublishState {
 function Save-PublishState {
     param([string]$Dir, $State)
     $State['time'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-    [System.IO.File]::WriteAllText((Join-Path $Dir 'publish.json'), (ConvertTo-Json -InputObject $State), $Utf8Bom)
+    Save-GateReportJson (Join-Path $Dir 'publish.json') $State
 }
 
 function Test-RunAlive {
@@ -133,11 +110,18 @@ function Test-RunAlive {
     if (-not $text) { return $false }
     $parts = $text.Split('|')
     $processId = 0
-    if (-not [int]::TryParse($parts[0], [ref]$processId)) { return $false }
+    if (-not [int]::TryParse($parts[0], [ref]$processId) -or $processId -le 0) { return $false }
     $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
     if ($null -eq $process) { return $false }
     if ($parts.Count -lt 2) { return $true }
-    try { return ($process.StartTime.ToString('o') -eq $parts[1]) } catch { return $true }
+    try {
+        if ($process.StartTime.ToString('o') -eq $parts[1]) { return $true }
+        # В .NET на Unix время рождения процесса восстанавливается по часам ядра и слегка
+        # различается у двух читателей. На Windows сохраняем точное сравнение, как раньше.
+        if ([Environment]::OSVersion.Platform -ne [PlatformID]::Unix) { return $false }
+        $expected = [datetimeoffset]::Parse($parts[1], [Globalization.CultureInfo]::InvariantCulture)
+        return [Math]::Abs(($process.StartTime.ToUniversalTime() - $expected.UtcDateTime).TotalMilliseconds) -lt 50
+    } catch { return $true }
 }
 
 function Write-PublishLog {
@@ -165,26 +149,12 @@ function ConvertTo-InlineCode {
     return ('`' + ([string]$Text).Replace('`', "'") + '`')
 }
 
-function Get-TailText {
-    param([string]$Text, [int]$Lines)
-    $all = @($Text -split "`r?`n")
-    if ($all.Count -le $Lines) { return $Text.TrimEnd() }
-    return ((@('…') + @($all | Select-Object -Last $Lines)) -join "`n").TrimEnd()
-}
-
-function Limit-Text {
-    # Не длиннее Chars символов; обрезанное - с пометкой, где полный текст.
-    param([string]$Text, [int]$Chars, [string]$FileName)
-    if ($Text.Length -le $Chars) { return $Text }
-    return ($Text.Substring(0, [Math]::Max(0, $Chars)).TrimEnd() + ("`n… обрезано: полный {0} - в папке прогона" -f $FileName))
-}
-
 function New-RunReport {
-    # Итог прогона для комментария: заголовок, сведения, summary.txt (или шаги, что успели), хвост run.log
-    # (при остановке и обрыве), report.txt под катом. Limits - сколько символов оставить от длинных частей.
+    # Итог прогона для комментария: заголовок, сведения, summary.txt (или шаги, что успели), run.log
+    # (при остановке и обрыве), report.txt под катом.
     # FilesLine - строка со ссылкой на файлы прогона в git (пусто - выкладка выключена): сразу под сведениями,
-    # чтобы её не съело урезание длинных частей.
-    param([string]$Dir, [string]$Kind, [string]$Reason, [hashtable]$Limits, [string]$FilesLine = '')
+    # до подробностей прогона.
+    param([string]$Dir, [string]$Kind, [string]$Reason, [string]$FilesLine = '')
     $id = Split-Path -Leaf $Dir
     $verdictData = $null
     $verdictText = Read-TextFile (Join-Path $Dir 'verdict.json')
@@ -265,7 +235,7 @@ function New-RunReport {
         $body.Add('')
         $body.Add('**Итог** (summary.txt)')
         $body.Add('````text')
-        $body.Add((Limit-Text $summary.TrimEnd() $Limits['summary'] 'summary.txt'))
+        $body.Add($summary.TrimEnd())
         $body.Add('````')
     }
     else {
@@ -284,7 +254,7 @@ function New-RunReport {
         if ($stepLines.Count -gt 0) {
             $body.Add('**Шаги, которые успели пройти**')
             $body.Add('````text')
-            $body.Add((Limit-Text ($stepLines -join "`n") $Limits['summary'] 'steps.jsonl'))
+            $body.Add(($stepLines -join "`n"))
             $body.Add('````')
         }
         else { $body.Add('Ни один шаг не успел закончиться.') }
@@ -294,28 +264,24 @@ function New-RunReport {
         $log = Read-TextFile (Join-Path $Dir 'run.log')
         if ($log) {
             $body.Add('')
-            $body.Add('<details><summary>Конец run.log</summary>')
+            $body.Add('<details><summary>Журнал run.log</summary>')
             $body.Add('')
             $body.Add('````text')
-            $body.Add((Limit-Text (Get-TailText $log 40) $Limits['log'] 'run.log'))
+            $body.Add($log.TrimEnd())
             $body.Add('````')
             $body.Add('</details>')
         }
     }
 
     $report = Read-TextFile (Join-Path $Dir 'report.txt')
-    if ($report -and $Limits['report'] -gt 0) {
+    if ($report) {
         $body.Add('')
         $body.Add('<details><summary>Разбор прогона (report.txt)</summary>')
         $body.Add('')
         $body.Add('````text')
-        $body.Add((Limit-Text $report.TrimEnd() $Limits['report'] 'report.txt'))
+        $body.Add($report.TrimEnd())
         $body.Add('````')
         $body.Add('</details>')
-    }
-    elseif ($report) {
-        $body.Add('')
-        $body.Add('Разбор прогона (report.txt) не влез - он в папке прогона.')
     }
     $body.Add('')
     $body.Add(('Папка прогона: ' + (ConvertTo-InlineCode $Dir)))
@@ -323,26 +289,6 @@ function New-RunReport {
     $verdictForEvent = $verdictCode
     if ($Kind -eq 'crash' -or $Kind -eq 'broken') { $verdictForEvent = $Kind.ToUpperInvariant() }
     return [pscustomobject]@{ Title = ('{0} · {1}' -f $title, $id); Verdict = $verdictForEvent; Body = ($body -join "`n") }
-}
-
-function New-RunPayload {
-    # Тело события: укладываем в предел, урезая сначала report.txt, потом хвост журнала и итог.
-    param([string]$Dir, [string]$Kind, [string]$Reason, [string]$FilesLine = '')
-    $limits = @{ report = 40000; summary = 15000; log = 6000 }
-    for ($try = 0; $try -lt 8; $try++) {
-        $report = New-RunReport -Dir $Dir -Kind $Kind -Reason $Reason -Limits $limits -FilesLine $FilesLine
-        $payload = [ordered]@{
-            event_type     = 'gate-run'
-            client_payload = [ordered]@{ run = (Split-Path -Leaf $Dir); stage = $Kind; verdict = $report.Verdict; title = $report.Title; body = $report.Body }
-        }
-        $json = ConvertTo-Json -InputObject $payload -Depth 4 -Compress
-        $size = $Utf8NoBom.GetByteCount($json)
-        if ($size -le $PayloadLimitBytes) { return $json }
-        $ratio = [double]$PayloadLimitBytes / $size * 0.9
-        if ($limits['report'] -gt 500) { $limits['report'] = [int]($limits['report'] * $ratio) - 500; if ($limits['report'] -lt 500) { $limits['report'] = 0 } }
-        else { $limits['report'] = 0; $limits['summary'] = [int]($limits['summary'] * $ratio); $limits['log'] = [int]($limits['log'] * $ratio) }
-    }
-    throw 'итог прогона не уложился в предел события GitHub'
 }
 
 #endregion
@@ -359,46 +305,6 @@ function Get-JsonText {
     param($Object, [string]$Name)
     if ($null -eq $Object -or $null -eq $Object.PSObject.Properties[$Name]) { return '' }
     return [string]$Object.$Name
-}
-
-function Read-PublishSecretFile {
-    # Пароль из файла DPAPI; не читается - пусто (секрет, которого гейт сам не прочтёт, в журнал не попадёт).
-    param([string]$PassFile)
-    $path = $PassFile
-    if (-not [System.IO.Path]::IsPathRooted($path)) { $path = Join-Path $Root $path }
-    if (-not (Test-Path -LiteralPath $path)) { return '' }
-    try {
-        $encrypted = [string](Get-Content -LiteralPath $path -Raw)
-        if (-not $encrypted.Trim()) { return '' }
-        $credential = New-Object System.Management.Automation.PSCredential('secret', (ConvertTo-SecureString -String $encrypted.Trim()))
-        return $credential.GetNetworkCredential().Password
-    }
-    catch { return '' }
-}
-
-function Get-PublishSecrets {
-    # Чего не должно быть в выложенных файлах: токен GitHub, пароли из файлов *PassFile (и у пользователей вроде
-    # CanaryUsers - PassFile в таблице), код разрешения входа UnlockCode. Name - имя настройки, значение не выводится.
-    param([hashtable]$Settings, [string]$Token)
-    $found = New-Object System.Collections.Generic.List[object]
-    if ($Token) { $found.Add([pscustomobject]@{ Name = 'GitHubTokenPassFile'; Value = $Token }) }
-    foreach ($key in @($Settings.Keys | Sort-Object)) {
-        $value = $Settings[$key]
-        if ($key -like '*PassFile' -and $key -ne 'GitHubTokenPassFile' -and $value -is [string] -and $value) {
-            $found.Add([pscustomobject]@{ Name = $key; Value = (Read-PublishSecretFile $value) })
-        }
-        foreach ($item in @($value)) {
-            if ($item -is [hashtable] -and $item.ContainsKey('PassFile') -and [string]$item['PassFile']) {
-                $found.Add([pscustomobject]@{ Name = ('{0}.PassFile' -f $key); Value = (Read-PublishSecretFile ([string]$item['PassFile'])) })
-            }
-        }
-    }
-    $unlock = [string](Get-PublishSetting $Settings 'UnlockCode' '')
-    if ($unlock) { $found.Add([pscustomobject]@{ Name = 'UnlockCode'; Value = $unlock }) }
-    $long = New-Object System.Collections.Generic.List[object]
-    foreach ($item in $found) { if (([string]$item.Value).Length -ge $RunFilesMinSecretLength) { $long.Add($item) } }
-    # Запятая - чтобы пустой список или список из одного не развернулся при возврате.
-    return , $long
 }
 
 function Read-RunFileText {
@@ -426,8 +332,9 @@ function Get-RunFileList {
         if (-not $file.FullName.StartsWith($rootFull + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
         $parts = @($file.FullName.Substring($rootFull.Length + 1) -split '[\\/]')
         $relative = $parts -join '/'
+        if ((Protect-GateReportText $relative $Secrets) -cne $relative) { $skipped.Add('Имя файла содержит секрет'); continue }
         # README.md папки в git пишет сам гейт (New-RunFilesReadme).
-        if ($relative -eq 'README.md') { continue }
+        if ($relative -in @('README.md', 'publish.json', 'run-launch.json')) { continue }
         if ($parts.Count -gt 1 -and $RunFilesSkipDirs -contains $parts[0]) { $other++; continue }
         if ($RunFilesExtensions -notcontains $file.Extension.ToLowerInvariant()) { $other++; continue }
         if ($file.Length -gt $RunFilesMaxFileBytes) {
@@ -453,6 +360,7 @@ function Get-RunFileList {
                 break
             }
         }
+        if (-not $leak -and ((Protect-GateReportText $text $Secrets) -cne $text -or (Protect-GateReportText $ansiText $Secrets) -cne $ansiText)) { $leak = 'реквизиты подключения' }
         if ($leak) {
             $skipped.Add(('{0}: в тексте секрет (настройка {1}) - не выложен' -f $relative, $leak))
             $secretHits.Add(('{0} ({1})' -f $relative, $leak))
@@ -467,7 +375,7 @@ function Get-RunFileList {
 function New-RunFilesReadme {
     # README.md папки прогона в git: что за прогон, с чего читать, что не выложено. Времени выкладки нет:
     # повтор без изменений не даёт нового коммита.
-    param([string]$Dir, [string]$Id, [string]$Kind, $List)
+    param([string]$Dir, [string]$Id, [string]$Kind, $List, $Secrets)
     $data = $null
     $verdictText = Read-TextFile (Join-Path $Dir 'verdict.json')
     if ($verdictText) { try { $data = $verdictText | ConvertFrom-Json } catch { $data = $null } }
@@ -503,7 +411,7 @@ function New-RunFilesReadme {
         $lines.Add(('Нетекстовых файлов (комплект, сохранённые расширения, обработки, выгрузки) в папке прогона: {0}; в git они не выкладываются.' -f $List.Other))
     }
     # Запятая - чтобы массив байтов не развернулся при возврате.
-    return , $Utf8NoBom.GetBytes((($lines -join "`n") + "`n"))
+    return , $Utf8NoBom.GetBytes((Protect-GateReportText (($lines -join "`n") + "`n") $Secrets))
 }
 
 function Publish-RunFiles {
@@ -514,8 +422,9 @@ function Publish-RunFiles {
     param([string]$Dir, [string]$Kind, [string]$Repo, [string]$Branch, [string]$Token, [hashtable]$Settings)
     $id = Split-Path -Leaf $Dir
     $gh = New-GhContext -Repo $Repo -Token $Token
-    $list = Get-RunFileList -Dir $Dir -Id $id -Secrets (Get-PublishSecrets -Settings $Settings -Token $Token)
-    $readme = [pscustomobject]@{ Path = ('runs/{0}/README.md' -f $id); Bytes = (New-RunFilesReadme -Dir $Dir -Id $id -Kind $Kind -List $list) }
+    $secrets = Get-PublishSecrets -Settings $Settings -Token $Token
+    $list = Get-RunFileList -Dir $Dir -Id $id -Secrets $secrets
+    $readme = [pscustomobject]@{ Path = ('runs/{0}/README.md' -f $id); Bytes = (New-RunFilesReadme -Dir $Dir -Id $id -Kind $Kind -List $list -Secrets $secrets) }
     $result = [pscustomobject]@{ Url = (Get-RunFilesUrl -Repo $Repo -Branch $Branch -Id $id); Changed = 0; Skipped = $list.Skipped.Count; Secrets = $list.Secrets }
     for ($try = 1; $try -le 2; $try++) {
         $head = Get-GhHead -Gh $gh -Branch $Branch
@@ -611,12 +520,15 @@ function Send-RunEvent {
     # POST repository_dispatch. Подставной GitHub для тестов: переменная CI_FAKE_HTTP - запрос пишется в
     # requests.log, тело - в dispatch-NN.json; файл dispatch-fail.txt в той же папке - «нет связи».
     param([string]$Repo, [string]$Token, [string]$Json)
+    if ($Repo -notmatch '^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$') { throw 'RunReportRepo: требуется имя в виде владелец/репозиторий' }
     $url = 'https://api.github.com/repos/{0}/dispatches' -f $Repo
     if ($env:CI_FAKE_HTTP) {
         $auth = 'нет'
         if ($Token) { $auth = 'да' }
         [System.IO.File]::AppendAllText((Join-Path $env:CI_FAKE_HTTP 'requests.log'), ("POST {0} токен={1}`r`n" -f $url, $auth), $Utf8NoBom)
         if (Test-Path -LiteralPath (Join-Path $env:CI_FAKE_HTTP 'dispatch-fail.txt')) { throw 'нет связи с api.github.com: подставной сбой' }
+        $nth = Join-Path $env:CI_FAKE_HTTP 'dispatch-fail-part.txt'
+        if ([IO.File]::Exists($nth) -and ($Json | ConvertFrom-Json).client_payload.part -eq [int]([IO.File]::ReadAllText($nth))) { throw 'подставной сбой отправки части' }
         $number = @(Get-ChildItem -LiteralPath $env:CI_FAKE_HTTP -Filter 'dispatch-*.json').Count + 1
         [System.IO.File]::WriteAllText((Join-Path $env:CI_FAKE_HTTP ('dispatch-{0:D2}.json' -f $number)), $Json, $Utf8NoBom)
         return
@@ -663,37 +575,200 @@ function Send-RunEvent {
     finally { $response.Close() }
 }
 
+function Get-ReportDate {
+    param($Stamp)
+    if ($Stamp -is [datetime]) { return $Stamp.ToUniversalTime() }
+    return [datetimeoffset]::Parse($Stamp, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+}
+
+function New-PublishPacket {
+    # Неизменная копия итога. Досылка берёт те же части, даже если после обрыва дописали журнал или сменился пользователь.
+    param([string]$Dir, [string]$Kind, [string]$Reason, [string]$FilesLine, $Secrets)
+    $id = Split-Path -Leaf $Dir
+    $isOperation = Test-Path -LiteralPath (Join-Path $Dir 'operation.json')
+    if ($isOperation) {
+        $launch = (Read-TextFile (Join-Path $Dir 'operation.json')) | ConvertFrom-Json
+        $result = (Read-TextFile (Join-Path $Dir 'result.json')) | ConvertFrom-Json
+        $outcome = [string]$result.outcome
+        $ended = Get-ReportDate $result.ended
+        $verdict = $outcome
+        $title = '{0} · {1} · {2}' -f $launch.operation, $outcome, $id
+        $detail = Read-TextFile (Join-Path $Dir 'summary.txt')
+        if ($Kind -eq 'broken') { $detail += "`nПроцесс завершился до записи исхода. Время окончания — по последней записи." }
+        $body = $detail
+    } else {
+        $launchText = Read-TextFile (Join-Path $Dir 'run-launch.json')
+        if ($launchText) { $launch = $launchText | ConvertFrom-Json }
+        else {
+            # Старые прогоны не записывали пользователя. Не приписываем запуск тому, кто дослал отчёт.
+            $startedAt = [datetime]::ParseExact($id, 'yyyyMMdd-HHmmss', [Globalization.CultureInfo]::InvariantCulture).ToUniversalTime()
+            $launch = [pscustomobject]@{ operation = 'run'; started = $startedAt.ToString('o'); user = ''; gateVersion = '' }
+        }
+        $report = New-RunReport -Dir $Dir -Kind $Kind -Reason $Reason -FilesLine $FilesLine
+        $title = $report.Title
+        $body = $report.Body
+        $verdict = $report.Verdict
+        $outcome = $verdict
+        if ($Kind -eq 'crash') {
+            $outcome = 'failed'
+            if ($Reason -match '(?i)отмен|cancel|остановлено из интерфейса|выход по ответу') { $outcome = 'cancelled' }
+        }
+        if ($Kind -eq 'broken') { $outcome = 'broken' }
+        $ended = [DateTime]::UtcNow
+        $log = Join-Path $Dir 'run.log'
+        if (Test-Path -LiteralPath $log) { $ended = [IO.File]::GetLastWriteTimeUtc($log) }
+    }
+    $duration = [Math]::Max(0, [Math]::Round(($ended - (Get-ReportDate $launch.started)).TotalSeconds))
+    $user = Protect-GateReportText $launch.user $Secrets
+    $meta = [ordered]@{ started = (Get-ReportDate $launch.started).ToString('o'); user = $user; gateVersion = (Protect-GateReportText $launch.gateVersion $Secrets); durationSeconds = $duration }
+    if ($isOperation) {
+        $body = "### $title`n$($meta.started) · $user · гейт $($meta.gateVersion) · $duration с`n`n$body"
+    }
+    return [ordered]@{
+        run = $id; stage = $Kind; verdict = $verdict; title = (Protect-GateReportText $title $Secrets)
+        body = (Protect-GateReportText $body $Secrets); operation = $launch.operation; outcome = $outcome; launch = $meta
+    }
+}
+
+function Send-ReportParts {
+    param([string]$Dir, [string]$Kind, [string]$Reason, [string]$FilesLine, [string]$Repo, [string]$Token, $Secrets, $State)
+    $outbox = Join-Path $Dir 'dispatch'
+    [void][IO.Directory]::CreateDirectory($outbox)
+    $path = Join-Path $outbox ($Kind + '.json')
+    if (-not [IO.File]::Exists($path)) {
+        $packet = New-PublishPacket $Dir $Kind $Reason $FilesLine $Secrets
+        Save-GateReportJson $path $packet
+    }
+    $packet = (Read-TextFile $path) | ConvertFrom-Json
+    $body = [string]$packet.body
+    # Один символ UTF-16 в JSON занимает не более 6 байт. Запас оставлен под метаданные.
+    # Короткие отчёты сначала пробуем целиком; длинные части не разрывают суррогатную пару.
+    $parts = New-Object System.Collections.Generic.List[string]
+    $whole = ConvertTo-Json -InputObject $packet -Compress -Depth 5
+    if ($Utf8NoBom.GetByteCount($whole) -lt $PayloadLimitBytes - 1024 -and $body.Length -lt 62000) { $parts.Add($body) }
+    else {
+        for ($start = 0; $start -lt $body.Length;) {
+            $length = [Math]::Min(8000, $body.Length - $start)
+            if ($start + $length -lt $body.Length) {
+                $newline = $body.LastIndexOf([char]10, $start + $length - 1, $length)
+                if ($newline -ge $start + 4000) { $length = $newline - $start + 1 }
+                if ([char]::IsHighSurrogate($body[$start + $length - 1])) { $length-- }
+            }
+            $parts.Add($body.Substring($start, $length))
+            $start += $length
+        }
+    }
+    $packet | Add-Member -NotePropertyName parts -NotePropertyValue $parts.Count
+    $packet | Add-Member -NotePropertyName part -NotePropertyValue 0
+    for ($i = [int]$State['sentPart']; $i -lt $parts.Count; $i++) {
+        $packet.part = $i + 1
+        $packet.body = $parts[$i]
+        $json = ConvertTo-Json -InputObject @{ event_type = 'gate-run'; client_payload = $packet } -Compress -Depth 6
+        if ($Utf8NoBom.GetByteCount($json) -gt $PayloadLimitBytes) { throw 'часть отчёта превышает предел GitHub' }
+        Send-RunEvent -Repo $Repo -Token $Token -Json $json
+        $State['sentPart'] = $i + 1
+        Save-PublishState $Dir $State
+    }
+}
+
+function Publish-Operation {
+    param([string]$Dir, [string]$Repo, [string]$TokenFile, [hashtable]$Settings, [switch]$Recover)
+    # Такой же вызов из -Pending может идти одновременно. Файловую блокировку отпустит и убитый процесс.
+    $lease = $null
+    try {
+        try { $lease = [IO.File]::Open((Join-Path $Dir 'publish.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
+        catch [IO.IOException] { return $true }
+        $launch = (Read-TextFile (Join-Path $Dir 'operation.json')) | ConvertFrom-Json
+        if ($launch.repo -ne $Repo) { return $true }
+        $state = Get-PublishState $Dir
+        if ($state['sent'] -and $state['wanted'] -eq $state['sent']) { return $true }
+        $resultPath = Join-Path $Dir 'result.json'
+        if (-not [IO.File]::Exists($resultPath)) {
+            if (-not $Recover -or (Test-RunAlive $Dir)) { return $true }
+            $forward = Read-TextFile (Join-Path $Dir 'forward.json')
+            if ($forward) {
+                $runId = ($forward | ConvertFrom-Json).run
+                if ($runId -match '^\d{8}-\d{6}$') {
+                    $runPath = Join-Path (Get-GateReportRoot $Settings) $runId
+                    $runLaunch = Read-TextFile (Join-Path $runPath 'run-launch.json')
+                    if ([IO.File]::Exists((Join-Path $runPath 'pid.txt')) -and $runLaunch -and (Get-JsonText ($runLaunch | ConvertFrom-Json) 'origin') -eq (Split-Path -Leaf $Dir)) { return $true }
+                }
+            }
+            $last = [IO.File]::GetLastWriteTimeUtc((Join-Path $Dir 'operation.json'))
+            $summary = Join-Path $Dir 'summary.txt'
+            if ([IO.File]::Exists($summary)) { $last = [IO.File]::GetLastWriteTimeUtc($summary) }
+            Save-GateReportJson $resultPath @{ outcome = 'broken'; ended = $last.ToString('o') }
+        }
+        $result = (Read-TextFile $resultPath) | ConvertFrom-Json
+        $kind = 'final'
+        if ($result.outcome -in @('cancelled', 'failed')) { $kind = 'crash' }
+        elseif ($result.outcome -eq 'broken') { $kind = 'broken' }
+        $state['wanted'] = $kind
+        Save-PublishState $Dir $state
+        # До чтения токена фиксируем, что именно нужно дослать.
+        $secrets = Get-PublishSecrets -Settings $Settings -Token ''
+        $token = Get-PublishToken $TokenFile
+        Send-ReportParts $Dir $kind '' '' $Repo $token $secrets $state
+        $state['sent'] = $kind
+        $state['error'] = ''
+        Save-PublishState $Dir $state
+        return $true
+    } catch {
+        if ($null -ne (Get-Variable state -Scope Local -ErrorAction SilentlyContinue)) {
+            $state['error'] = 'Не удалось отправить итог. При следующем запуске отправка повторится.'
+            Save-PublishState $Dir $state
+        }
+        Write-Warning ('Итог операции {0} не ушёл в GitHub. Он остался в очереди.' -f (Split-Path -Leaf $Dir))
+        return $false
+    } finally { if ($null -ne $lease) { $lease.Dispose() } }
+}
+
 function Publish-Run {
     # Отправить итог одного прогона. Возвращает $true, если ушло. Сбой - в выводе и в run.log, не исключением.
     # Файлы прогона (RunFilesRepo) уходят до события: ссылка на них - в тексте итога; их сбой событию не мешает.
-    param([string]$Dir, [string]$Kind, [string]$Reason, [string]$Repo, [string]$TokenFile, [hashtable]$Settings = @{})
-    $state = Get-PublishState $Dir
-    $state['wanted'] = $Kind
-    $state['message'] = $Reason
-    Save-PublishState $Dir $state
-    try {
-        $token = Get-PublishToken $TokenFile
-        $filesLine = ''
-        if ([string](Get-PublishSetting $Settings 'RunFilesRepo' '')) {
-            $filesLine = Invoke-RunFilesUpload -Dir $Dir -Kind $Kind -State $state -Settings $Settings -Token $token
-            Save-PublishState $Dir $state
+    param([string]$Dir, [string]$Kind, [string]$Reason, [string]$Repo, [string]$TokenFile, [hashtable]$Settings = @{}, [switch]$Retry)
+    try { $lease = [IO.File]::Open((Join-Path $Dir 'publish.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
+    catch [IO.IOException] {
+        if (-not $Retry -and $Kind -in @('final', 'crash')) {
+            # Другая отправка успела занять папку. Даже если процесс сейчас закончится,
+            # досылка должна знать реальный исход, а не объявлять завершённый прогон оборванным.
+            $masked = Protect-GateReportText $Reason (Get-PublishSecrets -Settings $Settings -Token '')
+            Save-GateReportJson (Join-Path $Dir 'end.pending') @{ kind = $Kind; reason = $masked }
         }
-        $json = New-RunPayload -Dir $Dir -Kind $Kind -Reason $Reason -FilesLine $filesLine
-        Send-RunEvent -Repo $Repo -Token $token -Json $json
-        $state['sent'] = $Kind
-        $state['error'] = ''
-        Save-PublishState $Dir $state
-        Write-Host ("Итог прогона {0} ушёл в GitHub ({1})." -f (Split-Path -Leaf $Dir), $Repo) -ForegroundColor DarkGray
-        Write-PublishLog $Dir ("Итог прогона ушёл в GitHub ({0}): {1}" -f $Repo, $Kind)
-        return $true
-    }
-    catch {
-        $state['error'] = $_.Exception.Message
-        Save-PublishState $Dir $state
-        Write-Host ("Итог прогона {0} в GitHub не ушёл: {1}. Уйдёт при следующем запуске гейта." -f (Split-Path -Leaf $Dir), $_.Exception.Message) -ForegroundColor Yellow
-        Write-PublishLog $Dir ("Итог прогона в GitHub не ушёл ({0}): {1}" -f $Kind, $_.Exception.Message)
         return $false
     }
+    try {
+        $state = Get-PublishState $Dir
+        if ($Retry -and $state['wanted'] -eq $Kind -and $state['sent'] -eq $Kind) { return $true }
+        if ($state['wanted'] -ne $Kind -or $state['sent'] -eq $Kind) { $state['sentPart'] = 0 }
+        $secrets = Get-PublishSecrets -Settings $Settings -Token ''
+        $Reason = Protect-GateReportText $Reason $secrets
+        $state['wanted'] = $Kind
+        $state['message'] = $Reason
+        Save-PublishState $Dir $state
+        try {
+            $token = Get-PublishToken $TokenFile
+            $filesLine = ''
+            if ([string](Get-PublishSetting $Settings 'RunFilesRepo' '')) {
+                $filesLine = Invoke-RunFilesUpload -Dir $Dir -Kind $Kind -State $state -Settings $Settings -Token $token
+                Save-PublishState $Dir $state
+            }
+            Send-ReportParts $Dir $Kind $Reason $filesLine $Repo $token $secrets $state
+            $state['sent'] = $Kind
+            $state['error'] = ''
+            Save-PublishState $Dir $state
+            Write-Host ("Итог прогона {0} ушёл в GitHub ({1})." -f (Split-Path -Leaf $Dir), $Repo) -ForegroundColor DarkGray
+            Write-PublishLog $Dir ("Итог прогона ушёл в GitHub ({0}): {1}" -f $Repo, $Kind)
+            return $true
+        }
+        catch {
+            $state['error'] = Protect-GateReportText $_.Exception.Message $secrets
+            Save-PublishState $Dir $state
+            Write-Host ("Итог прогона {0} в GitHub не ушёл: {1}. Уйдёт при следующем запуске гейта." -f (Split-Path -Leaf $Dir), $state['error']) -ForegroundColor Yellow
+            Write-PublishLog $Dir ("Итог прогона в GitHub не ушёл ({0}): {1}" -f $Kind, $state['error'])
+            return $false
+        }
+    } finally { $lease.Dispose() }
 }
 
 #endregion
@@ -720,11 +795,8 @@ function Watch-RunProgress {
                 $secrets = Get-PublishSecrets -Settings $Settings -Token $token
                 # Убираем строку целиком до обрезки: в Git не попадёт даже начало найденного пароля.
                 $safe = foreach ($line in $lines) {
-                    $hidden = $false
-                    foreach ($secret in $secrets) {
-                        if ($line.Contains([string]$secret.Value)) { $hidden = $true; break }
-                    }
-                    if ($hidden) { '[строка скрыта]' } else { $line.Substring(0, [Math]::Min(512, $line.Length)) }
+                    $masked = Protect-GateReportText $line $secrets
+                    if ($masked -cne $line) { '[строка скрыта]' } else { $line.Substring(0, [Math]::Min(512, $line.Length)) }
                 }
                 $gh = New-GhContext -Repo $repo -Token $token
                 $head = Get-GhHead -Gh $gh -Branch $branch
@@ -760,15 +832,22 @@ $repoName = [string](Get-PublishSetting $cfg 'RunReportRepo' '')
 if (-not $repoName) { return }
 $tokenFile = [string](Get-PublishSetting $cfg 'GitHubTokenPassFile' '')
 
+if ($OperationDir) { $null = Publish-Operation $OperationDir $repoName $tokenFile $cfg; return }
+
 if ($WatchProgress) { Watch-RunProgress -Dir $RunDir -Settings $cfg; return }
 
 if ($Pending) {
     # Не ушедшее: прогоны с pid.txt (их запускал гейт с отправкой итогов), процесс которых уже не живёт, а итог
     # не отправлен до конца. Старше двух недель не трогаем. Первый сбой связи - дальше не пробуем.
-    $runsSetting = [string](Get-PublishSetting $cfg 'RunsDir' 'runs')
-    $runsRoot = $runsSetting
-    if (-not [System.IO.Path]::IsPathRooted($runsRoot)) { $runsRoot = Join-Path $Root $runsRoot }
+    $runsRoot = Get-GateReportRoot $cfg
     if (-not (Test-Path -LiteralPath $runsRoot)) { return }
+    $operations = Join-Path $runsRoot 'operations'
+    if (Test-Path -LiteralPath $operations) {
+        foreach ($dir in @(Get-ChildItem -LiteralPath $operations -Directory | Sort-Object Name)) {
+            if (-not [IO.File]::Exists((Join-Path $dir.FullName 'operation.json'))) { continue }
+            if (-not (Publish-Operation $dir.FullName $repoName $tokenFile $cfg -Recover)) { break }
+        }
+    }
     $border = (Get-Date).AddDays(-14)
     $candidates = @(Get-ChildItem -LiteralPath $runsRoot -Directory | Where-Object { $_.Name -match '^\d{8}-\d{6}$' } |
             Sort-Object Name | Select-Object -Last 30 | Where-Object {
@@ -779,9 +858,22 @@ if ($Pending) {
     # RunFilesRepo задним числом не выкладываются.
     $filesOn = [bool][string](Get-PublishSetting $cfg 'RunFilesRepo' '')
     foreach ($candidate in $candidates) {
+        $launch = Read-TextFile (Join-Path $candidate.FullName 'run-launch.json')
+        if ($launch) {
+            $destination = Get-JsonText ($launch | ConvertFrom-Json) 'repo'
+            if ($destination -and $destination -ne $repoName) { continue }
+        }
         $state = Get-PublishState $candidate.FullName
-        $finished = @('final', 'crash', 'broken') -contains $state['wanted']
-        $eventDone = $finished -and $state['sent'] -eq $state['wanted']
+        $wanted = $state['wanted']
+        $reason = $state['message']
+        $deferred = Read-TextFile (Join-Path $candidate.FullName 'end.pending')
+        if ($deferred) {
+            $saved = $deferred | ConvertFrom-Json
+            $wanted = $saved.kind
+            $reason = $saved.reason
+        }
+        $finished = @('final', 'crash', 'broken') -contains $wanted
+        $eventDone = $finished -and $state['sent'] -eq $wanted
         $filesPending = $filesOn -and $state['filesWanted'] -and $state['filesSent'] -ne $state['filesWanted']
         if ($eventDone -and -not $filesPending) { continue }
         if (Test-RunAlive $candidate.FullName) { continue }
@@ -791,8 +883,8 @@ if ($Pending) {
             continue
         }
         $kind = 'broken'
-        if ($finished) { $kind = $state['wanted'] }
-        $sent = Publish-Run -Dir $candidate.FullName -Kind $kind -Reason $state['message'] -Repo $repoName -TokenFile $tokenFile -Settings $cfg
+        if ($finished) { $kind = $wanted }
+        $sent = Publish-Run -Dir $candidate.FullName -Kind $kind -Reason $reason -Repo $repoName -TokenFile $tokenFile -Settings $cfg -Retry
         if (-not $sent) { break }
     }
     return

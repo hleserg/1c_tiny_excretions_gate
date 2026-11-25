@@ -1,11 +1,5 @@
-# Итоги прогонов гейта (readme.txt гейта, раздел 5.22). Гейт шлёт событие repository_dispatch «gate-run»
-# (publish.ps1), этот workflow пишет комментарий в issue «Прогоны гейта» от имени бота GitHub Actions и упоминает
-# владельца репозитория - так приходит уведомление: о своих же действиях GitHub человека не уведомляет, а гейт
-# ходит с его токеном.
-# Положить в .github/workflows/ того репозитория, который указан в настройке гейта RunReportRepo.
-# Один прогон - один комментарий (вердикт, потом решение по комплекту дописываются в него же); остановка
-# и обрыв прогона - новым комментарием, чтобы пришло уведомление.
-name: Прогоны гейта
+# Положить в .github/workflows/ репозитория RunReportRepo. Параметры — в разделе 5.22 руководства.
+name: Итоги гейта
 run-name: ${{ github.event.client_payload.title }}
 
 on:
@@ -15,16 +9,18 @@ on:
 permissions:
   issues: write
 
+# Первые части без заданных номеров лент создают issue по очереди. Другие части и настроенные
+# ленты работают параллельно. Повтор одной части обновляет тот же комментарий.
 concurrency:
-  group: gate-runs
-  cancel-in-progress: false
+  group: gate-report-${{ (!vars.GATE_RUNS_ISSUE || !vars.GATE_OPERATIONS_ISSUE) && (github.event.client_payload.part || 1) == 1 && 'create-feed' || format('{0}-{1}', github.event.client_payload.run, github.event.client_payload.part || 1) }}
+  queue: max
 
 jobs:
   comment:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Комментарий в issue «Прогоны гейта»
+      - name: Записать итог
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -32,28 +28,55 @@ jobs:
           RUN_ID: ${{ github.event.client_payload.run }}
           STAGE: ${{ github.event.client_payload.stage }}
           BODY: ${{ github.event.client_payload.body }}
+          OPERATION: ${{ github.event.client_payload.operation || 'run' }}
+          PART: ${{ github.event.client_payload.part || 1 }}
+          PARTS: ${{ github.event.client_payload.parts || 1 }}
+          RUNS_ISSUE: ${{ vars.GATE_RUNS_ISSUE }}
+          OPERATIONS_ISSUE: ${{ vars.GATE_OPERATIONS_ISSUE }}
         run: |
           set -euo pipefail
-          # Данные события - только через переменные окружения, не подстановкой в текст скрипта.
-          if ! [[ "$RUN_ID" =~ ^[0-9]{8}-[0-9]{6}$ ]]; then echo "не тот номер прогона: $RUN_ID"; exit 1; fi
-          case "$STAGE" in verdict|final|crash|broken) ;; *) echo "не тот этап: $STAGE"; exit 1 ;; esac
-          label=gate-runs
-          gh label create "$label" --repo "$REPO" --color 5A56E0 --description "Итоги прогонов гейта" 2>/dev/null || true
-          issue=$(gh issue list --repo "$REPO" --label "$label" --state open --limit 1 --json number --jq '.[0].number // empty')
-          if [ -z "$issue" ]; then
-            url=$(gh issue create --repo "$REPO" --title "Прогоны гейта" --label "$label" \
-              --body "Сюда гейт пишет итог каждого прогона (readme.txt гейта, раздел 5.22). Комментарии пишет бот, владелец репозитория получает уведомление.")
-            issue=${url##*/}
+          [[ "$RUN_ID" =~ ^[0-9]{8}-[0-9]{6}(-[0-9a-f]{32})?$ ]]
+          [[ "$OPERATION" =~ ^[a-z][a-z0-9-]*$ ]]
+          [[ "$PART" =~ ^[1-9][0-9]*$ && "$PARTS" =~ ^[1-9][0-9]*$ && "$PART" -le "$PARTS" ]]
+          case "$STAGE" in verdict|final|crash|broken) ;; *) exit 1 ;; esac
+          case "$OPERATION" in
+            run|resume) issue="$RUNS_ISSUE"; label=gate-runs; title='Прогоны гейта' ;;
+            *) issue="$OPERATIONS_ISSUE"; label=gate-operations; title='Операции гейта' ;;
+          esac
+          if [[ -z "$issue" ]]; then
+            # При первом включении ленту создаёт первая часть. Остальные могут попасть на runner раньше.
+            find_issue() { gh issue list --repo "$REPO" --label "$label" --state open --limit 1 --json number --jq '.[0].number // empty'; }
+            issue=$(find_issue)
+            if [[ -z "$issue" && "$PART" = 1 ]]; then
+              gh label create "$label" --repo "$REPO" --color 5A56E0 --description "$title" 2>/dev/null || true
+              url=$(gh issue create --repo "$REPO" --title "$title" --label "$label" --body "Отчёты гейта. Раздел 5.22 руководства.")
+              issue=${url##*/}
+            fi
+            for attempt in {1..30}; do
+              [[ -n "$issue" ]] && break
+              sleep 2
+              issue=$(find_issue)
+            done
           fi
+          [[ "$issue" =~ ^[1-9][0-9]*$ ]]
           marker="<!-- gate-run:${RUN_ID} -->"
-          { printf '%s\n' "$marker"; printf '%s\n' "$BODY"; printf '\n@%s\n' "$OWNER"; } > body.md
-          existing=""
-          if [ "$STAGE" = verdict ] || [ "$STAGE" = final ]; then
-            existing=$(gh api --paginate "repos/$REPO/issues/$issue/comments" --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | tail -n 1)
+          if [[ "$PARTS" != 1 || "$STAGE" = crash || "$STAGE" = broken ]]; then
+            marker="<!-- gate-run:${RUN_ID}:${STAGE}:${PART} -->"
           fi
-          if [ -n "$existing" ]; then
-            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -F body=@body.md > /dev/null
-            echo "дописан комментарий $existing в issue #$issue"
+          stage_marker="<!-- stage:${STAGE} -->"
+          {
+            printf '%s\n%s\n' "$marker" "$stage_marker"
+            if [[ "$PARTS" != 1 ]]; then printf '**%s · %s · %s/%s**\n\n' "$OPERATION" "$RUN_ID" "$PART" "$PARTS"; fi
+            printf '%s\n' "$BODY"
+            if [[ "$PART" = 1 ]]; then printf '\n@%s\n' "$OWNER"; fi
+          } > body.md
+          # Учитывается только собственный комментарий бота. Поздний verdict не заменяет уже пришедший final.
+          gh api --paginate "repos/$REPO/issues/$issue/comments?per_page=100" --jq '.[] | select(.user.login == "github-actions[bot]") | {id,body}' > comments.jsonl
+          existing=$(jq -rs --arg marker "$marker" 'map(select(.body | startswith($marker))) | last // {}' comments.jsonl)
+          if [[ "$STAGE" = verdict ]] && jq -e '.body // "" | split("\n")[1] == "<!-- stage:final -->"' <<< "$existing" >/dev/null; then exit 0; fi
+          id=$(jq -r '.id // empty' <<< "$existing")
+          if [[ -n "$id" ]]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@body.md > /dev/null
           else
             gh issue comment "$issue" --repo "$REPO" --body-file body.md
           fi

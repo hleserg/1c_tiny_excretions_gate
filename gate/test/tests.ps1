@@ -61,7 +61,7 @@ function New-Sandbox {
     $dir = Join-Path $workRoot $Name
     foreach ($sub in @('bin', 'tools', 'inbox', 'fake')) { New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null }
     # ** Хлебников С.Ю. 20261123 Песочница содержит полный комплект удалённой приёмки.
-    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'github.ps1', 'operations.ps1', 'delivery.ps1', 'delivery-parcel.ps1', 'delivery-designer.ps1', 'delivery-git.ps1', 'delivery-worker.ps1', 'cluster-target.ps1', 'canary-users.ps1', 'locks.ps1', 'post-update.ps1', 'timeline.ps1', 'selfcheck-compare.ps1')) {
+    foreach ($script in @('run.ps1', 'ui.ps1', 'stats.ps1', 'report.ps1', 'deploy.ps1', 'settings.ps1', 'nightly.ps1', 'unittests.ps1', 'unittests-cli.ps1', 'update.ps1', 'publish.ps1', 'operation-report.ps1', 'github.ps1', 'operations.ps1', 'delivery.ps1', 'delivery-parcel.ps1', 'delivery-designer.ps1', 'delivery-git.ps1', 'delivery-worker.ps1', 'cluster-target.ps1', 'canary-users.ps1', 'locks.ps1', 'post-update.ps1', 'timeline.ps1', 'selfcheck-compare.ps1')) {
         Copy-Item -LiteralPath (Join-Path $ciRoot $script) -Destination $dir
     }
     # Объединение поставок (раздел 5.26): merge1c.exe рядом с fake1c.exe (собирает CI).
@@ -240,7 +240,7 @@ function Invoke-Script {
     $verdict = $null
     $runs = Join-Path $Sandbox 'runs'
     if (Test-Path -LiteralPath $runs) {
-        $last = @(Get-ChildItem -LiteralPath $runs -Directory | Sort-Object Name | Select-Object -Last 1)
+        $last = @(Get-ChildItem -LiteralPath $runs -Directory | Where-Object { $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name | Select-Object -Last 1)
         if ($last.Count -gt 0) {
             $runDir = $last[0].FullName
             $verdictFile = Join-Path $runDir 'verdict.json'
@@ -331,6 +331,45 @@ function Check-DeployCommon {
         $prod = $Result.ComState.bases.erp_base
         Check (-not [bool]$prod.scheduledJobsDenied) 'в конце осталась блокировка регламентных заданий рабочей'
         Check (-not [bool]$prod.sessionsDenied) 'в конце осталась блокировка начала сеансов рабочей'
+    }
+}
+
+function New-ReportingDeploySandbox {
+    param([string]$Name)
+    $config = $deployConfig.Clone()
+    $config['RunReportRepo'] = 'owner/reports'
+    $config['GitHubTokenPassFile'] = 'secrets\github.txt'
+    $config['UnlockCode'] = 'test-report-unlock'
+    $sb = New-Sandbox $Name -Config $config
+    foreach ($dir in @('secrets', 'fake-http')) {
+        New-Item -ItemType Directory -Path (Join-Path $sb $dir) -Force | Out-Null
+    }
+    $token = ConvertTo-SecureString 'test-report-token' -AsPlainText -Force
+    [System.IO.File]::WriteAllText((Join-Path $sb 'secrets\github.txt'), (ConvertFrom-SecureString $token))
+    return $sb
+}
+
+function Check-OperationDispatch {
+    param([string]$Sandbox, [string]$Operation, [string]$Outcome, [string[]]$Details)
+    $events = @(foreach ($file in Get-ChildItem -LiteralPath (Join-Path $Sandbox 'fake-http') -Filter 'dispatch-*.json') {
+        $raw = [System.IO.File]::ReadAllText($file.FullName, $utf8)
+        $message = $raw | ConvertFrom-Json
+        Check (-not ($raw.Contains('test-report-token') -or $raw.Contains('test-report-unlock'))) 'в опубликованном итоге есть секрет'
+        if ($message.client_payload.operation -eq $Operation -and $message.client_payload.outcome -eq $Outcome) {
+            Check ($message.event_type -eq 'gate-run') 'неверный тип события'
+            $message.client_payload
+        }
+    })
+    Check ($events.Count -gt 0) ("нет итога операции {0} со статусом {1}" -f $Operation, $Outcome)
+    if (-not $events.Count) { return }
+    $sorted = @($events | Sort-Object { [int]$_.part })
+    Check ($sorted.Count -eq [int]$sorted[0].parts) 'в итог операции попали не все части либо есть дубли'
+    for ($i = 0; $i -lt $sorted.Count; $i++) {
+        Check ([int]$sorted[$i].part -eq $i + 1 -and $sorted[$i].run -eq $sorted[0].run) 'нарушена нумерация частей одного запуска'
+    }
+    $body = ($sorted | ForEach-Object { $_.body }) -join ''
+    foreach ($detail in $Details) {
+        Check ([bool]($body -match $detail)) ("в итоге операции нет ожидаемых сведений: {0}" -f $detail)
     }
 }
 
@@ -2105,7 +2144,7 @@ $tests = @(
         Text = 'обновление рабочей «все»: изменённое расширение и обработка, блокировки поставлены и сняты, отчёт с разницей по обработке'
         Run = {
             param($Name)
-            $sb = New-Sandbox $Name -Config $deployConfig
+            $sb = New-ReportingDeploySandbox $Name
             $com = New-ComState -TempProcessings @((New-PrintProcessing '2' $printNew)) -ProdProcessings @((New-PrintProcessing '1' $printOld))
             $fake = @{ regepf = @(@{ status = 'done'; old = 'прежняя печать'; objversion = '2'; oldversion = '1' }) }
             $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Fake $fake -Com $com -Answers @(
@@ -2133,6 +2172,7 @@ $tests = @(
             Check ((Get-Calls $r @('/LoadCfg', 'Доработки')).Count -eq 0) 'загружено неизменённое расширение Доработки'
             Check ((Get-Calls $r @('ENTERPRISE', 'regepf', 'name=Печать.epf')).Count -eq 1) 'обработка не записана в рабочую'
             Check (@($r.ComLog | Where-Object { $_ -match 'UpdateInfoBase erp_base scheduledJobsDenied=1' }).Count -gt 0) 'блокировку регламентных заданий не ставили'
+            Check-OperationDispatch $sb 'deploy' 'updated' @('Адаптация', 'Печать', 'провер', 'блокиров')
         }
     },
     @{
@@ -2245,7 +2285,7 @@ $tests = @(
         Text = 'гейт красный, на переспрос «нет»: в рабочую ничего не грузится, блокировки не ставятся'
         Run = {
             param($Name)
-            $sb = New-Sandbox $Name -Config $deployConfig
+            $sb = New-ReportingDeploySandbox $Name
             $runDir = Join-Path $sb 'runs\20261117-090000'
             New-Item -ItemType Directory -Path $runDir -Force | Out-Null
             $verdict = @{ verdict = 'RED'; kit = 'inbox\тест'; kitDecision = 'kept'; steps = @(@{ name = 'Самопроверка после загрузки'; status = 'FAIL'; detail = 'новые ошибки: 1' }) }
@@ -2257,6 +2297,7 @@ $tests = @(
             Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
             Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0) 'после «нет» что-то загружено'
             Check (@($r.ComLog | Where-Object { $_ -match 'UpdateInfoBase' }).Count -eq 0) 'после «нет» трогали свойства рабочей'
+            Check-OperationDispatch $sb 'deploy' 'cancelled' @('выход')
         }
     },
     @{
@@ -2685,7 +2726,9 @@ $tests = @(
         Text = 'обновление БД рабочей не прошло: откат к резервной копии, итог rolledBack, блокировки сняты'
         Run = {
             param($Name)
-            $sb = New-Sandbox $Name -Config $deployConfig
+            $sb = New-ReportingDeploySandbox $Name
+            $fault = Join-Path $sb 'fake-http\dispatch-fail.txt'
+            [System.IO.File]::WriteAllText($fault, 'offline')
             $fake = @{ designer = @(@{ match = @('/UpdateDBCfg', 'erp_base'); exit = 1; log = 'Ошибка обновления: тест'; times = 1 }) }
             $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Fake $fake -Com (New-ComState) -Answers @(
                 @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить все' },
@@ -2697,7 +2740,13 @@ $tests = @(
             if ($null -ne $record) { Check ($record.outcome -eq 'rolledBack') ("итог {0}, ждали rolledBack" -f $record.outcome) } else { Check $false 'нет deploy.json' }
             $loads = (Get-Calls $r @('/LoadCfg', '-Extension Адаптация', 'fake\erp_base'))
             Check ($loads.Count -eq 2) ("загрузок Адаптация в рабочую {0}, ждали 2 (новая и резервная копия)" -f $loads.Count)
-            if ($loads.Count -eq 2) { Check ($loads[1].Line.Contains('\before\erp_base_Адаптация_')) 'откат грузил не резервную копию' }
+            if ($loads.Count -eq 2) { Check ($loads[1].Line.Replace('/', '\').Contains('\before\erp_base_Адаптация_')) 'откат грузил не резервную копию' }
+            Check (@(Get-ChildItem -LiteralPath (Join-Path $sb 'fake-http') -Filter 'dispatch-*.json').Count -eq 0) 'подставной сбой не остановил отправку'
+            Remove-Item -LiteralPath $fault
+            $retry = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ComCheck' -Com (New-ComState)
+            Check-DeployCommon $retry -LocksExpected $false
+            Check ($retry.ExitCode -eq 0) 'проверка соединения с досылкой завершилась ошибкой'
+            Check-OperationDispatch $sb 'deploy' 'rolled-back' @('откат', 'блокиров')
         }
     },
     @{
@@ -2742,7 +2791,7 @@ $tests = @(
         Text = 'проверки после обновления нашли проблему: сводка, вопрос кнопками внизу (оставить или откатить); «оставить» - обновлено, блокировки сняты'
         Run = {
             param($Name)
-            $sb = New-Sandbox $Name -Config $deployConfig
+            $sb = New-ReportingDeploySandbox $Name
             $fake = @{ canary = @(@{ status = 'error' }) }
             $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Fake $fake -Com (New-ComState) -Answers @(
                 @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить все' },
@@ -2754,6 +2803,7 @@ $tests = @(
             Check ($question.Count -eq 1 -and $question[0].Contains('"dock"') -and $question[0].Contains('DeployKeepTimeoutMin')) 'вопрос не внизу экрана или без срока ожидания'
             $record = Get-DeployRecord $sb
             if ($null -ne $record) { Check ($record.outcome -eq 'updated') ("итог {0}, ждали updated" -f $record.outcome) } else { Check $false 'нет deploy.json' }
+            Check-OperationDispatch $sb 'deploy' 'kept-after-failed-checks' @('канаре', 'блокиров')
         }
     },
     @{
@@ -2824,7 +2874,7 @@ $tests = @(
         Text = '«Проверка рабочей перед обновлением»: обработка самопроверки пересобрана из поставки конфигуратором temp, клиент рабочей в режиме precheck, журнал на экране и в файле, счёт ошибок и предупреждений; в рабочей ничего не меняется; второй раз обработка не пересобирается'
         Run = {
             param($Name)
-            $sb = New-Sandbox $Name -Config $deployConfig
+            $sb = New-ReportingDeploySandbox $Name
             $src = Join-Path $sb 'tools\src'
             New-Item -ItemType Directory -Path (Join-Path $src 'ВыполнитьПослеОбновления\Ext') -Force | Out-Null
             [System.IO.File]::WriteAllText((Join-Path $src 'ВыполнитьПослеОбновления.xml'), '<MetaDataObject><ExternalDataProcessor><Properties><Name>ВыполнитьПослеОбновления</Name></Properties></ExternalDataProcessor></MetaDataObject>', $utf8)
@@ -2858,6 +2908,7 @@ $tests = @(
             Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\precheck\precheck.txt')) 'нет журнала deploy\precheck\precheck.txt'
             $runDirs = @(Get-ChildItem -LiteralPath (Join-Path $sb 'deploy') -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8}-\d{6}$' })
             Check ($runDirs.Count -eq 0) 'проверка создала папку запуска обновления'
+            Check-OperationDispatch $sb 'prod-precheck' 'failed' @('ошибок 1', 'предупреждений 1', 'проверку выполнить не удалось')
             Reset-FakeState $sb
             $again = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-ProdPreCheck' -Fake $fake -Com (New-ComState)
             Check-DeployCommon $again -LocksExpected $false
@@ -2915,7 +2966,8 @@ $tests = @(
         Text = 'обновление в два приёма: подготовка - копии и загрузка без блокировок, сеансов и обновления БД; «подготовленным» - без загрузки, БД обновлена, блокировки сняты, подготовки больше нет'
         Run = {
             param($Name)
-            $sb = New-GitSandbox $Name -Extra @{PublishOperations=$true;RunFilesRepo='owner/ext'} # ** Хлебников С.Ю. 20261124
+            $sb = New-GitSandbox $Name -Extra @{PublishOperations=$true;RunFilesRepo='owner/ext';RunReportRepo='owner/reports'} # ** Хлебников С.Ю. 20261124
+            New-Item -ItemType Directory -Path (Join-Path $sb 'fake-http') -Force | Out-Null
             $com = New-ComState -Sessions @(@{ id = 5; base = 'erp_base'; app = '1CV8C'; user = 'Пользователь'; host = 'pc1' })
             $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Prepare' -Com $com -Answers @(
                 @{ Kind = 'one'; Header = 'Подготовка обновления erp_base'; Item = '^Подготовить все' },
@@ -2924,7 +2976,7 @@ $tests = @(
             Check ($first.ExitCode -eq 0) ("подготовка: код возврата {0}, ждали 0" -f $first.ExitCode)
             $preparedFile = Join-Path $sb 'deploy\prepared.json'
             Check (Test-Path -LiteralPath $preparedFile) 'подготовка не записала deploy\prepared.json'
-            Check ((Get-Calls $first @('/DumpCfg', 'fake\erp_base', '\before\erp_base_Адаптация_')).Count -eq 1) 'подготовка не сняла резервную копию Адаптация'
+            Check ((Get-Calls $first @('/DumpCfg', 'fake\erp_base', ([IO.Path]::Combine('before', 'erp_base_Адаптация_')))).Count -eq 1) 'подготовка не сняла резервную копию Адаптация'
             Check ((Get-Calls $first @('/LoadCfg', '-Extension Адаптация', 'fake\erp_base')).Count -eq 1) 'подготовка не загрузила Адаптация в рабочую ровно один раз'
             Check ((Get-Calls $first @('/UpdateDBCfg')).Count -eq 0) 'подготовка обновила конфигурацию БД'
             Check (@($first.ComLog | Where-Object { $_ -match '\tUpdateInfoBase |\tTerminateSession ' }).Count -eq 0) 'подготовка меняла блокировки или завершала сеансы'
@@ -2971,6 +3023,8 @@ $tests = @(
             $ext = @($record.extensions)
             Check ($ext.Count -eq 1 -and $ext[0].name -eq 'Адаптация') 'в deploy.json нет Адаптация'
             if ($ext.Count -eq 1) { Check ($ext[0].backup -and (Test-Path -LiteralPath (Join-Path $record.Dir $ext[0].backup))) ("резервной копии нет в папке запуска (откату нечем): {0}" -f $ext[0].backup) }
+            Check-OperationDispatch $sb 'prepare' 'prepared' @('подготов', 'Адаптация')
+            Check-OperationDispatch $sb 'apply-prepared' 'updated' @('блокиров', 'Адаптация')
         }
     },
     @{
@@ -3139,7 +3193,7 @@ $tests = @(
         Text = '«Сравнить расширения»: одинаковые - по COM без выгрузки, отличающиеся - выгрузка обеих баз и разница по процедурам; в базах ничего не меняется'
         Run = {
             param($Name)
-            $sb = New-Sandbox $Name -Config $deployConfig
+            $sb = New-ReportingDeploySandbox $Name
             $oldModule = "Процедура Старая() Экспорт`r`nКонецПроцедуры"
             $newModule = $oldModule + "`r`n`r`nПроцедура НоваяПроцедура() Экспорт`r`nКонецПроцедуры"
             $fake = @{ dumps = @{
@@ -3154,6 +3208,7 @@ $tests = @(
             Check ((Get-Calls $r @('/DumpConfigToFiles', '-Extension Доработки')).Count -eq 0) 'одинаковые Доработки выгружались'
             Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0 -and (Get-Calls $r @('/UpdateDBCfg')).Count -eq 0) 'сравнение что-то загружало'
             Check (Test-Path -LiteralPath (Join-Path $sb 'deploy\compare-ext\compare.html')) 'нет compare.html'
+            Check-OperationDispatch $sb 'compare-extensions' 'completed' @('НоваяПроцедура', 'Адаптация')
         }
     },
     # ** Хлебников С.Ю. 20261124 Дата замены привязана к хешу, время правки карточки служит подсказкой.
@@ -5483,6 +5538,7 @@ $tests = @(
 $tests = @($tests) + @(. (Join-Path $here 'deploy-contract.tests.ps1'))
 # Приёмка поставок подрядчика (раздел 5.26).
 $tests = @($tests) + @(. (Join-Path $here 'delivery.tests.ps1'))
+$tests = @($tests) + @(. (Join-Path $here 'operation-report.tests.ps1'))
 if ($Extra) { $tests = @($tests) + @(. $Extra) }
 
 $selected = @($tests | Where-Object { -not $Only -or $_.Name -like "*$Only*" })

@@ -142,8 +142,17 @@ $script:ProdClosedAt = $null
 $script:ProdOpenedAt = $null
 # Блокировка начала сеансов стояла до запуска (код тот же) и оставлена: после обновления база закрыта не нами.
 $script:SessionLockKept = $false
+$script:DeployReport = $null
+$script:DeployReportDeferred = $false
+$script:DeployReportOutcome = ''
+$script:DeployBranchOutcome = 'completed'
+$script:DeploySessionsReport = 'этот запуск не ставил'
+$script:DeployJobsReport = 'этот запуск не ставил'
 
 trap {
+    $deployError = $_.Exception.Message
+    $errorOutcome = 'failed'
+    if ($_.Exception -is [OperationCanceledException]) { $errorOutcome = 'cancelled' }
     Write-Host ''
     Write-Host ("Остановлено: {0}" -f $_.Exception.Message) -ForegroundColor Red
     if ([string]$_.FullyQualifiedErrorId -ne [string]$_.Exception.Message -and $null -ne $_.InvocationInfo) {
@@ -164,10 +173,15 @@ trap {
     if ($null -ne $script:ProdLockState) {
         try { Clear-ProdLocks } catch { Write-Host ("Блокировки снять не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Yellow }
     }
+    if ($null -ne $script:DeployReport) {
+        Add-GateOperationLine -Context $script:DeployReport -Text $deployError
+        Complete-DeployReport $errorOutcome
+    }
     exit 1
 }
 
 $Root = $PSScriptRoot
+. (Join-Path $Root 'operation-report.ps1')
 . (Join-Path $Root 'cluster-target.ps1')
 $Utf8Bom = New-Object System.Text.UTF8Encoding($true)
 $TestBasePattern = 'temp|test|copy|tmp|dev|sandbox|stand|тест|копи|стенд|песочниц'
@@ -194,6 +208,28 @@ function Get-Setting {
 # Значения, которые в выводе и журнале заменяются звёздочками целиком (Get-MaskedLine): код разрешения входа.
 $script:MaskValues = @()
 
+function Complete-DeployReport {
+    param([string]$Outcome)
+    if ($null -eq $script:DeployReport) { return }
+    if ($script:DeployReportDeferred) {
+        Add-GateOperationLine -Context $script:DeployReport -Text ("Блокировка начала сеансов: {0}. Запрет регламентных заданий: {1}." -f $script:DeploySessionsReport, $script:DeployJobsReport)
+        if ($null -ne $script:ProdClosedAt -and ($null -eq $script:ProdOpenedAt -or $script:DeploySessionsReport -eq 'снятие не подтверждено')) {
+            Add-GateOperationLine -Context $script:DeployReport -Text ('Простой: вход закрыт в {0}, время открытия не подтверждено.' -f $script:ProdClosedAt)
+        }
+    }
+    Complete-GateOperation -Context $script:DeployReport -Outcome $Outcome
+}
+
+function Set-DeployReportResult {
+    # Выход до захвата deploy.lock завершает отчёт здесь. Под блокировками только запоминаем исход.
+    param([string]$Outcome, [string]$Text = '', [switch]$Show)
+    if ($Show) { Write-Host $Text }
+    $script:DeployReportOutcome = $Outcome
+    if ($null -eq $script:DeployReport) { return }
+    if ($Text) { Add-GateOperationLine -Context $script:DeployReport -Text $Text }
+    if (-not $script:DeployReportDeferred) { Complete-DeployReport $Outcome }
+}
+
 function Write-RunLog {
     param([string]$Text)
     $stamp = Get-Date -Format 'HH:mm:ss'
@@ -208,6 +244,7 @@ function Write-Line {
     Write-RunLog $Text
     # ** Хлебников С.Ю. 20261124 Итог операции, в том числе подготовки, без сырых команд и их аргументов.
     if ($script:GateOperation -and $Text -match '^ИТОГ:|: в рабочей новее \(') { Write-OperationEvent $script:GateOperation 'result' @{summary=$Text} }
+    if ($null -ne $script:DeployReport) { Add-GateOperationLine -Context $script:DeployReport -Text $Text }
 }
 
 function Get-PlainPassword {
@@ -242,11 +279,7 @@ function Get-MaskedLine {
     # само значение UnlockCode, где бы оно ни встретилось, - если в нём шесть знаков и больше (короткий код вроде
     # «0» совпал бы с обычными цифрами текста; он закрыт в ключах и строке соединения).
     param([string]$Line)
-    if (-not $Line) { return $Line }
-    $masked = [regex]::Replace([regex]::Replace($Line, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"')
-    $masked = [regex]::Replace($masked, '(?i)\b(Pwd|UC)="(?:[^"]|"")*"', '$1="***"')
-    foreach ($secret in @($script:MaskValues)) { if ($secret) { $masked = $masked.Replace([string]$secret, '***') } }
-    return $masked
+    return (Protect-GateReportText -Text $Line -LiteralValues $script:MaskValues)
 }
 
 function Invoke-V8 {
@@ -332,7 +365,7 @@ function Resolve-DesignerBusy {
     }
     if ($answer -eq '2') {
         Write-RunLog ("Отменено пользователем: открыт конфигуратор {0} ({1})" -f $BaseName, $Title)
-        throw ("отменено пользователем: открыт конфигуратор {0}, «{1}» не выполнено" -f $BaseName, $Title)
+        throw [OperationCanceledException]::new(("отменено пользователем: открыт конфигуратор {0}, «{1}» не выполнено" -f $BaseName, $Title))
     }
     if ($answer -eq '1') {
         foreach ($line in @(Stop-BaseSessions -Link $link -BaseName $BaseName -Designers)) { Write-Line ('  ' + $line) }
@@ -370,6 +403,9 @@ function Invoke-Designer {
         }
         $result = Invoke-V8 -Exe $script:V8 -Arguments $argList -TimeoutSec $TimeoutSec -Title $Title -NoResultLine
         $lines = @(Read-V8Log $logPath)
+        if ($null -ne $script:DeployReport -and $result.ExitCode -ne 0 -and $lines.Count -gt 0) {
+            Add-GateOperationLine -Context $script:DeployReport -Text ("{0}, код {1}:`n{2}" -f $LogName, $result.ExitCode, ($lines -join "`n"))
+        }
         if ($Title) {
             # Итог операции - сразу под её строкой «начато»: готово или нет, за сколько и что написал конфигуратор.
             $problem = ''
@@ -647,7 +683,7 @@ function Wait-ProdWarnLock {
         if ($shown -ne $script:WarnShown) { $script:WarnShown = $shown; Write-Host ('  ' + $shown) -ForegroundColor DarkGray }
         return ''
     }
-    if ($answer -eq '2') { throw ("обновление {0} отменено во время предупреждения пользователей: в рабочую ничего не загружено" -f $script:ProdBase) }
+    if ($answer -eq '2') { throw [OperationCanceledException]::new(("обновление {0} отменено во время предупреждения пользователей: в рабочую ничего не загружено" -f $script:ProdBase)) }
     if ($answer -eq 'empty') { Write-Line ("  в {0} сеансов не осталось" -f $script:ProdBase) 'Green' }
     if ($answer -eq 'time') { Write-Line ("  {0}: завершаю оставшиеся сеансы" -f (Get-Date -Format 'HH:mm')) }
     if ($script:ProdLockState.Expected.Count) {
@@ -659,6 +695,7 @@ function Wait-ProdWarnLock {
         if ((Get-Date) -lt $lockAt) {
             $until = [datetime]$script:WarnLockUntil
             $message = "Идёт обновление расширений, база заблокирована до {0}" -f $until.ToString('HH:mm')
+            $script:DeploySessionsReport = 'снятие не подтверждено'
             try { Set-GateSessionLock $script:ProdLockState $target ((Get-Date).AddMinutes(-30)) $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:ProdBase } }
             finally { Save-ProdLockFile }
             Write-Line '  блокировка начала сеансов действует с этой минуты' 'Green'
@@ -723,7 +760,16 @@ function Clear-ProdLocks {
     for ($try = 1; $try -le 2; $try++) {
         try {
             $target = Get-BaseInfo -Link (Connect-ClusterAgent) -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
-            $released = Restore-GateLocks $state $target $true { param($t) Read-BaseInfoAgain $t $script:ProdBase }
+            $lockWarnings = @()
+            $released = & {
+                [CmdletBinding()] param()
+                Restore-GateLocks $state $target $true { param($t) Read-BaseInfoAgain $t $script:ProdBase }
+            } -WarningVariable lockWarnings
+            foreach ($warning in $lockWarnings) {
+                if ($null -ne $script:DeployReport) { Add-GateOperationLine -Context $script:DeployReport -Text ([string]$warning) }
+            }
+            if (([string]$released).Contains('начала сеансов') -and $lockWarnings.Count -eq 0) { $script:DeploySessionsReport = 'снята, проверено' }
+            if (([string]$released).Contains('регламентных заданий')) { $script:DeployJobsReport = 'снят, проверено' }
             if ($released) { Write-Line ("Снял с {0}: {1}." -f $script:ProdBase, $released) 'Green' }
             # ** Хлебников С.Ю. 20261120 Простой (#24): считается, только если базу закрывал этот запуск и он же открыл.
             if ($released -and ([string]$released).Contains('начала сеансов') -and $null -ne $script:ProdClosedAt -and $null -eq $script:ProdOpenedAt) {
@@ -918,7 +964,7 @@ function Write-DeployCancellation {
         $script:GateOperation.FinalStatus = 'cancelled'
         Write-OperationEvent $script:GateOperation 'result' @{status='cancelled'; stage=$Stage}
     }
-    Write-Host 'Оператор отменил обновление до записи.'
+    Set-DeployReportResult 'cancelled' -Show -Text 'Оператор отменил обновление до записи.'
 }
 # ** Хлебников С.Ю. 20261124 конец
 
@@ -951,6 +997,26 @@ if (-not $OperationContext -and $cfg['PublishOperations'] -and -not $SnapshotTem
 }
 # ** Хлебников С.Ю. 20261124 конец
 
+# Выбираем тот же вход, что разбор ключей ниже. Снимок состава для run.ps1 — внутренний шаг его прогона.
+if (-not $SnapshotTemp) {
+    $reportModes = [ordered]@{
+        'base-state' = $BaseState; 'manual-locks' = $ManualLocks; 'close-base' = $CloseBase; 'open-base' = $OpenBase
+        'com-check' = $ComCheck; 'prod-precheck' = $ProdPreCheck
+        'compare-extensions' = $CompareExtensions; 'compare-processings' = $CompareProcessings
+        'pull-extensions' = $PullExtensions; 'pull-processings' = $PullProcessings; 'delivery' = $Delivery
+        'git-typical' = $GitTypical; 'git-prod' = $GitProd; 'git-export' = $GitExport; 'git-import' = $GitImport
+        'cancel-prepared' = $CancelPrepared; 'rollback' = $Rollback; 'prepare' = $Prepare
+        'apply-prepared' = $ApplyPrepared; 'status' = $StatusOnly; 'deploy' = $true
+    }
+    foreach ($key in $reportModes.Keys) {
+        if ($reportModes[$key]) {
+            $reportConfig = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($configPath)
+            $script:DeployReport = Start-GateOperationReport -Operation $key -Config $reportConfig
+            break
+        }
+    }
+}
+
 # Меню и вопросы (ui.ps1): из ci.exe их рисует ci.exe, без него - консоль. Нужны уже здесь: если в настройках
 # чего-то не хватает, скрипт спрашивает и записывает в config.psd1.
 . (Join-Path $Root 'locks.ps1')
@@ -980,7 +1046,7 @@ if (-not $script:ProdBase) {
     else {
         while (-not $script:ProdBase) {
             $typed = Read-UiText -Prompt ("Имя рабочей базы в кластере {0} (запишу в config.psd1, больше не спрошу)" -f $script:Server) -Default $guess -CancelAsNull
-            if ($null -eq $typed) { Write-Host 'Выход: рабочая база не задана.'; exit 0 }
+            if ($null -eq $typed) { Set-DeployReportResult 'cancelled' -Show -Text 'Выход: рабочая база не задана.'; exit 0 }
             $script:ProdBase = $typed.Trim()
         }
         Set-ConfigSetting -Path $configPath -Key 'ProdBase' -Literal ("'" + $script:ProdBase.Replace("'", "''") + "'")
@@ -1130,6 +1196,10 @@ else {
     New-Item -ItemType Directory -Path $script:RunDir -Force | Out-Null
     $script:RunLogPath = Join-Path $script:RunDir 'run.log'
     Set-StatRun $runId
+    if ($null -ne $script:DeployReport) {
+        try { [IO.File]::WriteAllText((Join-Path $script:RunDir 'operation-report.txt'), $script:DeployReport.Dir, $Utf8Bom) }
+        catch { Write-Warning ("Не записал ссылку на отчёт операции: {0}" -f $_.Exception.Message) }
+    }
 }
 if ($script:GateOperation) { Write-OperationEvent $script:GateOperation 'step' @{run=$runId; base=$script:ProdBase; tempBase=$script:TempBase} } # ** Хлебников С.Ю. 20261124
 $runsRoot = Resolve-RootPath ([string](Get-Setting $cfg 'RunsDir' 'runs'))
@@ -1450,6 +1520,7 @@ function Assert-ProdOpen {
     else { return }
     Write-RunLog ("В рабочую не войти: {0}" -f $text)
     # Не авария, а состояние рабочей: выходим без «Остановлено», блокировок deploy к этому моменту не ставил.
+    Set-DeployReportResult 'failed' -Text $States.Error
     exit 2
 }
 
@@ -2338,6 +2409,7 @@ if ($BaseState) {
     $stateLink = Connect-ClusterAgent
     Show-BaseState -Link $stateLink -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
     Show-BaseState -Link $stateLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
+    Set-DeployReportResult 'completed'
     exit 0
 }
 
@@ -2445,6 +2517,7 @@ function Invoke-ManualLocks {
 
 if ($ManualLocks) {
     Invoke-ManualLocks $LocksBase
+    Set-DeployReportResult 'completed'
     exit 0
 }
 
@@ -2559,6 +2632,7 @@ function Invoke-CloseBase {
         Write-RunLog ("Закрыть базу: {0}, пользователь Windows {1}" -f $baseName, [Environment]::UserName)
         $record = Read-CloseRecord $baseName
         if ($null -ne $record) {
+            $script:DeployBranchOutcome = 'unchanged'
             Write-Line ("  {0} уже {1}; {2}" -f $baseName, (Get-CloseRecordText $record), (Get-OpenBaseHint $baseName)) 'Yellow'
             return
         }
@@ -2567,6 +2641,7 @@ function Invoke-CloseBase {
         $target = Get-BaseInfo -Link $link -BaseName $baseName -User $user -Password $password
         $current = Read-BaseInfoAgain $target $baseName
         if ([bool]$current.SessionsDenied) {
+            $script:DeployBranchOutcome = 'blocked'
             Write-Line ("  на {0} уже стоит блокировка начала сеансов: закрываю только базу без неё. Сними её («Блокировки рабочей базы» или консоль кластера) и закрой снова." -f $baseName) 'Yellow'
             return
         }
@@ -2579,7 +2654,7 @@ function Invoke-CloseBase {
         $how = Read-UiChoice -Header ("Закрыть {0} для пользователей: когда?" -f $baseName) -Keys $keys.ToArray() -Labels $labels.ToArray() -CancelKey '0' -DefaultKey $keys[0] -Notes @(
             'В назначенное время вход закрывается (кроме входа с кодом разрешения), регламентные задания запрещаются, оставшиеся сеансы завершаются; конфигуратор - по вопросу.',
             ('Блокировки остаются, пока базу не откроют: {0}.' -f (Get-OpenBaseHint $baseName)))
-        if ($how -ne '1' -and $how -ne '2') { Write-Line '  отмена: ничего не менял'; return }
+        if ($how -ne '1' -and $how -ne '2') { Write-Line '  отмена: ничего не менял'; $script:DeployBranchOutcome = 'cancelled'; return }
         $warn = ($how -eq '1')
         $lockAt = Get-Date
         if ($warn) { $lockAt = $lockAt.AddSeconds($closeWarnMinutes * 60) }
@@ -2594,14 +2669,14 @@ function Invoke-CloseBase {
             'Открыть раньше - тем же меню. Срок - на случай, если забыть открыть: в это время вход откроется сам, а запрет регламентных заданий останется до «Открыть».')
         $until = $null
         switch ($period) { '1' { $until = $until1 } '2' { $until = $until3 } '3' { $until = $night } '4' { $until = $morning } }
-        if ($null -eq $until) { Write-Line '  отмена: ничего не менял'; return }
+        if ($null -eq $until) { Write-Line '  отмена: ничего не менял'; $script:DeployBranchOutcome = 'cancelled'; return }
 
         $whenText = 'Сейчас вход закроется'
         if ($warn) { $whenText = ('Сейчас пользователи увидят предупреждение, в {0} вход закроется' -f $lockAt.ToString('HH:mm')) }
         if ($isProd) {
             $question = "Закрыть {0}? {1} до {2} (кроме входа с кодом разрешения), регламентные задания будут запрещены, оставшиеся сеансы - завершены." -f `
                 $baseName, $whenText, $until.ToString('dd.MM HH:mm')
-            if (-not (Confirm-Ui -Question $question -Yes 'Да, закрыть' -No 'Нет' -DefaultNo)) { Write-Line '  отмена: ничего не менял'; return }
+            if (-not (Confirm-Ui -Question $question -Yes 'Да, закрыть' -No 'Нет' -DefaultNo)) { Write-Line '  отмена: ничего не менял'; $script:DeployBranchOutcome = 'cancelled'; return }
         }
 
         $state = New-GateLockState
@@ -2628,7 +2703,7 @@ function Invoke-CloseBase {
             Write-Line ("  поставил блокировку начала сеансов с {0} до {1}: пользователи видят предупреждение, в {0} их программы закроются сами" -f $lockAt.ToString('HH:mm'), $until.ToString('dd.MM HH:mm')) 'Green'
             Write-RunLog ("Предупреждение пользователей {0}: блокировка начала сеансов с {1}" -f $baseName, $lockAt.ToString('HH:mm:ss'))
             $answer = Wait-CloseWarning $lockAt
-            if ($answer -eq '2') { Write-Line '  закрытие отменено: снимаю предупреждение, база остаётся открытой' 'Yellow'; return }
+            if ($answer -eq '2') { Write-Line '  закрытие отменено: снимаю предупреждение, база остаётся открытой' 'Yellow'; $script:DeployBranchOutcome = 'cancelled'; return }
             if ($answer -eq 'empty') { Write-Line ("  в {0} сеансов пользователей не осталось" -f $baseName) 'Green' }
             if ($answer -eq 'time') { Write-Line ("  {0}: время вышло" -f (Get-Date -Format 'HH:mm')) }
         }
@@ -2750,6 +2825,7 @@ function Invoke-OpenBase {
         $link = Connect-ClusterAgent
         Show-BaseState -Link $link -BaseName $baseName -User $user -Password $password
         if ($null -eq $record) {
+            $script:DeployBranchOutcome = 'unchanged'
             Write-Line ("  {0} не закрывалась пунктом «Закрыть»: снимать нечего. Блокировки руками - «Блокировки рабочей базы»." -f $baseName) 'Yellow'
             return
         }
@@ -2758,6 +2834,7 @@ function Invoke-OpenBase {
         if (-not $savedTarget -or $savedTarget -cne [string]$target.Identity) {
             # Сверять нечего: файл про ту базу, где ставились блокировки, - он остаётся.
             Write-Line ("  файл закрытия {0} записан для другого кластера или ИБ, чем в текущем профиле {1}\{2}: не сверяю и не снимаю. Блокировки той базы - консоль кластера." -f (Get-CloseFile $baseName), $script:Server, $baseName) 'Yellow'
+            $script:DeployBranchOutcome = 'blocked'
             Write-RunLog ("Файл закрытия: цель «{0}» не совпала с текущей" -f $savedTarget)
             return
         }
@@ -2778,10 +2855,12 @@ function Invoke-OpenBase {
         if ($own.Count -eq 0) {
             Write-Line ("  блокировок, поставленных закрытием, на {0} уже нет: убираю файл закрытия" -f $baseName) 'Green'
             Save-CloseRecord $baseName $null @{}
+            $script:DeployBranchOutcome = 'unchanged'
             Write-CloseHistory ("{0}: файл закрытия убран, блокировок закрытия на базе уже не было" -f $baseName)
             return
         }
         if ($isProd -and -not (Confirm-Ui -Question ("Открыть {0}: снять {1}?" -f $baseName, ($own -join ' и ')) -Yes 'Да, открыть' -No 'Нет' -DefaultNo)) {
+            $script:DeployBranchOutcome = 'cancelled'
             Write-Line '  оставил как есть: база закрыта'
             return
         }
@@ -2812,11 +2891,13 @@ if ($CloseBase -and $OpenBase) { throw '-CloseBase и -OpenBase вместе н�
 if ($CloseBase) {
     $script:CloseUnconfirmed = $false
     Invoke-CloseBase $LocksBase
-    if ($script:CloseUnconfirmed) { exit 1 }
+    if ($script:CloseUnconfirmed) { Set-DeployReportResult 'failed'; exit 1 }
+    Set-DeployReportResult $script:DeployBranchOutcome
     exit 0
 }
 if ($OpenBase) {
     Invoke-OpenBase $LocksBase
+    Set-DeployReportResult $script:DeployBranchOutcome
     exit 0
 }
 # ** Хлебников С.Ю. 20261120 конец
@@ -3033,10 +3114,12 @@ if ($ComCheck) {
     if ($comStates.Ok) {
         foreach ($name in @($comStates.Items.Keys | Sort-Object)) { Write-Line ("  {0}: версия {1}, хеш-сумма {2}" -f $name, $(if ($comStates.Items[$name].Version) { [string]$comStates.Items[$name].Version } else { '?' }), $(if ($comStates.Items[$name].Hash) { 'есть' } else { 'нет' })) }
         Write-Line ("ИТОГ: расширения {0} через внешнее соединение читаются: {1}. В базе ничего не изменено. Журнал: {2}" -f $script:TempBase, $comStates.Items.Count, $script:RunLogPath) 'Green'
+        Set-DeployReportResult 'completed'
         exit 0
     }
     Write-Line ("  не прочитал: {0}" -f $comStates.Error) 'Red'
     Write-Line ("ИТОГ: расширения {0} через внешнее соединение не читаются - сравнение идёт по выгрузкам. В базе ничего не изменено. Журнал: {1}" -f $script:TempBase, $script:RunLogPath) 'Yellow'
+    Set-DeployReportResult 'failed'
     exit 1
 }
 
@@ -3090,6 +3173,7 @@ if ($ProdPreCheck) {
     $preTotalColor = 'Green'
     if ($preCounts['ОШИБКА'] -gt 0) { $preTotalColor = 'Red' } elseif ($preCounts['ВНИМАНИЕ'] + $preCounts['ПРОПУСК'] -gt 0) { $preTotalColor = 'Yellow' }
     Write-Line ("Проверка {0} перед обновлением: {1}. В базе ничего не изменено. Журнал: {2}" -f $script:ProdBase, $preTotal, $preJournalCopy) $preTotalColor
+    Set-DeployReportResult $(if ($preCounts['ОШИБКА'] -gt 0) { 'failed' } else { 'completed' })
     exit 0
 }
 
@@ -3186,6 +3270,7 @@ if ($CompareExtensions) {
     $cmpFailText = ''
     if ($cmpFailed -gt 0) { $cmpColor = 'Red'; $cmpFailText = (", НЕ СРАВНИЛИСЬ: {0} (см. выше)" -f $cmpFailed) }
     Write-Line ("Отличаются расширений: {0}{1}. Обозначения: + новая процедура, ~ изменена, - удалена. Отчёт: {2}" -f $cmpDiffer, $cmpFailText, $cmpFile) $cmpColor
+    Set-DeployReportResult $(if ($cmpFailed) { 'partial' } else { 'completed' })
     exit 0
 }
 
@@ -3199,13 +3284,14 @@ if ($CompareProcessings) {
     $prodList = Export-Processings -WithDates -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword -Dir (Join-Path $script:RunDir 'prod')
     if (-not $tempList.Ok) { Write-Line ("  {0}: не выгрузил - {1}" -f $script:TempBase, $tempList.Error) 'Red' }
     if (-not $prodList.Ok) { Write-Line ("  {0}: не выгрузил - {1}" -f $script:ProdBase, $prodList.Error) 'Red' }
-    if (-not $tempList.Ok -or -not $prodList.Ok) { exit 1 }
+    if (-not $tempList.Ok -or -not $prodList.Ok) { Set-DeployReportResult 'failed'; exit 1 }
     $tempByRef = @{}; foreach ($item in @($tempList.Items)) { $tempByRef[[string]$item.Ref] = $item }
     $prodByRef = @{}; foreach ($item in @($prodList.Items)) { $prodByRef[[string]$item.Ref] = $item }
     $cmpHtml = New-Object System.Text.StringBuilder
     [void]$cmpHtml.Append('<html><head><meta charset="utf-8"></head><body>')
     [void]$cmpHtml.Append(('<h1>Внешние обработки: {0} и {1}, {2}</h1><p>Было - рабочая, стало - temp.</p>' -f (ConvertTo-Html $script:ProdBase), (ConvertTo-Html $script:TempBase), (Get-Date -Format 'dd.MM.yyyy HH:mm')))
     $same = 0; $differ = 0
+    $cmpIncomplete = $false
     foreach ($ref in @(@($tempByRef.Keys) + @($prodByRef.Keys) | Sort-Object -Unique)) {
         $inTemp = $tempByRef.ContainsKey($ref); $inProd = $prodByRef.ContainsKey($ref)
         $card = if ($inTemp) { $tempByRef[$ref] } else { $prodByRef[$ref] }
@@ -3229,7 +3315,7 @@ if ($CompareProcessings) {
         $dumpRoot = Join-Path $script:RunDir 'dump'
         $newDump = Get-ProcessingDump -File $tempByRef[$ref].File -Dir (Join-Path $dumpRoot ($ref + '-temp')) -Title ("Выгрузить в файлы {0} из temp" -f $name)
         $oldDump = Get-ProcessingDump -File $prodByRef[$ref].File -Dir (Join-Path $dumpRoot ($ref + '-prod')) -Title ("Выгрузить в файлы {0} из рабочей" -f $name)
-        if (-not $newDump -or -not $oldDump) { Write-Line '    в файлы не выгрузилась: разницы по модулям нет, см. run.log' 'Red'; continue }
+        if (-not $newDump -or -not $oldDump) { Write-Line '    в файлы не выгрузилась: разницы по модулям нет, см. run.log' 'Red'; $cmpIncomplete = $true; continue }
         $changes = Get-ExtensionChanges -OldDir $oldDump -NewDir $newDump -KeyPrefix 'DataProcessors/'
         if (@($changes.Objects).Count -eq 0) { Write-Line '    по выгрузке отличий нет: разница в самом файле (служебные данные)' 'DarkGray'; continue }
         Write-ChangeGroups -Changes $changes -Html $cmpHtml
@@ -3239,6 +3325,7 @@ if ($CompareProcessings) {
     [System.IO.File]::WriteAllText($cmpFile, $cmpHtml.ToString(), $Utf8Bom)
     Write-Host ''
     Write-Line ("Обработок: одинаковых {0}, отличаются {1}. Отчёт: {2}" -f $same, $differ, $cmpFile) 'Cyan'
+    Set-DeployReportResult $(if ($cmpIncomplete) { 'partial' } else { 'completed' })
     exit 0
 }
 
@@ -3273,10 +3360,10 @@ if ($PullExtensions -or $PullProcessings) {
             Write-Line ("  {0}: {1}" -f $name, $text) 'Yellow'
             $differ.Add([pscustomobject]@{ Name = $name; Text = $text })
         }
-        if ($differ.Count -eq 0) { Write-Line 'Все расширения рабочей такие же, как в temp: подтягивать нечего.' 'Green'; exit 0 }
+        if ($differ.Count -eq 0) { Write-Line 'Все расширения рабочей такие же, как в temp: подтягивать нечего.' 'Green'; Set-DeployReportResult 'unchanged'; exit 0 }
         $labels = @($differ | ForEach-Object { '{0}  {1}' -f $_.Name, $_.Text })
         $picked = Select-UiMany -Header ("Какие расширения взять из {0} в inbox" -f $script:ProdBase) -Items $labels -Preselected @(0..($differ.Count - 1))
-        if ($null -eq $picked) { Write-Host 'Выход, ничего не брал.'; exit 0 }
+        if ($null -eq $picked) { Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не брал.'; exit 0 }
         $targetDir = Join-Path $inboxRoot ("из_рабочей_{0}" -f $pullStamp)
         New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
         $taken = 0
@@ -3292,6 +3379,7 @@ if ($PullExtensions -or $PullProcessings) {
         Write-Host ''
         Write-Line ("Положил в inbox: {0} из {1}, папка {2}." -f $taken, $picked.Count, $targetDir)
         Write-Line 'Дальше: меню гейта, «Прогон с обновлением из inbox» - они там в списке.'
+        Set-DeployReportResult $(if ($taken -lt $picked.Count) { 'partial' } else { 'completed' })
         exit 0
     }
 
@@ -3333,10 +3421,11 @@ if ($PullExtensions -or $PullProcessings) {
         }
         $differ.Add([pscustomobject]@{ Item = $item; Text = $text; Expected = $expected })
     }
-    if (-not $differ.Count) { Write-Line 'Нет обработок для переноса из рабочей.'; exit 0 }
+    Write-Line ("  обработок в рабочей: {0}, отличаются от temp: {1}" -f $prodExport.Items.Count, $differ.Count)
+    if (-not $differ.Count) { Write-Line 'Нет обработок для переноса из рабочей.'; Set-DeployReportResult 'unchanged'; exit 0 }
     $labels = @($differ | ForEach-Object { '{0} [{1}]  {2}' -f $_.Item.ObjName, $_.Item.Ref, $_.Text })
     $picked = Select-UiMany -Header ("Какие обработки взять из {0} в inbox" -f $script:ProdBase) -Items $labels -Preselected $defaults.ToArray() -AllowEmpty
-    if ($null -eq $picked -or -not @($picked).Count) { Write-Host 'Выход, ничего не брал.'; exit 0 }
+    if ($null -eq $picked -or -not @($picked).Count) { Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не брал.'; exit 0 }
     $targetDir = Join-Path $inboxRoot ("обработки_из_рабочей_{0}" -f $pullStamp)
     # Публикуем комплект одной операцией в том же томе. Незавершённое копирование не видно меню inbox.
     $stage = Join-Path (Split-Path -Parent $inboxRoot) ('gate-pull-' + [guid]::NewGuid().ToString('N'))
@@ -3359,6 +3448,7 @@ if ($PullExtensions -or $PullProcessings) {
     Write-Host ''
     Write-Line ("Положил в inbox: {0}, папка {1}." -f @($picked).Count, $targetDir)
     Write-Line 'Дальше: меню гейта, «Прогон с обновлением из inbox» - гейт запишет их в справочник temp и проверит.'
+    Set-DeployReportResult 'completed'
     exit 0
 }
 
@@ -3867,7 +3957,7 @@ function Invoke-GitExport {
     $bootstrap = (@($tracked.Extensions).Count -eq 0) -and -not $tracked.HasProcessings
     if ($bootstrap) {
         $tracked = Select-GitTracked $Setup
-        if ($null -eq $tracked) { Write-Line 'Отмена: ничего не выгружал.'; return }
+        if ($null -eq $tracked) { Write-Line 'Отмена: ничего не выгружал.'; $script:DeployBranchOutcome = 'cancelled'; return }
     }
     $processingsText = 'нет'
     if ($tracked.HasProcessings) { $processingsText = 'все из справочника' }
@@ -3906,8 +3996,10 @@ function Invoke-GitExport {
     if ($changes.Count -eq 0) {
         Write-Line ("{0} совпадает с git (коммит {1}): выгружать нечего." -f $script:TempBase, (Get-GitShort $base)) 'Green'
         if (-not [string]$State['commit'] -and $base) { $State['commit'] = $base; $State['how'] = 'export'; Save-GitState $Setup $State }
+        $script:DeployBranchOutcome = 'unchanged'
         return
     }
+    if ($null -ne $script:DeployReport) { Add-GateOperationLine -Context $script:DeployReport -Text ((Get-GitFileLines $changes -Limit ([int]::MaxValue)) -join "`n") }
     foreach ($line in (Get-GitChangeLines $changes)) { Write-Line ('  ' + $line) }
     if ($bootstrap) {
         $repoFiles = [ordered]@{ 'README.md' = (Get-GitReadme); '.gitattributes' = "* -text`n" }
@@ -3924,8 +4016,9 @@ function Invoke-GitExport {
         $question = "Выгрузить снимок карточек веткой temp/<время> и открыть pull request в {0}?" -f $Setup.Branch
     }
     $answer = Confirm-Ui -Question $question -Yes 'Выгрузить' -No 'Отмена'
-    if (-not $answer) { Write-Line 'Отмена: ничего не выгружал.'; return }
+    if (-not $answer) { Write-Line 'Отмена: ничего не выгружал.'; $script:DeployBranchOutcome = 'cancelled'; return }
     $null = New-GitTempBranch -Setup $Setup -State $State -Base $base -Changes $changes
+    $script:DeployBranchOutcome = 'pull-request'
 }
 
 function Get-GitFileSha256 {
@@ -4193,6 +4286,7 @@ function Invoke-GitImport {
     if ($drift.Count -eq 0) { Write-Line ("  правок нет: {0} совпадает с коммитом {1}" -f $script:TempBase, $knownName) 'Green' }
     if ($drift.Count -gt 0) {
         Write-Line ("В {0} есть правки, которых нет в git (коммит {1}):" -f $script:TempBase, $knownName) 'Yellow'
+        if ($null -ne $script:DeployReport) { Add-GateOperationLine -Context $script:DeployReport -Text ((Get-GitFileLines $drift -Limit ([int]::MaxValue)) -join "`n") }
         foreach ($line in (Get-GitChangeLines $drift)) { Write-Line ('  ' + $line) 'Yellow' }
         foreach ($line in (Get-GitFileLines $drift)) { Write-Line ('    ' + $line) 'Yellow' }
         $driftBase = $known
@@ -4224,7 +4318,7 @@ function Invoke-GitImport {
         $choice = Select-UiOne -Header ("Правки {0} из pull request #{1} ещё не в {2}: загрузка {2} уберёт их из temp" -f $script:TempBase, $State['pendingNumber'], $Setup.Branch) -Items @(
             ('Загрузить {0} всё равно: правки из pull request уйдут из temp' -f $Setup.Branch),
             'Отмена: сначала слить pull request') -Danger @(0) -Notes @([string]$State['pendingUrl'])
-        if ($choice -ne 0) { Write-Line ("Отмена: {0} не трогаю." -f $script:TempBase); return 0 }
+        if ($choice -ne 0) { Write-Line ("Отмена: {0} не трогаю." -f $script:TempBase); $script:DeployBranchOutcome = 'cancelled'; return 0 }
     }
     # Что грузить: папки main, которые не такие, как в temp (в том числе новые).
     $headTracked = Get-GitFolders $headFiles
@@ -4303,12 +4397,13 @@ function Invoke-GitImport {
     }
     foreach ($id in $newActions) { $incoming.Add([pscustomobject]@{ Path = ('actions/{0}.bsl' -f $id); Kind = 'add' }) }
     Write-Line ("Загрузка изменит в {0} ({1}, коммит {2}, против того, что в базе сейчас):" -f $script:TempBase, $Setup.Branch, (Get-GitShort $head.Sha)) 'Cyan'
+    if ($null -ne $script:DeployReport) { Add-GateOperationLine -Context $script:DeployReport -Text ((Get-GitFileLines $incoming -Limit ([int]::MaxValue)) -join "`n") }
     foreach ($line in (Get-GitChangeLines $incoming)) { Write-Line ('  ' + $line) }
     foreach ($line in (Get-GitFileLines $incoming)) { Write-Line ('    ' + $line) }
     if ($Unattended) { Write-Line ("Загружаю в {0} из {1} (коммит {2}): {3}" -f $script:TempBase, $Setup.Branch, (Get-GitShort $head.Sha), $what) 'Cyan' }
     else {
         $answer = Confirm-Ui -Question ("Загрузить в {0} из {1} (коммит {2}): {3} - прогоном гейта?" -f $script:TempBase, $Setup.Branch, (Get-GitShort $head.Sha), $what) -Yes 'Загрузить' -No 'Отмена'
-        if (-not $answer) { Write-Line ("Отмена: {0} не трогаю." -f $script:TempBase); return 0 }
+        if (-not $answer) { Write-Line ("Отмена: {0} не трогаю." -f $script:TempBase); $script:DeployBranchOutcome = 'cancelled'; return 0 }
     }
 
     # Комплект: выгрузки изменившихся папок из main, каждая - своей папкой (гейт сам видит, что в ней), и действия -
@@ -4484,13 +4579,15 @@ function Invoke-GitProdSnapshot {
     Write-Line ("  в справочнике {0}: элементов {1}, с файлом {2}, помечены на удаление {3}" -f $script:ProdBase, @($taken.Items).Count, $withFile, @($taken.Items | Where-Object { $_.Deleted }).Count)
     if ($changes.Count -eq 0) {
         Write-Line ("Обработки {0} - те же, что в ветке {1} (коммит {2}): записывать нечего." -f $script:ProdBase, $prodBranch, (Get-GitShort $base)) 'Green'
+        $script:DeployBranchOutcome = 'unchanged'
         return
     }
+    if ($null -ne $script:DeployReport) { Add-GateOperationLine -Context $script:DeployReport -Text ((Get-GitFileLines $changes -Limit ([int]::MaxValue)) -join "`n") }
     foreach ($line in (Get-GitChangeLines $changes)) { Write-Line ('  ' + $line) }
     $where = 'обновить ветку {0}' -f $prodBranch
     if (-not $prod.Sha) { $where = 'создать ветку {0} от {1} (без расширений)' -f $prodBranch, $Setup.Branch }
     $answer = Confirm-Ui -Question ("Записать снимок обработок {0} в git: {1}?" -f $script:ProdBase, $where) -Yes 'Записать' -No 'Отмена'
-    if (-not $answer) { Write-Line 'Отмена: в git ничего не писал.'; return }
+    if (-not $answer) { Write-Line 'Отмена: в git ничего не писал.'; $script:DeployBranchOutcome = 'cancelled'; return }
     $sha = New-GitVerifiedCommit -Setup $Setup -Parent $base -Changes $changes -Message ("Снимок внешних обработок {0} от {1}" -f $script:ProdBase, (Get-Date).ToString('dd.MM.yyyy HH:mm'))
     if ($prod.Sha) { Set-GhBranch -Gh $Setup.Gh -Branch $prodBranch -Sha $sha }
     else { Set-GhBranch -Gh $Setup.Gh -Branch $prodBranch -Sha $sha -Create }
@@ -4612,7 +4709,11 @@ function Invoke-GitTypical {
     # та же, что в прошлый раз, - ничего не делает; иначе вопрос, выгрузка в файлы, коммит поверх ветки, push.
     # Репозиторий git - отдельно от выгрузки (repo.git): конфигуратор может стереть выгрузку и выгрузить заново.
     $repo = [string](Get-Setting $cfg 'TypicalRepo' '')
-    if (-not $repo) { return }
+    if (-not $repo) {
+        $script:DeployBranchOutcome = 'skipped'
+        Add-GateOperationLine -Context $script:DeployReport -Text 'Типовая не выгружалась: в профиле не задан TypicalRepo.'
+        return
+    }
     if ($repo -eq [string](Get-Setting $cfg 'ExtensionsRepo' '')) { throw 'TypicalRepo совпадает с ExtensionsRepo. Для выгрузки типовой нужен отдельный репозиторий.' }
     $branch = [string](Get-Setting $cfg 'TypicalBranch' 'main')
     if ($repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw ("TypicalRepo «{0}» - не в виде владелец/имя" -f $repo) }
@@ -4631,7 +4732,7 @@ function Invoke-GitTypical {
     Write-Host ''
     Write-Line ("Типовая {0} - в {1}: смотрю версию" -f $script:TempBase, $repo) 'Cyan'
     $info = Get-ComConfigInfo -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
-    if (-not $info.Ok) { Write-Line ("  версию конфигурации {0} не прочитал: {1}. Типовую не выгружаю." -f $script:TempBase, $info.Error) 'Yellow'; return }
+    if (-not $info.Ok) { Write-Line ("  версию конфигурации {0} не прочитал: {1}. Типовую не выгружаю." -f $script:TempBase, $info.Error) 'Yellow'; $script:DeployBranchOutcome = 'failed'; return }
     $title = '{0} ({1}) {2}' -f $info.Synonym, $info.Name, $info.Version
     if (-not $state['version'] -and $state['commit']) {
         # Коммит есть, а версии при нём нет: до 20.11.2026 версия могла прочитаться пустой (свойства COM 1С), выгрузка
@@ -4651,6 +4752,7 @@ function Invoke-GitTypical {
             $state['time'] = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
             [System.IO.File]::WriteAllText($statePath, (ConvertTo-Json -InputObject $state), $Utf8Bom)
             Write-Line ("  типовая {0}: в {1} коммит {2} записан без версии, в нём та же версия - дописал её, выгружать нечего." -f $title, $repo, (Get-GitShort $state['commit'])) 'Green'
+            $script:DeployBranchOutcome = 'unchanged'
             return
         }
         $seen = $committed
@@ -4659,12 +4761,13 @@ function Invoke-GitTypical {
     }
     if ($state['version'] -eq $info.Version -and $state['commit']) {
         Write-Line ("  типовая {0} уже в {1} (коммит {2}): выгружать нечего." -f $title, $repo, (Get-GitShort $state['commit'])) 'Green'
+        $script:DeployBranchOutcome = 'unchanged'
         return
     }
     $question = "Выгрузить и типовую {0} в {1} (только для чтения агентами)? Первый раз долго: выгрузка в файлы и отправка около гигабайта, порядка часа." -f $title, $repo
     if ($state['version']) { $question = "Типовая в {0} обновилась: {1} -> {2}. Выгрузить новую версию в {3}?" -f $script:TempBase, $state['version'], $info.Version, $repo }
     $answer = Confirm-Ui -Question $question -Yes 'Выгрузить' -No 'Не сейчас'
-    if (-not $answer) { Write-Line '  типовую не выгружаю: спрошу в следующий раз.'; return }
+    if (-not $answer) { Write-Line '  типовую не выгружаю: спрошу в следующий раз.'; $script:DeployBranchOutcome = 'cancelled'; return }
     # Токен - до выгрузки: выгрузка в файлы идёт долго, и без токена она пропала бы зря.
     $tokenFile = [string](Get-Setting $cfg 'GitHubTokenPassFile' '')
     if (-not $tokenFile) { throw 'нет токена GitHub: «Настройки - Обновление гейта и git», GitHubTokenPassFile' }
@@ -4683,6 +4786,7 @@ function Invoke-GitTypical {
     $freeGb = [Math]::Round($drive.AvailableFreeSpace / 1GB, 1)
     if ($freeGb -lt $needGb) {
         Write-Line ("  на диске {0} свободно {1} ГБ, а выгрузке типовой нужно не меньше {2} ГБ (настройка TypicalMinFreeGB): не выгружаю. Освободи место или перенеси GitDir на другой диск." -f $drive.Name, $freeGb, $needGb) 'Yellow'
+        $script:DeployBranchOutcome = 'unchanged'
         return
     }
     Write-Line ("  выгружаю типовую {0} в файлы: {1} (первый раз - надолго; на диске {2} свободно {3} ГБ)" -f $script:TempBase, $dump, $drive.Name, $freeGb)
@@ -4808,6 +4912,7 @@ if ($Delivery) {
     . (Join-Path $Root 'github.ps1')
     . (Join-Path $Root 'delivery.ps1')
     $deliveryCode = Invoke-Delivery -Unattended:$DeliveryUnattended -OnlyId $DeliveryId
+    Set-DeployReportResult $(if ($deliveryCode -ne 0) { 'failed' } else { 'completed' })
     exit $deliveryCode
 }
 
@@ -4818,6 +4923,7 @@ if ($GitExport -or $GitImport -or $GitProd -or $GitTypical) {
     . (Join-Path $Root 'github.ps1')
     if ($GitTypical) {
         Invoke-GitTypical
+        Set-DeployReportResult $script:DeployBranchOutcome
         exit 0
     }
     $gitSetup = Get-GitSetup
@@ -4826,17 +4932,44 @@ if ($GitExport -or $GitImport -or $GitProd -or $GitTypical) {
     if ($GitProd) {
         Write-Host ("СНИМОК ВНЕШНИХ ОБРАБОТОК {0} В GIT ({1}, ветка {2})" -f $script:ProdBase, $gitSetup.Repo, [string](Get-Setting $cfg 'ExtensionsProdBranch' 'prod')) -ForegroundColor Cyan
         Invoke-GitProdSnapshot -Setup $gitSetup
+        Set-DeployReportResult $script:DeployBranchOutcome
         exit 0
     }
     if ($GitExport) {
         Write-Host ("ВЫГРУЗИТЬ {0} В GIT ({1}, {2})" -f $script:TempBase, $gitSetup.Repo, $gitSetup.Branch) -ForegroundColor Cyan
         Invoke-GitExport -Setup $gitSetup -State $gitState
         # Типовая - туда же, если задан TypicalRepo и её версия изменилась (после обновления типовой).
+        Set-DeployReportResult $script:DeployBranchOutcome
+        if ($null -ne $script:DeployReport -and (Get-Setting $cfg 'TypicalRepo' '')) {
+            $script:DeployReport = Start-GateOperationReport -Operation 'git-typical' -Config $reportConfig
+        }
+        else { $script:DeployReport = $null }
+        $script:DeployBranchOutcome = 'completed'
         Invoke-GitTypical
+        Set-DeployReportResult $script:DeployBranchOutcome
         exit 0
     }
     Write-Host ("ЗАГРУЗИТЬ ИЗ GIT В {0} ({1}, {2})" -f $script:TempBase, $gitSetup.Repo, $gitSetup.Branch) -ForegroundColor Cyan
     $gitCode = Invoke-GitImport -Setup $gitSetup -State $gitState -Unattended:$GitUnattended -ExpectCommit $GitCommit
+    $importOutcome = [string]$script:GitImportLast.outcome
+    $importNote = $script:GitImportLast.note
+    if ($script:DeployBranchOutcome -eq 'cancelled') {
+        $importOutcome = 'cancelled'
+        $importNote = 'Отмена загрузки из git.'
+    }
+    $importNames = @{ drift = 'pull-request'; cancel = 'cancelled'; same = 'unchanged'; rolledback = 'rolled-back' }
+    if ($importNames.ContainsKey($importOutcome)) { $importOutcome = $importNames[$importOutcome] }
+    if ($null -ne $script:DeployReport -and $importOutcome -in @('pull-request', 'pending') -and $gitState['pendingNumber']) {
+        # Конфликт подтверждает только GitHub для этого PR. Неизвестный статус оставляет исход ветки или ожидания.
+        try {
+            $pull = Get-GhPull -Gh $gitSetup.Gh -Number ([int]$gitState['pendingNumber'])
+            if ($pull.State -eq 'open' -and $pull.Mergeable -eq $false) {
+                Add-GateOperationLine -Context $script:DeployReport -Text ('Конфликт слияния PR #{0}: {1}' -f $pull.Number, $pull.Url)
+                $importOutcome = 'conflict'
+            }
+        } catch { Add-GateOperationLine -Context $script:DeployReport -Text ('Статус слияния PR не прочитан: ' + $_.Exception.Message) }
+    }
+    Set-DeployReportResult $importOutcome -Text ('{0}. Коммит {1}, прогон {2}, код {3}.' -f $importNote, $script:GitImportLast.commit, $script:GitImportLast.run, $gitCode)
     exit $gitCode
 }
 
@@ -5010,7 +5143,7 @@ function Assert-DeployRecordTarget {
             $sure = Confirm-Ui -Question ("В записи {0} нет идентификатора кластера и базы: её сделал гейт прежней версии. Она относится к {1}\{2}?" -f $Path, $script:Server, $script:ProdBase) -Yes 'Да, к этой базе' -No 'Нет, выйти'
         }
         if ($sure -ne $true) {
-            throw ("В записи {0} нет идентификатора кластера и ИБ, и подтверждения, что она относится к {1}\{2}, нет. Ничего не менял." -f $Path, $script:Server, $script:ProdBase)
+            throw [OperationCanceledException]::new(("В записи {0} нет идентификатора кластера и ИБ, и подтверждения, что она относится к {1}\{2}, нет. Ничего не менял." -f $Path, $script:Server, $script:ProdBase))
         }
         Write-RunLog ("Запись {0} без идентификатора цели: человек подтвердил, что она относится к {1}\{2}" -f $Path, $script:Server, $script:ProdBase)
         return
@@ -5024,6 +5157,8 @@ if ($writeRun) {
     try { $deployGuard = [System.IO.File]::Open((Join-Path $deployRoot 'deploy.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
     catch { throw ("Не получил исключительный доступ к каталогу обновлений {0}. Проверь права и другие запуски deploy." -f $deployRoot) }
 }
+$script:DeployReportDeferred = $true
+$script:DeployReportOutcome = 'cancelled'   # штатная остановка конвейера тоже выполняет finally
 try {
 $prepared = Read-PreparedState
 $deployTarget = $null
@@ -5036,7 +5171,7 @@ if ($writeRun -and (-not $CancelPrepared -or $null -ne $prepared)) {
 
 if ($CancelPrepared) {
     if (-not (Test-UiCanAsk)) { throw 'отмена подготовки только из консоли или ci.exe' }
-    if ($null -eq $prepared) { Write-Line ("Подготовленного обновления {0} нет: отменять нечего." -f $script:ProdBase); exit 0 }
+    if ($null -eq $prepared) { Write-Line ("Подготовленного обновления {0} нет: отменять нечего." -f $script:ProdBase); Set-DeployReportResult 'unchanged'; exit 0 }
     # Отмена грузит копии в конфигурацию без обновления БД: после неполного отката это не восстановление (#10).
     $failedText = Get-PreparedRollbackFailedText $prepared
     if ($failedText) { throw $failedText }
@@ -5044,13 +5179,15 @@ if ($CancelPrepared) {
     Write-Line ("ОТМЕНА ПОДГОТОВКИ {0}" -f $script:ProdBase) 'Cyan'
     Write-Line ("  подготовлено {0}: {1}" -f (Get-JsonValue $prepared 'timeText' '?'), (Get-PreparedText $prepared))
     $sure = Confirm-Ui -Question ("Вернуть расширения {0} к применённым версиям? В конфигурацию рабочей загрузятся резервные копии, снятые до подготовки; база данных, блокировки и сеансы не затрагиваются." -f $script:ProdBase) -Yes 'Да, отменить подготовку' -No 'Нет, выйти'
-    if ($sure -ne $true) { Write-Host 'Выход, ничего не менял.'; exit 0 }
+    if ($sure -ne $true) { Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не менял.'; exit 0 }
     if (Undo-PreparedExtensions -Items @(Get-PreparedItems $prepared)) {
         Remove-Item -LiteralPath $preparedPath -Force
         Write-Line ("ИТОГ: подготовка отменена, расширения {0} - как применены." -f $script:ProdBase) 'Green'
+        Set-DeployReportResult 'preparation-cancelled'
         exit 0
     }
     Write-Line ("ИТОГ: подготовка отменена не полностью (см. выше). {0} оставлен: повтори отмену." -f $preparedPath) 'Red'
+    Set-DeployReportResult 'failed'
     exit 1
 }
 
@@ -5193,6 +5330,7 @@ if (-not $Prepare -and -not $CancelPrepared) {
     $interrupted = Resolve-InterruptedDeploys
     if (($interrupted -gt 0 -or $lockedBefore -gt 0) -and -not $Rollback) {
         Write-Line 'Сначала - разобраться с прерванным обновлением (см. выше). Выход, ничего не менял.' 'Yellow'
+        Set-DeployReportResult 'blocked'
         exit 0
     }
 }
@@ -5246,7 +5384,7 @@ if ($Rollback) {
         }
         $items.Add('Отмена')
         $index = Select-UiOne -Header ("Откат {0}: последние обновления" -f $script:ProdBase) -Items $items.ToArray() -Notes $notes -Danger @(0)
-        if ($index -lt 0 -or $index -eq $items.Count - 1) { Write-Host 'Выход, ничего не откатывал.'; exit 0 }
+        if ($index -lt 0 -or $index -eq $items.Count - 1) { Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не откатывал.'; exit 0 }
         if ($history.Count -eq 0) { continue }
         if ($index -eq 0) { $target = $history[0]; break }
         # Подробно об обновлении - и две кнопки на том же экране: «Откатить» и «Отмена».
@@ -5307,7 +5445,7 @@ if ($Rollback) {
         }
         else { $skippedProcessings += $objName }
     }
-    if ($selected.Count -eq 0 -and $selectedProcessings.Count -eq 0) { Write-Line 'В этом обновлении нет ни расширений, ни обработок с резервной копией: откатывать нечего.' 'Yellow'; exit 0 }
+    if ($selected.Count -eq 0 -and $selectedProcessings.Count -eq 0) { Write-Line 'В этом обновлении нет ни расширений, ни обработок с резервной копией: откатывать нечего.' 'Yellow'; Set-DeployReportResult 'unchanged'; exit 0 }
 
     $returned = @(@($selected | ForEach-Object { $_.Name }) + @($selectedProcessings | Where-Object { $_.Action -eq 'register' } | ForEach-Object { $_.ObjName }))
     $question = "Точно откатить {0} к состоянию до обновления {1}? Вернутся: {2}." -f $script:ProdBase, (Get-DeployLabel $target), ($returned -join ', ')
@@ -5316,7 +5454,7 @@ if ($Rollback) {
     if ($skippedNew.Count -gt 0) { $question += (" Новые в том обновлении ({0}) останутся: удалять их - руками." -f ($skippedNew -join ', ')) }
     if ($skippedProcessings.Count -gt 0) { $question += (" Обработки без резервной копии ({0}) останутся как есть." -f ($skippedProcessings -join ', ')) }
     $sure = Confirm-Ui -Question $question -Yes 'Да, откатить' -No 'Отмена'
-    if ($sure -ne $true) { Write-Host 'Выход, ничего не откатывал.'; exit 0 }
+    if ($sure -ne $true) { Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не откатывал.'; exit 0 }
     $mode = 'rollback'
     $rollbackOf = [string]$target.runId
     $ciLines.Add(("Откат к состоянию до обновления {0} ({1})." -f $target.runId, (Get-DeployLabel $target)))
@@ -5591,7 +5729,7 @@ else {
     }
     if ($StatusOnly) {
         Write-Host ''
-        Write-Host 'Только просмотр (-StatusOnly): ничего не обновляю.'
+        Set-DeployReportResult 'completed' -Show -Text 'Только просмотр (-StatusOnly): ничего не обновляю.'
         exit 0
     }
 
@@ -5683,9 +5821,9 @@ else {
         $modeHeader = ("Подготовка обновления {0}" -f $script:ProdBase)
     }
     $modeIndex = Select-UiOne -Header $modeHeader -Items @($modeMenu | ForEach-Object { $_.Label }) -Notes $modeNotes
-    if ($modeIndex -lt 0 -or $modeMenu[$modeIndex].Key -eq 'exit') { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
+    if ($modeIndex -lt 0 -or $modeMenu[$modeIndex].Key -eq 'exit') { Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не обновлял.'; exit 0 }
     $mode = $modeMenu[$modeIndex].Key
-    if (($mode -eq '1' -or $mode -eq '2') -and $fromTemp.Count -eq 0 -and $processingsPending.Count -eq 0) { Write-Host 'В temp нечего брать: выход, ничего не обновлял.'; exit 0 }
+    if (($mode -eq '1' -or $mode -eq '2') -and $fromTemp.Count -eq 0 -and $processingsPending.Count -eq 0) { Write-Host 'В temp нечего брать: выход, ничего не обновлял.'; Set-DeployReportResult 'unchanged' -Text 'В temp нечего брать.'; exit 0 }
     }
 
     $selected = @()
@@ -5707,7 +5845,7 @@ else {
         for ($i = 0; $i -lt $asisCandidates.Count; $i++) { if ($asisCandidates[$i].ProdChanged -gt 0) { $preselected += $i } }
         if ($preselected.Count -eq 0) { $preselected = @(0..($asisCandidates.Count - 1)) }
         $picked = Select-UiMany -Header 'Каким расширениям обновить конфигурацию БД' -Items $labels -Preselected $preselected
-        if ($null -eq $picked) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
+        if ($null -eq $picked) { Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не обновлял.'; exit 0 }
         $selected = @($picked | Sort-Object | ForEach-Object { $asisCandidates[$_] })
     }
     else {
@@ -5717,7 +5855,7 @@ else {
         if ($choices.Count -eq 0) { $choices = @($fromTemp); $header = ("Необновлённых нет. Какие расширения загрузить из {0} в {1} заново" -f $script:TempBase, $script:ProdBase) }
         $labels = @($choices | ForEach-Object { '{0}  {1}' -f $_.Name, $_.Text })
         $picked = Select-UiMany -Header $header -Items $labels
-        if ($null -eq $picked) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
+        if ($null -eq $picked) { Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не обновлял.'; exit 0 }
         $selected = @($picked | Sort-Object | ForEach-Object { $choices[$_] })
     }
 
@@ -5739,7 +5877,7 @@ else {
         if (@($procPicked).Count -eq 0) { Write-Line '  внешние обработки: не отмечено ни одной - не трогаю' }
         $selectedProcessings = @($procPicked | Sort-Object | ForEach-Object { $processingsPending[$_] })
     }
-    if ($selected.Count -eq 0 -and $selectedProcessings.Count -eq 0 -and $mode -ne 'actions') { Write-Host 'Ничего не выбрано: выход, ничего не обновлял.'; exit 0 }
+    if ($selected.Count -eq 0 -and $selectedProcessings.Count -eq 0 -and $mode -ne 'actions') { Set-DeployReportResult 'cancelled' -Show -Text 'Ничего не выбрано: выход, ничего не обновлял.'; exit 0 }
     if ($selectedProcessings.Count) {
         $hasVendor = @($selectedProcessings | Where-Object { $vendorProcessings -contains $_.ObjName }).Count -gt 0
         Update-SelfCheckEpf -RequireCurrent:$hasVendor
@@ -5869,7 +6007,7 @@ else {
         $question = "Обновить {0}, хотя {1}? Красное из гейта попадёт в отчёт с пометкой «проверить работоспособность»." -f $script:ProdBase, ($gateRisks -join '; ')
         if ($Prepare) { $question = "Готовить обновление {0}, хотя {1}? Новые версии загрузятся в конфигурацию рабочей (без применения)." -f $script:ProdBase, ($gateRisks -join '; ') }
         $sure = Confirm-Ui -Question $question -Yes 'Да, обновлять' -No 'Нет, выйти'
-        if ($sure -ne $true) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
+        if ($sure -ne $true) { Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не обновлял.'; exit 0 }
         $riskAccepted = $true
         Write-RunLog ('Обновление несмотря на: ' + ($gateRisks -join '; '))
         Write-Line ("  Обновляю, несмотря на: {0}" -f ($gateRisks -join '; ')) 'Yellow'
@@ -5878,11 +6016,11 @@ else {
         if ($gateRed) {
             for ($attempt = 1; $attempt -le 3 -and -not $riskReason; $attempt++) {
                 $typedReason = Read-UiText -Prompt 'Причина выпуска с красным гейтом (одной строкой, попадёт в отчёт)' -CancelAsNull
-                if ($null -eq $typedReason) { Write-Host 'Выход, ничего не обновлял.'; exit 0 }
+                if ($null -eq $typedReason) { Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не обновлял.'; exit 0 }
                 $riskReason = ([string]$typedReason).Trim()
                 if (-not $riskReason) { Write-Line '  Без причины красный комплект не выпускаю: напиши её одной строкой (Esc - выйти).' 'Yellow' }
             }
-            if (-not $riskReason) { Write-Host 'Причина не указана - выход, ничего не обновлял.'; exit 0 }
+            if (-not $riskReason) { Set-DeployReportResult 'cancelled' -Show -Text 'Причина не указана - выход, ничего не обновлял.'; exit 0 }
             Write-RunLog ('Причина выпуска с красным гейтом: ' + $riskReason)
             Write-Line ("  Причина: {0}" -f $riskReason) 'Yellow'
             $ciLines.Add(("Выпуск с красным гейтом, причина: {0}." -f $riskReason))
@@ -6043,7 +6181,7 @@ if (-not $Prepare) {
         $finishAt = (Get-Date).AddSeconds($forecastSeconds)
         if ($finishAt -gt $windowEnd) {
             $goOn = Confirm-Ui -Question ("По прогнозу обновление займёт ~{0} мин и закончится около {1:HH:mm}, а окно обновления - до {2:HH:mm}. Начинать?" -f [Math]::Ceiling($forecastSeconds / 60), $finishAt, $windowEnd) -Yes 'Да, начинать' -No 'Нет, выйти'
-            if ($goOn -ne $true) { Write-Host 'Выход, в рабочую ничего не записано.'; exit 0 }
+            if ($goOn -ne $true) { Set-DeployReportResult 'cancelled' -Show -Text 'Выход, в рабочую ничего не записано.'; exit 0 }
             Write-RunLog ("Начато, хотя прогноз выходит за окно: до {0:HH:mm}, окно до {1:HH:mm}" -f $finishAt, $windowEnd)
         }
     }
@@ -6062,8 +6200,10 @@ if ($needExclusive) {
     $prepTarget = Get-BaseInfo -Link $prepLink -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
     try {
         # Запись прошла, а чтение-подтверждение упало: JobsSet уже true - в locks.json это должно попасть и так.
+        $script:DeployJobsReport = 'снятие не подтверждено'
         try { $jobsLocked = Set-GateJobsLock $script:ProdLockState $prepTarget { param($t) Read-BaseInfoAgain $t $script:ProdBase } }
         finally { Save-ProdLockFile }
+        if (-not $jobsLocked) { $script:DeployJobsReport = 'стоял до обновления, оставлен' }
         if ($jobsLocked) {
             Write-Line '  поставил блокировку регламентных заданий на время обновления; в конце сниму' 'Green'
         }
@@ -6088,7 +6228,7 @@ if ($needExclusive) {
             if (@($now | Where-Object { $_.IsError }).Count -eq 0 -and @($now | Where-Object { $_.IsDesigner }).Count -eq 0) { return 'closed' }
             return ''
         }
-        if ($answer -eq '2') { throw ("открыт конфигуратор {0}, отмена по ответу" -f $script:ProdBase) }
+        if ($answer -eq '2') { throw [OperationCanceledException]::new(("открыт конфигуратор {0}, отмена по ответу" -f $script:ProdBase)) }
         if ($answer -eq '1') {
             foreach ($line in @(Stop-BaseSessions -Link $prepLink -BaseName $script:ProdBase -Designers)) { Write-Line ('  ' + $line) }
             $left = @()
@@ -6116,7 +6256,7 @@ if ($needExclusive) {
             if (@($now | Where-Object { $_.IsError }).Count -eq 0 -and @($now | Where-Object { $_.IsDesigner }).Count -eq 0) { return 'closed' }
             return ''
         }
-        if ($answer -eq '2') { throw ("открыт конфигуратор {0}, отмена по ответу" -f $script:TempBase) }
+        if ($answer -eq '2') { throw [OperationCanceledException]::new(("открыт конфигуратор {0}, отмена по ответу" -f $script:TempBase)) }
         if ($answer -eq '1') {
             foreach ($line in @(Stop-BaseSessions -Link $prepLink -BaseName $script:TempBase -Designers)) { Write-Line ('  ' + $line) }
             $left = @()
@@ -6148,6 +6288,7 @@ if ($needExclusive) {
                 ($null -ne $infoBase.DeniedTo -and ([datetime]$infoBase.DeniedTo).Year -ge 1900 -and [datetime]$infoBase.DeniedTo -lt $now)) {
                 throw 'в свойствах уже стоит блокировка начала сеансов с другим периодом, оставляю её расписание'
             }
+            $script:DeploySessionsReport = 'стояла до обновления, оставлена'
             Write-Line '  блокировка начала сеансов уже стоит (код тот же), оставляю её'
             $script:SessionLockKept = $true
             if ($null -ne $StartAt) {
@@ -6168,6 +6309,7 @@ if ($needExclusive) {
         else {
             $message = "Обновление программы: в {0} база закрывается (не дольше чем до {1}). Сохраните работу и выйдите из программы до {0}." -f $start.ToString('HH:mm'), $until.ToString('HH:mm')
         }
+        $script:DeploySessionsReport = 'снятие не подтверждено'
         try { Set-GateSessionLock $script:ProdLockState $Target $from $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:ProdBase } }
         finally { Save-ProdLockFile }
         if ($null -eq $StartAt) {
@@ -6216,7 +6358,7 @@ if ($needExclusive) {
             }
             return ''
         }
-        if ($answer -eq '2') { throw ("в {0} есть сеансы, выход по ответу" -f $script:ProdBase) }
+        if ($answer -eq '2') { throw [OperationCanceledException]::new(("в {0} есть сеансы, выход по ответу" -f $script:ProdBase)) }
         if ($answer -eq 'empty') { Write-Line '  сеансы закончились сами' 'Green'; Set-ProdSessionLock $prepTarget }
         if ($answer -eq '3') {
             Set-ProdSessionLock $prepTarget
@@ -6480,13 +6622,18 @@ if ($Prepare) {
             else { Write-Line ("ИТОГ: подготовка не закончена. В конфигурации {0} остались загруженные, не применённые версии: «Отменить подготовку рабочей» или «Подготовить обновление рабочей» заново." -f $script:ProdBase) 'Red' }
         }
         else { Write-Line ("ИТОГ: подготовка не прошла, в конфигурации {0} ничего не изменено." -f $script:ProdBase) 'Red' }
+        Set-DeployReportResult 'failed'
         exit 1
     }
     Save-PreparedState -Entries $selected -Partial $false -TempStates $tempStates -GateRun $preparedGate -ReadProd ([bool]$prodStates.Ok)
+    foreach ($entry in $selected) {
+        Add-GateOperationLine -Context $script:DeployReport -Text ('Подготовлено {0}: {1} → {2} (ещё не применено).' -f $entry.Name, $entry.ProdVersion, $entry.TempVersion)
+    }
     Write-Line ("ИТОГ: подготовлено. В конфигурацию {0} загружены, но не применены: {1}." -f $script:ProdBase, (@($selected | ForEach-Object { $_.Name }) -join ', ')) 'Green'
     Write-Line '  Пользователи работают на прежних версиях. Дальше - «Обновить рабочую подготовленным» (в разрешённые часы) или «Отменить подготовку».'
     Write-Line ("  До обновления не нажимать «Обновить конфигурацию базы данных» в конфигураторе {0}: подготовленное применится сразу." -f $script:ProdBase) 'Yellow'
     Write-Line ("  Резервные копии: {0}" -f $beforeDir)
+    Set-DeployReportResult 'prepared'
     exit 0
 }
 # Конфигурация БД обновляется после загрузки всех расширений.
@@ -6687,6 +6834,7 @@ if ($failed) {
         while ($null -eq $rollbackNow) {
             $rollbackNow = Confirm-Ui -Question 'Откатить? (к резервным копиям, а при «как есть» - к прежней выгрузке рабочей; Нет - оставить как есть)' -Yes 'Откатить' -No 'Оставить' -DangerYes
         }
+        Add-GateOperationLine -Context $script:DeployReport -Text $(if ($rollbackNow) { 'Решение: откатить.' } else { 'Решение: оставить.' })
         if ($rollbackNow) {
             if (Invoke-ProdRollback) { $outcome = 'rolledBack' } else { $outcome = 'rollbackFailed' }
         }
@@ -6793,6 +6941,9 @@ if ($outcome -eq 'updated') {
         elseif ($result.ExitCode -eq 0) { Add-Light 'WARN' 'Проверка применимости' ("замечаний {0} (код 0), первое: {1}" -f $applyLines.Count, ($applyLines | Select-Object -First 1)) }
         elseif ($result.ExitCode -eq 101) { Add-Light 'WARN' 'Проверка применимости' ("замечаний {0}, первое: {1}" -f $applyLines.Count, ($applyLines | Select-Object -First 1)) }
         else { Add-Light 'FAIL' 'Проверка применимости' ("не выполнилась: {0}" -f $result.Text) }
+        if ($null -ne $script:DeployReport -and $applyLines.Count -gt 0) {
+            Add-GateOperationLine -Context $script:DeployReport -Text ("Журнал проверки применимости:`n" + ($applyLines -join "`n"))
+        }
 
         # Канареечный вход: применились ли расширения в сеансе.
         if (Test-Path -LiteralPath $canaryEpf) {
@@ -6866,6 +7017,10 @@ if ($outcome -eq 'updated') {
             }
             if ($null -ne $current) { $selfCheckErrors.Add($current) }
             $counts = "заданий без ошибок {0}, ошибок {1}, предупреждений {2}, пропущено {3}" -f (Get-Setting $resultTable 'ok' '?'), (Get-Setting $resultTable 'errors' '?'), (Get-Setting $resultTable 'warnings' '?'), (Get-Setting $resultTable 'skipped' '?')
+            if ($null -ne $script:DeployReport) {
+                Add-GateOperationLine -Context $script:DeployReport -Text ('Самопроверка на чтение: ' + $counts)
+                foreach ($message in $selfCheckErrors) { Add-GateOperationLine -Context $script:DeployReport -Text ('ОШИБКА: ' + $message) }
+            }
             if (-not $client.Done) { Add-Light 'FAIL' 'Самопроверка на чтение' ("не закончилась за {0} мин; журнал - selfcheck.journal.txt" -f $prodSelfCheckTimeoutMin) }
             elseif ($state -eq 'refused') { Add-Light 'FAIL' 'Самопроверка на чтение' ("обработка отказалась: {0}. Нужна сборка с режимом «только чтение» для рабочей базы" -f (Get-Setting $resultTable 'message' '')) }
             elseif ($state -ne 'done') { Add-Light 'FAIL' 'Самопроверка на чтение' ("итог {0}: {1}" -f $state, (Get-Setting $resultTable 'message' '')) }
@@ -6907,6 +7062,7 @@ if ($outcome -eq 'updated') {
                 Write-RunLog ("Ответа на «оставить или откатить» нет {0} мин: обновление оставлено" -f $deployKeepTimeoutMin)
             }
         }
+        Add-GateOperationLine -Context $script:DeployReport -Text $(if ($keepUpdate) { 'Решение: оставить.' } else { 'Решение: откатить.' })
         if (-not $keepUpdate) {
             if (Invoke-ProdRollback) { $outcome = 'rolledBack' } else { $outcome = 'rollbackFailed' }
         }
@@ -6988,6 +7144,9 @@ foreach ($entry in $selected) {
         continue
     }
     $newVersion = Get-ExtensionVersion $entry.NewDir
+    if ($mode -eq 'asis' -and $null -ne $script:DeployReport) {
+        Add-GateOperationLine -Context $script:DeployReport -Text ('По выгрузкам {0}: {1} → {2}' -f $entry.Name, (Get-NonEmpty $oldVersion '?'), (Get-NonEmpty $newVersion '?'))
+    }
     if (-not $entry.OldDir) {
         [void]$html.Append(('<p>Версия {0}. Прежней выгрузки рабочей нет: с чем сравнить, неизвестно, ниже - всё расширение как новое.</p>' -f (ConvertTo-Html $newVersion)))
     }
@@ -7186,6 +7345,19 @@ $recordProcessings = @(foreach ($proc in $touchedProcessings) {
         [ordered]@{ name = $proc.ObjName; title = $proc.Title; fileName = $proc.FileName; action = $proc.Action; isNew = $proc.IsNew; ref = $proc.Ref
             oldVersion = $proc.OldVersion; newVersion = $proc.NewVersion; backup = $backupRelative; file = $fileRelative; status = $procStatus; problems = @($proc.Problems) }
     })
+if ($null -ne $script:DeployReport) {
+    Add-GateOperationLine -Context $script:DeployReport -Text ($summary -join "`n")
+    if ($outcome -notin @('updated', 'actionsFailed')) {
+        Add-GateOperationLine -Context $script:DeployReport -Text 'Версии ниже — до операции и в выбранном комплекте. Что удалось вернуть, указано в результатах отката.'
+    }
+    foreach ($item in $recordExtensions) {
+        Add-GateOperationLine -Context $script:DeployReport -Text ('Расширение {0}: {1} → {2} ({3})' -f $item.name, (Get-NonEmpty $item.oldVersion '?'), (Get-NonEmpty $item.newVersion '?'), $item.status)
+    }
+    foreach ($item in $recordProcessings) {
+        Add-GateOperationLine -Context $script:DeployReport -Text ('Обработка {0}: {1} → {2} ({3}, {4})' -f $item.name, (Get-NonEmpty $item.oldVersion '?'), (Get-NonEmpty $item.newVersion '?'), $item.action, $item.status)
+    }
+    foreach ($message in $script:RollbackResults) { Add-GateOperationLine -Context $script:DeployReport -Text $message }
+}
 $recordGate = $null
 if ($null -ne $lastRun) {
     # ** Хлебников С.Ю. 20261120 Связь «вход - прогон - установка»: откуда комплект (полный коммит), что проверено, что выпущено.
@@ -7233,6 +7405,7 @@ $statLines = @(Get-StatRunLines)
 if ($statLines.Count -gt 0) {
     Write-Host ''
     Write-Host 'Длительность шагов, факт и план:'
+    Add-GateOperationLine -Context $script:DeployReport -Text ("Длительность шагов, факт и план:`n" + ($statLines -join "`n"))
     foreach ($line in $statLines) { Write-Host $line -ForegroundColor DarkGray }
 }
 Write-Line ("ИТОГ: {0}. Резервные копии: {1}" -f $outcomeNames[$outcome], $beforeDir) $finalColor
@@ -7249,6 +7422,7 @@ if ($null -ne $plainLogin -and $plainLogin.Status -eq 'FAIL') {
 if ($riskAccepted -and $outcome -eq 'updated') {
     Write-Line ("ПРОВЕРИТЬ РАБОТОСПОСОБНОСТЬ: обновлено, хотя {0}." -f ($gateRisks -join '; ')) 'Red'
     if ($riskReason) { Write-Line ("  причина выпуска: {0}" -f $riskReason) 'Red' }
+    if ($null -ne $script:DeployReport) { Add-GateOperationLine -Context $script:DeployReport -Text ($gateRedItems -join "`n") }
     foreach ($item in @($gateRedItems | Select-Object -First 15)) { Write-Line ("  [КРАСН] {0}" -f $item) 'Red' }
 }
 
@@ -7294,6 +7468,18 @@ if ($mode -eq 'rollback' -and $outcome -eq 'updated') {
         if ($UiChannel) { & (Join-Path $Root 'run.ps1') -Kit $kitDir -UiChannel $UiChannel @childConfig } else { & (Join-Path $Root 'run.ps1') -Kit $kitDir @childConfig }
     }
 }
+$releaseOutcome = switch ($outcome) {
+    'updated' {
+        if (@($light | Where-Object { $_.Status -eq 'FAIL' }).Count -gt 0) { 'kept-after-failed-checks' }
+        elseif ($Rollback) { 'rolled-back' }
+        else { 'updated' }
+    }
+    'rolledBack' { 'rolled-back' }
+    'rollbackFailed' { 'rollback-failed' }
+    'actionsFailed' { 'actions-failed' }
+    default { 'failed' }
+}
+Set-DeployReportResult $releaseOutcome
 if ($outcome -eq 'updated') { exit 0 }
 exit 1
 
@@ -7305,4 +7491,12 @@ finally {
 
 #endregion
 }
-finally { if ($null -ne $deployGuard) { $deployGuard.Dispose() } }
+catch {
+    # Причину запишет trap после последней попытки снять свои блокировки.
+    $script:DeployReportOutcome = ''
+    throw
+}
+finally {
+    if ($null -ne $deployGuard) { $deployGuard.Dispose() }
+    if ($script:DeployReportOutcome) { Complete-DeployReport $script:DeployReportOutcome }
+}
