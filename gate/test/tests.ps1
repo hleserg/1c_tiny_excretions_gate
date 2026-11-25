@@ -547,22 +547,22 @@ $script:ProdTargetId = '[["fake",1541,""],"erp_base","","[\"MSSQLServer\",\"fixt
 
 function New-InterruptedLockCom {
     # Рабочая после обрыва deploy: стоит блокировка начала сеансов с кодом по умолчанию и запрет регламентных.
-    param([string]$Message)
+    param([string]$Message, [string]$Until = '2026-11-18T01:00:00')
     $com = New-ComState -ProdJobsDenied $true
     $prod = $com.bases.erp_base
     $prod.sessionsDenied = $true; $prod.permissionCode = '0'; $prod.deniedMessage = $Message
-    $prod.deniedFrom = '2026-11-17T22:30:00'; $prod.deniedTo = '2026-11-18T01:00:00'
+    $prod.deniedFrom = '2026-11-17T22:30:00'; $prod.deniedTo = $Until
     return $com
 }
 
 function Write-InterruptedLockFile {
     # locks.json запуска 20261117-230000, чей процесс уже не живёт: до него запрета не было.
-    param([string]$Sandbox, [string]$Marker, [bool]$JobsSet, [string]$Target = $script:ProdTargetId)
+    param([string]$Sandbox, [string]$Marker, [bool]$JobsSet, [string]$Target = $script:ProdTargetId, [string]$Until = '2026-11-18T01:00:00.0000000')
     $dir = Join-Path $Sandbox 'deploy\20261117-230000'
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     $record = @{ base = 'erp_base'; target = $Target; pid = 999999; processStart = '2026-11-17T23:00:00'; marker = $Marker; jobsSet = $JobsSet
         before = @{ SessionsDenied = $false; PermissionCode = ''; DeniedMessage = ''; DeniedFrom = $null; DeniedTo = $null }
-        expected = @(@{ SessionsDenied = $true; PermissionCode = '0'; DeniedMessage = ('Обновление [{0}]' -f $Marker); DeniedFrom = '2026-11-17T22:30:00.0000000'; DeniedTo = '2026-11-18T01:00:00.0000000' }) }
+        expected = @(@{ SessionsDenied = $true; PermissionCode = '0'; DeniedMessage = ('Обновление [{0}]' -f $Marker); DeniedFrom = '2026-11-17T22:30:00.0000000'; DeniedTo = $Until }) }
     [System.IO.File]::WriteAllText((Join-Path $dir 'locks.json'), (ConvertTo-Json -InputObject $record -Depth 6), $utf8)
 }
 
@@ -2237,14 +2237,8 @@ $tests = @(
                 $fromSec = [int]([regex]::Match($lock[0], 'deniedFromSec=(-?\d+)').Groups[1].Value)
                 Check ($fromSec -gt 0) ("блокировка начала сеансов не с будущего времени: начало через {0} с" -f $fromSec)
                 Check ($lock[0] -match 'message=.*15 мин') 'в предупреждении отсутствует введённая длительность'
+                Check ($lock[0] -match 'deniedTo=0100-01-01T00:00:00 ') 'блокировка должна действовать до снятия гейтом'
                 Check ($lock[0] -match 'message=.*Сохраните работу') ("в блокировке нет предупреждения пользователям: {0}" -f $lock[0])
-            }
-            $period = [regex]::Match(($r.Output -join "`n"), 'поставил блокировку начала сеансов с (\d{2}:\d{2}) до (\d{2}:\d{2})')
-            Check $period.Success 'в журнале нет начала и конца блокировки'
-            if ($period.Success) {
-                $startTime = [timespan]::Parse($period.Groups[1].Value)
-                $endTime = [timespan]::Parse($period.Groups[2].Value)
-                Check ((($endTime - $startTime).TotalMinutes + 1440) % 1440 -eq 180) 'оценка 15 минут изменила технический срок блокировки'
             }
             Check (@($r.Questions | Where-Object { $_ -match 'Пользователи erp_base предупреждены' }).Count -eq 1) 'не было ожидания закрытия базы'
             Check (@($r.ComLog | Where-Object { $_ -match 'TerminateSession 5$' }).Count -eq 1) 'сеанс рабочей не завершён после предупреждения'
@@ -2663,8 +2657,8 @@ $tests = @(
         Run = {
             param($Name)
             $sb = New-Sandbox $Name -Config $deployConfig
-            $com = New-InterruptedLockCom -Message 'Обновление [abc123]'
-            Write-InterruptedLockFile $sb -Marker 'abc123' -JobsSet $true
+            $com = New-InterruptedLockCom -Message 'Обновление [abc123]' -Until '0100-01-01T00:00:00'
+            Write-InterruptedLockFile $sb -Marker 'abc123' -JobsSet $true -Until '0100-01-01T00:00:00'
             $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @(
                 @{ Kind = 'confirm'; Header = 'оставленные прерванным обновлением'; Yes = $true })
             Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)

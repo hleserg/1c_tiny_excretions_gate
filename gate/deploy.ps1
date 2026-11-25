@@ -6311,7 +6311,8 @@ if ($needExclusive) {
             $script:WarnDurationMinutes = $minutes
             $start = (Get-Date).AddSeconds($deployWarnMinutes * 60)
         }
-        $until = $start.AddHours($sessionLockHours)
+        # Пустая дата окончания в COM-интерфейсе кластера 1С означает, что кластер держит запрет до снятия гейтом.
+        $until = if ($Warn) { [datetime]::new(100, 1, 1) } else { $start.AddHours($sessionLockHours) }
         $from = $start
         if (-not $Warn) {
             $from = $start.AddMinutes(-30)
@@ -6330,7 +6331,7 @@ if ($needExclusive) {
         }
         $script:WarnLockAt = $start
         $script:WarnLockUntil = $until
-        Write-Line ("  поставил блокировку начала сеансов с {0} до {1}: пользователи видят предупреждение, в {0} их программы закроются сами; сниму в конце" -f $start.ToString('HH:mm'), $until.ToString('HH:mm')) 'Green'
+        Write-Line ("  поставил блокировку начала сеансов с {0} до завершения обновления. Пользователи предупреждены. Плановая длительность {1} мин." -f $start.ToString('HH:mm'), $script:WarnDurationMinutes) 'Green'
         Write-Line '  пока они сохраняются - выгрузки и резервные копии; загрузка в рабочую - после закрытия'
         Write-RunLog ("Предупреждение пользователей: блокировка начала сеансов с {0}, плановая длительность {1} мин" -f $start.ToString('HH:mm:ss'), $script:WarnDurationMinutes)
     }

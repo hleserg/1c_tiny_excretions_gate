@@ -187,7 +187,7 @@ function New-FakeComProcess {
         $base | Add-Member -NotePropertyName deniedFrom -NotePropertyValue $fromText -Force
         $base | Add-Member -NotePropertyName deniedTo -NotePropertyValue $toText -Force
         Save-FakeComState $this.StateFile $state
-        Write-FakeComLog $this.StateFile ("UpdateInfoBase {0} scheduledJobsDenied={1} sessionsDenied={2} deniedFromSec={3} message={4}" -f $InfoBase.Name, [int][bool]$InfoBase.ScheduledJobsDenied, [int][bool]$InfoBase.SessionsDenied, $fromSec, [string]$InfoBase.DeniedMessage)
+        Write-FakeComLog $this.StateFile ("UpdateInfoBase {0} scheduledJobsDenied={1} sessionsDenied={2} deniedFromSec={3} deniedTo={5} message={4}" -f $InfoBase.Name, [int][bool]$InfoBase.ScheduledJobsDenied, [int][bool]$InfoBase.SessionsDenied, $fromSec, [string]$InfoBase.DeniedMessage, $toText)
     }
     return $process
 }
