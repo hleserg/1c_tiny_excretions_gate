@@ -6104,7 +6104,7 @@ Write-RunLog ('Сводка перед подтверждением: ' + ($confi
 Write-Host ("  Это рабочая база. Чтобы продолжить, набери её имя ({0}) и Enter:" -f $script:ProdBase) -ForegroundColor Yellow
 $typedName = Read-UiText -Prompt ("Это рабочая база. Чтобы продолжить, набери её имя ({0})" -f $script:ProdBase) -CancelAsNull
 if ([string]::IsNullOrWhiteSpace($typedName)) { Write-DeployCancellation 'ConfirmBase'; exit 0 } # ** Хлебников С.Ю. 20261124
-if ($typedName -cne $script:ProdBase) { throw [OperationCanceledException]::new('имя базы набрано не так: обновление отменено') }
+if ($typedName -cne $script:ProdBase) { throw 'имя базы набрано не так: обновление отменено' }
 Write-RunLog 'Подтверждено именем базы'
 # ** Хлебников С.Ю. 20261120 Пока ждали ввода имени, могло наступить запретное время: сверка ещё раз перед первой записью.
 if ((Test-DeployHourDenied (Get-Date)) -and -not $Prepare) { throw ("пока ждал подтверждения, наступило {0} - обновлять рабочую в это время запрещено (DeployDeniedFrom/To): рабочую базу обновляем только {1}. В рабочую ничего не записано" -f (Get-Date -Format 'HH:mm'), (Get-DeployWindowText)) }
