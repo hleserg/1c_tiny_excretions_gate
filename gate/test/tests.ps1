@@ -4403,7 +4403,7 @@ $tests = @(
             Check ($save.ExitCode -eq 0 -and $cards -ne $base) 'явная выгрузка пропустила переименование карточки'
             $same = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport -GitUnattended' -Fake @{dumps=$dumps} -Com $com
             Check ($same.ExitCode -eq 0 -and ($same.Output -match 'загружать нечего')) 'снимок карточек остановил импорт'
-            $module = 'extensions/Адаптация/CommonModules/АГБ_Общий/Ext/Module.bsl'
+            $module = 'extensions/Доработки/CommonModules/Д/Ext/Module.bsl'
             $changes = @(
                 [pscustomobject]@{Path=$module; Bytes=$utf8.GetBytes('Изменённый модуль')},
                 [pscustomobject]@{Path='actions/test.bsl'; Bytes=$utf8.GetBytes('Действие')},
