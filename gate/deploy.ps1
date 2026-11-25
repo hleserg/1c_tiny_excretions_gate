@@ -694,7 +694,7 @@ function Wait-ProdWarnLock {
         }
         if ((Get-Date) -lt $lockAt) {
             $until = [datetime]$script:WarnLockUntil
-            $message = "Идёт обновление расширений, база заблокирована до {0}" -f $until.ToString('HH:mm')
+            $message = "Идёт обновление. Плановая длительность блокировки — {0} мин." -f $script:WarnDurationMinutes
             $script:DeploySessionsReport = 'снятие не подтверждено'
             try { Set-GateSessionLock $script:ProdLockState $target ((Get-Date).AddMinutes(-30)) $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:ProdBase } }
             finally { Save-ProdLockFile }
@@ -1146,6 +1146,7 @@ $deployWarnMinutes = [double](Get-Setting $cfg 'DeployWarnMinutes' 10)
 if ($deployWarnMinutes -lt 0) { $deployWarnMinutes = 0 }
 $script:WarnLockAt = $null
 $script:WarnLockUntil = $null
+$script:WarnDurationMinutes = 0
 # ** Хлебников С.Ю. 20261120 Закрыть базу (-CloseBase): за сколько минут до закрытия предупреждать пользователей.
 # 0 - варианта с предупреждением нет, только «закрыть сейчас».
 $closeWarnMinutes = [double](Get-Setting $cfg 'CloseWarnMinutes' 10)
@@ -6271,11 +6272,11 @@ if ($needExclusive) {
     }
 
     function Set-ProdSessionLock {
-        # Блокировка начала сеансов рабочей. StartAt - начало в будущем (предупреждение пользователям): до него
+        # Блокировка начала сеансов рабочей. С Warn - начало в будущем (предупреждение пользователям): до него
         # сеансы пускаются, клиенты БСП раз в минуту видят блокировку, показывают предупреждение со временем
-        # и в это время закрываются сами; оставшихся перед загрузкой завершает Wait-ProdWarnLock. Без StartAt -
+        # и в это время закрываются сами; оставшихся перед загрузкой завершает Wait-ProdWarnLock. Без предупреждения -
         # сразу (начало на 30 минут назад: часы сервера и этой машины могут расходиться).
-        param($Target, $StartAt = $null)
+        param($Target, [switch]$Warn)
         if ($null -eq $Target) { Write-Line '  блокировку начала сеансов поставить не смог (нет входа в свойства базы): сеансы могут вернуться' 'Yellow'; return }
         $infoBase = Read-BaseInfoAgain $Target $script:ProdBase
         if ([bool]$infoBase.SessionsDenied) {
@@ -6291,7 +6292,7 @@ if ($needExclusive) {
             $script:DeploySessionsReport = 'стояла до обновления, оставлена'
             Write-Line '  блокировка начала сеансов уже стоит (код тот же), оставляю её'
             $script:SessionLockKept = $true
-            if ($null -ne $StartAt) {
+            if ($Warn) {
                 Write-Line '  предупреждать не буду: блокировка уже стоит; оставшиеся сеансы завершу перед загрузкой'
                 $script:WarnLockAt = Get-Date
             }
@@ -6299,20 +6300,30 @@ if ($needExclusive) {
         }
         if ([string]::IsNullOrEmpty($script:UnlockCode)) { $script:UnlockCode = '123'; Write-Line '  UnlockCode пустой: на этот запуск взят код разрешения входа по умолчанию. Задай свой: Настройки, Базы, UnlockCode.' }
         $start = Get-Date
-        if ($null -ne $StartAt) { $start = [datetime]$StartAt }
+        if ($Warn) {
+            do {
+                $typed = Read-UiText -Prompt 'На сколько минут планируется закрыть базу? Этот срок увидят пользователи' -Default ([string]($sessionLockHours * 60)) -CancelAsNull
+                if ($null -eq $typed) { throw [OperationCanceledException]::new('Предупреждение отменено до отправки.') }
+                $minutes = 0
+                if ([int]::TryParse($typed, [ref]$minutes) -and $minutes -gt 0) { break }
+                Write-Line 'Введите целое число минут больше нуля.' 'Yellow'
+            } while ($true)
+            $script:WarnDurationMinutes = $minutes
+            $start = (Get-Date).AddSeconds($deployWarnMinutes * 60)
+        }
         $until = $start.AddHours($sessionLockHours)
         $from = $start
-        if ($null -eq $StartAt) {
+        if (-not $Warn) {
             $from = $start.AddMinutes(-30)
             $message = "Идёт обновление расширений, база заблокирована до {0}" -f $until.ToString('HH:mm')
         }
         else {
-            $message = "Обновление программы: в {0} база закрывается (не дольше чем до {1}). Сохраните работу и выйдите из программы до {0}." -f $start.ToString('HH:mm'), $until.ToString('HH:mm')
+            $message = "В {0} база закроется для обновления ориентировочно на {1} мин. Сохраните работу и выйдите из программы до {0}." -f $start.ToString('HH:mm'), $script:WarnDurationMinutes
         }
         $script:DeploySessionsReport = 'снятие не подтверждено'
         try { Set-GateSessionLock $script:ProdLockState $Target $from $until $script:UnlockCode $message { param($t) Read-BaseInfoAgain $t $script:ProdBase } }
         finally { Save-ProdLockFile }
-        if ($null -eq $StartAt) {
+        if (-not $Warn) {
             $script:ProdClosedAt = Get-Date
             Write-Line ("  поставил блокировку начала сеансов до {0}; сниму в конце" -f $until.ToString('HH:mm')) 'Green'
             return
@@ -6321,7 +6332,7 @@ if ($needExclusive) {
         $script:WarnLockUntil = $until
         Write-Line ("  поставил блокировку начала сеансов с {0} до {1}: пользователи видят предупреждение, в {0} их программы закроются сами; сниму в конце" -f $start.ToString('HH:mm'), $until.ToString('HH:mm')) 'Green'
         Write-Line '  пока они сохраняются - выгрузки и резервные копии; загрузка в рабочую - после закрытия'
-        Write-RunLog ("Предупреждение пользователей: блокировка начала сеансов с {0}" -f $start.ToString('HH:mm:ss'))
+        Write-RunLog ("Предупреждение пользователей: блокировка начала сеансов с {0}, плановая длительность {1} мин" -f $start.ToString('HH:mm:ss'), $script:WarnDurationMinutes)
     }
 
     # Другие сеансы рабочей базы. Обновлению БД нужен монопольный доступ.
@@ -6369,7 +6380,7 @@ if ($needExclusive) {
                 Write-Line '  предупредить пользователей не могу (нет входа в свойства базы): оставшиеся сеансы завершу перед загрузкой' 'Yellow'
                 $script:WarnLockAt = Get-Date
             }
-            else { Set-ProdSessionLock $prepTarget -StartAt ((Get-Date).AddSeconds($deployWarnMinutes * 60)) }
+            else { Set-ProdSessionLock $prepTarget -Warn }
         }
         if ($answer -eq '1') { Write-Line '  продолжаю с сеансами в базе' }
     }
