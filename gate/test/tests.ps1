@@ -2218,6 +2218,7 @@ $tests = @(
             param($Name)
             $config = $deployConfig.Clone()
             $config['DeployWarnMinutes'] = 0.1
+            $config['SessionLockHours'] = 3
             $sb = New-Sandbox $Name -Config $config
             $com = New-ComState -Sessions @(@{ id = 5; base = 'erp_base'; app = '1CV8C'; user = 'Пользователь'; host = 'pc1' }, @{ id = 6; base = 'erp_temp_test'; app = '1CV8C'; user = 'Тест'; host = 'pc2' })
             $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @(
@@ -2225,6 +2226,8 @@ $tests = @(
                 @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
                 $deployRiskAnswer, $deployNameAnswer,
                 @{ Kind = 'one'; Header = 'В erp_base есть сеансы'; Item = '^Предупредить пользователей' },
+                @{ Kind = 'text'; Header = 'На сколько минут'; Text = '0' },
+                @{ Kind = 'text'; Header = 'На сколько минут'; Text = '15' },
                 @{ Kind = 'one'; Header = 'Пользователи erp_base предупреждены'; Wait = $true })
             Check-DeployCommon $r
             Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
@@ -2233,7 +2236,15 @@ $tests = @(
             if ($lock.Count -eq 1) {
                 $fromSec = [int]([regex]::Match($lock[0], 'deniedFromSec=(-?\d+)').Groups[1].Value)
                 Check ($fromSec -gt 0) ("блокировка начала сеансов не с будущего времени: начало через {0} с" -f $fromSec)
+                Check ($lock[0] -match 'message=.*15 мин') 'в предупреждении отсутствует введённая длительность'
                 Check ($lock[0] -match 'message=.*Сохраните работу') ("в блокировке нет предупреждения пользователям: {0}" -f $lock[0])
+            }
+            $period = [regex]::Match(($r.Output -join "`n"), 'поставил блокировку начала сеансов с (\d{2}:\d{2}) до (\d{2}:\d{2})')
+            Check $period.Success 'в журнале нет начала и конца блокировки'
+            if ($period.Success) {
+                $startTime = [timespan]::Parse($period.Groups[1].Value)
+                $endTime = [timespan]::Parse($period.Groups[2].Value)
+                Check ((($endTime - $startTime).TotalMinutes + 1440) % 1440 -eq 180) 'оценка 15 минут изменила технический срок блокировки'
             }
             Check (@($r.Questions | Where-Object { $_ -match 'Пользователи erp_base предупреждены' }).Count -eq 1) 'не было ожидания закрытия базы'
             Check (@($r.ComLog | Where-Object { $_ -match 'TerminateSession 5$' }).Count -eq 1) 'сеанс рабочей не завершён после предупреждения'
@@ -2264,6 +2275,7 @@ $tests = @(
                 @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
                 $deployRiskAnswer, $deployNameAnswer,
                 @{ Kind = 'one'; Header = 'В erp_base есть сеансы'; Item = '^Предупредить пользователей' },
+                @{ Kind = 'text'; Header = 'На сколько минут'; Text = '120' },
                 @{ Kind = 'one'; Header = 'Пользователи erp_base предупреждены'; Item = '^Отмена' })
             Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
             Check ($r.ExitCode -eq 1) ("код возврата {0}, ждали 1" -f $r.ExitCode)
@@ -2274,6 +2286,24 @@ $tests = @(
                 Check (-not [bool]$r.ComState.bases.erp_base.sessionsDenied) 'после отмены осталась блокировка начала сеансов'
                 Check (-not [bool]$r.ComState.bases.erp_base.scheduledJobsDenied) 'после отмены осталась блокировка регламентных заданий'
             }
+        }
+    },
+    @{
+        Name = 'deploy-sessions-warn-duration-cancel'
+        Text = 'отмена при вводе длительности оставляет сеансы пользователей открытыми'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $com = New-ComState -Sessions @(@{ id = 5; base = 'erp_base'; app = '1CV8C'; user = 'Пользователь'; host = 'pc1' })
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить выбранные' },
+                @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
+                $deployRiskAnswer, $deployNameAnswer,
+                @{ Kind = 'one'; Header = 'В erp_base есть сеансы'; Item = '^Предупредить пользователей' },
+                @{ Kind = 'text'; Header = 'На сколько минут'; Cancel = $true })
+            Check ($r.ExitCode -eq 1 -and $r.Unexpected.Count -eq 0) 'выпуск не остановился при отмене'
+            Check (@($r.ComLog | Where-Object { $_ -match 'UpdateInfoBase erp_base .*sessionsDenied=1|TerminateSession 5$' }).Count -eq 0) 'пользователей предупредили или отключили после отмены'
+            Check ((Get-Calls $r @('/LoadCfg', 'fake\erp_base')).Count -eq 0) 'после отмены началась загрузка'
         }
     },
     @{
