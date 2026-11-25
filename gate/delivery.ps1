@@ -25,6 +25,10 @@
 Выпуск в рабочую - отдельно (deploy), здесь рабочая не трогается.
 #>
 
+# ** Хлебников С.Ю. 20261123 Обмен с удалённым исполнителем разбора и сборки.
+. (Join-Path $PSScriptRoot 'delivery-parcel.ps1')
+# ** Хлебников С.Ю. 20261123 конец
+
 #region Настройки, реестр, журнал
 
 # Блокировка начала сеансов temp на время применения (Lock-DeliveryTemp); снимается в конце прохода в любом случае.
@@ -44,7 +48,16 @@ function Get-DeliverySetup {
         if ($techName -ieq [string]$name) { throw ("техническая база {0} в списке запрещённых (ForbiddenBases)" -f $tech) }
     }
     foreach ($dir in @($root, $inbox, (Join-Path $root 'history\blobs'))) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    # ** Хлебников С.Ю. 20261123 Обмен включается явным именем приватного репозитория.
+    $remote = $null
+    $repo = [string](Get-Setting $cfg 'DeliveryWorkerRepo' '')
+    if ($repo) {
+        $remote = New-GhContext $repo (Get-PlainPassword ([string](Get-Setting $cfg 'GitHubTokenPassFile' '')))
+    }
+    # ** Хлебников С.Ю. 20261123 конец
     return [pscustomobject]@{
+        Remote = $remote
+        WorkerWaitMin = [int](Get-Setting $cfg 'DeliveryWorkerWaitMin' 20)
         Root = $root; Inbox = $inbox; Tech = $tech
         Merge = (Resolve-RootPath ([string](Get-Setting $cfg 'DeliveryMergeExe' 'merge1c.exe')))
         AutoMerge = [bool](Get-Setting $cfg 'DeliveryAutoMerge' $false)
@@ -295,6 +308,8 @@ function Initialize-TechBase {
     # Техническая база для разбора поставок: пустая файловая база с основной конфигурацией temp. Создаётся при первой
     # поставке и после обновления типовой (версия - в <база>.json). В temp не пишет: оттуда только /DumpCfg.
     param($D)
+    # ** Хлебников С.Ю. 20261123 Удалённый режим не инициализирует локальную базу.
+    if ($null -ne $D.Remote) { return [pscustomobject]@{Ok=$true; Note='Разбор на удалённом исполнителе'} }
     $marker = $D.Tech.TrimEnd('\') + '.json'
     $info = Get-ComConfigInfo -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
     $version = ''
@@ -356,6 +371,20 @@ function Expand-DeliveryFile {
     # файла, не вышло - другим способом. Не разбирается (защищён, повреждён) - opaque с причиной.
     param($D, $State, $File, [int]$Index)
     $dump = Join-Path (Join-Path (Join-Path $D.Root ([string]$State['id'])) 'theirs') ('{0:00}' -f $Index)
+    # ** Хлебников С.Ю. 20261123 Получаем проверенную выгрузку файла.
+    if ($null -ne $D.Remote) {
+        $bytes = Invoke-ParcelRequest $D $State $Index ('expand-' + $File.kind) $File.path
+        $archive = "$dump.zip"
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($archive))
+        [IO.File]::WriteAllBytes($archive,$bytes)
+        if ([IO.Directory]::Exists($dump)) { Remove-Item -LiteralPath $dump -Recurse -Force }
+        Expand-ParcelArchive $archive $dump
+        $info = Get-DumpIdentity $dump
+        if ($null -eq $info) { throw 'В ответе исполнителя отсутствует корневой XML объекта' }
+        $protected = @([IO.Directory]::GetFiles($dump,'*.bin','AllDirectories') | Where-Object { [IO.Path]::GetFileName($_) -in @('ObjectModule.bin','Module.bin') })
+        return [pscustomobject]@{Ok=($protected.Count -eq 0); Kind=$info.Kind; Dir=$dump; Identity=$info; Reason=($protected -join ', ')}
+    }
+    # ** Хлебников С.Ю. 20261123 конец
     if (Test-Path -LiteralPath $dump) { Remove-Item -LiteralPath $dump -Recurse -Force }
     New-Item -ItemType Directory -Path $dump -Force | Out-Null
     $tries = @('cfe', 'epf')
@@ -693,13 +722,14 @@ function Get-DeliveryTempDrift {
     Initialize-GitBinaryShas -Setup $Setup -FileSets @($knownFiles, $HeadFiles)
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$withProcessings
     $skipped = Get-GitSkippedPaths $snapshot $knownFiles
-    $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes -Ignore (@('processings/manifest.json') + @($skipped))
-    if ($drift.Count -gt 0 -and $known -ne $Head) { $drift = @($drift | Where-Object { -not (Test-GitSameAsHead $_ $HeadFiles) }) }
+    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $knownFiles $HeadFiles
+    $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $comparison.Known -Prefixes $snapshot.Prefixes -Ignore (@('processings/manifest.json') + @($skipped)) -LocalShas $comparison.LocalShas
+    if ($drift.Count -gt 0 -and $known -ne $Head) { $drift = @($drift | Where-Object { -not (Test-GitSameAsHead $_ $comparison.Head) }) }
     if ($drift.Count -gt 0) {
-        $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes -Ignore $skipped
-        if ($known -ne $Head) { $drift = @($drift | Where-Object { -not (Test-GitSameAsHead $_ $HeadFiles) }) }
+        $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $comparison.Known -Prefixes $snapshot.Prefixes -Ignore $skipped -LocalShas $comparison.LocalShas
+        if ($known -ne $Head) { $drift = @($drift | Where-Object { -not (Test-GitSameAsHead $_ $comparison.Head) }) }
     }
-    return [pscustomobject]@{ Changes = @($drift); Snapshot = $snapshot; Known = $known }
+    return [pscustomobject]@{ Changes = @($drift); Snapshot = $snapshot; Known = $known; Comparison = $comparison }
 }
 
 function Sync-DeliveryTemp {
@@ -711,7 +741,7 @@ function Sync-DeliveryTemp {
     $headFiles = Get-GhFiles -Gh $Setup.Gh -Commit $head
     # Неслитый PR выгрузки temp - сначала он.
     $pending = [int]$GitState['pendingNumber']
-    if ($pending -gt 0 -and [string]$GitState['pendingCommit'] -and -not (Test-GhContains -Gh $Setup.Gh -Branch '' -Head $head -Commit ([string]$GitState['pendingCommit']))) {
+    if ($pending -gt 0 -and (Test-GitPendingSourceChanges $Setup $GitState $head)) {
         $merged = Complete-DeliveryPull -D $D -State $State -Setup $Setup -Number $pending -What 'выгрузки правок temp' -Unattended:$Unattended
         if (-not $merged) { return [pscustomobject]@{ Ready = $false; Cards = @() } }
         $head = (Get-GhHead -Gh $Setup.Gh -Branch $Setup.Branch).Sha
@@ -954,6 +984,16 @@ function Invoke-DeliveryMerge {
     $resultFile = Join-Path $dir 'merge-result.json'
     $reportFile = Join-Path $dir 'merge-report.md'
     $stamp = [System.TimeZoneInfo]::ConvertTimeBySystemTimeZoneId((Get-Date), 'Russian Standard Time').ToString('yyyyMMdd.HHmmss')
+    # ** Хлебников С.Ю. 20261123 Повтор после ожидания исполнителя собирает ту же версию.
+    if ($null -ne $D.Remote) {
+        if ($State['stampBase'] -ne $Base -or -not $State['stamp']) {
+            $State['stampBase'] = $Base
+            $State['stamp'] = $stamp
+            Save-DeliveryState $D $State
+        }
+        $stamp = $State['stamp']
+    }
+    # ** Хлебников С.Ю. 20261123 конец
     $spec = [ordered]@{
         delivery = [string]$State['id']; stamp = $stamp; historyIndex = $D.History; blobDir = $D.Blobs; ledgers = $ledgers
         decisions = $decisionsFile; objects = $specObjects; result = $resultFile; report = $reportFile
@@ -1009,6 +1049,10 @@ function Request-MergeDecisions {
             $choice = 'theirs'
             if ($picked -eq 1) { $choice = 'ours' }
             $decisions[[string]$decision['id']] = $choice
+            # ** Хлебников С.Ю. 20261123 Сохранить принятое решение до следующего вопроса.
+            [IO.File]::WriteAllText("$DecisionsFile.tmp",(ConvertTo-Json -InputObject $decisions),[Text.Encoding]::UTF8)
+            [IO.File]::Replace("$DecisionsFile.tmp",$DecisionsFile,[System.Management.Automation.Language.NullString]::Value)
+
             Write-DeliveryEvent $D $State 'decision' ("решение {0} ({1}): {2}" -f $decision['id'], $decision['title'], $items[$picked])
             $asked++
         }
@@ -1031,6 +1075,22 @@ function Test-DeliveryBuild {
         if ($status -eq 'opaque') { $notes.Add(('{0}: файл целиком - из исходников не собирается, ставится как пришёл (проверка - открытие и регистрация после загрузки)' -f $object['name'])); continue }
         if ($status -ne 'changed' -and $status -ne 'new') { continue }
         $dir = Join-Path $outRoot ([string]$object['repoPath']).Replace('/', '\')
+        # ** Хлебников С.Ю. 20261123 На сборку отправляется дерево после merge1c.
+        if ($null -ne $D.Remote) {
+            $info = Get-DumpIdentity $dir
+            if ($null -eq $info) { throw 'Не найден корневой XML объединённого объекта' }
+            $type = @{extension='cfe'; report='erf'; processing='epf'}[$info.Kind]
+            $output = Join-Path (Join-Path $D.Root $State.id) ('built\{0:00}' -f $index)
+            [void][IO.Directory]::CreateDirectory($output)
+            $archive = Join-Path $output 'source.zip'
+            [IO.File]::Delete($archive)
+            New-ParcelArchive $dir $archive
+            $bytes = Invoke-ParcelRequest $D $State $index ("build-$type") $archive
+            [IO.File]::WriteAllBytes((Join-Path $output ("result.$type")),$bytes)
+            $notes.Add(('{0}: собрано исполнителем, SHA-256 {1}' -f $info.Name,(Get-ParcelHash $bytes)))
+            continue
+        }
+        # ** Хлебников С.Ю. 20261123 конец
         if ([string]$object['kind'] -eq 'extension') {
             $name = [string]$object['name']
             $extName = 'Сборка{0}' -f $index
@@ -1099,6 +1159,27 @@ function Add-DeliveryTextChange {
     $Changes.Add([pscustomobject]@{ Path = $Path; Kind = $kind; File = $file; Sha = $sha })
 }
 
+# ** Хлебников С.Ю. 20261123 Замена кандидата возможна только поверх известного коммита этой поставки.
+function Set-DeliveryCandidateBranch {
+    param($Gh,[string]$Branch,[string]$Before,[string]$After)
+    if ($Branch -cnotmatch '^delivery/\d{8}-\d{6}-[0-9a-f]{6}$' -or $After -cnotmatch '^[a-f0-9]{40}$') { throw 'Некорректная ветка или хеш кандидата' }
+    if (-not $Before) { Set-GhBranch $Gh $Branch $After -Create; return }
+    if ($Before -cnotmatch '^[a-f0-9]{40}$') { throw 'Некорректный прежний хеш кандидата' }
+    if ($Gh.FakeDir) {
+        if ((Get-GhHead $Gh $Branch).Sha -cne $Before) { throw 'Ветка кандидата изменилась перед обновлением' }
+        Set-GhBranch $Gh $Branch $After -Force
+        return
+    }
+    $repo = (Invoke-GhApi $Gh GET ('/repos/' + $Gh.Repo)).Text | ConvertFrom-Json
+    $update = @{name=('refs/heads/' + $Branch); beforeOid=$Before; afterOid=$After; force=$true}
+    $params = @{repositoryId=$repo.node_id; clientMutationId=$After; refUpdates=@($update)}
+    $query = 'mutation($input:UpdateRefsInput!){updateRefs(input:$input){clientMutationId}}'
+    $body = @{query=$query; variables=@{input=$params}} | ConvertTo-Json -Depth 6 -Compress
+    $answer = (Invoke-GhApi $Gh POST '/graphql' $body).Text | ConvertFrom-Json
+    if ($answer.PSObject.Properties['errors'] -or $answer.data.updateRefs.clientMutationId -cne $After) { throw 'GitHub не подтвердил условное обновление ветки кандидата. Сверьте PR.' }
+}
+# ** Хлебников С.Ю. 20261123 конец
+
 function Publish-DeliveryCandidate {
     # Кандидат: коммит поверх Base в ветку delivery/<номер> (пересборка - та же ветка), PR в main (один на поставку).
     # В коммите - объединённые объекты, журнал поставки deliveries/<номер>.json, привязки, целые файлы binaries/.
@@ -1162,8 +1243,16 @@ function Publish-DeliveryCandidate {
     $objectsText = (@(Get-DeliveryObjects $State | ForEach-Object { [string]$_['object']['name'] } | Sort-Object -Unique) -join ', ')
     $sha = New-GitVerifiedCommit -Setup $Setup -Parent $Base -Changes $changes.ToArray() -Message ("Поставка подрядчика {0}: {1}" -f $State['id'], $objectsText)
     $branch = 'delivery/' + [string]$State['id']
+    # ** Хлебников С.Ю. 20261123 Сохранить ожидаемый коммит до публикации, чтобы восстановиться после обрыва.
     $existing = (Get-GhHead -Gh $Setup.Gh -Branch $branch).Sha
-    if ($existing) { Set-GhBranch -Gh $Setup.Gh -Branch $branch -Sha $sha -Force } else { Set-GhBranch -Gh $Setup.Gh -Branch $branch -Sha $sha -Create }
+    $known = @($State['proposedSha'], $State['previousCandidate'])
+    if ($null -ne $State['pr']) { $known += $State['pr']['head'] }
+    if ($existing -and $known -cnotcontains $existing) { throw "Ветка $branch содержит чужие изменения. Сверьте кандидата до продолжения." }
+    $State['previousCandidate'] = $existing
+    $State['proposedSha'] = $sha
+    Save-DeliveryState $D $State
+    if ($existing -cne $sha) { Set-DeliveryCandidateBranch $Setup.Gh $branch $existing $sha }
+    # ** Хлебников С.Ю. 20261123 конец
     $body = Get-DeliveryReport -D $D -State $State -ForPull
     $number = Find-GhPull -Gh $Setup.Gh -Head $branch -Base $Setup.Branch
     $url = ''
@@ -1250,13 +1339,11 @@ function Unlock-DeliveryTemp {
 function Get-DeliveryObjectStates {
     # Фактическое состояние объектов поставки в temp против main: загружен (как в main) или нет - перед повтором
     # загрузки после обрыва и в итоге.
-    param($Setup, $State, $Snapshot, [hashtable]$HeadFiles)
-    $localShas = @{}
-    foreach ($path in @($Snapshot.Files.Keys)) { $localShas[$path] = Get-GitBlobSha ([System.IO.File]::ReadAllBytes($Snapshot.Files[$path])) }
+    param($State, $Snapshot, $Comparison)
     $list = @()
     foreach ($file in @(Get-DeliveryObjects $State)) {
         $repo = [string]$file['object']['repoPath'] + '/'
-        $same = ((Get-GitFolderPrint $HeadFiles $repo) -eq (Get-GitFolderPrint $localShas $repo))
+        $same = ((Get-GitFolderPrint $Comparison.Head $repo) -eq (Get-GitFolderPrint $Comparison.LocalShas $repo))
         if ([bool]$file['opaque']) {
             $same = @($Snapshot.Processings | Where-Object { ([string]$_.Hash).Replace('-', '').ToLowerInvariant() -eq [string]$file['sha256'] }).Count -gt 0
         }
@@ -1284,7 +1371,7 @@ function Invoke-DeliveryApply {
         $drift = Get-DeliveryTempDrift -Setup $Setup -GitState $GitState -HeadFiles $headFiles -Head $head
         if ([string]$State['status'] -eq 'loading') {
             # Повтор после обрыва: сначала - что из поставки уже стоит в temp.
-            $objectStates = Get-DeliveryObjectStates -Setup $Setup -State $State -Snapshot $drift.Snapshot -HeadFiles $headFiles
+            $objectStates = Get-DeliveryObjectStates -State $State -Snapshot $drift.Snapshot -Comparison $drift.Comparison
             $State['recovery'] = $objectStates
             Write-DeliveryEvent $D $State 'recovery' ("повтор после обрыва, в temp сейчас: {0}" -f (@($objectStates | ForEach-Object { '{0} - {1}' -f $_['object'], $(if ($_['loaded']) { 'как в main' } else { 'не загружен' }) }) -join '; ')) 'Yellow'
         }
@@ -1564,6 +1651,47 @@ function Get-DeliveryReport {
 
 #region Проход
 
+# ** Хлебников С.Ю. 20261123 Восстановить связь с опубликованным PR после обрыва записи state.json.
+function Restore-DeliveryPull {
+    param($D,$State,$Setup)
+    if ($null -ne $State['pr']) { return }
+    $branch = 'delivery/' + $State.id
+    $number = Find-GhPull $Setup.Gh $branch $Setup.Branch -IncludeClosed
+    if (-not $number) { return }
+    $pull = Get-GhPull $Setup.Gh $number
+    if ($pull.HeadRef -cne $branch -or $pull.BaseRef -cne $Setup.Branch) { throw 'Ветки найденного PR отличаются от веток поставки' }
+    if (-not $pull.Merged -and $pull.State -ne 'open') { throw "PR #$number закрыт без слияния. Требуется решение." }
+    if (-not $pull.Merged -and $State['proposedSha'] -cne $pull.Head) { throw "Ветка поставки уже используется PR #$number. Сверьте изменения кандидата." }
+    $tree = Get-GhFiles $Setup.Gh $pull.Head
+    $path = 'deliveries/' + $State.id + '.json'
+    if (-not $tree.ContainsKey($path)) { throw "В PR #$number отсутствует журнал поставки" }
+    $ledger = ConvertTo-DeliveryData ([Text.Encoding]::UTF8.GetString((Get-GhBlob $Setup.Gh $tree[$path])).TrimStart([char]0xFEFF) | ConvertFrom-Json)
+    $hashes = @($ledger.files | ForEach-Object { $_.sha256 } | Sort-Object)
+    if ($ledger.id -cne $State.id -or (Get-GitFileSha256Text ($hashes -join [char]10)) -cne $State.setHash) { throw "Оригиналы не совпали с PR #$number" }
+    if ($pull.Merged) {
+        $main = (Get-GhHead $Setup.Gh $Setup.Branch).Sha
+        $current = Get-GhFiles $Setup.Gh $main
+        if ($current[$path] -cne $tree[$path] -or -not (Test-GhContains $Setup.Gh $Setup.Branch $pull.Head)) { throw "Не подтверждено присутствие поставки #$number в main" }
+    }
+    foreach ($file in $State.files) {
+        $items = @($ledger.files | Where-Object { $_.sha256 -ceq $file.sha256 })
+        if ($items.Count -ne 1) { throw 'Неоднозначная запись оригинала в журнале PR' }
+        $item = $items[0]
+        $file.actualKind = $item.actualKind
+        $file.opaque = $item.opaque
+        $file.status = $item.status
+        if (-not $item.object) { continue }
+        $objects = @($ledger.objects | Where-Object { $_.repoPath -ceq $item.object })
+        if ($objects.Count -ne 1 -or $item.object -notmatch '^(extensions|processings)/([^/\\:]+)$') { throw 'Неоднозначная цель в журнале PR' }
+        $file.object = @{kind=$objects[0].kind; repoPath=$item.object; folder=$Matches[2]; name=$objects[0].name; ref=$item.ref; title=$objects[0].name}
+    }
+    $State.pr = @{number=$number; url=$pull.Url; branch=$branch; head=$pull.Head; base=$ledger.base}
+    if ($null -eq $State.ci) { $State.ci = @{run=''} }
+    Write-DeliveryEvent $D $State 'recovery' ("Восстановлен PR #{0}, оригиналы совпали по SHA-256" -f $number)
+    Set-DeliveryStatus $D $State 'pr' ("PR #{0}" -f $number)
+}
+# ** Хлебников С.Ю. 20261123 конец
+
 function Invoke-DeliveryStep {
     # Одна поставка - от текущего статуса как можно дальше. Каждый шаг сверяет фактическое состояние.
     param($D, $Setup, $GitState, [string]$Id, [switch]$Unattended)
@@ -1571,6 +1699,7 @@ function Invoke-DeliveryStep {
     if ($null -eq $State) { return }
     if ([string]$State['status'] -eq 'done') { return }
     Write-Line ("Поставка {0}: {1}" -f $Id, [string]$State['status']) 'Cyan'
+    if ($null -ne $D.Remote) { Restore-DeliveryPull $D $State $Setup }
     # 1. Разбор - один раз (результат - в state.json).
     $needDump = @(@($State['files']) | Where-Object { -not [string]$_['actualKind'] -and -not [bool]$_['opaque'] })
     if ($needDump.Count -gt 0) {
@@ -1620,7 +1749,7 @@ function Invoke-DeliveryStep {
         $sync = Sync-DeliveryTemp -D $D -State $State -Setup $Setup -GitState $GitState -Unattended:$Unattended
         if (-not $sync.Ready) { return }
         $base = (Get-GhHead -Gh $Setup.Gh -Branch $Setup.Branch).Sha
-        $ready = ($null -ne $State['pr'] -and [string]$State['pr']['base'] -eq $base -and @('rebuild', 'waiting-decision', 'waiting-temp', 'received') -notcontains [string]$State['status'])
+        $ready = ($null -ne $State['pr'] -and [string]$State['pr']['base'] -eq $base -and @('rebuild', 'waiting-decision', 'waiting-temp', 'received', 'waiting-worker') -notcontains [string]$State['status'])
         # PR кандидата уже в main (слил человек или прежний проход): не пересобирать - main и есть результат, дальше
         # применение и проверка.
         if (-not $ready -and $null -ne $State['pr'] -and [int]$State['pr']['number'] -gt 0) {
@@ -1745,6 +1874,13 @@ function Invoke-Delivery {
             catch {
                 # Сбой этапа: причина и место - в журнал поставки; состояние остаётся как было, следующий проход
                 # начинает с проверки фактического состояния.
+                # ** Хлебников С.Ю. 20261123 После доставки ответа продолжим с тем же номером и решениями.
+                if ($_.Exception.Data['DeliveryPending']) {
+                    $state = Read-DeliveryState $D $id
+                    Set-DeliveryStatus $D $state 'waiting-worker' $_.Exception.Message
+                    Write-Line $_.Exception.Message 'Yellow'
+                    continue
+                }
                 $failed++
                 $where = ([string]$_.ScriptStackTrace -split "`r?`n" | Select-Object -First 3) -join ' <- '
                 $state = Read-DeliveryState $D $id

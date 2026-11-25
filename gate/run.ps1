@@ -266,7 +266,7 @@ function Invoke-RunPublish {
     param([string]$Stage = 'final', [string]$Message = '', [switch]$Pending)
     try {
         if ($null -eq (Get-Variable -Name cfg -Scope Script -ErrorAction SilentlyContinue)) { return }
-        if (-not [string](Get-Setting $cfg 'RunReportRepo' '')) { return }
+        if (-not [string](Get-Setting $cfg 'RunReportRepo' '') -and -not ($Pending -and $cfg['PublishOperations'])) { return } # ** Хлебников С.Ю. 20261124
         $publishScript = Join-Path $Root 'publish.ps1'
         if (-not (Test-Path -LiteralPath $publishScript)) { return }
         if ($Pending) { & $publishScript -Pending -Config $configPath; return }
@@ -482,15 +482,16 @@ function Compare-WithBaseline {
         [void]$present.Add($line)
         if (-not $known.Contains($line)) { $new.Add($line) }
     }
-    $goneCount = 0
+    $missing = New-Object 'System.Collections.Generic.SortedSet[string]' ([System.StringComparer]::Ordinal)
     foreach ($line in $known) {
-        if (-not $present.Contains($line)) { $goneCount++ }
+        if (-not $present.Contains($line)) { [void]$missing.Add($line) }
     }
     return [pscustomobject]@{
         HasBaseline = $hasBaseline
         NewLines    = $new.ToArray()
         KnownCount  = $known.Count
-        GoneCount   = $goneCount
+        GoneCount   = $missing.Count
+        Missing     = @($missing)
     }
 }
 
@@ -906,11 +907,11 @@ function Compare-SelfCheck {
         elseif ($record.StartsWith('[ПРОПУСК]', [System.StringComparison]::Ordinal)) { $newSkips.Add($record) }
     }
     $fixedErrors = 0
-    $goneOk = 0
+    $goneOk = New-Object 'System.Collections.Generic.SortedSet[string]' ([System.StringComparer]::Ordinal)
     foreach ($record in $known) {
         if ($present.Contains($record)) { continue }
         if ($record.StartsWith('[ОШИБКА]', [System.StringComparison]::Ordinal)) { $fixedErrors++ }
-        elseif ($record.StartsWith('[ОК]', [System.StringComparison]::Ordinal)) { $goneOk++ }
+        elseif ($record.StartsWith('[ОК]', [System.StringComparison]::Ordinal)) { [void]$goneOk.Add($record) }
     }
     return [pscustomobject]@{
         HasReference = $hasReference
@@ -919,7 +920,8 @@ function Compare-SelfCheck {
         NewSkips     = $newSkips.ToArray()
         ErrorsTotal  = $errorsTotal
         FixedErrors  = $fixedErrors
-        GoneOk       = $goneOk
+        GoneOk       = $goneOk.Count
+        GoneOkRecords = @($goneOk)
     }
 }
 
@@ -3092,17 +3094,52 @@ function Resolve-ResumeKitSource {
     $kind = [string](Get-UiField $Entry 'kind' '')
     $path = [string](Get-UiField $Entry 'path' '')
     $inboxItem = [string](Get-UiField $Entry 'inboxItem' '')
+    # ** Хлебников С.Ю. 20261124 В прежнем прогоне path мог содержать короткое имя Windows, а inboxItem полное.
+    if ($path) { $path = [IO.Path]::GetFullPath($path).TrimEnd('\') }
+    if ($inboxItem) { $inboxItem = [IO.Path]::GetFullPath($inboxItem).TrimEnd('\') }
+    # ** Хлебников С.Ю. 20261124 конец
     $prevHash = [string](Get-UiField $Entry 'hash' '')
     $current = ''
     if ($path -and (Test-Path -LiteralPath $path)) { $current = $path }
-    elseif ($inboxItem -and $path -and $path.StartsWith($inboxItem, [System.StringComparison]::OrdinalIgnoreCase)) {
+    elseif ($inboxItem -and $path -and ($path -eq $inboxItem -or $path.StartsWith($inboxItem + '\', [System.StringComparison]::OrdinalIgnoreCase))) { # ** Хлебников С.Ю. 20261124
         $moved = Join-Path (Join-Path $PrevDir 'inbox') ((Split-Path -Leaf $inboxItem) + $path.Substring($inboxItem.Length))
+        $ref = [string](Get-UiField $Entry 'targetRef' '')
+        if ($Processing -and $ref -match '^[a-fA-F0-9-]{36}$') {
+            $scoped = Join-Path (Join-Path (Join-Path $PrevDir 'inbox') $ref) (Split-Path -Leaf $moved)
+            if (Test-Path -LiteralPath $scoped) { $moved = $scoped }
+        }
         if (Test-Path -LiteralPath $moved) { $current = $moved }
     }
     $kinds = @('cfe', 'files')
     if ($Processing) { $kinds = @('epf', 'epfdir') }
     $candidates = @($InboxList | Where-Object {
             $_.Usable -and $kinds -contains $_.Kind -and @($_.Names).Count -eq 1 -and [string]@($_.Names)[0] -ieq $name -and $_.Path -ne $current })
+    if ($Processing) {
+        # ** Хлебников С.Ю. 20261124 Идентичность адресной поставки сохраняется и при повторе.
+        $savedRef = [string](Get-UiField $Entry 'targetRef' '')
+        $savedGuard = [string](Get-UiField $Entry 'expectedTargetHash' '')
+        if ($current -and (Test-Path -LiteralPath ($current + '.gate.json'))) {
+            $proof = [IO.File]::ReadAllText($current + '.gate.json') | ConvertFrom-Json
+            $ref = [string](Get-UiField $proof 'ref' '')
+            $guard = [string](Get-UiField $proof 'expectedTargetHash' '')
+            if (($savedRef -and $ref -ne $savedRef) -or ($savedGuard -and ($guard -ne $savedGuard -or [string]$proof.sha256 -ne [string]$Entry.expectSha256))) {
+                throw ("Изменились ссылка, файл или условие записи {0}, повторите сравнение" -f $name)
+            }
+            $savedRef = $ref
+            $savedGuard = $guard
+        } elseif ($savedGuard -and $current) { throw ("Утеряна ссылка и условие записи {0}, повторите сравнение" -f $name) }
+        $candidates = @($candidates | Where-Object {
+            $proof = $_.Path + '.gate.json'
+            $ref = ''
+            $guard = ''
+            if (Test-Path -LiteralPath $proof) {
+                $target = [IO.File]::ReadAllText($proof) | ConvertFrom-Json
+                $ref = [string](Get-UiField $target 'ref' '')
+                $guard = [string](Get-UiField $target 'expectedTargetHash' '')
+            }
+            $ref -eq $savedRef -and (-not $savedGuard -or $guard)
+        })
+    }
     $source = [pscustomobject]@{ Name = $name; Kind = $kind; Path = $current; InboxItem = ''; Hash = ''; PrevHash = $prevHash; Changed = $false; Missing = $false; Note = '' }
     if ($candidates.Count -gt 0) {
         $replacement = @($candidates | Sort-Object { (Get-Item -LiteralPath $_.Path).LastWriteTime } -Descending)[0]
@@ -3462,6 +3499,7 @@ function Set-ResumeKitFields {
             $proc.IsNew = [string](Get-UiField $old 'isNew' 'unknown')
             $proc.Ref = [string](Get-UiField $old 'ref' '')
             $proc.ObjectName = [string](Get-UiField $old 'objectName' '')
+            $proc.AppliedSha256 = [string](Get-UiField $old 'appliedSha256' '')
             $proc | Add-Member -NotePropertyName KeepRoot -NotePropertyValue $true -Force
         }
         if ($script:ResumeRun.Reused.ContainsKey('load')) {
@@ -3486,6 +3524,7 @@ function Save-RunState {
             [ordered]@{
                 name = $_.Name; kind = $_.Kind; path = $_.Path; hash = [string]$_.Hash; inboxItem = [string]$_.InboxItem; file = [string]$_.File
                 fileName = [string]$_.FileName; objectName = [string]$_.ObjectName; ref = [string]$_.Ref; isNew = [string]$_.IsNew
+                targetRef = [string]$_.TargetRef; expectedTargetHash = [string]$_.ExpectedTargetHash; expectSha256 = [string]$_.ExpectSha256; appliedSha256 = [string]$_.AppliedSha256
                 oldVersion = [string]$_.OldVersion; newVersion = [string]$_.NewVersion; oldB64 = [string]$_.OldB64; oldFile = [string]$_.OldFile
                 tried = [bool]$_.Tried; touched = [bool]$_.Touched; loaded = [bool]$_.Loaded
             } })
@@ -4359,6 +4398,7 @@ function Show-UtMenu {
 
 #endregion
 
+. (Join-Path $Root 'operations.ps1') # ** Хлебников С.Ю. 20261124 Журнал действий основного меню.
 # Итоги прежних прогонов, которые не ушли в GitHub (прогон оборвался, не было связи), - до всего остального.
 if (-not ($Tests -or $SelfCheckGroup)) { Invoke-RunPublish -Pending } # ** Хлебников С.Ю. 20261120 служебные запуски не публикуются
 
@@ -4545,6 +4585,17 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         if ($choice -eq 'exit') { Write-Host 'Выход.'; exit 0 }
         # Экран ci.exe - с чистого листа: шаги и вердикт прошлого действия не должны висеть над следующим.
         Send-UiReset
+        # ** Хлебников С.Ю. 20261124 Прогоны уже публикует run.ps1, действия с базами и Git — deploy.ps1.
+        $previousOperation = $script:UiOperation
+        $menuOperation = $null
+        $menuStatus = 'closed'
+        if ($choice -in @('update','settings','accept','stats','tests','runs')) {
+            $menuOperation = Start-GateOperation $cfg $configPath $choice
+            $script:GateOperation = $menuOperation
+            $script:UiOperation = $menuOperation
+        }
+        try {
+        # ** Хлебников С.Ю. 20261124 конец
         if ($choice -eq 'deploy') {
             if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') }
             exit $LASTEXITCODE
@@ -4693,6 +4744,14 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         if ($choice -ne 'runs') { break }
         Show-RecentRuns
         if ($null -ne $script:ResumeRequest) { $choice = 'resume'; break }
+        # ** Хлебников С.Ю. 20261124 Записываем также выход из пункта меню и исключение.
+        } catch { $menuStatus = 'failed'; throw }
+        finally {
+            if ($menuOperation) { Write-OperationEvent $menuOperation 'finish' @{status=$menuStatus} }
+            $script:GateOperation = $previousOperation
+            $script:UiOperation = $previousOperation
+        }
+        # ** Хлебников С.Ю. 20261124 конец
     }
 
     if ($choice -eq 'kit') {
@@ -5491,6 +5550,7 @@ function Add-CheckStep {
         return
     }
     # Замечания по модулям тестовых расширений (Get-UtCheckIgnorePattern) - не в счёт: их видно в шаге «Модульные тесты».
+    $rawRecords = $records
     $utIgnored = 0
     if ($script:UtCheckIgnore) {
         $kept = @($records | Where-Object { $_ -notmatch $script:UtCheckIgnore })
@@ -5520,6 +5580,8 @@ function Add-CheckStep {
     [System.IO.File]::WriteAllLines((Join-Path $RunDir ($FileKey + '.norm.txt')), [string[]]$records, $Utf8Bom)
 
     $comparison = Compare-WithBaseline -Current $records -BaselineFile (Join-Path $baselineDir ($FileKey + '.norm.txt'))
+    # Сохраняем и пустую разницу: другой локальный эталон не должен менять отчёт по архиву.
+    [System.IO.File]::WriteAllLines((Join-Path $RunDir ($FileKey + '.missing.txt')), [string[]]$comparison.Missing, $Utf8Bom)
 
     if (-not $comparison.HasBaseline) {
         if ($records.Count -eq 0) {
@@ -5541,7 +5603,14 @@ function Add-CheckStep {
     }
     $knownNow = $records.Count - $comparison.NewLines.Count
     $tail = "известных: {0}" -f $knownNow
-    if ($comparison.GoneCount -gt 0) { $tail += (", ушло из эталона: {0}" -f $comparison.GoneCount) }
+    if ($comparison.Missing.Count -gt 0) {
+        $rawSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        foreach ($line in $rawRecords) { [void]$rawSet.Add($line) }
+        $filtered = @($comparison.Missing | Where-Object { $rawSet.Contains($_) })
+        $absent = $comparison.Missing.Count - $filtered.Count
+        if ($filtered.Count -gt 0) { $tail += (", исключено фильтром: {0}" -f $filtered.Count) }
+        if ($absent -gt 0) { $tail += (", больше нет в журнале: {0}" -f $absent) }
+    }
 
     if ($comparison.NewLines.Count -eq 0) {
         Add-StepResult -Name $Name -Status 'OK' -Detail ("новых замечаний нет, {0}, {1} с" -f $tail, $Result.Seconds) -Log $Result.Log -Seconds $Result.Seconds
@@ -6002,7 +6071,11 @@ function Invoke-SelfCheckLanes {
     $first = New-SelfCheckLane -Number 1 -Extra (@($Extra) + @(("split={0}" -f $Group), 'worker=1')) -Known $Known
     $second = New-SelfCheckLane -Number 2 -Extra (@($Extra) + @(("split={0}" -f $Group), 'worker=2')) -Known ''
     $lanes = @($first, $second)
-    Write-RunLog ("Самопроверка: два исполнителя, группу «{0}» делят пополам" -f $Group)
+    # ** Хлебников С.Ю. 20261123 В полном прогоне начинают с общей очереди независимых чтений.
+    $earlyReads = ($Extra -contains 'earlyreads=1')
+    if ($earlyReads) { Write-RunLog 'Самопроверка: два исполнителя делят независимые проверки в начале прогона' }
+    else { Write-RunLog ("Самопроверка: два исполнителя, группу «{0}» делят пополам" -f $Group) }
+    # ** Хлебников С.Ю. 20261123 конец
     Start-SelfCheckLane -Lane $first -BaseDir $BaseDir -Title $Title -ExchangeSetFile $ExchangeSetFile
     $go = $false
     $secondStarted = $false
@@ -6021,7 +6094,8 @@ function Invoke-SelfCheckLanes {
             Update-SelfCheckSession $session
             if ($lane.Number -eq 1 -and -not $go -and ([string](Get-Setting $session.Header 'group' '') -eq '1' -or [string](Get-Setting $session.Header 'wait' '') -eq '1')) {
                 $go = $true
-                Write-RunLog ("Самопроверка: первый исполнитель дошёл до группы «{0}», второму - начинать" -f $Group)
+                if ($earlyReads) { Write-RunLog 'Самопроверка: начались независимые проверки, второму исполнителю - начинать' }
+                else { Write-RunLog ("Самопроверка: первый исполнитель дошёл до группы «{0}», второму - начинать" -f $Group) }
                 Write-SelfCheckLaneSignal -Lane $second -Signal 'go=1'
             }
             if (-not $session.State) { continue }
@@ -6220,6 +6294,10 @@ function Invoke-SelfCheck {
     if ($workerCount -le 0) { $workerCount = $selfCheckWorkerCount }
     $splitGroup = $selfCheckSplit
     if ($OnlyGroup) { $splitGroup = $OnlyGroup }
+    elseif ($workerCount -ge 2 -and $splitGroup -and [bool](Get-Setting $cfg 'SelfCheckEarlyReads' $false)) {
+        # ** Хлебников С.Ю. 20261123 Два сеанса делят чтения до перехода к операциям с документами.
+        $extraParts += 'earlyreads=1'
+    }
     $laneRun = $null
     # ** Хлебников С.Ю. 20261120 конец
 
@@ -6436,13 +6514,22 @@ function Invoke-KitRollback {
             # снимается режимом unregepf - по имени объекта и ссылке элемента вместе, чужой элемент не заденет.
             $proc = $entry.Processing
             $rollbackDir = Join-Path (Get-ProcessingDirectory $proc) 'rollback'
+            $guard = ''
+            if ($proc.ExpectedTargetHash) {
+                $guard = $proc.AppliedSha256
+                if (-not $guard) {
+                    $allDone = $false
+                    $lines.Add(("[FAIL] {0}: нет подтверждения записанного файла, перед откатом нужна сверка" -f $proc.Name))
+                    continue
+                }
+            }
             if ($entry.Action -eq 'epfrestore') {
                 $done = 'прежняя версия записана в справочник'
-                $session = Invoke-ProcessingSession -Mode 'regepf' -OutDir $rollbackDir -TextFile $entry.Backup -Name $proc.FileName -Ref $proc.TargetRef -Title ("Вернуть в справочник прежнюю {0}" -f $proc.Name)
+                $session = Invoke-ProcessingSession -Mode 'regepf' -OutDir $rollbackDir -TextFile $entry.Backup -Name $proc.FileName -Ref $proc.TargetRef -ExpectedTargetHash $guard -Title ("Вернуть в справочник прежнюю {0}" -f $proc.Name)
             }
             else {
                 $done = 'снята из справочника: публикация «Отключена», помечена на удаление'
-                $session = Invoke-ProcessingSession -Mode 'unregepf' -OutDir $rollbackDir -Name $proc.ObjectName -Ref $proc.Ref -Title ("Снять из справочника {0}" -f $proc.Name)
+                $session = Invoke-ProcessingSession -Mode 'unregepf' -OutDir $rollbackDir -Name $proc.ObjectName -Ref $proc.Ref -ExpectedTargetHash $guard -Title ("Снять из справочника {0}" -f $proc.Name)
             }
             if ($session.State -eq 'result' -and $session.Status -eq 'done') {
                 $line = "[OK  ] {0}: {1}" -f $entry.Name, $done
@@ -6805,7 +6892,7 @@ function Invoke-ProcessingSession {
     # unregepf - снять обработку, которую добавил гейт: по имени объекта и ссылке элемента вместе.
     # State: result - итог записан; exited - клиент закрылся без итога; nostart - обработка не открылась;
     # timeout - итога нет дольше ProcessingTimeoutSec.
-    param([string]$Mode, [string]$OutDir, [string]$File = '', [string]$TextFile = '', [string]$Name, [string]$Ref = '', [string]$Title)
+    param([string]$Mode, [string]$OutDir, [string]$File = '', [string]$TextFile = '', [string]$Name, [string]$Ref = '', [string]$Title, [string]$ExpectedTargetHash = '', [string]$ExpectedSha256 = '')
 
     New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
     $launch = New-Object System.Collections.Generic.List[string]
@@ -6816,10 +6903,21 @@ function Invoke-ProcessingSession {
         if ([bool](Get-Setting $cfg 'ProcessingAllForms' $false) -and -not $TextFile) { $launch.Add('allforms=1') }
         $newB64 = Join-Path $OutDir 'new.b64'
         if ($TextFile) { Copy-Item -LiteralPath $TextFile -Destination $newB64 -Force }
-        else { [System.IO.File]::WriteAllText($newB64, [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($File)), [System.Text.Encoding]::ASCII) }
-        $launch.Add(("file={0}" -f $newB64))
+        else {
+            $bytes = [IO.File]::ReadAllBytes($File)
+            if ($ExpectedSha256) {
+                $sha = [Security.Cryptography.SHA256]::Create()
+                try { $actual = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '') } finally { $sha.Dispose() }
+                if ($actual -ne $ExpectedSha256) { throw ("Изменился файл перед регистрацией: {0}" -f $Name) }
+            }
+            [IO.File]::WriteAllText($newB64, [Convert]::ToBase64String($bytes), [Text.Encoding]::ASCII)
+        }
+        # ** Хлебников С.Ю. 20261124 Старый исполнитель не увидит file= и не сможет пропустить условие записи.
+        if ($ExpectedTargetHash) { $launch.Add(("casfile={0}||{1}" -f $ExpectedTargetHash, $newB64)) }
+        else { $launch.Add(("file={0}" -f $newB64)) }
     }
-    if ($Ref) { $launch.Add(("ref={0}" -f $Ref)) }
+    if ($Mode -eq 'unregepf' -and $ExpectedTargetHash) { $launch.Add(("casref={0}|{1}" -f $ExpectedTargetHash, $Ref)) }
+    elseif ($Ref) { $launch.Add(("ref={0}" -f $Ref)) }
 
     $argList = @('ENTERPRISE') + @(Get-ConnectionArgs -User $adminUser -Password $adminPassword) + @(
         '/DisableStartupDialogs',
@@ -7021,11 +7119,18 @@ function New-KitProcessing {
     # должен быть у файла. Без него - как раньше: элемент с тем же именем объекта.
     $targetRef = ''
     $expectSha = ''
+    $expectedTargetHash = ''
     $sidecar = $path.TrimEnd('\') + '.gate.json'
     if (Test-Path -LiteralPath $sidecar) {
         try {
             $target = [System.IO.File]::ReadAllText($sidecar, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
             if ($null -ne $target.PSObject.Properties['ref']) { $targetRef = [string]$target.ref }
+            if ($null -ne $target.PSObject.Properties['expectedTargetHash']) {
+                $expectedTargetHash = [string]$target.expectedTargetHash
+                if (-not $targetRef -or $expectedTargetHash -notmatch '^(absent|[a-f0-9]{64})$' -or [string]$target.sha256 -notmatch '^[a-f0-9]{64}$' -or $Entry.Kind -ne 'epf') {
+                    throw 'для переноса из базы нужны исходный файл, ссылка, SHA-256 источника и ожидаемое состояние цели'
+                }
+            }
             if ($null -ne $target.PSObject.Properties['sha256']) { $expectSha = ([string]$target.sha256).ToLowerInvariant() }
         }
         catch { throw ("{0} не разобрался: {1}" -f $sidecar, $_.Exception.Message) }
@@ -7035,7 +7140,7 @@ function New-KitProcessing {
         Name = $name; Kind = [string]$Entry.Kind; Path = $path; Xml = $xml; FileName = $fileName; File = $source
         IsReport = $isReport; What = $what; Tried = $false; Touched = $false; Loaded = $false; IsNew = 'unknown'; Ref = ''; ObjectName = ''
         OldVersion = ''; NewVersion = ''; OldB64 = ''; OldFile = ''; InboxItem = (Get-EntryInboxItem $Entry)
-        TargetRef = $targetRef; ExpectSha256 = $expectSha; Registration = ''
+        TargetRef = $targetRef; ExpectSha256 = $expectSha; ExpectedTargetHash = $expectedTargetHash; AppliedSha256 = ''; Registration = ''
     }
 }
 
@@ -7063,7 +7168,7 @@ elseif ($script:MenuItems.Count -gt 0) {
 }
 if (-not [string]::IsNullOrWhiteSpace($Kit)) {
     if ($script:MenuItems.Count -eq 0 -and $script:ResumeKitFound.Count -eq 0) {
-    $kitPath = Resolve-RootPath $Kit
+    $kitPath = [IO.Path]::GetFullPath((Resolve-RootPath $Kit)) # ** Хлебников С.Ю. 20261124 Сохраняем путь, пока исходный файл существует.
     if (Test-DeliveryPath $kitPath) {
         throw ("{0} - поставка подрядчика («Входящие» или реестр поставок): в temp она идёт только через git - приёмкой поставок (меню «Приёмка поставок», deploy.ps1 -Delivery), а не прямой загрузкой." -f $kitPath)
     }
@@ -7836,7 +7941,9 @@ for ($procIndex = 0; $procIndex -lt $kitProcessings.Count; $procIndex++) {
         }
     }
     $proc.Tried = $true
-    $session = Invoke-ProcessingSession -Mode 'regepf' -OutDir (Join-Path $procDir 'register') -File $proc.File -Name $proc.FileName -Ref $targetRef -Title $registerName
+    $guard = $proc.ExpectedTargetHash
+    if ($guard -and $proc.AppliedSha256) { $guard = $proc.AppliedSha256 }
+    $session = Invoke-ProcessingSession -Mode 'regepf' -OutDir (Join-Path $procDir 'register') -File $proc.File -Name $proc.FileName -Ref $targetRef -Title $registerName -ExpectedTargetHash $guard -ExpectedSha256 $proc.ExpectSha256
     $values = $session.Values
     $proc.ObjectName = [string](Get-Setting $values 'objname' '')
     $proc.Ref = [string](Get-Setting $values 'ref' '')
@@ -7878,6 +7985,8 @@ for ($procIndex = 0; $procIndex -lt $kitProcessings.Count; $procIndex++) {
         $proceed = $false
         continue
     }
+    # ** Хлебников С.Ю. 20261124 Подтверждённый хеш нужен для повтора и отката под той же блокировкой.
+    if ($session.Status -eq 'done' -and $proc.ExpectedTargetHash -and $proc.Ref -eq $targetRef) { $proc.AppliedSha256 = $proc.ExpectSha256 }
     # Что поменяла запись в карточке (команды, назначение, публикация) - отдельно, для отчёта приёмки (раздел 5.26).
     $registration = @()
     foreach ($pair in @(@('commandsold', 'команды были'), @('commandsnew', 'команды стали'), @('targetsold', 'назначение было'), @('targetsnew', 'назначение стало'), @('publication', 'публикация'), @('targetskept', 'назначение сохранено'))) {
@@ -8251,6 +8360,8 @@ else {
             Copy-Item -LiteralPath $selfCheckReferenceFile -Destination $referenceCopyDir -Force
         }
         $comparison = Compare-SelfCheck -Current $after.Records -ReferenceFile $selfCheckReferenceFile
+        # Сохраняем и пустую разницу: другой локальный эталон не должен менять отчёт по архиву.
+        [System.IO.File]::WriteAllLines((Join-Path $RunDir 'selfcheck-after.gone-ok.txt'), [string[]]$comparison.GoneOkRecords, $Utf8Bom)
         $newAll = @($comparison.NewErrors) + @($comparison.NewWarnings) + @($comparison.NewSkips)
         if ($newAll.Count -gt 0) {
             [System.IO.File]::WriteAllLines((Join-Path $RunDir 'selfcheck-after.new.txt'), [string[]]$newAll, $Utf8Bom)
@@ -8298,7 +8409,9 @@ else {
             $knownErrors = $comparison.ErrorsTotal - $comparison.NewErrors.Count
             $detail = "новых ошибок: {0}, новых предупреждений: {1}, новых пропусков: {2}; известных ошибок: {3}" -f $comparison.NewErrors.Count, $comparison.NewWarnings.Count, $comparison.NewSkips.Count, $knownErrors
             if ($comparison.FixedErrors -gt 0) { $detail += (", ошибок эталона, которых больше нет: {0}" -f $comparison.FixedErrors) }
-            if ($comparison.GoneOk -gt 0) { $detail += (", проверок «ОК» из эталона, которых больше нет: {0}" -f $comparison.GoneOk) }
+            if ($comparison.GoneOk -gt 0) {
+                $detail += (", проверок «ОК» из эталона, которых больше нет: {0} (selfcheck-after.gone-ok.txt)" -f $comparison.GoneOk)
+            }
             $detail += ('; ' + $tail)
             if ($newAll.Count -gt 0) {
                 $sample = (@($newAll | Select-Object -First 2 | ForEach-Object { if ($_.Length -gt 220) { $_.Substring(0, 220) + '...' } else { $_ } }) -join ' | ')
@@ -8705,7 +8818,20 @@ if ($decision -ne 'rolledBack' -and $decision -ne 'rollbackFailed') {
             if (-not (Test-Path -LiteralPath $source)) { continue }
             try {
                 $parent = Split-Path -Parent $source
-                Move-Item -LiteralPath $source -Destination $movedDir -Force
+                # ** Хлебников С.Ю. 20261124 При продолжении из runs применяются те же ссылка и ограничения записи.
+                $proof = $source + '.gate.json'
+                $destination = $movedDir
+                if (Test-Path -LiteralPath $proof -PathType Leaf) {
+                    $target = [IO.File]::ReadAllText($proof) | ConvertFrom-Json
+                    $ref = [string](Get-UiField $target 'ref' '')
+                    if ($ref) {
+                        $destination = Join-Path $movedDir ([guid]::Parse($ref).ToString())
+                        New-Item -ItemType Directory -Path $destination -Force -ErrorAction Stop | Out-Null
+                    }
+                    Copy-Item -LiteralPath $proof -Destination $destination -Force -ErrorAction Stop
+                }
+                Move-Item -LiteralPath $source -Destination $destination -Force -ErrorAction Stop
+                if (Test-Path -LiteralPath $proof -PathType Leaf) { Remove-Item -LiteralPath $proof -ErrorAction Stop }
                 Write-Host ("Перенёс из inbox в папку прогона: {0}" -f $source)
                 Write-RunLog ("Перенесено из inbox: {0}" -f $source)
                 # Опустевшие папки inbox (inbox\<дата>) убираются, сам inbox остаётся.
