@@ -1358,6 +1358,22 @@ $tests = @(
             }
         }
     },
+    @{
+        Name = 'gate-processing-first-card'
+        Text = 'Первое создание по UUID проходит мимо чтения резервной копии отсутствующей карточки'
+        Run = {
+            param($Name)
+            $module = 'ВыполнитьПослеОбновления\Forms\Форма\Ext\Form\Module.bsl'
+            $form = Join-Path $ciRoot ('tools\src\' + $module)
+            if (-not (Test-Path -LiteralPath $form)) { $form = Join-Path (Split-Path -Parent $ciRoot) ('epf\' + $module) }
+            $source = [IO.File]::ReadAllText($form, $utf8)
+            $body = [regex]::Match($source, '(?ms)^Процедура ПослеЧтенияФайлаОбработки\([^\r\n]*\).*?^КонецПроцедуры').Value
+            $read = $body.IndexOf('ТекущаяОбработкаНаСервере(')
+            Check ($read -gt 0) 'нет чтения прежнего файла для обновления'
+            $create = 'Если\s+Автозапуск\.ОжидаемыйХешФайла\s*=\s*"absent"\s+Тогда\s+ЗарегистрироватьОбработкуАвтозапуском\(\);\s+Возврат;\s+КонецЕсли;'
+            Check ($body.Substring(0, $read) -match $create) 'первая загрузка дошла до чтения отсутствующей карточки'
+        }
+    },
     # ** Хлебников С.Ю. 20261124 Повтор после подтверждённой записи сохраняет исходный откат.
     @{
         Name = 'gate-processing-resume-hash'
