@@ -4369,6 +4369,60 @@ $tests = @(
         }
     },
     @{
+        Name = 'git-pending-snapshot'
+        Text = 'Старый снимок карточек не мешает загрузке. Незавершённая ветка с правкой исходника, действием или удалением остаётся на проверке.'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $dumps = New-GitDumps
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
+            $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{dumps=$dumps} -Com $com -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            $state = Read-GitStateFile $sb
+            $file = Join-Path $sb 'git/ext/state.json'
+            $manifest = 'processings/manifest.json'
+            $base = $state.pendingCommit
+            $files = Get-GhFiles -Gh $gh -Commit $base
+            $json = $utf8.GetString((Get-GhBlob $gh $files[$manifest]))
+            $row = @(ConvertFrom-Json $json)[0]
+            foreach ($field in @('fileUpdatedAt','fileDateSource','cardUpdatedAt','cardDateSource')) { $row.PSObject.Properties.Remove($field) }
+            $oldJson = ConvertTo-Json -InputObject @($row) -Compress
+            $base = New-GhCommit -Gh $gh -Parent $base -Changes @([pscustomobject]@{Path=$manifest; Bytes=$utf8.GetBytes($oldJson)}) -Message 'Прежний формат снимка'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $base
+            $state.commit = $base
+            $state.pendingCommit = ''
+            [IO.File]::WriteAllText($file, (ConvertTo-Json $state), $utf8Bom)
+            $same = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{dumps=$dumps} -Com $com
+            Check ($same.ExitCode -eq 0 -and ($same.Output -match 'выгружать нечего')) 'пустые даты или форматирование JSON вызвали новый PR'
+            $com.bases.erp_temp_test.processings[0].title = 'Другое название'
+            $save = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{dumps=$dumps} -Com $com -Answers @(
+                @{Kind='confirm'; Header='снимок карточек'; Yes=$true})
+            $state = Read-GitStateFile $sb
+            $cards = $state.commit
+            Check ($save.ExitCode -eq 0 -and $cards -ne $base) 'явная выгрузка пропустила переименование карточки'
+            $same = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport -GitUnattended' -Fake @{dumps=$dumps} -Com $com
+            Check ($same.ExitCode -eq 0 -and ($same.Output -match 'загружать нечего')) 'снимок карточек остановил импорт'
+            $module = 'extensions/Доработки/CommonModules/Д/Ext/Module.bsl'
+            $changes = @(
+                [pscustomobject]@{Path=$module; Bytes=$utf8.GetBytes('Изменённый модуль')},
+                [pscustomobject]@{Path='actions/test.bsl'; Bytes=$utf8.GetBytes('Действие')},
+                [pscustomobject]@{Path=$module; Bytes=$null})
+            foreach ($change in $changes) {
+                # Карточки выгрузили вторым коммитом, первая правка в этой же ветке всё ещё ждёт проверки.
+                $first = New-GhCommit -Gh $gh -Parent $base -Changes @($change) -Message 'Содержательная правка'
+                $state.pendingCommit = New-GhCommit -Gh $gh -Parent $first -Changes @([pscustomobject]@{Path=$manifest; Bytes=$utf8.GetBytes($json)}) -Message 'Снимок карточек'
+                $state.pendingBranch = 'temp/' + $first
+                Set-GhBranch -Gh $gh -Branch $state.pendingBranch -Sha $state.pendingCommit -Create
+                # Текущее содержимое temp уже как в main; блокировать должен именно неразобранный PR.
+                $state.commit = $base
+                [IO.File]::WriteAllText($file, (ConvertTo-Json $state), $utf8Bom)
+                $pending = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport -GitUnattended' -Fake @{dumps=$dumps} -Com $com
+                Check ($pending.ExitCode -eq 0 -and ($pending.Output -match 'ещё не в main')) ("содержимое открытой ветки не защитило " + $change.Path)
+            }
+        }
+    },
+    @{
         Name = 'git-import-xml-roundtrip'
         Text = 'Повторная выгрузка XML проходит без PR. Изменённые типы и реквизиты сохраняются, принудительная загрузка снимает ожидание PR.'
         Run = {
@@ -4400,10 +4454,15 @@ $tests = @(
             $files[$document] = $files[$document].Replace('</InternalInfo>','<r:PropertyState><r:Property>ObjectModule</r:Property><r:State>Extended</r:State></r:PropertyState></InternalInfo>')
             $same = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport -GitUnattended' -Fake @{dumps=$dumps} -Com $com
             Check ($same.ExitCode -eq 0 -and ($same.Output -match 'загружать нечего')) 'служебный XML вызвал PR или повторную загрузку'
+            $export = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{dumps=$dumps} -Com $com
+            Check ($export.ExitCode -eq 0 -and ($export.Output -match 'выгружать нечего')) 'ручная выгрузка предложила PR для служебного XML'
             $unchanged = $files[$criterion]
             $files[$criterion] = $unchanged.Replace('>B<','>C<')
             $files[$single] = $files[$single].Replace('>A<','>C<')
             $files[$form] = $files[$form].Replace('<Attributes/>','<Attributes><Attribute name="Item"/></Attributes>')
+            $offer = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{dumps=$dumps} -Com $com -Answers @(
+                @{Kind='confirm'; Header='веткой temp/'; Yes=$false})
+            Check ($offer.ExitCode -eq 0 -and ($offer.Output -match 'изменено 3, новых 0, удалено 0')) 'выгрузка должна предложить три содержательных правки'
             $changed = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport -GitUnattended' -Fake @{dumps=$dumps} -Com $com
             $pending = (Read-GitStateFile $sb).pendingCommit
             Check ($changed.ExitCode -eq 0 -and $pending -and $pending -ne $head) 'реальные изменения не попали в PR'

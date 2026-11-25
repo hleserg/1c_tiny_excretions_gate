@@ -3772,15 +3772,23 @@ function New-GitTempBranch {
     # Открытый PR выгрузки, и снимок - поверх его же коммита: новый коммит в ту же ветку, второго PR нет.
     param($Setup, $State, [string]$Base, $Changes, [string]$Note = '')
     $stamp = Get-Date
+    $subject = "Правки $script:TempBase"
+    $titleSubject = 'Правки temp'
+    $intro = "Правки, сделанные прямо в $script:TempBase, - выгружены гейтом («Выгрузить temp в git»)."
+    if ($Changes.Count -eq 1 -and $Changes[0].Path -eq 'processings/manifest.json') {
+        $subject = "Снимок карточек обработок $script:TempBase"
+        $titleSubject = $subject
+        $intro = 'Исходники совпадают с основой снимка. Гейт выгрузил сведения справочника внешних обработок в processings/manifest.json.'
+    }
     if ([int]$State['pendingNumber'] -gt 0 -and [string]$State['pendingBranch'] -and $Base -eq [string]$State['pendingCommit']) {
         $open = $null
         try { $open = Get-GhPull -Gh $Setup.Gh -Number ([int]$State['pendingNumber']) }
         catch { Write-RunLog ("git: pull request #{0} не прочитан, выгружаю новым: {1}" -f $State['pendingNumber'], $_.Exception.Message) }
         if ($null -ne $open -and $open.State -eq 'open' -and $open.HeadRef -eq [string]$State['pendingBranch'] -and $open.Head -eq $Base) {
-            $sha = New-GitVerifiedCommit -Setup $Setup -Parent $Base -Changes $Changes -Message ("Правки {0} от {1}" -f $script:TempBase, $stamp.ToString('dd.MM.yyyy HH:mm'))
+            $sha = New-GitVerifiedCommit -Setup $Setup -Parent $Base -Changes $Changes -Message ("{0} от {1}" -f $subject, $stamp.ToString('dd.MM.yyyy HH:mm'))
             Set-GhBranch -Gh $Setup.Gh -Branch $open.HeadRef -Sha $sha
             $comment = New-Object System.Collections.Generic.List[string]
-            $comment.Add(("Ещё правки {0} от {1} (коммит {2}) - в этот же pull request, второго не открываю." -f $script:TempBase, $stamp.ToString('dd.MM.yyyy HH:mm'), $sha))
+            $comment.Add(("{0} от {1} (коммит {2}) - в этот же pull request." -f $subject, $stamp.ToString('dd.MM.yyyy HH:mm'), $sha))
             foreach ($line in (Get-GitChangeLines $Changes)) { $comment.Add(('- ' + $line)) }
             try { Add-GhComment -Gh $Setup.Gh -Number $open.Number -Body ($comment -join "`n") }
             catch { Write-RunLog ("git: комментарий к pull request #{0} не записан: {1}" -f $open.Number, $_.Exception.Message) }
@@ -3798,10 +3806,10 @@ function New-GitTempBranch {
         $branchName = 'temp/{0}-{1}' -f $stamp.ToString('yyyyMMdd-HHmmss'), $suffix
     }
     $lines = Get-GitChangeLines $Changes
-    $sha = New-GitVerifiedCommit -Setup $Setup -Parent $Base -Changes $Changes -Message ("Правки {0} от {1}" -f $script:TempBase, $stamp.ToString('dd.MM.yyyy HH:mm'))
+    $sha = New-GitVerifiedCommit -Setup $Setup -Parent $Base -Changes $Changes -Message ("{0} от {1}" -f $subject, $stamp.ToString('dd.MM.yyyy HH:mm'))
     Set-GhBranch -Gh $Setup.Gh -Branch $branchName -Sha $sha -Create
     $body = New-Object System.Collections.Generic.List[string]
-    $body.Add(("Правки, сделанные прямо в {0}, - выгружены гейтом («Выгрузить temp в git»)." -f $script:TempBase))
+    $body.Add($intro)
     $body.Add('')
     $body.Add(("Основа снимка: {0}. Коммит для проверки: {1}." -f $Base, $sha))
     $body.Add('Перед слиянием проверь разницу и дождись успешных проверок CI для текущей версии PR. Если проверок нет, оставь PR открытым.')
@@ -3818,7 +3826,7 @@ function New-GitTempBranch {
     if (@($Changes).Count -gt 200) { $body.Add(('    … и ещё {0}' -f (@($Changes).Count - 200))) }
     $body.Add('')
     $body.Add('</details>')
-    $title = "Правки temp {0}" -f $stamp.ToString('dd.MM.yyyy HH:mm')
+    $title = "{0} {1}" -f $titleSubject, $stamp.ToString('dd.MM.yyyy HH:mm')
     if ($Note) { $title += ' (' + $Note + ')' }
     try {
         $pull = New-GhPull -Gh $Setup.Gh -Head $branchName -Base $Setup.Branch -Title $title -Body ($body -join "`n")
@@ -3861,7 +3869,16 @@ function Invoke-GitExport {
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$tracked.HasProcessings
     foreach ($item in $snapshot.Missing) { Write-Line ("  в {0} нет: {1} - в git остаётся как есть" -f $script:TempBase, $item) 'Yellow' }
     # Без @(): функция возвращает массив запятой, @() завернул бы его ещё раз.
-    $changes = Compare-GitSnapshot -Local $snapshot.Files -Remote $baseFiles -Prefixes $snapshot.Prefixes -Ignore (Get-GitSkippedPaths $snapshot $baseFiles)
+    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $baseFiles $baseFiles
+    $changes = Compare-GitSnapshot -Local $snapshot.Files -Remote $comparison.Known -Prefixes $snapshot.Prefixes -Ignore (Get-GitSkippedPaths $snapshot $baseFiles) -LocalShas $comparison.LocalShas
+    $manifest = 'processings/manifest.json'
+    if ($snapshot.Files.ContainsKey($manifest) -and $baseFiles.ContainsKey($manifest) -and $comparison.LocalShas[$manifest] -ne $baseFiles[$manifest]) {
+        $current = Get-GitComparisonManifest ([IO.File]::ReadAllBytes($snapshot.Files[$manifest]))
+        $previous = Get-GitComparisonManifest (Get-GhBlob -Gh $Setup.Gh -Sha $baseFiles[$manifest])
+        if ($current -and [string]::Equals($current, $previous, [StringComparison]::Ordinal)) {
+            $changes = @($changes | Where-Object { $_.Path -ne $manifest })
+        }
+    }
     if ($changes.Count -eq 0) {
         Write-Line ("{0} совпадает с git (коммит {1}): выгружать нечего." -f $script:TempBase, (Get-GitShort $base)) 'Green'
         if (-not [string]$State['commit'] -and $base) { $State['commit'] = $base; $State['how'] = 'export'; Save-GitState $Setup $State }
@@ -3877,7 +3894,12 @@ function Invoke-GitExport {
             $changes += [pscustomobject]@{ Path = $path; Kind = 'add'; File = $file; Sha = (Get-GitBlobSha ([System.IO.File]::ReadAllBytes($file))) }
         }
     }
-    $answer = Confirm-Ui -Question ("Выгрузить правки {0} веткой temp/<время> и открыть pull request в {1}?" -f $script:TempBase, $Setup.Branch) -Yes 'Выгрузить' -No 'Отмена'
+    $question = "Выгрузить правки {0} веткой temp/<время> и открыть pull request в {1}?" -f $script:TempBase, $Setup.Branch
+    if ($changes.Count -eq 1 -and $changes[0].Path -eq 'processings/manifest.json') {
+        Write-Line 'Исходники совпадают. Изменились сведения о карточках внешних обработок.' 'Green'
+        $question = "Выгрузить снимок карточек веткой temp/<время> и открыть pull request в {0}?" -f $Setup.Branch
+    }
+    $answer = Confirm-Ui -Question $question -Yes 'Выгрузить' -No 'Отмена'
     if (-not $answer) { Write-Line 'Отмена: ничего не выгружал.'; return }
     $null = New-GitTempBranch -Setup $Setup -State $State -Base $base -Changes $changes
 }
@@ -3960,33 +3982,81 @@ function Get-GitDumpComparisonXml {
     return $xml.OuterXml
 }
 
-function Get-GitImportComparisonFiles {
+function Get-GitComparisonManifest {
+    # JSON в XML-представлении .NET сохраняет типы значений. Отсутствовавшая дата и явный null равнозначны.
+    param([byte[]]$Bytes)
+    Add-Type -AssemblyName System.Runtime.Serialization
+    $xml = New-Object System.Xml.XmlDocument
+    $xml.PreserveWhitespace = $true
+    $reader = [Runtime.Serialization.Json.JsonReaderWriterFactory]::CreateJsonReader($Bytes, [Xml.XmlDictionaryReaderQuotas]::Max)
+    try { $xml.Load($reader) }
+    catch [System.Xml.XmlException] { return $null }
+    finally { $reader.Dispose() }
+    if ($xml.DocumentElement.GetAttribute('type') -ne 'array') { return $null }
+    foreach ($row in $xml.DocumentElement.ChildNodes) {
+        if ($row.GetAttribute('type') -ne 'object' -or $null -eq $row.SelectSingleNode('ref[@type="string"]')) { return $null }
+        $fields = New-Object 'System.Collections.Generic.SortedDictionary[string,System.Xml.XmlNode]' ([StringComparer]::Ordinal)
+        foreach ($node in @($row.ChildNodes)) {
+            if ($fields.ContainsKey($node.Name)) { return $null }
+            $fields.Add($node.Name, $node)
+            $null = $row.RemoveChild($node)
+        }
+        foreach ($node in $fields.Values) {
+            if ($node.Name -cin @('fileUpdatedAt','fileDateSource','cardUpdatedAt','cardDateSource') -and $node.GetAttribute('type') -eq 'null') { continue }
+            $null = $row.AppendChild($node)
+        }
+    }
+    return $xml.OuterXml
+}
+
+function Get-GitDumpXmlKind {
+    param([string]$Path, [hashtable]$Local, [hashtable]$Remote)
+    if ($Path -match '^extensions/[^/]+/(?:.+/)?Forms/[^/]+/Ext/Form\.xml$') { return 'form' }
+    if ($Path -match '^extensions/[^/]+/FilterCriteria/[^/]+\.xml$') { return 'criterion' }
+    if ($Path -match '^extensions/[^/]+/Documents/[^/]+\.xml$') {
+        $module = $Path.Substring(0, $Path.Length - 4) + '/Ext/ObjectModule.bsl'
+        if ($Local.ContainsKey($module) -and $Remote.ContainsKey($module)) { return 'module' }
+    }
+    return ''
+}
+
+function Test-GitDumpXmlMatch {
+    param($Setup, [byte[]]$Bytes, [string]$Kind, [string]$SourceSha)
+    $dump = Get-GitDumpComparisonXml $Bytes $Kind $true
+    if (-not $dump) { return $false }
+    $source = Get-GitDumpComparisonXml (Get-GhBlob -Gh $Setup.Gh -Sha $SourceSha) $Kind $false
+    return [string]::Equals($dump, $source, [StringComparison]::Ordinal)
+}
+
+function Get-GitDumpComparisonFiles {
     # Копия таблицы хешей только для сравнения. В комплект скачиваются оригинальные файлы коммита.
     param($Setup, [hashtable]$Local, [hashtable]$LocalShas, [hashtable]$Remote, [hashtable]$Cache)
     $files = $Remote.Clone()
     foreach ($path in $Local.Keys) {
         if (-not $Remote.ContainsKey($path) -or $LocalShas[$path] -eq $Remote[$path]) { continue }
-        if ($path -match '^extensions/[^/]+/(?:.+/)?Forms/[^/]+/Ext/Form\.xml$') { $kind = 'form' }
-        elseif ($path -match '^extensions/[^/]+/FilterCriteria/[^/]+\.xml$') { $kind = 'criterion' }
-        elseif ($path -match '^extensions/[^/]+/Documents/[^/]+\.xml$') {
-            $module = $path.Substring(0, $path.Length - 4) + '/Ext/ObjectModule.bsl'
-            if (-not $Local.ContainsKey($module) -or -not $Remote.ContainsKey($module)) { continue }
-            $kind = 'module'
-        }
-        else { continue }
+        $kind = Get-GitDumpXmlKind $path $Local $Remote
+        if (-not $kind) { continue }
         $key = $kind + '/' + $LocalShas[$path] + '/' + $Remote[$path]
         if (-not $Cache.ContainsKey($key)) {
-            $dump = Get-GitDumpComparisonXml ([IO.File]::ReadAllBytes($Local[$path])) $kind $true
-            $same = $false
-            if ($dump) {
-                $source = Get-GitDumpComparisonXml (Get-GhBlob -Gh $Setup.Gh -Sha $Remote[$path]) $kind $false
-                $same = [string]::Equals($dump, $source, [StringComparison]::Ordinal)
-            }
-            $Cache[$key] = $same
+            $Cache[$key] = Test-GitDumpXmlMatch $Setup ([IO.File]::ReadAllBytes($Local[$path])) $kind $Remote[$path]
         }
         if ($Cache[$key]) { $files[$path] = $LocalShas[$path] }
     }
     return $files
+}
+
+function Get-GitSnapshotComparison {
+    # Хеши выгрузки считаем один раз. Совпадающие пары XML для основы снимка и main читаем один раз.
+    param($Setup, [hashtable]$Local, [hashtable]$KnownFiles, [hashtable]$HeadFiles)
+    $localShas = @{}
+    foreach ($path in $Local.Keys) { $localShas[$path] = Get-GitBlobSha ([IO.File]::ReadAllBytes($Local[$path])) }
+    $cache = @{}
+    $known = Get-GitDumpComparisonFiles $Setup $Local $localShas $KnownFiles $cache
+    $head = $known
+    if (-not [object]::ReferenceEquals($KnownFiles, $HeadFiles)) {
+        $head = Get-GitDumpComparisonFiles $Setup $Local $localShas $HeadFiles $cache
+    }
+    return [pscustomobject]@{ LocalShas = $localShas; Known = $known; Head = $head }
 }
 
 function Test-GitSameAsHead {
@@ -3995,6 +4065,34 @@ function Test-GitSameAsHead {
     param($Change, [hashtable]$HeadFiles)
     if ($Change.Kind -eq 'delete') { return (-not $HeadFiles.ContainsKey([string]$Change.Path)) }
     return ($HeadFiles.ContainsKey([string]$Change.Path) -and [string]$HeadFiles[[string]$Change.Path] -eq [string]$Change.Sha)
+}
+
+function Test-GitPendingSourceChanges {
+    # В старом состоянии гейта может оставаться PR со служебным XML. Проверяем всю ветку от общего предка,
+    # в том числе коммиты, добавленные после первого снимка. При неполных данных сохраняем ожидание.
+    param($Setup, $State, [string]$Head)
+    $pending = [string]$State['pendingCommit']
+    if (-not $pending) { return $false }
+    $base = ''
+    if (Test-GhContains -Gh $Setup.Gh -Branch '' -Head $Head -Commit $pending -MergeBase ([ref]$base)) { return $false }
+    if (-not $base -or -not $State['pendingBranch']) { return $true }
+    if ((Get-GhHead -Gh $Setup.Gh -Branch $State['pendingBranch']).Sha -ne $pending) { return $true }
+    $before = Get-GhFiles -Gh $Setup.Gh -Commit $base
+    $after = Get-GhFiles -Gh $Setup.Gh -Commit $pending
+    if ($before.Count -eq 0 -or $before.Count -ne $after.Count) { return $true }
+    foreach ($path in $after.Keys) {
+        if (-not $before.ContainsKey($path)) { return $true }
+        if ($after[$path] -eq $before[$path]) { continue }
+        if ($path -ceq 'processings/manifest.json') {
+            if (-not (Get-GitComparisonManifest (Get-GhBlob -Gh $Setup.Gh -Sha $after[$path]))) { return $true }
+            if (-not (Get-GitComparisonManifest (Get-GhBlob -Gh $Setup.Gh -Sha $before[$path]))) { return $true }
+            continue
+        }
+        $kind = Get-GitDumpXmlKind $path $after $before
+        if (-not $kind) { return $true }
+        if (-not (Test-GitDumpXmlMatch $Setup (Get-GhBlob -Gh $Setup.Gh -Sha $after[$path]) $kind $before[$path])) { return $true }
+    }
+    return $false
 }
 
 function Invoke-GitImport {
@@ -4049,12 +4147,10 @@ function Invoke-GitImport {
     # ** Хлебников С.Ю. 20261124 конец
     # manifest.json правкой temp не считается: версия и хеш обработки меняются от самой загрузки из git. В ветку с
     # правками он идёт, если правки есть.
-    $localShas = @{}
-    foreach ($path in $snapshot.Files.Keys) { $localShas[$path] = Get-GitBlobSha ([IO.File]::ReadAllBytes($snapshot.Files[$path])) }
-    $cache = @{}
-    $compareKnown = Get-GitImportComparisonFiles $Setup $snapshot.Files $localShas $knownFiles $cache
-    $compareHead = $compareKnown
-    if ($known -and $known -ne $head.Sha) { $compareHead = Get-GitImportComparisonFiles $Setup $snapshot.Files $localShas $headFiles $cache }
+    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $knownFiles $headFiles
+    $localShas = $comparison.LocalShas
+    $compareKnown = $comparison.Known
+    $compareHead = $comparison.Head
     $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $compareKnown -Prefixes $snapshot.Prefixes -Ignore (@('processings/manifest.json') + @($skippedPaths)) -LocalShas $localShas
     # Совпадающее с main - не правка temp, а недогруженная прежняя загрузка (раздел 5.26: обрыв после первого объекта).
     $sameAsHead = @()
@@ -4095,7 +4191,7 @@ function Invoke-GitImport {
         }
         Write-Line ("Загружаю {0} поверх правок {1}: так решили." -f $Setup.Branch, $script:TempBase) 'Yellow'
     }
-    elseif ([string]$State['pendingCommit'] -and -not (Test-GhContains -Gh $Setup.Gh -Branch '' -Head $head.Sha -Commit ([string]$State['pendingCommit']))) {
+    elseif (Test-GitPendingSourceChanges $Setup $State $head.Sha) {
         if ($Unattended) {
             Write-Line ("Правки {0} из pull request #{1} ещё не в {2}: без человека {2} не гружу." -f $script:TempBase, $State['pendingNumber'], $Setup.Branch) 'Yellow'
             Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note ("pull request #{0} с правками temp не слит: main не грузил" -f $State['pendingNumber']) -Outcome 'pending' -Commit $head.Sha

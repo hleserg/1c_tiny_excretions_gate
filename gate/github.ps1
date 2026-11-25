@@ -389,7 +389,7 @@ function New-GhPull {
 
 function Test-GhContains {
     # Есть ли коммит Commit в истории ветки Branch (или коммита Head). Слит ли PR - по этому.
-    param($Gh, [string]$Branch, [string]$Commit, [string]$Head = '')
+    param($Gh, [string]$Branch, [string]$Commit, [string]$Head = '', [ref]$MergeBase)
     if ($Gh.FakeDir) {
         $current = $Head
         if (-not $current) {
@@ -397,12 +397,21 @@ function Test-GhContains {
             if (-not $refs.ContainsKey($Branch)) { return $false }
             $current = $refs[$Branch]
         }
-        return (Get-GhFakeAncestors $Gh $current).ContainsKey($Commit)
+        $ancestors = Get-GhFakeAncestors $Gh $current
+        if ($null -ne $MergeBase) {
+            $from = Get-GhFakeAncestors $Gh $Commit
+            $MergeBase.Value = $from.Keys | Where-Object { $ancestors.ContainsKey($_) } | Sort-Object { $from[$_] } | Select-Object -First 1
+        }
+        return $ancestors.ContainsKey($Commit)
     }
     $target = $Head
     if (-not $target) { $target = $Branch }
     $answer = Invoke-GhApi -Gh $Gh -Method 'GET' -Path ('/repos/{0}/compare/{1}...{2}?per_page=1' -f $Gh.Repo, $Commit, $target) -AllowStatus @(404)
     if ($answer.Status -eq 404) { return $false }
+    if ($null -ne $MergeBase) {
+        $common = [regex]::Match($answer.Text, '"merge_base_commit"\s*:\s*\{\s*"sha"\s*:\s*"([0-9a-f]{40})"')
+        if ($common.Success) { $MergeBase.Value = $common.Groups[1].Value }
+    }
     $found = [regex]::Match($answer.Text, '"status"\s*:\s*"(ahead|behind|identical|diverged)"\s*,\s*"ahead_by"')
     if (-not $found.Success) { throw 'GitHub: не понял ответ сравнения коммитов' }
     return (@('ahead', 'identical') -contains $found.Groups[1].Value)

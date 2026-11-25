@@ -735,11 +735,16 @@ function Check-DeliveryCommon {
         Run = {
             param($Name)
             $com = New-ComState
-            $sb = New-DeliverySandbox $Name -Com $com -Dumps (New-DDumps)
+            $dumps = New-DDumps
+            $form = 'Catalogs/Items/Forms/List/Ext/Form.xml'
+            $source = '<Form xmlns="http://v8.1c.ru/8.3/xcf/logform"><AutoCommandBar/></Form>'
+            $dumps['Адаптация'][$form] = $source
+            $sb = New-DeliverySandbox $Name -Com $com -Dumps $dumps
             $gh = Get-FakeGh $sb
             $null = New-DZip -Path (Join-Path $sb 'Входящие\Доработки.cfe') -Files (New-DExtFiles -Module (New-DModule -Extra 'Сумма * 0.2'))
             [System.IO.File]::WriteAllText((Join-Path $sb 'fake-github\ci-default.txt'), "in_progress`t", $utf8)
-            $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{ dumps = (New-DDumps) } -Com $null
+            $dumps['Адаптация'][$form] = $source.Replace('</Form>', '<Attributes/></Form>')
+            $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{ dumps = $dumps } -Com $null
             Check-DeliveryCommon $first
             $state = @(Get-DeliveryStates $sb)[0]
             Check ([string]$state.status -eq 'ci') ("пока CI идёт - статус {0}" -f $state.status)
@@ -749,11 +754,13 @@ function Check-DeliveryCommon {
             Reset-FakeState $sb
             [System.IO.File]::WriteAllText((Join-Path $sb 'fake-github\ci-default.txt'), "completed`tsuccess", $utf8)
             $dumps = New-DDumps -Ext (New-DExtFiles -Module (New-DModule -Discount 'Сумма * 0.03'))
+            $dumps['Адаптация'][$form] = $source.Replace('</Form>', '<Attributes/></Form>')
             $second = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{ dumps = $dumps } -Com $null
             Check-DeliveryCommon $second
             $state = @(Get-DeliveryStates $sb)[0]
             Check ([string]$state.verdict -eq 'GREEN') ("итог {0}: {1}" -f $state.verdict, $state.note)
             Check ([int]$state.pr.number -eq $deliveryPull) 'пересборка открыла новый PR поставки'
+            Check ((Get-DMainText $gh ('extensions/Адаптация/' + $form)) -notmatch 'Attributes') 'в main попал служебный XML вместе с правкой модуля'
             $module = Get-DMainText $gh 'extensions/Доработки/Documents/Заказ/Ext/ObjectModule.bsl'
             Check ($null -ne $module -and $module.Contains('Возврат Сумма * 0.03;') -and $module.Contains('Возврат Сумма * 0.2;')) ("в main нет правки temp или поставки: " + $module)
             Check (@($second.Output | Where-Object { $_ -match 'правки после синхронизации с git' }).Count -gt 0) 'правка temp не замечена'
