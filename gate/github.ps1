@@ -389,7 +389,7 @@ function New-GhPull {
 
 function Test-GhContains {
     # Есть ли коммит Commit в истории ветки Branch (или коммита Head). Слит ли PR - по этому.
-    param($Gh, [string]$Branch, [string]$Commit, [string]$Head = '')
+    param($Gh, [string]$Branch, [string]$Commit, [string]$Head = '', [ref]$MergeBase)
     if ($Gh.FakeDir) {
         $current = $Head
         if (-not $current) {
@@ -397,12 +397,21 @@ function Test-GhContains {
             if (-not $refs.ContainsKey($Branch)) { return $false }
             $current = $refs[$Branch]
         }
-        return (Get-GhFakeAncestors $Gh $current).ContainsKey($Commit)
+        $ancestors = Get-GhFakeAncestors $Gh $current
+        if ($null -ne $MergeBase) {
+            $from = Get-GhFakeAncestors $Gh $Commit
+            $MergeBase.Value = $from.Keys | Where-Object { $ancestors.ContainsKey($_) } | Sort-Object { $from[$_] } | Select-Object -First 1
+        }
+        return $ancestors.ContainsKey($Commit)
     }
     $target = $Head
     if (-not $target) { $target = $Branch }
     $answer = Invoke-GhApi -Gh $Gh -Method 'GET' -Path ('/repos/{0}/compare/{1}...{2}?per_page=1' -f $Gh.Repo, $Commit, $target) -AllowStatus @(404)
     if ($answer.Status -eq 404) { return $false }
+    if ($null -ne $MergeBase) {
+        $common = [regex]::Match($answer.Text, '"merge_base_commit"\s*:\s*\{\s*"sha"\s*:\s*"([0-9a-f]{40})"')
+        if ($common.Success) { $MergeBase.Value = $common.Groups[1].Value }
+    }
     $found = [regex]::Match($answer.Text, '"status"\s*:\s*"(ahead|behind|identical|diverged)"\s*,\s*"ahead_by"')
     if (-not $found.Success) { throw 'GitHub: не понял ответ сравнения коммитов' }
     return (@('ahead', 'identical') -contains $found.Groups[1].Value)
@@ -575,17 +584,19 @@ function Get-GhPull {
 }
 
 function Find-GhPull {
-    # Открытый PR из ветки Head в Base. 0 - нет.
-    param($Gh, [string]$Head, [string]$Base)
+    # ** Хлебников С.Ю. 20261123 Для восстановления поставки ищем также слитый или закрытый PR.
+    param($Gh, [string]$Head, [string]$Base, [switch]$IncludeClosed)
     if ($Gh.FakeDir) {
         foreach ($pull in @(Read-GhFakePulls $Gh | Where-Object { $_.Head -eq $Head -and $_.Base -eq $Base } | Sort-Object Number -Descending)) {
-            if ((Get-GhPull -Gh $Gh -Number $pull.Number).State -eq 'open') { return [int]$pull.Number }
+            if ($IncludeClosed -or (Get-GhPull -Gh $Gh -Number $pull.Number).State -eq 'open') { return [int]$pull.Number }
         }
         return 0
     }
     $owner = $Gh.Repo.Split('/')[0]
-    $answer = Invoke-GhApi -Gh $Gh -Method 'GET' -Path ('/repos/{0}/pulls?state=open&base={1}&head={2}' -f $Gh.Repo, [uri]::EscapeDataString($Base), [uri]::EscapeDataString($owner + ':' + $Head))
-    $list = @($answer.Text | ConvertFrom-Json)
+    $stateFilter = 'open'
+    if ($IncludeClosed) { $stateFilter = 'all' }
+    $answer = Invoke-GhApi -Gh $Gh -Method 'GET' -Path ('/repos/{0}/pulls?state={3}&base={1}&head={2}' -f $Gh.Repo, [uri]::EscapeDataString($Base), [uri]::EscapeDataString($owner + ':' + $Head), $stateFilter)
+    $list = ConvertFrom-Json -InputObject $answer.Text
     if ($list.Count -gt 0) { return [int]$list[0].number }
     return 0
 }
