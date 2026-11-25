@@ -66,13 +66,16 @@ function New-ContractCatalogLink {
 }
 
 function New-ActionsTemplate {
-    # Шаблон обработки «Действия после обновления» в tools\src песочницы: как в поставке, с метками @@ДЕЙСТВИЯ.
+    # Исходники для сборки те же, что в поставке. В установленном гейте они лежат в tools\src.
     param([string]$Sandbox)
-    $src = Join-Path $Sandbox 'tools\src'
-    New-Item -ItemType Directory -Path (Join-Path $src 'ДействияПослеОбновления\Ext') -Force | Out-Null
-    [System.IO.File]::WriteAllText((Join-Path $src 'ДействияПослеОбновления.xml'), '<MetaDataObject/>', $utf8Bom)
-    $module = "// Шаблон`r`n#Область Действия`r`n// @@ДЕЙСТВИЯ: НАЧАЛО@@`r`n// В исходниках поставки действий нет.`r`n// @@ДЕЙСТВИЯ: КОНЕЦ@@`r`n#КонецОбласти`r`n"
-    [System.IO.File]::WriteAllText((Join-Path $src 'ДействияПослеОбновления\Ext\ObjectModule.bsl'), $module, $utf8Bom)
+    $source = Join-Path $ciRoot 'tools\src'
+    if (-not (Test-Path -LiteralPath (Join-Path $source 'ДействияПослеОбновления.xml'))) {
+        $source = Join-Path (Split-Path -Parent $ciRoot) 'epf'
+    }
+    $target = Join-Path $Sandbox 'tools\src'
+    New-Item -ItemType Directory -Path $target -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $source 'ДействияПослеОбновления.xml') -Destination $target
+    Copy-Item -LiteralPath (Join-Path $source 'ДействияПослеОбновления') -Destination $target -Recurse
 }
 
 function New-ActionText {
@@ -593,6 +596,8 @@ function New-ActionsKit {
                 Check (Test-Path -LiteralPath $module) 'нет собранного модуля объекта с действиями'
                 if (Test-Path -LiteralPath $module) {
                     $text = [System.IO.File]::ReadAllText($module, $utf8)
+                    Check ($text.Contains('Функция ДействиеВыполнено(')) 'нет проверки регистра из поставляемого модуля'
+                    Check ($text -notmatch '(?im)^\s*\|[^\r\n]*\bКАК[ \t]+ЕСТЬ\b') 'зарезервированное слово ЕСТЬ использовано как псевдоним поля запроса'
                     Check ($text.IndexOf('Список.Добавить("20261121-01-первое");') -ge 0 -and $text.IndexOf('Список.Добавить("20261121-01-первое");') -lt $text.IndexOf('Список.Добавить("20261121-02-второе");')) 'порядок действий в обработке - не по именам'
                     Check ($text.Contains("Процедура Действие2(Журнал)") -and $text.Contains("`tЖурнал.Добавить(""второе сделано"");")) 'тело действия не вставлено процедурой'
                     Check ($text.Contains('Если Номер = 1 Тогда') -and $text.Contains('Действие1(Журнал);')) 'нет выбора действия по номеру'
