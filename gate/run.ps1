@@ -482,15 +482,16 @@ function Compare-WithBaseline {
         [void]$present.Add($line)
         if (-not $known.Contains($line)) { $new.Add($line) }
     }
-    $goneCount = 0
+    $missing = New-Object 'System.Collections.Generic.SortedSet[string]' ([System.StringComparer]::Ordinal)
     foreach ($line in $known) {
-        if (-not $present.Contains($line)) { $goneCount++ }
+        if (-not $present.Contains($line)) { [void]$missing.Add($line) }
     }
     return [pscustomobject]@{
         HasBaseline = $hasBaseline
         NewLines    = $new.ToArray()
         KnownCount  = $known.Count
-        GoneCount   = $goneCount
+        GoneCount   = $missing.Count
+        Missing     = @($missing)
     }
 }
 
@@ -906,11 +907,11 @@ function Compare-SelfCheck {
         elseif ($record.StartsWith('[ПРОПУСК]', [System.StringComparison]::Ordinal)) { $newSkips.Add($record) }
     }
     $fixedErrors = 0
-    $goneOk = 0
+    $goneOk = New-Object 'System.Collections.Generic.SortedSet[string]' ([System.StringComparer]::Ordinal)
     foreach ($record in $known) {
         if ($present.Contains($record)) { continue }
         if ($record.StartsWith('[ОШИБКА]', [System.StringComparison]::Ordinal)) { $fixedErrors++ }
-        elseif ($record.StartsWith('[ОК]', [System.StringComparison]::Ordinal)) { $goneOk++ }
+        elseif ($record.StartsWith('[ОК]', [System.StringComparison]::Ordinal)) { [void]$goneOk.Add($record) }
     }
     return [pscustomobject]@{
         HasReference = $hasReference
@@ -919,7 +920,8 @@ function Compare-SelfCheck {
         NewSkips     = $newSkips.ToArray()
         ErrorsTotal  = $errorsTotal
         FixedErrors  = $fixedErrors
-        GoneOk       = $goneOk
+        GoneOk       = $goneOk.Count
+        GoneOkRecords = @($goneOk)
     }
 }
 
@@ -5548,6 +5550,7 @@ function Add-CheckStep {
         return
     }
     # Замечания по модулям тестовых расширений (Get-UtCheckIgnorePattern) - не в счёт: их видно в шаге «Модульные тесты».
+    $rawRecords = $records
     $utIgnored = 0
     if ($script:UtCheckIgnore) {
         $kept = @($records | Where-Object { $_ -notmatch $script:UtCheckIgnore })
@@ -5577,6 +5580,8 @@ function Add-CheckStep {
     [System.IO.File]::WriteAllLines((Join-Path $RunDir ($FileKey + '.norm.txt')), [string[]]$records, $Utf8Bom)
 
     $comparison = Compare-WithBaseline -Current $records -BaselineFile (Join-Path $baselineDir ($FileKey + '.norm.txt'))
+    # Сохраняем и пустую разницу: другой локальный эталон не должен менять отчёт по архиву.
+    [System.IO.File]::WriteAllLines((Join-Path $RunDir ($FileKey + '.missing.txt')), [string[]]$comparison.Missing, $Utf8Bom)
 
     if (-not $comparison.HasBaseline) {
         if ($records.Count -eq 0) {
@@ -5598,7 +5603,14 @@ function Add-CheckStep {
     }
     $knownNow = $records.Count - $comparison.NewLines.Count
     $tail = "известных: {0}" -f $knownNow
-    if ($comparison.GoneCount -gt 0) { $tail += (", ушло из эталона: {0}" -f $comparison.GoneCount) }
+    if ($comparison.Missing.Count -gt 0) {
+        $rawSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+        foreach ($line in $rawRecords) { [void]$rawSet.Add($line) }
+        $filtered = @($comparison.Missing | Where-Object { $rawSet.Contains($_) })
+        $absent = $comparison.Missing.Count - $filtered.Count
+        if ($filtered.Count -gt 0) { $tail += (", исключено фильтром: {0}" -f $filtered.Count) }
+        if ($absent -gt 0) { $tail += (", больше нет в журнале: {0}" -f $absent) }
+    }
 
     if ($comparison.NewLines.Count -eq 0) {
         Add-StepResult -Name $Name -Status 'OK' -Detail ("новых замечаний нет, {0}, {1} с" -f $tail, $Result.Seconds) -Log $Result.Log -Seconds $Result.Seconds
@@ -8348,6 +8360,8 @@ else {
             Copy-Item -LiteralPath $selfCheckReferenceFile -Destination $referenceCopyDir -Force
         }
         $comparison = Compare-SelfCheck -Current $after.Records -ReferenceFile $selfCheckReferenceFile
+        # Сохраняем и пустую разницу: другой локальный эталон не должен менять отчёт по архиву.
+        [System.IO.File]::WriteAllLines((Join-Path $RunDir 'selfcheck-after.gone-ok.txt'), [string[]]$comparison.GoneOkRecords, $Utf8Bom)
         $newAll = @($comparison.NewErrors) + @($comparison.NewWarnings) + @($comparison.NewSkips)
         if ($newAll.Count -gt 0) {
             [System.IO.File]::WriteAllLines((Join-Path $RunDir 'selfcheck-after.new.txt'), [string[]]$newAll, $Utf8Bom)
@@ -8395,7 +8409,9 @@ else {
             $knownErrors = $comparison.ErrorsTotal - $comparison.NewErrors.Count
             $detail = "новых ошибок: {0}, новых предупреждений: {1}, новых пропусков: {2}; известных ошибок: {3}" -f $comparison.NewErrors.Count, $comparison.NewWarnings.Count, $comparison.NewSkips.Count, $knownErrors
             if ($comparison.FixedErrors -gt 0) { $detail += (", ошибок эталона, которых больше нет: {0}" -f $comparison.FixedErrors) }
-            if ($comparison.GoneOk -gt 0) { $detail += (", проверок «ОК» из эталона, которых больше нет: {0}" -f $comparison.GoneOk) }
+            if ($comparison.GoneOk -gt 0) {
+                $detail += (", проверок «ОК» из эталона, которых больше нет: {0} (selfcheck-after.gone-ok.txt)" -f $comparison.GoneOk)
+            }
             $detail += ('; ' + $tail)
             if ($newAll.Count -gt 0) {
                 $sample = (@($newAll | Select-Object -First 2 | ForEach-Object { if ($_.Length -gt 220) { $_.Substring(0, 220) + '...' } else { $_ } }) -join ' | ')

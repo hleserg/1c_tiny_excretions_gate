@@ -786,6 +786,61 @@ $tests = @(
         }
     },
     @{
+        Name = 'review-report-filter-and-missing-ok'
+        Text = 'замечание из сырого лога исключено фильтром; известные ошибки и пропавший ОК видны по ключам'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $dir = Join-Path $sb 'runs/20260101-101010'
+            $ref = Join-Path $dir 'reference'
+            $null = New-Item -ItemType Directory -Path $ref -Force
+            $step = @{name='Самопроверка'; status='OK'; detail='новых ошибок: 0, новых предупреждений: 0, новых пропусков: 0; известных ошибок: 1'}
+            $meta = @{runId='20260101-101010'; baseKey='unit'; verdict='GREEN'; steps=@($step)}
+            [IO.File]::WriteAllText((Join-Path $dir 'verdict.json'), ($meta | ConvertTo-Json -Depth 5), $utf8Bom)
+            $filtered = '{Тесты.Модуль()}: прежнее замечание :: <<?>>Тест()'
+            $absent = 'УдаленноеЗамечание'
+            $known = '[ОШИБКА] Печать :: Не найдено поле'
+            $lost = '[ОК] Проверка/Документ :: сформирован'
+            [IO.File]::WriteAllLines((Join-Path $ref 'checkconfig.norm.txt'), [string[]]@($filtered, $absent), $utf8Bom)
+            [IO.File]::WriteAllLines((Join-Path $dir 'checkconfig.log'), [string[]]@('{Тесты.Модуль(12, 3)}: прежнее замечание', '<<?>>Тест()'), $utf8Bom)
+            [IO.File]::WriteAllText((Join-Path $dir 'checkconfig.norm.txt'), '', $utf8Bom)
+            [IO.File]::WriteAllLines((Join-Path $ref 'selfcheck.norm.txt'), [string[]]@($known, $lost), $utf8Bom)
+            [IO.File]::WriteAllText((Join-Path $dir 'selfcheck-after.norm.txt'), $known, $utf8Bom)
+            $scriptPath = Join-Path $sb 'report.ps1'
+            foreach ($archived in @($false, $true)) {
+                if ($archived) {
+                    Remove-Item -LiteralPath $ref -Recurse -Force
+                    [IO.File]::WriteAllLines((Join-Path $dir 'checkconfig.missing.txt'), [string[]]@($filtered, $absent), $utf8Bom)
+                    [IO.File]::WriteAllText((Join-Path $dir 'selfcheck-after.gone-ok.txt'), $lost, $utf8Bom)
+                }
+                & $scriptPath -RunDir $dir -Quiet
+                $result = [IO.File]::ReadAllText((Join-Path $dir 'report.txt'))
+                Check ($result.Contains('больше нет в журнале 1, исключено фильтром 1')) 'смешаны отфильтрованное и исчезнувшее'
+                Check ($result.Contains('Исключено фильтром: ' + $filtered)) 'потеряна исходная двухстрочная запись'
+                Check ($result.Contains('новых ошибок 0, известных 1') -and $result.Contains('Известная: Печать ::')) 'в коротком итоге нет известной ошибки'
+                Check ($result.Contains($lost)) 'не виден ключ пропавшей записи ОК'
+            }
+            $step.detail = 'новых ошибок: 0, новых предупреждений: 0, новых пропусков: 0; известных ошибок: 0'
+            [IO.File]::WriteAllText((Join-Path $dir 'verdict.json'), ($meta | ConvertTo-Json -Depth 5), $utf8Bom)
+            [IO.File]::WriteAllText((Join-Path $dir 'selfcheck-after.norm.txt'), '', $utf8Bom)
+            & $scriptPath -RunDir $dir -Quiet
+            Check ([IO.File]::ReadAllText((Join-Path $dir 'report.txt')).Contains($lost)) 'пропал ОК при пустом результате завершённой проверки'
+            $later = Join-Path $sb 'baseline/unit'
+            $null = New-Item -ItemType Directory -Path $later -Force
+            [IO.File]::WriteAllText((Join-Path $later 'checkconfig.norm.txt'), $filtered, $utf8Bom)
+            [IO.File]::WriteAllText((Join-Path $later 'selfcheck.norm.txt'), $lost, $utf8Bom)
+            [IO.File]::WriteAllText((Join-Path $dir 'checkconfig.missing.txt'), '', $utf8Bom)
+            [IO.File]::WriteAllText((Join-Path $dir 'selfcheck-after.gone-ok.txt'), '', $utf8Bom)
+            & $scriptPath -RunDir $dir -Quiet
+            $result = [IO.File]::ReadAllText((Join-Path $dir 'report.txt'))
+            Check (-not $result.Contains($lost) -and -not $result.Contains('Исключено фильтром: ')) 'поздний эталон изменил пустую разницу архива'
+            [IO.File]::WriteAllText((Join-Path $dir 'checkconfig.missing.txt'), $filtered, $utf8Bom)
+            Remove-Item -LiteralPath (Join-Path $dir 'checkconfig.norm.txt')
+            & $scriptPath -RunDir $dir -Quiet
+            Check (-not [IO.File]::ReadAllText((Join-Path $dir 'report.txt')).Contains('Исключено фильтром: ')) 'сравнили незавершённую проверку'
+        }
+    },
+    @{
         Name = 'review-report-junit'
         Text = 'JUnit всего прогона: ошибки, пропуски и эталон по шагам, XML-символы, повтор и отдельный отчёт YAxUnit'
         Run = {
