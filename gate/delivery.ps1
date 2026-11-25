@@ -722,13 +722,14 @@ function Get-DeliveryTempDrift {
     Initialize-GitBinaryShas -Setup $Setup -FileSets @($knownFiles, $HeadFiles)
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$withProcessings
     $skipped = Get-GitSkippedPaths $snapshot $knownFiles
-    $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes -Ignore (@('processings/manifest.json') + @($skipped))
-    if ($drift.Count -gt 0 -and $known -ne $Head) { $drift = @($drift | Where-Object { -not (Test-GitSameAsHead $_ $HeadFiles) }) }
+    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $knownFiles $HeadFiles
+    $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $comparison.Known -Prefixes $snapshot.Prefixes -Ignore (@('processings/manifest.json') + @($skipped)) -LocalShas $comparison.LocalShas
+    if ($drift.Count -gt 0 -and $known -ne $Head) { $drift = @($drift | Where-Object { -not (Test-GitSameAsHead $_ $comparison.Head) }) }
     if ($drift.Count -gt 0) {
-        $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $knownFiles -Prefixes $snapshot.Prefixes -Ignore $skipped
-        if ($known -ne $Head) { $drift = @($drift | Where-Object { -not (Test-GitSameAsHead $_ $HeadFiles) }) }
+        $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $comparison.Known -Prefixes $snapshot.Prefixes -Ignore $skipped -LocalShas $comparison.LocalShas
+        if ($known -ne $Head) { $drift = @($drift | Where-Object { -not (Test-GitSameAsHead $_ $comparison.Head) }) }
     }
-    return [pscustomobject]@{ Changes = @($drift); Snapshot = $snapshot; Known = $known }
+    return [pscustomobject]@{ Changes = @($drift); Snapshot = $snapshot; Known = $known; Comparison = $comparison }
 }
 
 function Sync-DeliveryTemp {
@@ -740,7 +741,7 @@ function Sync-DeliveryTemp {
     $headFiles = Get-GhFiles -Gh $Setup.Gh -Commit $head
     # Неслитый PR выгрузки temp - сначала он.
     $pending = [int]$GitState['pendingNumber']
-    if ($pending -gt 0 -and [string]$GitState['pendingCommit'] -and -not (Test-GhContains -Gh $Setup.Gh -Branch '' -Head $head -Commit ([string]$GitState['pendingCommit']))) {
+    if ($pending -gt 0 -and (Test-GitPendingSourceChanges $Setup $GitState $head)) {
         $merged = Complete-DeliveryPull -D $D -State $State -Setup $Setup -Number $pending -What 'выгрузки правок temp' -Unattended:$Unattended
         if (-not $merged) { return [pscustomobject]@{ Ready = $false; Cards = @() } }
         $head = (Get-GhHead -Gh $Setup.Gh -Branch $Setup.Branch).Sha
@@ -1338,13 +1339,11 @@ function Unlock-DeliveryTemp {
 function Get-DeliveryObjectStates {
     # Фактическое состояние объектов поставки в temp против main: загружен (как в main) или нет - перед повтором
     # загрузки после обрыва и в итоге.
-    param($Setup, $State, $Snapshot, [hashtable]$HeadFiles)
-    $localShas = @{}
-    foreach ($path in @($Snapshot.Files.Keys)) { $localShas[$path] = Get-GitBlobSha ([System.IO.File]::ReadAllBytes($Snapshot.Files[$path])) }
+    param($State, $Snapshot, $Comparison)
     $list = @()
     foreach ($file in @(Get-DeliveryObjects $State)) {
         $repo = [string]$file['object']['repoPath'] + '/'
-        $same = ((Get-GitFolderPrint $HeadFiles $repo) -eq (Get-GitFolderPrint $localShas $repo))
+        $same = ((Get-GitFolderPrint $Comparison.Head $repo) -eq (Get-GitFolderPrint $Comparison.LocalShas $repo))
         if ([bool]$file['opaque']) {
             $same = @($Snapshot.Processings | Where-Object { ([string]$_.Hash).Replace('-', '').ToLowerInvariant() -eq [string]$file['sha256'] }).Count -gt 0
         }
@@ -1372,7 +1371,7 @@ function Invoke-DeliveryApply {
         $drift = Get-DeliveryTempDrift -Setup $Setup -GitState $GitState -HeadFiles $headFiles -Head $head
         if ([string]$State['status'] -eq 'loading') {
             # Повтор после обрыва: сначала - что из поставки уже стоит в temp.
-            $objectStates = Get-DeliveryObjectStates -Setup $Setup -State $State -Snapshot $drift.Snapshot -HeadFiles $headFiles
+            $objectStates = Get-DeliveryObjectStates -State $State -Snapshot $drift.Snapshot -Comparison $drift.Comparison
             $State['recovery'] = $objectStates
             Write-DeliveryEvent $D $State 'recovery' ("повтор после обрыва, в temp сейчас: {0}" -f (@($objectStates | ForEach-Object { '{0} - {1}' -f $_['object'], $(if ($_['loaded']) { 'как в main' } else { 'не загружен' }) }) -join '; ')) 'Yellow'
         }
