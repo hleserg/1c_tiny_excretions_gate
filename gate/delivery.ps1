@@ -461,6 +461,10 @@ function Resolve-DeliveryTargets {
         if ($null -ne $file['object'] -and [string]$file['object']['repoPath']) { continue }
         $identity = $file['identity']
         if ($null -eq $identity) { continue }
+        if (([string]$identity['kind'] -eq 'extension' -and [string]$identity['name'] -in $excludedExtensions) -or
+            ([string]$identity['kind'] -ne 'extension' -and [string]$identity['name'] -in $excludedProcessings)) {
+            throw ("Объект {0} исключён из поставок настройками площадки." -f $identity['name'])
+        }
         if ([string]$identity['kind'] -eq 'extension') {
             $name = [string]$identity['name']
             $repo = 'extensions/' + $name

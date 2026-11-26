@@ -1108,6 +1108,9 @@ foreach ($name in $deployExtensions) {
     }
 }
 # ** Хлебников С.Ю. 20261124 Обработки поставщиков переносятся исходным файлом из проверенной базы.
+$excludedExtensions = @(Get-Setting $cfg 'ExcludedExtensions' @() | Where-Object { $_ })
+$excludedProcessings = @(Get-Setting $cfg 'ExcludedProcessings' @() | Where-Object { $_ })
+$deployExtensions = @($deployExtensions | Where-Object { $_ -notin $excludedExtensions })
 $vendorProcessings = @(Get-Setting $cfg 'VendorProcessings' @() | Where-Object { $_ })
 $retainedVendorProcessings = @{}
 # ** Хлебников С.Ю. 20261124 конец
@@ -1743,7 +1746,7 @@ function Export-Processings {
     param([string]$BaseName, [string]$User, [string]$Password, [string]$Dir, [switch]$All, [switch]$WithDates)
     New-Item -ItemType Directory -Path $Dir -Force | Out-Null
     $reader = {
-        param([string]$Line, [string]$Dir, [string]$FakeScript, [string]$FakeFile, [bool]$All, [bool]$ReadDates)
+        param([string]$Line, [string]$Dir, [string]$FakeScript, [string]$FakeFile, [bool]$All, [bool]$ReadDates, [string[]]$ExcludedProcessings)
         if ($FakeScript) { . $FakeScript; $connector = New-FakeComConnector $FakeFile }
         else { $connector = New-Object -ComObject V83.COMConnector }
         $connection = $null
@@ -1771,7 +1774,7 @@ function Export-Processings {
                 $objName = [string]$selection.Get(1)
                 $version = [string]$selection.Get(2)
                 $kind = [string]$selection.Get(3)
-                if (-not $objName) { continue }
+                if (-not $objName -or $objName -in $ExcludedProcessings) { continue }
                 $extension = '.epf'
                 if ($kind -match 'тч[её]т') { $extension = '.erf' }
                 # ** Хлебников С.Ю. 20261124 Одно имя может относиться к нескольким карточкам.
@@ -1905,7 +1908,7 @@ function Export-Processings {
         }
         return , @($found.ToArray())
     }
-    $call = Invoke-UiBackground -Script $reader -Arguments @((Get-ComConnectionLine $BaseName $User $Password), $Dir, $script:FakeComScript, [string]$env:CI_FAKE_COM, [bool]$All, [bool]($All -or $WithDates)) `
+    $call = Invoke-UiBackground -Script $reader -Arguments @((Get-ComConnectionLine $BaseName $User $Password), $Dir, $script:FakeComScript, [string]$env:CI_FAKE_COM, [bool]$All, [bool]($All -or $WithDates), $excludedProcessings) `
         -Title ("Выгрузить обработки {0}" -f $BaseName) -TimeoutSec ($comTimeoutSec * 3)
     $message = $call.Error
     if ($Password -and $message) { $message = $message.Replace($Password, '***') }
@@ -3521,8 +3524,8 @@ function Get-GitFolders {
         $parts = ([string]$path).Split('/')
         if ($parts[0] -eq 'processings' -and $parts.Count -ge 2) { $hasProcessings = $true }
         if ($parts.Count -lt 3) { continue }
-        if ($parts[0] -eq 'extensions' -and -not $extensions.Contains($parts[1])) { $extensions.Add($parts[1]) }
-        elseif ($parts[0] -eq 'processings' -and -not $processings.Contains($parts[1])) { $processings.Add($parts[1]) }
+        if ($parts[0] -eq 'extensions' -and $parts[1] -notin $excludedExtensions -and -not $extensions.Contains($parts[1])) { $extensions.Add($parts[1]) }
+        elseif ($parts[0] -eq 'processings' -and ($parts[1] -split '~', 2)[0] -notin $excludedProcessings -and -not $processings.Contains($parts[1])) { $processings.Add($parts[1]) }
     }
     return [pscustomobject]@{ Extensions = @($extensions | Sort-Object); Processings = @($processings | Sort-Object); HasProcessings = $hasProcessings }
 }
@@ -3609,7 +3612,7 @@ function Get-TempSnapshot {
     $files = @{}
     $missing = New-Object System.Collections.Generic.List[string]
     $prefixes = New-Object System.Collections.Generic.List[string]
-    foreach ($name in @($Extensions)) {
+    foreach ($name in @($Extensions | Where-Object { $_ -notin $excludedExtensions })) {
         $dump = Update-DumpDir -BaseName $script:TempBase -Extension $name -Dir (Join-Path (Join-Path $Setup.Work 'extensions') $name)
         if ($dump.Absent) { $missing.Add(('расширение ' + $name)); continue }
         if (-not $dump.Ok) { throw ("{0} из {1} не выгрузилось в файлы: {2}" -f $name, $script:TempBase, $dump.Detail) }
@@ -3724,6 +3727,7 @@ function Get-GitBinaries {
     $manifest = Read-GitJsonFile -Setup $Setup -Files $Files -Path 'binaries/manifest.json'
     foreach ($item in @($manifest)) {
         if ($null -eq $item -or $null -eq $item.PSObject.Properties['folder'] -or -not [string]$item.folder) { continue }
+        if ([string](Get-UiField $item 'objectName' '') -in $excludedProcessings -or [string]$item.folder -in $excludedProcessings) { continue }
         $list[[string]$item.folder] = $item
     }
     return $list
@@ -3744,7 +3748,10 @@ function Initialize-GitBinaryShas {
 function Get-GitSkippedPaths {
     # Пути папок processings/<папка>/ коммита, которые выгрузка temp пропустила (обработка принята файлом целиком).
     param($Snapshot, [hashtable]$Files)
-    $paths = @()
+    $paths = @(foreach ($path in $Files.Keys) {
+        $parts = $path.Split('/')
+        if ($parts.Count -ge 3 -and $parts[0] -eq 'processings' -and ($parts[1] -split '~', 2)[0] -in $excludedProcessings) { $path }
+    })
     foreach ($folder in @($Snapshot.Skipped)) {
         $prefix = 'processings/' + $folder + '/'
         $paths += @($Files.Keys | Where-Object { ([string]$_).StartsWith($prefix, [System.StringComparison]::Ordinal) })
@@ -4249,7 +4256,8 @@ function Invoke-GitImport {
     $vendorFolders = @{}
     foreach ($folder in $manifestRefs.Keys) {
         $card = $manifestRefs[$folder]
-        if ($vendorProcessings -notcontains (Get-UiField $card 'objectName' '')) { continue }
+        $objectName = Get-UiField $card 'objectName' ''
+        if ($objectName -in $excludedProcessings -or $vendorProcessings -notcontains $objectName) { continue }
         $wanted = [string](Get-UiField $card 'fileHash' '')
         $ref = [string](Get-UiField $card 'ref' '')
         $originals = @($snapshot.Processings | Where-Object {
@@ -4333,7 +4341,7 @@ function Invoke-GitImport {
     $binaries = Get-GitBinaries -Setup $Setup -Files $headFiles
     foreach ($name in @($headTracked.Processings)) {
         $prefix = 'processings/' + $name + '/'
-        if ($binaries.ContainsKey($name)) { continue }
+        if ($binaries.ContainsKey($name) -or ($manifestRefs.ContainsKey($name) -and [string]$manifestRefs[$name].objectName -in $excludedProcessings)) { continue }
         # ** Хлебников С.Ю. 20261124 Архивная карточка не обновляется и не требует оригинала для регистрации.
         if ($vendorFolders.ContainsKey($name) -and [bool](Get-UiField $manifestRefs[$name] 'deleted' $false)) {
             Write-Line ("  {0}: карточка помечена на удаление, пропускаю" -f $name) 'Yellow'
