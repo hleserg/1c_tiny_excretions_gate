@@ -4663,6 +4663,27 @@ $tests = @(
     },
     # ** Хлебников С.Ю. 20261124 Совпавший оригинальный EPF не пересобирается даже при отличающихся файлах форм.
     @{
+        Name = 'git-import-site-exclusions'
+        Text = 'исключённое расширение и обработка из старого снимка не попадают в импорт'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
+            $fake = @{dumps=(New-GitDumps)}
+            $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake $fake -Com $com -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            $snapshot = (Read-GitStateFile $sb).pendingCommit
+            $form = [pscustomobject]@{Path='processings/Печать/Печать/Forms/Проверочная/Ext/Form.bin'; Bytes=[byte[]](1,2,3)}
+            $module = [pscustomobject]@{Path='extensions/Адаптация/CommonModules/Образец/Ext/Module.bsl'; Bytes=$utf8.GetBytes('// новый файл')}
+            $head = New-GhCommit -Gh $gh -Parent $snapshot -Changes @($form,$module) -Message 'два исключённых объекта'
+            Set-GhBranch -Gh $gh -Branch 'main' -Sha $head
+            [IO.File]::WriteAllText((Join-Path $sb 'config.site.psd1'), "@{ExcludedExtensions=@('Адаптация'); ExcludedProcessings=@('Печать')}", $utf8Bom)
+            $load = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport -GitUnattended' -Fake $fake -Com $com
+            Check ($load.ExitCode -eq 0 -and ($load.Output -match 'загружать нечего')) 'исключённый объект предложен к загрузке или отмечен как правка temp'
+        }
+    },
+    @{
         Name = 'git-import-vendor-processing'
         Text = 'загрузка из git оставляет исходный файл поставщика по SHA и останавливается без оригинала'
         Run = {

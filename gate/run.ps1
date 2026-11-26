@@ -2433,7 +2433,9 @@ $v8 = Join-Path $binDir '1cv8.exe'
 $v8c = Join-Path $binDir '1cv8c.exe'
 if (-not (Test-Path -LiteralPath $v8)) { throw "Не нашёл конфигуратор: $v8. Поправь V8Bin в config.psd1." }
 
-$knownExtensions = @(Get-Setting $cfg 'Extensions' @() | Where-Object { $_ })
+$excludedExtensions = @(Get-Setting $cfg 'ExcludedExtensions' @() | Where-Object { $_ })
+$excludedProcessings = @(Get-Setting $cfg 'ExcludedProcessings' @() | Where-Object { $_ })
+$knownExtensions = @(Get-Setting $cfg 'Extensions' @() | Where-Object { $_ -and $_ -notin $excludedExtensions })
 
 # Модульные тесты YAxUnit (unittests.ps1). Тестовые расширения (UnitTestExtensions) грузятся из файлов UnitTestsDir\<имя>
 # только в тестовую базу и только ради их тестов: комплектом они не грузятся и в рабочую не уходят. Движок (UnitTestEngine,
@@ -7295,12 +7297,14 @@ if (-not [string]::IsNullOrWhiteSpace($Kit)) {
     foreach ($entry in $kitFound) {
         if ($entry.Kind -eq 'epf' -or $entry.Kind -eq 'epfdir') {
             # Внешняя обработка или отчёт: в базе это элемент справочника «Дополнительные отчёты и обработки».
-            $kitProcessings += New-KitProcessing -Entry $entry
+            $processing = New-KitProcessing -Entry $entry
+            if ($processing.Name -notin $excludedProcessings) { $kitProcessings += $processing }
             continue
         }
         if ($entry.Kind -eq 'cfe') {
             $file = Get-Item -LiteralPath $entry.Path
             # Принятый формат имени выгрузки: <база>_<расширение>_<дата>.cfe. Годится и просто <расширение>....cfe.
+            if (@($excludedExtensions | Where-Object { $file.BaseName.IndexOf($_, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count) { continue }
             $matched = @($knownExtensions | Where-Object { $file.BaseName.IndexOf([string]$_, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } | Sort-Object { $_.Length } -Descending)
             if ($matched.Count -eq 0) {
                 throw "Не понял, какое расширение лежит в файле $($file.Name). В имени файла должно быть имя расширения из списка Extensions в config.psd1, например erp_temp_Адаптация_20261115.cfe."
@@ -7332,6 +7336,7 @@ if (-not [string]::IsNullOrWhiteSpace($Kit)) {
             throw "Не смог прочитать имя расширения из $configurationXml : $($_.Exception.Message)"
         }
         if ([string]::IsNullOrWhiteSpace($extensionName)) { throw "В $configurationXml пустое имя расширения." }
+        if ($extensionName -in $excludedExtensions) { continue }
         $nameParts = Split-KitName -ItemName $dir.Name -ExtensionName $extensionName
         $kitItems += [pscustomobject]@{ Name = $extensionName; Kind = 'files'; Path = $dir.FullName; Version = $extensionVersion; Source = $nameParts.Source; Label = $nameParts.Label; WasInBase = 'unknown'; Backup = ''; LoadTried = $false; Touched = $false; Loaded = $false; InboxItem = (Get-EntryInboxItem $entry) }
     }
