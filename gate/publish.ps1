@@ -355,7 +355,7 @@ function Get-RunFileList {
         $leak = ''
         foreach ($secret in $Secrets) {
             if ($null -eq $secret) { continue }
-            if ($text.Contains([string]$secret.Value) -or $ansiText.Contains([string]$secret.Value)) {
+            if ((Test-GateReportSecretValue $text $secret) -or (Test-GateReportSecretValue $ansiText $secret)) {
                 $leak = [string]$secret.Name
                 break
             }

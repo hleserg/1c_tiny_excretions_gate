@@ -69,6 +69,15 @@ function Get-PublishSecrets {
     return , $long
 }
 
+function Test-GateReportSecretValue {
+    param([string]$Text, $Secret)
+    $value = [string]$Secret.Value
+    if (-not $value) { return $false }
+    # В планах, UUID и версиях те же цифры встречаются как данные. Отдельный код и реквизиты входа защищаем.
+    if ($Secret.Name -eq 'UnlockCode' -and $value -cmatch '^[0-9]{1,5}$') { return $Text.Trim() -ceq $value }
+    return $Text.Contains($value)
+}
+
 function Protect-GateReportText {
     # Командная строка 1С, строка соединения и заголовок HTTP могут содержать и незнакомые гейту значения.
     param([string]$Text, $Secrets = @(), [string[]]$LiteralValues = @())
@@ -78,10 +87,12 @@ function Protect-GateReportText {
     $safe = [regex]::Replace($safe, '(?i)([?&](?:access_token|token|password)=)[^&\s]+', '$1***')
     $safe = [regex]::Replace($safe, '(?i)(/(?:UC|P)\s+)(?![/\-"*])[^\s;]+', '$1***')
     $safe = [regex]::Replace($safe, '(?i)(/UC)(?![\s"*])[^\s;]+', '$1***')
-    $safe = [regex]::Replace($safe, '(?i)(код разрешения(?: входа)?\s*[:=]\s*)0(?=\W|$)', '$1***')
+    $safe = [regex]::Replace($safe, '(?i)((?:\b(?:UC|UnlockCode|permission[-_]?code)\s*[:=]\s*|--permission-code\s+|код разрешения(?: входа)?[ \t]*(?:[:=][ \t]*)?)["'']?)[0-9]+\b', '$1***')
+    $safe = [regex]::Replace($safe, '(?i)("(?:UC|UnlockCode|permission[-_]?code)"\s*:\s*)(?:"[0-9]+"|[0-9]+(?=\s*[,}]|\s*$))', '$1"***"')
+    $safe = [regex]::Replace($safe, '(?i)(<(?:UC|UnlockCode|permission[-_]?code)>\s*)[0-9]+(?=\s*</)', '$1***')
     foreach ($value in $LiteralValues) { if ($value) { $safe = $safe.Replace($value, '***') } }
     foreach ($secret in $Secrets) {
-        $safe = $safe.Replace([string]$secret.Value, '***')
+        if (Test-GateReportSecretValue $safe $secret) { $safe = $safe.Replace([string]$secret.Value, '***') }
     }
     return $safe
 }
