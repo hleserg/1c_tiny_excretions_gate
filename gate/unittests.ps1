@@ -429,7 +429,8 @@ function Read-UtJUnit {
                 $kind = $result.LocalName
                 if (@('failure', 'error', 'skipped') -notcontains $kind) { continue }
                 $text = [string]$result.GetAttribute('message')
-                if ($text) { $messages.Add($text.Trim()) }
+                if (-not $text) { $text = [string]$result.InnerText }
+                if ($text.Trim()) { $messages.Add($text.Trim()) }
                 if ($kind -eq 'error') { $status = 'ERROR' }
                 elseif ($kind -eq 'failure' -and $status -ne 'ERROR') { $status = 'FAIL' }
                 elseif ($kind -eq 'skipped' -and $status -eq 'OK') { $status = 'SKIP' }
@@ -448,6 +449,61 @@ function Read-UtJUnit {
 function Test-UtFailed {
     param([string]$Status)
     return ($Status -eq 'FAIL' -or $Status -eq 'ERROR')
+}
+
+# Для оператора используем описание из проверенной версии тестов. Технический ключ сохраняется в эталоне и jUnit.
+function Get-UtDisplayTitle {
+    param([string]$Key, [string]$Name, [hashtable]$Presentations)
+    $testKey = $Key -replace '\s*\[.*$', ''
+    if ($Presentations -and $Presentations[$testKey]) { return [string]$Presentations[$testKey] }
+    if (-not [string]::IsNullOrWhiteSpace($Name)) { return $Name.Trim() }
+    return $Key
+}
+
+function Get-UtDisplayMessage {
+    param([string]$Message, [string]$Status)
+    if ([string]::IsNullOrWhiteSpace($Message)) {
+        if ($Status -eq 'SKIP') { return 'Причина пропуска не указана.' }
+        return 'YAxUnit не записал причину падения.'
+    }
+    # Платформа пишет основное сообщение в конце вложенной цепочки исключений, после отдельного «по причине:».
+    if ($Status -eq 'ERROR') {
+        $causes = [regex]::Split($Message, '(?im)^\s*по причине\s*:\s*')
+        if ($causes.Count -gt 1 -and $causes[-1].Trim()) { $Message = $causes[-1] }
+    }
+    # Стек с номерами строк остаётся в junit.xml. Из многострочного пояснения сохраняем все предметные строки.
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($Message -split '\r?\n')) {
+        $part = $line.Trim()
+        if ($parts.Count -gt 0 -and $part -match '^(?:Стек вызовов\s*:|Stack trace\s*:|\{[^{}]+\(\d+(?:,\s*\d+)?\)\}\s*:)') { break }
+        if ($part) { $parts.Add($part) }
+    }
+    return ($parts -join ' ')
+}
+
+function Format-UtFailureSummary {
+    param([object[]]$Results, [hashtable]$Presentations)
+    $groups = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($result in @($Results | Select-Object -First 3)) {
+        $reason = Get-UtDisplayMessage -Message $result.Message -Status $result.Status
+        $groupKey = $result.Status + [char]0 + $reason
+        if (-not $groups.Contains($groupKey)) {
+            $groups[$groupKey] = [pscustomobject]@{ Reason = $reason; Status = $result.Status; Titles = (New-Object System.Collections.Generic.List[string]) }
+        }
+        $title = Get-UtDisplayTitle -Key $result.Key -Name $result.Name -Presentations $Presentations
+        if ($groups[$groupKey].Titles.Contains($title)) { $title += (' (' + $result.Key + ')') }
+        $groups[$groupKey].Titles.Add($title)
+    }
+    foreach ($group in $groups.Values) {
+        $reason = $group.Reason
+        if ($reason.Length -gt 320) { $reason = $reason.Substring(0, 320) + '…' }
+        if ($group.Status -eq 'ERROR') { $reason = 'Ошибка выполнения. ' + $reason }
+        $lines.Add($reason)
+        foreach ($title in $group.Titles) { $lines.Add(('  Проверка — ' + $title)) }
+    }
+    if ($Results.Count -gt 3) { $lines.Add(('Ещё падений: {0}. Все результаты в unittests\junit.xml.' -f ($Results.Count - 3))) }
+    return ($lines -join ([Environment]::NewLine + '       '))
 }
 
 function Format-UtResultLine {

@@ -474,11 +474,37 @@ $newSelfCheck = @(Read-RecordSet (Join-Path $RunDir 'selfcheck-after.new.txt'))
 $selfCheckErrorText = (@($newSelfCheck | Where-Object { $_.StartsWith('[ОШИБКА]') }) -join "`n")
 $checkNames = New-Object System.Collections.Generic.List[string]
 
+# Сначала разницы, затем остальные результаты: одному ключу соответствует одна запись разбора.
+$unitResults = @(Read-RecordSet (Join-Path $RunDir 'unittests.txt'))
+$unitFailures = [ordered]@{}
+foreach ($source in @('new', 'changed', 'current')) {
+    $rows = $unitResults
+    if ($source -ne 'current') { $rows = @(Read-RecordSet (Join-Path $RunDir ("unittests.{0}.txt" -f $source))) }
+    foreach ($row in $rows) {
+        $parts = $row.Split("`t")
+        if ($parts.Length -lt 2 -or $parts[0] -notin @('FAIL', 'ERROR') -or $unitFailures.Contains($parts[1])) { continue }
+        if ($source -eq 'changed' -and $parts.Length -lt 4) { continue }
+        $unitFailures[$parts[1]] = [pscustomobject]@{ Source = $source; Parts = $parts }
+    }
+}
+$unitPassed = $false
+
 # Шаги, которые не прошли и не разбираются ниже по своим записям.
 foreach ($step in $steps) {
     $status = [string](Get-JsonProperty $step 'status' '')
     $name = [string](Get-JsonProperty $step 'name' '')
     $detail = [string](Get-JsonProperty $step 'detail' '')
+    if ($name -eq 'Модульные тесты' -and $unitFailures.Count) {
+        $unitPassed = $status -eq 'OK'
+        if ($status -in @('FAIL', 'WARN')) {
+            $mark = 'ЖЁЛТ'
+            if ($status -eq 'FAIL') { $mark = 'КРАСН' }
+            # В detail за счётчиками следует пример ошибки. Все причины с именами перечислены ниже.
+            $counts = ($detail -split '\r?\n|\. Новые падения в unittests\.new\.txt:', 2)[0]
+            $summary.Add(('[{0}] {1}: {2}' -f $mark, $name, $counts))
+            continue
+        }
+    }
     if ($status -eq 'OK' -or $status -eq '') { continue }
     $isCompared = ($name.StartsWith('Проверка') -or $name.StartsWith('Синтаксический') -or $name.StartsWith('Самопроверка после') -or $name -eq 'Самопроверка')
     if ($isCompared -and ($detail.Contains('новых') -or $detail.Contains('эталона нет'))) { continue }
@@ -1093,23 +1119,51 @@ $report.Add('')
 foreach ($line in $body) { $report.Add($line) }
 # ** Хлебников С.Ю. 20261120 Модульные тесты: вид падения буквально (ERROR - ошибка выполнения, FAIL - не прошло
 # утверждение), без догадок о стадии; известные, что падают по-другому, - отдельно.
-$unitNewPath = Join-Path $RunDir 'unittests.new.txt'
-$unitChangedPath = Join-Path $RunDir 'unittests.changed.txt'
-if ((Test-Path -LiteralPath $unitNewPath) -or (Test-Path -LiteralPath $unitChangedPath)) {
-    $report.Add('== Модульные тесты: падения')
-    foreach ($unitLine in @(Read-TextLines $unitNewPath | Where-Object { $_ })) {
-        $unitParts = ([string]$unitLine).TrimStart([char]0xFEFF).Split("`t")
-        if ($unitParts.Length -lt 2) { continue }
-        $unitTitle = $unitParts[0]
-        if ($unitTitle -eq 'ERROR') { $unitTitle = 'ERROR - ошибка выполнения' } elseif ($unitTitle -eq 'FAIL') { $unitTitle = 'FAIL - не прошло утверждение' }
-        $unitMessage = ''
-        if ($unitParts.Length -ge 3) { $unitMessage = $unitParts[2] }
-        $report.Add(('   новое, {0}: {1}: {2}' -f $unitTitle, $unitParts[1], $unitMessage))
+if ($unitFailures.Count) {
+    . (Join-Path $PSScriptRoot 'unittests.ps1')
+    # Состав падений задаёт сохранённая разница с эталоном. Каталог и jUnit только поясняют эти строки.
+    $presentations = @{}
+    foreach ($file in @(Get-ChildItem -LiteralPath $RunDir -Filter 'unittests-*.catalog.json' -File)) {
+        try { $catalog = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json }
+        catch { continue }
+        foreach ($test in @(Get-JsonProperty $catalog 'tests' @())) {
+            $key = [string](Get-JsonProperty $test 'key')
+            $presentation = [string](Get-JsonProperty $test 'presentation')
+            if ($key -and $presentation) { $presentations[$key] = $presentation }
+        }
     }
-    foreach ($unitLine in @(Read-TextLines $unitChangedPath | Where-Object { $_ })) {
-        $unitParts = ([string]$unitLine).TrimStart([char]0xFEFF).Split("`t")
-        if ($unitParts.Length -lt 4) { continue }
-        $report.Add(('   известный, падает по-другому: {0}; {1}; {2}' -f $unitParts[1], $unitParts[2], $unitParts[3]))
+    $unitCases = @{}
+    $unitJUnit = Join-Path $RunDir 'unittests\junit.xml'
+    if (Test-Path -LiteralPath $unitJUnit -PathType Leaf) {
+        try { foreach ($case in (Read-UtJUnit $unitJUnit)) { $unitCases[$case.Key] = $case } }
+        catch { } # Архив может содержать неполный jUnit. Причины остались в TSV.
+    }
+
+    $report.Add('== Модульные тесты: падения')
+    foreach ($failure in $unitFailures.Values) {
+        $unitParts = $failure.Parts
+        $status, $key = $unitParts[0], $unitParts[1]
+        $change = 'падение'
+        if ($failure.Source -eq 'new') { $change = 'новое падение' }
+        elseif ($unitPassed) { $change = 'известное падение' }
+        $raw = ''
+        if ($unitParts.Length -ge 3) { $raw = $unitParts[2] }
+        $before = ''
+        if ($failure.Source -eq 'changed') {
+            $change = 'известный тест, падение изменилось'
+            $before = $unitParts[2] -replace '^было:\s*', ''
+            $raw = $unitParts[3] -replace '^стало:\s*(ERROR|FAIL)\s*', ''
+        }
+        $case = $unitCases[$key]
+        $title = Get-UtDisplayTitle -Key $key -Name ([string](Get-JsonProperty $case 'Name')) -Presentations $presentations
+        if ($null -ne $case -and $case.Status -eq $status -and $case.Message) { $raw = $case.Message }
+        $reason = Get-UtDisplayMessage -Message $raw -Status $status
+        $report.Add(('   {0} — {1} ({2})' -f $title, $change, (Get-UtStatusTitle $status)))
+        $report.Add(('     Причина: ' + $reason))
+        if ($before) { $report.Add(('     В эталоне: ' + $before)) }
+        if ($title -ne $key) { $report.Add(('     Тест: ' + $key)) }
+        $raw = ($raw -replace '\s+', ' ').Trim()
+        if ($raw -and $raw -ne $reason) { $report.Add(('     Сообщение YAxUnit: ' + $raw)) }
     }
     $report.Add('')
 }
@@ -1117,7 +1171,7 @@ if ((Test-Path -LiteralPath $unitNewPath) -or (Test-Path -LiteralPath $unitChang
 # ** Хлебников С.Ю. 20261120 Поимённо то, что в итоге шагов стоит числом: разбор читают и там, где папки прогона нет
 # (итог прогона в GitHub). Всё ниже - сведения, на вердикт и на «КОРОТКО» не влияет.
 # 1. Пропущенные модульные тесты с причиной: по ним видно, каких данных в базе нет.
-$unitSkipped = @(Read-TextLines (Join-Path $RunDir 'unittests.txt') | ForEach-Object { ([string]$_).TrimStart([char]0xFEFF) } | Where-Object { $_.StartsWith("SKIP`t") })
+$unitSkipped = @($unitResults | Where-Object { $_.StartsWith("SKIP`t") })
 if ($unitSkipped.Count -gt 0) {
     $report.Add(('== Модульные тесты: пропущено {0}' -f $unitSkipped.Count))
     foreach ($unitLine in $unitSkipped) {
