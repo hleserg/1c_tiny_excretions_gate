@@ -521,10 +521,6 @@ $script:UiTick = 0
 $script:UiLastMinuteLine = -1
 $script:UiAnimate = $true
 try { $script:UiAnimate = -not [Console]::IsOutputRedirected } catch { $script:UiAnimate = $false }
-# Подписи под полосой хода, когда у операции нет своих подробностей. Они показываются у любой долгой операции
-# (конфигуратор, клиент 1С, git), поэтому не называют, кто именно работает: «сервер 1С занят делом» при отправке
-# в GitHub сбивало с толку.
-$script:UiIdleCaptions = @('работа идёт', 'жду, пока закончит', 'процесс жив', 'ещё немного')
 
 function Format-UiDuration {
     param([double]$Seconds)
@@ -591,7 +587,7 @@ function Write-UiProgress {
         $fraction = [Math]::Min(1.0, [double]$Done / $Total)
         $filled = [int][Math]::Floor($fraction * $width)
         for ($i = 0; $i -lt $width; $i++) { if ($i -lt $filled) { $cells[$i] = [char]0x2588 } else { $cells[$i] = [char]0x2591 } }
-        $percent = ('{0,3}%' -f [int][Math]::Floor($fraction * 100))
+        $percent = ('{0} из {1} ({2}%)' -f $Done, $Total, [int][Math]::Floor($fraction * 100))
         $color = 'Green'
         if ($Expected -gt 0) { $timeText += (' / ~' + (Format-UiDuration $Expected)) }
     }
@@ -599,7 +595,7 @@ function Write-UiProgress {
         $fraction = [Math]::Min(0.99, $Elapsed / $Expected)
         $filled = [int][Math]::Floor($fraction * $width)
         for ($i = 0; $i -lt $width; $i++) { if ($i -lt $filled) { $cells[$i] = [char]0x2588 } else { $cells[$i] = [char]0x2591 } }
-        $percent = ('~{0,2}%' -f [int][Math]::Floor($fraction * 100))
+        $percent = ('~{0,2}% по времени' -f [int][Math]::Floor($fraction * 100))
         $timeText += (' / ~' + (Format-UiDuration $Expected))
     }
     else {
@@ -619,7 +615,7 @@ function Write-UiProgress {
             $timeText += (', обычно ~' + (Format-UiDuration $Expected))
             $color = 'Yellow'
         }
-        if (-not $caption) { $caption = $script:UiIdleCaptions[[int][Math]::Floor($script:UiTick / 40) % $script:UiIdleCaptions.Count] }
+        if (-not $caption -and $Expected -le 0) { $caption = 'Длительность пока неизвестна' }
     }
 
     # Блик по заполненной части полосы: видно движение, даже когда процент стоит.

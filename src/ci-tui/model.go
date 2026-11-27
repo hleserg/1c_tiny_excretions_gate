@@ -90,7 +90,8 @@ type model struct {
 	restartAfter bool
 	// planOps - план колонки шагов прислан как план долгих операций (событие plan с ops): шаги закрывает
 	// событие step, узла «Вердикт» нет.
-	planOps bool
+	planOps                     bool
+	snapshotDone, snapshotTotal int
 }
 
 func newModel(baseDir, script string, extra []string) model {
@@ -283,6 +284,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// она встаёт в колонку шагов с итогом и временем; с планом колонку ведут план и строки [OK]/[FAIL].
 			m.addOperation(ev.Title, ev.Status, ev.Elapsed)
 			return m, m.syncOverall()
+		case "snapshot-extensions":
+			m.snapshotDone, m.snapshotTotal = ev.Done, ev.Total
 		case "subplan":
 			m.setSubPlan(ev)
 			m.layout()
@@ -728,7 +731,7 @@ func (m model) viewProgress() string {
 	case p.total > 0 && p.done >= 0:
 		fraction := float64(p.done) / float64(p.total)
 		bar = m.bar.View()
-		percent = fmt.Sprintf("%3d%%", int(fraction*100))
+		percent = fmt.Sprintf("%d из %d (%d%%)", p.done, p.total, int(fraction*100))
 		if p.expected > 0 {
 			timeText += " / ~" + formatDuration(p.expected)
 		}
@@ -738,7 +741,7 @@ func (m model) viewProgress() string {
 			fraction = 0.99
 		}
 		bar = m.bar.View()
-		percent = fmt.Sprintf("~%2d%%", int(fraction*100))
+		percent = fmt.Sprintf("~%d%% по времени", int(fraction*100))
 		timeText += " / ~" + formatDuration(p.expected)
 	default:
 		bar = bounceBar(m.bar.Width, m.frame)
@@ -752,7 +755,7 @@ func (m model) viewProgress() string {
 	line2 := bar + " " + percent
 	detail := p.detail
 	if detail == "" && p.total == 0 && p.expected == 0 {
-		detail = idleCaption(m.frame)
+		detail = "Длительность пока неизвестна"
 	}
 	line3 := wrapBlock(detail, m.width-6, styleDim)
 	return styleProgressBox.Width(m.width - 2).Render(line1 + "\n" + line2 + "\n" + line3)
@@ -842,14 +845,6 @@ func bounceBar(width, frame int) string {
 		}
 	}
 	return b.String()
-}
-
-// Подписи под полосой хода, когда у операции нет своих подробностей: любая долгая операция (конфигуратор,
-// клиент 1С, git), поэтому без имён - «сервер 1С занят делом» при отправке в GitHub сбивало с толку.
-var idleCaptions = []string{"работа идёт", "жду, пока закончит", "процесс жив", "ещё немного"}
-
-func idleCaption(frame int) string {
-	return idleCaptions[(frame/40)%len(idleCaptions)]
 }
 
 func renderTitleBox(ev uiEvent, width int) string {

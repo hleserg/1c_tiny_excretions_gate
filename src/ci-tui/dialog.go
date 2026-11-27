@@ -825,7 +825,7 @@ func (d *dialog) ViewDocked(width int) string {
 				buttons = append(buttons, styleButton.Render(label))
 			}
 		}
-		help = "←→ выбор · enter ок · цифра, щелчок мышью - сразу · ↑↓ PgUp PgDn журнал · F2 журнал в буфер обмена · esc отмена"
+		help = "←→ выбор · enter ок · цифра, щелчок мышью - сразу · ↑↓ PgUp PgDn журнал · F2 журнал в буфер обмена · esc закрыть вопрос"
 	} else {
 		yes := nonEmpty(d.ev.Yes, "Да")
 		no := nonEmpty(d.ev.No, "Нет")

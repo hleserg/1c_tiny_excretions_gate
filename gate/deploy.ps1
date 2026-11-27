@@ -1324,7 +1324,7 @@ function Get-ExtensionVersion {
 function Invoke-UiBackground {
     # Долгий вызов (внешнее соединение 1С) - в отдельном потоке, а в окне - строка хода с временем.
     # Не уложился в TimeoutSec - не ждём (поток бросается), Ok = $false. Ошибка внутри - Ok = $false и её текст.
-    param([scriptblock]$Script, [object[]]$Arguments, [string]$Title, [int]$TimeoutSec)
+    param([scriptblock]$Script, [object[]]$Arguments, [string]$Title, [int]$TimeoutSec, [string]$ProgressTitle = $Title)
     $runspace = [runspacefactory]::CreateRunspace()
     $runspace.ApartmentState = 'STA'
     $runspace.Open()
@@ -1342,7 +1342,7 @@ function Invoke-UiBackground {
             Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status 'TIMEOUT'
             return [pscustomobject]@{ Ok = $false; Error = ("нет ответа за {0} с (настройка ComTimeoutSec)" -f $TimeoutSec); Result = $null }
         }
-        Write-UiProgress -Title $Title -Elapsed $watch.Elapsed.TotalSeconds -Expected $plan
+        Write-UiProgress -Title $ProgressTitle -Elapsed $watch.Elapsed.TotalSeconds -Expected $plan
         Start-Sleep -Milliseconds 250
     }
     Complete-UiProgress
@@ -1745,7 +1745,7 @@ function Export-Processings {
     # с File = ''.
     # Внешнее соединение - в фоне, со строкой хода и таймаутом (ComTimeoutSec, втрое: файлов бывает много):
     # раньше синхронный вызов вешал экран, и до кнопки остановки скрипт не доходил.
-    param([string]$BaseName, [string]$User, [string]$Password, [string]$Dir, [switch]$All, [switch]$WithDates)
+    param([string]$BaseName, [string]$User, [string]$Password, [string]$Dir, [switch]$All, [switch]$WithDates, [switch]$ForGit)
     New-Item -ItemType Directory -Path $Dir -Force | Out-Null
     $reader = {
         param([string]$Line, [string]$Dir, [string]$FakeScript, [string]$FakeFile, [bool]$All, [bool]$ReadDates, [string[]]$ExcludedProcessings)
@@ -1910,7 +1910,9 @@ function Export-Processings {
         }
         return , @($found.ToArray())
     }
-    $call = Invoke-UiBackground -Script $reader -Arguments @((Get-ComConnectionLine $BaseName $User $Password), $Dir, $script:FakeComScript, [string]$env:CI_FAKE_COM, [bool]$All, [bool]($All -or $WithDates), $excludedProcessings) `
+    $progressTitle = "Читаю внешние отчёты и обработки из $BaseName"
+    if ($ForGit) { $progressTitle += ' для сверки с Git' }
+    $call = Invoke-UiBackground -ProgressTitle $progressTitle -Script $reader -Arguments @((Get-ComConnectionLine $BaseName $User $Password), $Dir, $script:FakeComScript, [string]$env:CI_FAKE_COM, [bool]$All, [bool]($All -or $WithDates), $excludedProcessings) `
         -Title ("Выгрузить обработки {0}" -f $BaseName) -TimeoutSec ($comTimeoutSec * 3)
     $message = $call.Error
     if ($Password -and $message) { $message = $message.Replace($Password, '***') }
@@ -3614,25 +3616,37 @@ function Get-TempSnapshot {
     $files = @{}
     $missing = New-Object System.Collections.Generic.List[string]
     $prefixes = New-Object System.Collections.Generic.List[string]
-    foreach ($name in @($Extensions | Where-Object { $_ -notin $excludedExtensions })) {
-        $dump = Update-DumpDir -BaseName $script:TempBase -Extension $name -Dir (Join-Path (Join-Path $Setup.Work 'extensions') $name)
-        if ($dump.Absent) { $missing.Add(('расширение ' + $name)); continue }
-        if (-not $dump.Ok) { throw ("{0} из {1} не выгрузилось в файлы: {2}" -f $name, $script:TempBase, $dump.Detail) }
-        Add-GitSnapshotFiles -Files $files -Dir $dump.Dir -Prefix ('extensions/' + $name + '/')
-        $prefixes.Add(('extensions/' + $name + '/'))
+    $names = @($Extensions | Where-Object { $_ -and $_ -notin $excludedExtensions })
+    $exported = 0
+    Send-UiPlan -StepNames @($names | ForEach-Object { 'Выгрузить {0} из {1}' -f $_, $script:TempBase }) -Operations
+    try {
+        if ($script:UiChannelDir) { Send-UiEvent @{ kind = 'snapshot-extensions'; done = 0; total = $names.Count } }
+        foreach ($name in $names) {
+            $dump = Update-DumpDir -BaseName $script:TempBase -Extension $name -Dir (Join-Path (Join-Path $Setup.Work 'extensions') $name)
+            if ($dump.Absent) { $missing.Add(('расширение ' + $name)); continue }
+            if (-not $dump.Ok) { throw ("{0} из {1} не выгрузилось в файлы: {2}" -f $name, $script:TempBase, $dump.Detail) }
+            Add-GitSnapshotFiles -Files $files -Dir $dump.Dir -Prefix ('extensions/' + $name + '/')
+            $prefixes.Add(('extensions/' + $name + '/'))
+            $exported++
+            if ($script:UiChannelDir) { Send-UiEvent @{ kind = 'snapshot-extensions'; done = $exported; total = $names.Count } }
+        }
+        $items = @()
+        $folders = @{}
+        $skipped = @()
+        if ($names.Count -gt 0) { Write-Line ("Выгружено расширений из {0}: {1} из {2}" -f $script:TempBase, $exported, $names.Count) }
+        if ($WithProcessings) {
+            $taken = Add-GitProcessingSnapshot -Files $files -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword `
+                -Root (Join-Path $Setup.Work 'processings') -EpfDir (Join-Path $script:RunDir 'epf') -Source 'temp'
+            $items = $taken.Items
+            $folders = $taken.Folders
+            $skipped = @($taken.Skipped)
+            $prefixes.Add('processings/')
+        }
+        return [pscustomobject]@{ Files = $files; Missing = $missing.ToArray(); Prefixes = $prefixes.ToArray(); Processings = $items; Folders = $folders; Skipped = $skipped }
     }
-    $items = @()
-    $folders = @{}
-    $skipped = @()
-    if ($WithProcessings) {
-        $taken = Add-GitProcessingSnapshot -Files $files -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword `
-            -Root (Join-Path $Setup.Work 'processings') -EpfDir (Join-Path $script:RunDir 'epf') -Source 'temp'
-        $items = $taken.Items
-        $folders = $taken.Folders
-        $skipped = @($taken.Skipped)
-        $prefixes.Add('processings/')
+    finally {
+        if ($script:UiChannelDir) { Send-UiEvent @{ kind = 'snapshot-extensions'; done = 0; total = 0 } }
     }
-    return [pscustomobject]@{ Files = $files; Missing = $missing.ToArray(); Prefixes = $prefixes.ToArray(); Processings = $items; Folders = $folders; Skipped = $skipped }
 }
 
 function Add-GitProcessingSnapshot {
@@ -3640,7 +3654,7 @@ function Add-GitProcessingSnapshot {
     # (конфигуратор temp) и manifest.json; в Files - пути processings/... Возвращает Items и Folders.
     param([hashtable]$Files, [string]$BaseName, [string]$User, [string]$Password, [string]$Root, [string]$EpfDir, [string]$Source)
     if (Test-Path -LiteralPath $EpfDir) { Remove-Item -LiteralPath $EpfDir -Recurse -Force }
-    $export = Export-Processings -BaseName $BaseName -User $User -Password $Password -Dir $EpfDir -All
+    $export = Export-Processings -BaseName $BaseName -User $User -Password $Password -Dir $EpfDir -All -ForGit
     if (-not $export.Ok) { throw ("обработки {0} не выгрузил: {1}" -f $BaseName, $export.Error) }
     $items = @($export.Items)
     $folders = Get-GitProcessingFolders $items
@@ -3972,8 +3986,6 @@ function Invoke-GitExport {
     $processingsText = 'нет'
     if ($tracked.HasProcessings) { $processingsText = 'все из справочника' }
     Write-Line ("Выгружаю из {0} в файлы: расширения {1}; обработки {2}" -f $script:TempBase, (Get-NonEmpty (@($tracked.Extensions) -join ', ') 'нет'), $processingsText) 'Cyan'
-    # Колонка шагов ci.exe: выгрузки расширений видны заранее, серыми (названия - заголовки самих операций).
-    Send-UiPlan -StepNames @(@($tracked.Extensions) | ForEach-Object { 'Выгрузить {0} из {1}' -f $_, $script:TempBase }) -Operations
     Initialize-GitBinaryShas -Setup $Setup -FileSets @($baseFiles)
     # ** Хлебников С.Ю. 20261123 Перед выгрузкой temp в git спросить о завершении занятого конфигуратора.
     # Иначе первая /DumpConfigToFiles падает, и приёмка поставки прерывается, не предложив оператору выбор.

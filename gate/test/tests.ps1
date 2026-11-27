@@ -1081,6 +1081,7 @@ $tests = @(
             Check ((Test-Path -LiteralPath $norm) -and ([System.IO.File]::ReadAllText($norm, $utf8) -match 'не компилируется')) 'новая ошибка не попала в эталон'
             $question = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('оставить или откатить') })
             Check ($question.Count -eq 1 -and $question[0].Contains('"dock"')) 'вопрос после вердикта не помечен для показа внизу экрана'
+            Check ($question.Count -eq 1 -and $question[0].Contains('Esc оставит комплект в базе')) 'до решения по комплекту не видно действия Esc'
         }
     },
     @{
@@ -4523,6 +4524,10 @@ $tests = @(
             $drift = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{ dumps = (New-GitDumps -Adapt 'Процедура ПравкаВTemp() КонецПроцедуры') } -Com $com -Answers @(
                 @{ Kind = 'one'; Header = 'правки после прошлой загрузки'; Item = '^Отмена' })
             Check-DeployCommon $drift -LocksExpected $false
+            $snapshotUi = @($drift.Output | Where-Object { $_.StartsWith('@@ui:') } | ForEach-Object { $_.Substring(5) | ConvertFrom-Json })
+            $counter = @($snapshotUi | Where-Object { $_.kind -eq 'snapshot-extensions' })
+            Check (@($counter | Where-Object { $_.total -gt 0 -and $_.done -eq $_.total }).Count -eq 1) 'нет итога выгрузки расширений перед чтением справочника'
+            Check (@($snapshotUi | Where-Object { $_.kind -eq 'progress' -and $_.title -eq 'Читаю внешние отчёты и обработки из erp_temp_test для сверки с Git' }).Count -gt 0) 'нет подписи этапа чтения внешних обработок'
             Check (@($drift.Output | Where-Object { $_ -match 'есть правки, которых нет в git' }).Count -eq 1) 'правки temp не замечены'
             Check (@($drift.Output | Where-Object { $_.Contains('~ extensions/Адаптация/CommonModules/АГБ_Общий/Ext/Module.bsl') }).Count -eq 1) 'не назван файл, который правили в temp'
             Check (@($drift.Output | Where-Object { $_ -match 'правок нет' }).Count -eq 0) 'при правках в temp сказано «правок нет»'
@@ -5299,6 +5304,8 @@ $tests = @(
                 @{ Kind = 'confirm'; Header = 'Поставить 20991231\.000000\?'; Yes = $true })
             Check ($r.ExitCode -eq 10) ("код {0}, ждали 10 (поставлен): {1}" -f $r.ExitCode, (($r.Output | Select-Object -Last 5) -join ' | '))
             Check ($r.Unexpected.Count -eq 0) ("неожиданные вопросы: " + ($r.Unexpected -join ' | '))
+            $installQuestion = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Поставить 20991231.000000?') } | ForEach-Object { $_.Substring(5) | ConvertFrom-Json })
+            Check ($installQuestion.Count -eq 1 -and $installQuestion[0].yes -eq 'Установить' -and $installQuestion[0].no -eq 'Отмена' -and $installQuestion[0].defaultNo) 'кнопки установки и действие по Enter'
             $marker = Join-Path $sb 'installed-marker.txt'
             Check ((Test-Path -LiteralPath $marker) -and ([System.IO.File]::ReadAllText($marker) -match 'unattended=True')) 'установщик комплекта не запускался без вопросов'
             Check ((Test-Path -LiteralPath (Join-Path $sb 'ci.exe.old')) -and -not (Test-Path -LiteralPath (Join-Path $sb 'ci.exe'))) 'ci.exe не переименован в ci.exe.old'
