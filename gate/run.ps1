@@ -6681,11 +6681,13 @@ function Connect-TestBaseAgent {
         Connector       = $null
         Agent           = $null
         Server          = $script:Server
+        AliasBinding    = $cfg['ClusterAliasBinding']
         Clusters        = @()
         Errors          = @()
         ClusterUser     = [string](Get-Setting $cfg 'ClusterAdmin' '')
         ClusterPassword = [string](Get-PlainPassword ([string](Get-Setting $cfg 'ClusterAdminPassFile' '')))
     }
+    if ($link.AliasBinding) { $link | Add-Member NoteProperty RacPath (Join-Path $binDir 'rac.exe') }
     $agentAddress = [string](Get-Setting $cfg 'ClusterAgent' '')
     if (-not $agentAddress) { $agentAddress = 'tcp://' + ($script:Server -split ':')[0] }
     try {
