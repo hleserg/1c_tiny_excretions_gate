@@ -8806,7 +8806,7 @@ elseif ($anyTouched -gt 0) {
                 if ($verdict -eq 'RED') { $acceptLabel = 'Оставить и принять новое в эталон (прогон КРАСНЫЙ)' }
                 $picked = Read-UiChoice -Header ("Комплект в {0}: оставить или откатить?" -f $baseKey) -Keys @('1', '2', '3') `
                     -Labels @('Оставить', $acceptLabel, 'Откатить') -DefaultKey '1' -Dock -Danger @(2) `
-                    -Notes @('Новое этого прогона - в report.txt и *.new.txt. «Принять в эталон» - оно станет известным и больше не будет красить прогоны.')
+                    -Notes @('Esc оставит комплект в базе. Эталон сохранится прежним.', 'Новое этого прогона - в report.txt и *.new.txt. «Принять в эталон» - оно станет известным и больше не будет красить прогоны.')
                 if ($picked -eq '1') { $answer = '1' }
                 elseif ($picked -eq '2') { $answer = '1'; $acceptAfterDecision = $true }
                 elseif ($picked -eq '3') { $answer = '2' }

@@ -331,7 +331,7 @@ try {
             Show-UiPager -Lines $lines -Header ('Что в {0}' -f $candidate.Version)
             $question = 'Поставить {0}?' -f $candidate.Version
             if ($installed -and $candidate.Version -lt $installed) { $question = 'Поставить более старый {0} вместо {1} (откат)?' -f $candidate.Version, $installed }
-            if (Confirm-Ui -Question $question -Default $true) { $chosen = $candidate }
+            if (Confirm-Ui -Question $question -Yes 'Установить' -No 'Отмена' -DefaultNo) { $chosen = $candidate }
         }
     }
     if ($null -ne $chosen) {
