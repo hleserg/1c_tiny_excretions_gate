@@ -3995,6 +3995,10 @@ function Invoke-GitExport {
     # Без @(): функция возвращает массив запятой, @() завернул бы его ещё раз.
     $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $baseFiles $baseFiles $base $head.Sha
     $changes = Compare-GitSnapshot -Local $snapshot.Files -Remote $comparison.Known -Prefixes $snapshot.Prefixes -Ignore (Get-GitSkippedPaths $snapshot $baseFiles) -LocalShas $comparison.LocalShas
+    if ($changes.Count -gt 0 -and $base -ne $head.Sha -and (Get-Setting $cfg 'GitRoleDumpPairs' @()) -and ($changes.Path -match '/Roles/[^/]+/Ext/Rights\.xml$')) {
+        $currentFiles = Get-GhFiles $Setup.Gh $head.Sha
+        $changes = @($changes | Where-Object { -not (Test-GitRoleDumpPair $Setup $_.Path $_.Sha $currentFiles[$_.Path]) })
+    }
     $manifest = 'processings/manifest.json'
     if ($snapshot.Files.ContainsKey($manifest) -and $baseFiles.ContainsKey($manifest) -and $comparison.LocalShas[$manifest] -ne $baseFiles[$manifest]) {
         $current = Get-GitComparisonManifest ([IO.File]::ReadAllBytes($snapshot.Files[$manifest]))
@@ -4004,7 +4008,8 @@ function Invoke-GitExport {
         }
     }
     if ($changes.Count -eq 0) {
-        Write-Line ("{0} совпадает с git (коммит {1}): выгружать нечего." -f $script:TempBase, (Get-GitShort $base)) 'Green'
+        if ($comparison.PublishedVersion) { Write-Line ("Версия расширения уже есть в истории {0}: выгружать нечего." -f $Setup.Branch) 'Green' }
+        else { Write-Line ("{0} совпадает с git (коммит {1}): выгружать нечего." -f $script:TempBase, (Get-GitShort $base)) 'Green' }
         if (-not [string]$State['commit'] -and $base) { $State['commit'] = $base; $State['how'] = 'export'; Save-GitState $Setup $State }
         $script:DeployBranchOutcome = 'unchanged'
         return
@@ -4204,12 +4209,26 @@ function Test-GitDumpXmlMatch {
     return ($Kind -eq 'module' -and [string]::Equals((Get-GitDumpComparisonXml $Bytes $Kind $false), $source, [StringComparison]::Ordinal))
 }
 
+function Test-GitRoleDumpPair {
+    # Пара Git blob для роли, проверенной на площадке загрузкой, повторной выгрузкой и тестом права.
+    param($Setup, [string]$Path, [string]$DumpBlob, [string]$SourceBlob)
+    if ($Path -cnotmatch '^extensions/[^/]+/Roles/[^/]+/Ext/Rights\.xml$' -or -not $SourceBlob) { return $false }
+    foreach ($pair in (Get-Setting $cfg 'GitRoleDumpPairs' @())) {
+        if ($pair.Repo -ceq $Setup.Repo -and $pair.Path -ceq $Path -and $pair.SourceBlob -ceq $SourceBlob -and $pair.DumpBlob -ceq $DumpBlob) { return $true }
+    }
+    return $false
+}
+
 function Get-GitDumpComparisonFiles {
     # Копия таблицы хешей только для сравнения. В комплект скачиваются оригинальные файлы коммита.
     param($Setup, [hashtable]$Local, [hashtable]$LocalShas, [hashtable]$Remote, [hashtable]$Cache)
     $files = $Remote.Clone()
     foreach ($path in $Local.Keys) {
         if (-not $Remote.ContainsKey($path) -or $LocalShas[$path] -eq $Remote[$path]) { continue }
+        if (Test-GitRoleDumpPair $Setup $path $LocalShas[$path] $Remote[$path]) {
+            $files[$path] = $LocalShas[$path]
+            continue
+        }
         $kind = Get-GitDumpXmlKind $path $Local $Remote
         if (-not $kind) { continue }
         $key = $kind + '/' + $LocalShas[$path] + '/' + $Remote[$path]
@@ -4239,6 +4258,7 @@ function Get-GitSnapshotComparison {
     if (-not [object]::ReferenceEquals($KnownFiles, $HeadFiles)) {
         $head = Get-GitDumpComparisonFiles $Setup $Local $localShas $HeadFiles $cache
     }
+    $publishedVersion = $false
     if ($KnownCommit -and $HeadCommit -and $KnownCommit -ne $HeadCommit) {
         # Для загрузки остаются байты текущего main. История влияет только на поиск прямых правок.
         $known = $known.Clone()
@@ -4246,11 +4266,12 @@ function Get-GitSnapshotComparison {
             if ($path -notmatch '^extensions/[^/]+/Configuration\.xml$' -or -not $known.ContainsKey($path) -or $localShas[$path] -eq $known[$path]) { continue }
             if (Test-GitPublishedVersion $Setup $path ([IO.File]::ReadAllBytes($Local[$path])) $localShas[$path] $known[$path] $KnownCommit $HeadCommit) {
                 $known[$path] = $localShas[$path]
+                $publishedVersion = $true
                 Write-RunLog ("git: {0} совпадает с опубликованной версией в истории {1}" -f $path, $Setup.Branch)
             }
         }
     }
-    return [pscustomobject]@{ LocalShas = $localShas; Known = $known; Head = $head }
+    return [pscustomobject]@{ LocalShas = $localShas; Known = $known; Head = $head; PublishedVersion = $publishedVersion }
 }
 
 function Test-GitSameAsHead {
@@ -4274,6 +4295,7 @@ function Test-GitPendingSourceChanges {
     $before = Get-GhFiles -Gh $Setup.Gh -Commit $base
     $after = Get-GhFiles -Gh $Setup.Gh -Commit $pending
     if ($before.Count -eq 0 -or $before.Count -ne $after.Count) { return $true }
+    $targetFiles = $null
     foreach ($path in $after.Keys) {
         if (-not $before.ContainsKey($path)) { return $true }
         if ($after[$path] -eq $before[$path]) { continue }
@@ -4281,6 +4303,11 @@ function Test-GitPendingSourceChanges {
             if (-not (Get-GitComparisonManifest (Get-GhBlob -Gh $Setup.Gh -Sha $after[$path]))) { return $true }
             if (-not (Get-GitComparisonManifest (Get-GhBlob -Gh $Setup.Gh -Sha $before[$path]))) { return $true }
             continue
+        }
+        if ($path -cmatch '/Roles/[^/]+/Ext/Rights\.xml$' -and (Get-Setting $cfg 'GitRoleDumpPairs' @())) {
+            if (Test-GitRoleDumpPair $Setup $path $after[$path] $before[$path]) { continue }
+            if ($null -eq $targetFiles) { $targetFiles = Get-GhFiles $Setup.Gh $Head }
+            if (Test-GitRoleDumpPair $Setup $path $after[$path] $targetFiles[$path]) { continue }
         }
         if ($path -match '^extensions/[^/]+/Configuration\.xml$' -and (Test-GitPublishedVersion $Setup $path (Get-GhBlob $Setup.Gh $after[$path]) $after[$path] $before[$path] $base $Head)) { continue }
         $kind = Get-GitDumpXmlKind $path $after $before
@@ -4362,7 +4389,10 @@ function Invoke-GitImport {
         if ($sameAsHead.Count -gt 0) { $drift = @($drift | Where-Object { -not (Test-GitSameAsHead $_ $compareHead) }) }
     }
     # Итог сверки - на экран и когда правок нет: иначе по выводу не понять, чем кончилась проверка.
-    if ($drift.Count -eq 0) { Write-Line ("  правок нет: {0} совпадает с коммитом {1}" -f $script:TempBase, $knownName) 'Green' }
+    if ($drift.Count -eq 0) {
+        if ($comparison.PublishedVersion) { Write-Line ("  новых правок нет. Версия расширения из {0} уже есть в истории {1}." -f $script:TempBase, $Setup.Branch) 'Green' }
+        else { Write-Line ("  правок нет: {0} совпадает с коммитом {1}" -f $script:TempBase, $knownName) 'Green' }
+    }
     if ($drift.Count -gt 0) {
         Write-Line ("В {0} есть правки, которых нет в git (коммит {1}):" -f $script:TempBase, $knownName) 'Yellow'
         if ($null -ne $script:DeployReport) { Add-GateOperationLine -Context $script:DeployReport -Text ((Get-GitFileLines $drift -Limit ([int]::MaxValue)) -join "`n") }

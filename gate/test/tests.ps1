@@ -4605,6 +4605,44 @@ $tests = @(
         }
     },
     @{
+        Name = 'git-role-dump-pair'
+        Text = 'Проверенная выгрузка роли совпадает с загруженным исходником, включая старый PR. Другая правка той же роли сохраняется.'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $dumps = New-GitDumps
+            $xmlPath = 'Roles/Admin/Ext/Rights.xml'
+            $path = 'extensions/Адаптация/' + $xmlPath
+            $put = { param($xml) [pscustomobject]@{Path=$path; Bytes=$utf8.GetBytes(([string][char]0xfeff) + $xml)} }
+            $allow = & $put '<Rights><View>true</View></Rights>'
+            $dump = & $put '<Rights/>'
+            $dumps['Адаптация'][$xmlPath] = '<Rights><View>false</View></Rights>'
+            $argsGit = @{Sandbox=$sb; Script='deploy.ps1'; Fake=@{dumps=$dumps}; Com=(New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld)))}
+            $boot = Invoke-Script @argsGit -Arguments '-GitExport' -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            $state = Read-GitStateFile $sb
+            $base = $state.commit
+            Set-GhBranch $gh main $base
+            $head = New-GhCommit $gh $base @($allow) 'Разрешить просмотр'
+            Set-GhBranch $gh main $head
+            $dumps['Адаптация'][$xmlPath] = '<Rights/>'
+            $old = Invoke-Script @argsGit -Arguments '-GitImport -GitUnattended'
+            $state = Read-GitStateFile $sb
+            Check ($state.pendingCommit -ne $base -and $state.pendingCommit) 'расхождение без подтверждения не сохранилось в PR'
+            $rule = @{Repo='owner/ext'; Path=$path; SourceBlob=(Get-GitBlobSha $allow.Bytes); DumpBlob=(Get-GitBlobSha $dump.Bytes)}
+            [IO.File]::WriteAllText((Join-Path $sb 'config.site.psd1'), (ConvertTo-Psd1 @{GitRoleDumpPairs=@($rule)}), $utf8Bom)
+            $same = Invoke-Script @argsGit -Arguments '-GitImport -GitUnattended'
+            Check-DeployCommon $same -LocksExpected $false
+            Check ([bool]($same.Output -match 'загружать нечего') -and (Read-GitStateFile $sb).commit -eq $head) 'старый PR или подтверждённая пара потребовали перезагрузки роли'
+            $dumps['Адаптация'][$xmlPath] = '<Rights><View>false</View></Rights>'
+            $changed = Invoke-Script @argsGit -Arguments '-GitImport -GitUnattended'
+            $state = Read-GitStateFile $sb
+            $files = Get-GhFiles $gh $state.pendingCommit
+            Check ($changed.ExitCode -eq 0 -and $files[$path] -eq (Get-GhFiles $gh $base)[$path]) 'изменённое право пропущено'
+        }
+    },
+    @{
         Name = 'git-snapshot-intermediate'
         Text = 'Версия расширения из промежуточного коммита допускает загрузку main. Свой вариант сохраняется в PR, из того же меню можно продолжить загрузку.'
         Run = {
