@@ -1766,6 +1766,7 @@ $tests = @(
             $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}" -OnNotGreen Keep' -f $file) -Fake $fake
             Check-Common $r; Check-Verdict $r 'YELLOW' 2
             Check-Step $r 'Карта покрытия' 'WARN'
+            Check ((Get-Step $r 'Карта покрытия').detail.Contains('Новых пробелов в покрытии по сравнению с эталоном: 2')) 'по итогу карты не видно, почему изменился статус'
             if ($r.RunDir) {
                 $new = @([System.IO.File]::ReadAllLines((Join-Path $r.RunDir 'coverage.new.txt'), $utf8) | Where-Object { $_ })
                 Check ($new.Count -eq 2) ("нового непокрытого {0}, ждали 2: {1}" -f $new.Count, ($new -join ' | '))
@@ -3816,6 +3817,13 @@ $tests = @(
             foreach ($expected in @('ОМ_Пример.Сложение [Сервер]=OK', 'ОМ_Пример.Вычитание [Сервер]=FAIL', 'ОМ_Пример.Вычитание [Сервер] #2=OK', 'ОМ_Сломан [Сервер] набор=ERROR')) {
                 Check ($keys -contains $expected) ("в разборе jUnit нет {0}: {1}" -f $expected, ($keys -join ', '))
             }
+            Check ((Get-UtDisplayTitle -Key 'Модуль.Метод [Сервер]' -Name 'Из JUnit' -Presentations @{}) -eq 'Из JUnit') 'утеряно имя из JUnit без каталога'
+            Check ((Get-UtDisplayTitle -Key 'Модуль.Метод [Сервер]' -Name '' -Presentations @{}) -eq 'Модуль.Метод [Сервер]') 'утерян ключ теста без описания'
+            Check ((Get-UtDisplayMessage -Message "Причина 1`nПричина 2`nСтек вызовов:`nстрока" -Status 'ERROR') -eq 'Причина 1 Причина 2') 'текст ошибки или стек отформатирован неверно'
+            $bodyJunit = Join-Path $dir 'junit-body.xml'
+            [IO.File]::WriteAllText($bodyJunit, '<testsuites><testsuite classname="Модуль"><testcase classname="Модуль.Метод"><error>Не удалось открыть документ</error></testcase></testsuite></testsuites>', $utf8)
+            $bodyResult = Read-UtJUnit $bodyJunit
+            Check ($bodyResult[0].Message -eq 'Не удалось открыть документ' -and $bodyResult[0].Status -eq 'ERROR') 'пропущена причина ошибки из текста элемента JUnit'
             $baselineFile = Join-Path $dir 'baseline.txt'
             [System.IO.File]::WriteAllLines($baselineFile, [string[]]@("OK`tОМ_Пример.Сложение [Сервер]`t", "FAIL`tОМ_Сломан [Сервер] набор`tстарое", "OK`tОМ_Пропал.Тест [Сервер]`t"), $utf8Bom)
             $comparison = Compare-UtResults -Current $results -BaselineFile $baselineFile
@@ -3919,6 +3927,27 @@ $tests = @(
         }
     },
     @{
+        Name = 'gate-unittests-readable-causes'
+        Text = 'Общая причина двух падений и названия проверок в итоге, исходные ключи в результатах'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $unitConfig
+            $null = Add-UnitTestSource -Dir (Join-Path $sb 'tests')
+            $reason = 'Не хватает тестовых данных. Не найден документ-пример № 123.'
+            $cases = @(
+                @{ module = 'ОМ_Пример'; method = 'Сложение'; name = 'Сложение'; status = 'fail'; message = $reason },
+                @{ module = 'ОМ_Пример'; method = 'Вычитание'; name = 'Вычитание'; status = 'fail'; message = $reason })
+            $r = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ absent = @('Тесты'); unittests = @(@{ cases = $cases }) }
+            Check-Verdict $r 'RED' 1
+            $detail = [string](Get-Step $r 'Модульные тесты').detail
+            Check ([regex]::Matches($detail, [regex]::Escape($reason)).Count -eq 1) 'одинаковая причина должна отображаться один раз'
+            Check ($detail.Contains('Сложение двух чисел') -and $detail.Contains('Вычитание') -and -not $detail.Contains('ОМ_Пример.')) 'вместо названий оператора показаны технические ключи'
+            Check ($detail.Contains('Прошло 0 из 2') -and $detail.Contains('Новых падений 2') -and -not $detail.Contains('ERROR -')) 'счётчик не объясняет исход'
+            $raw = Get-Content -LiteralPath (Join-Path $r.RunDir 'unittests.new.txt') -Encoding UTF8
+            Check ($raw.Count -eq 2 -and ($raw -join ' ').Contains('ОМ_Пример.Сложение [Сервер]')) 'нарушен формат идентификаторов для эталона'
+        }
+    },
+    @{
         Name = 'gate-unittests-new-failure-accept'
         Text = 'модульные тесты: новое падение - красный, unittests.new.txt; принять в эталон - то же падение потом известное, зелёный'
         Run = {
@@ -3945,7 +3974,7 @@ $tests = @(
             $known = Invoke-Script -Sandbox $sb -Arguments '-OnNotGreen Keep' -Fake @{ unittests = @($unitMinusFails) }
             Check-Common $known; Check-Verdict $known 'GREEN' 0
             $step = Get-Step $known 'Модульные тесты'
-            Check ($null -ne $step -and [string]$step.detail -match 'известных 1') ("после принятия: {0}" -f $(if ($null -ne $step) { $step.detail } else { 'шага нет' }))
+            Check ($null -ne $step -and [string]$step.detail -match 'Падений, уже принятых в эталон: 1') ("после принятия: {0}" -f $(if ($null -ne $step) { $step.detail } else { 'шага нет' }))
         }
     },
     @{
@@ -5834,6 +5863,7 @@ $tests = @($tests) + @(. (Join-Path $here 'deploy-contract.tests.ps1'))
 # Приёмка поставок подрядчика (раздел 5.26).
 $tests = @($tests) + @(. (Join-Path $here 'delivery.tests.ps1'))
 $tests = @($tests) + @(. (Join-Path $here 'operation-report.tests.ps1'))
+$tests = @($tests) + @(. (Join-Path $here 'unit-failure-report.tests.ps1'))
 if ($Extra) { $tests = @($tests) + @(. $Extra) }
 
 $selected = @($tests | Where-Object { -not $Only -or $_.Name -like "*$Only*" })

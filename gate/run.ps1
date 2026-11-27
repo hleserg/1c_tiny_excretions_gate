@@ -1544,9 +1544,10 @@ function Invoke-CoverageStep {
     $none = @($measured | Where-Object { $_.Level -eq 'none' }).Count
     $detail = "доработок {0}: проверяется {1}, только компиляция {2}, не покрыто {3}" -f $measured.Count, $covered, $compiledOnly, $none
     if ($null -eq $reference) { $detail += '; эталона карты ещё нет, этот прогон станет им' }
-    else { $detail += ("; нового непокрытого {0}" -f $newUncovered.Count) }
+    elseif ($newUncovered.Count -eq 0) { $detail += ". Новых пробелов в покрытии по сравнению с эталоном нет" }
+    else { $detail += (". Новых пробелов в покрытии по сравнению с эталоном: {0}" -f $newUncovered.Count) }
     if ($newUncovered.Count -gt 0) { $detail += ('. Новое непокрытое: ' + (@($newUncovered | Select-Object -First 3 | ForEach-Object { $_.Text }) -join ' | ')) }
-    if ($testHints.Count -gt 0) { $detail += ("; указаний прошедших тестов (@Проверяет) {0}" -f $testHints.Count) }
+    if ($testHints.Count -gt 0) { $detail += (". В описаниях прошедших тестов указано связей с доработками: {0} (@Проверяет)" -f $testHints.Count) }
     $detail += $testsNote
     if ($receiveUnchecked.Count -gt 0) { $detail += ('. Изменён перехват правил обмена на загрузку, а загрузку ничто не проверяло (шаг «Обмены» только выгружает): ' + (@($receiveUnchecked | Select-Object -First 3) -join ' | ')) }
     $detail += '; карта - coverage.txt'
@@ -4162,34 +4163,33 @@ function Invoke-UtStep {
     if (-not $Filter) { $goneCount = @($comparison.Gone).Count }
     $changedCount = @($comparison.ReasonChanged).Count
     # ** Хлебников С.Ю. 20261120 конец
-    $detail = 'тестов {0}: прошло {1}, упало {2}' -f $results.Count, $passed, $failed.Count
-    if ($failed.Count -gt 0) {
-        $newErrors = @($comparison.NewFailed | Where-Object { $_.Status -eq 'ERROR' }).Count
-        $newFails = @($comparison.NewFailed).Count - $newErrors
-        $detail += (' (новых {0}: ERROR - ошибка выполнения {1}, FAIL - не прошло утверждение {2}; известных {3})' -f @($comparison.NewFailed).Count, $newErrors, $newFails, @($comparison.KnownFailed).Count)
-    }
-    if ($changedCount -gt 0) { $detail += (', известных падает по-другому {0} (unittests.changed.txt)' -f $changedCount) }
-    if ($skippedCount -gt 0) { $detail += (', пропущено {0}' -f $skippedCount) }
-    if ($disabled.Count -gt 0 -and -not $Filter) { $detail += (', выключено {0}' -f $disabled.Count) }
-    if (@($comparison.Fixed).Count -gt 0) { $detail += (', починились {0}' -f @($comparison.Fixed).Count) }
-    if ($goneCount -gt 0) { $detail += (', пропало из эталона {0}: эталон не сдвинут, принять - вручную' -f $goneCount) }
-    if (-not $comparison.HasBaseline) { $detail += '; эталона тестов не было' }
-    if ($problems -gt 0) { $detail += ('; замечаний к описаниям тестов {0} (unittests-*.catalog.txt)' -f $problems) }
-    if ($session.State -eq 'junit') { $detail += '; кода возврата YAxUnit нет (движок упал после отчёта, см. unittests\yaxunit.log) - итог по junit.xml' }
-    $detail += ('; {0} с' -f $session.Seconds)
+    $detail = 'Прошло {0} из {1}.' -f $passed, $results.Count
+    if (@($comparison.NewFailed).Count -gt 0) { $detail += (' Новых падений {0}.' -f @($comparison.NewFailed).Count) }
+    if (@($comparison.KnownFailed).Count -gt 0) { $detail += (' Падений, уже принятых в эталон: {0}.' -f @($comparison.KnownFailed).Count) }
+    if ($changedCount -gt 0) { $detail += (' У {0} из них изменилась причина (unittests.changed.txt).' -f $changedCount) }
+    if ($skippedCount -gt 0) { $detail += (' Пропущено {0}.' -f $skippedCount) }
+    if ($disabled.Count -gt 0 -and -not $Filter) { $detail += (' Выключено в настройках тестов: {0}.' -f $disabled.Count) }
+    if (@($comparison.Fixed).Count -gt 0) { $detail += (' Теперь проходят: {0}.' -f @($comparison.Fixed).Count) }
+    if ($goneCount -gt 0) { $detail += (' Тестов из эталона, которых больше нет в каталоге: {0}. Изменение принимается вручную.' -f $goneCount) }
+    if (-not $comparison.HasBaseline) { $detail += ' Эталона для сравнения пока нет.' }
+    if ($problems -gt 0) { $detail += (' Замечаний к описаниям тестов: {0} (unittests-*.catalog.txt).' -f $problems) }
+    if ($session.State -eq 'junit') { $detail += ' Кода возврата YAxUnit нет. Результаты взяты из junit.xml.' }
+    $detail += (' Время {0} с.' -f $session.Seconds)
     $status = 'OK'
     if (@($comparison.NewFailed).Count -gt 0) {
         $status = 'FAIL'
         $newLines = @($comparison.NewFailed | ForEach-Object { Format-UtResultLine $_ })
         [System.IO.File]::WriteAllLines((Join-Path $RunDir 'unittests.new.txt'), [string[]]$newLines, $Utf8Bom)
-        $sample = (@($comparison.NewFailed | Select-Object -First 3 | ForEach-Object {
-                    $message = [string]$_.Message
-                    if ($message.Length -gt 160) { $message = $message.Substring(0, 160) + '...' }
-                    '{0} ({1}): {2}' -f $_.Key, (Get-UtStatusTitle $_.Status), $message
-                }) -join ' | ')
-        $detail += ('. Новые падения в unittests.new.txt: {0}' -f $sample)
     }
     elseif ($problems -gt 0 -or $goneCount -gt 0 -or $changedCount -gt 0) { $status = 'WARN' }
+    if ($failed.Count -gt 0) {
+        $presentations = @{}
+        foreach ($test in $known) { $presentations[$test.Key] = $test.Presentation }
+        $shown = @($comparison.NewFailed)
+        if ($shown.Count -eq 0) { $shown = @($comparison.ReasonChanged | ForEach-Object { $_.Result }) }
+        if ($shown.Count -eq 0) { $shown = @($comparison.KnownFailed) }
+        $detail += ([Environment]::NewLine + '       ' + (Format-UtFailureSummary -Results $shown -Presentations $presentations))
+    }
     if ($changedCount -gt 0) {
         $changedLines = @($comparison.ReasonChanged | ForEach-Object { ("{0}`t{1}`tбыло: {2} {3}`tстало: {4} {5}" -f $_.Result.Status, $_.Result.Key, $_.BeforeStatus, $_.BeforeMessage, $_.Result.Status, (([string]$_.Result.Message) -replace '\s+', ' ')) })
         [System.IO.File]::WriteAllLines((Join-Path $RunDir 'unittests.changed.txt'), [string[]]$changedLines, $Utf8Bom)
