@@ -1678,6 +1678,35 @@ $tests = @(
         }
     },
     @{
+        Name = 'gate-selfcheck-lanes-compile'
+        Text = 'Второй исполнитель завершает чтение данных до операций первого и проверяет модули параллельно с ними.'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config @{SelfCheckWorkers=2; SelfCheckSplitGroup=$laneGroup; SelfCheckEarlyReads=$true}
+            $file = Add-InboxFile $sb $cfeName
+            $tasks = @(foreach ($i in 1..12) {
+                @{key=("КомпиляцияМодулей/Менеджер|Документы.Док{0}" -f $i); title=("Менеджер {0}" -f $i); step='Модули'; lines=@('[ОК] Менеджер')}
+            }) + @($laneTasks[1..5])
+            $fake = @{selfcheck=@(@{tasks=$tasks; sleep=0.8}, @{tasks=$tasks; sleep=0.8; fingerprint='после'})}
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake
+            Check-Common $r
+            Check-Verdict $r 'GREEN' 0
+            foreach ($label in 'before','after') {
+                $dir = Join-Path $r.RunDir ('selfcheck-' + $label)
+                $first = @(Get-ChildItem -LiteralPath (Join-Path $dir 'w1-try1') -Filter 'p*.txt' | Where-Object Name -match '^p\d+')
+                $second = @(Get-ChildItem -LiteralPath (Join-Path $dir 'w2-try1') -Filter 'p*.txt' | Where-Object Name -match '^p\d+')
+                $write = @($first | Where-Object { Select-String -LiteralPath $_.FullName -Pattern '^@@key=ПерепроведениеДокументов/' -Quiet })
+                $compile = @($second | Where-Object { Select-String -LiteralPath $_.FullName -Pattern '^@@key=КомпиляцияМодулей/Менеджер\|' -Quiet } | Sort-Object Name)
+                $forms = @($second | Where-Object { Select-String -LiteralPath $_.FullName -Pattern '^@@key=Форма/' -Quiet } | Sort-Object Name)
+                Check ($compile.Count -eq 12 -and $write.Count -eq 1 -and $forms.Count -eq 2) 'План не выделил 12 проверок менеджеров второму исполнителю'
+                if ($compile.Count -eq 12 -and $write.Count -eq 1 -and $forms.Count -eq 2) {
+                    Check ($forms[-1].LastWriteTimeUtc -le $compile[0].LastWriteTimeUtc) 'Компиляция началась до окончания чтений второго'
+                    Check ($write[0].LastWriteTimeUtc -ge $compile[0].LastWriteTimeUtc -and $write[0].LastWriteTimeUtc -lt $compile[-1].LastWriteTimeUtc) 'Первый должен начать операции во время компиляции у второго'
+                }
+            }
+        }
+    },
+    @{
         # ** Хлебников С.Ю. 20261120
         Name = 'gate-selfcheck-lanes-crash'
         Text = 'два исполнителя, второй оборвался после первого задания: задание, на котором он оборвался, - ошибка, его невыполненное задание названо в итоге шага, первый дождался и закончил, вердикт не зелёный'
