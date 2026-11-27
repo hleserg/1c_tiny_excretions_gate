@@ -55,6 +55,8 @@ func (m *model) resetRun() {
 	m.overall = newOverallBar()
 	m.verdict = ""
 	m.eta = nil
+	m.runLogPath = ""
+	m.notice = ""
 }
 
 // setPlan - событие plan: заменяет трубу планом. Отметки, пришедшие раньше плана, сохраняются.
@@ -389,21 +391,36 @@ func (m model) connector(next pipeNode, active bool) string {
 	return styleOk.Render("│")
 }
 
-// timeText - сколько прошло с начала скрипта и (у прогона, если скрипт умеет оценить) сколько осталось:
-// «прошло 1:02:03 · осталось ~12:34+». «+» - есть шаги без статистики. Скрипт не идёт - пусто.
+// timeText показывает, сколько прошло и на какую часть оставшейся работы есть оценка.
 func (m model) timeText() string {
 	if !m.running || m.started.IsZero() {
 		return ""
 	}
 	text := "прошло " + formatDuration(time.Since(m.started).Seconds())
-	if m.eta != nil {
-		left := m.eta.seconds - time.Since(m.eta.at).Seconds()
-		text += " · осталось ~" + formatDuration(left)
-		if m.eta.unknown > 0 {
-			text += "+"
-		}
+	if m.eta == nil {
+		return text
+	}
+	left := max(0, int(m.eta.seconds-time.Since(m.eta.at).Seconds()+0.5))
+	if left == 0 && m.eta.unknown > 0 {
+		return fmt.Sprintf("%s · шагов без оценки: %d", text, m.eta.unknown)
+	}
+	if left < 60 {
+		text += fmt.Sprintf(" · осталось около %d с", left)
+	} else {
+		text += fmt.Sprintf(" · осталось около %d мин", (left+30)/60)
+	}
+	if m.eta.unknown > 0 {
+		text += fmt.Sprintf(" по известным шагам. Без оценки ещё %d", m.eta.unknown)
 	}
 	return text
+}
+
+// В узком окне колонки шагов нет. Прогноз прогона остаётся над журналом.
+func (m model) narrowETA() string {
+	if m.width >= minWidthForSteps || m.eta == nil {
+		return ""
+	}
+	return wrapBlock(m.timeText(), m.width, styleDim)
 }
 
 func (m model) viewPipe(width, height int) string {
@@ -457,6 +474,9 @@ func (m model) viewPipe(width, height int) string {
 	}
 	if timeLine != "" {
 		rows -= strings.Count(hang("", timeLine, width, styleDim), "\n") + 1
+	}
+	if rows <= 0 {
+		return b.String()
 	}
 	active := -1
 	if m.running {

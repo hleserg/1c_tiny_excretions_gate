@@ -831,7 +831,8 @@ function Wait-DeliveryCi {
             Write-DeliveryEvent $D $State 'ci' ("CI PR #{0}: {1} (head {2}, merge {3})" -f $Number, $result, (Get-GitShort $pull.Head), (Get-GitShort $pull.Merge)) $color
             return [pscustomobject]@{ Result = $result; Merge = $pull.Merge; Head = $pull.Head; Base = $pull.Base; Run = $runId }
         }
-        Write-UiProgress -Title $title -Elapsed $watch.Elapsed.TotalSeconds -Expected $limit -Detail 'жду проверку ERP static для текущего merge SHA'
+        $detail = 'Жду результат проверки ERP static. Лимит ожидания {0} мин.' -f ($limit / 60)
+        Write-UiProgress -Title $title -Elapsed $watch.Elapsed.TotalSeconds -Detail $detail
         Start-Sleep -Seconds 10
     }
 }

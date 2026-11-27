@@ -18,6 +18,9 @@ const maxLogLines = 6000
 
 var stepLine = regexp.MustCompile(`^\[(OK|WARN|FAIL|SKIP)\s*\]\s+(.+)$`)
 
+// Штатные коды run.ps1 для завершённых проверок.
+var verdictExitCodes = map[string]int{"ВЕРДИКТ: ЗЕЛЁНЫЙ": 0, "ВЕРДИКТ: ЖЁЛТЫЙ": 2, "ВЕРДИКТ: КРАСНЫЙ": 1}
+
 type step struct {
 	status string
 	name   string
@@ -79,6 +82,9 @@ type model struct {
 	stopAsked time.Time
 	notice    string
 
+	logTruncated bool
+	runLogPath   string
+
 	// ** Хлебников С.Ю. 20261120 Для шапки (#32): с какой базой работает скрипт (событие context) и когда от него
 	// было последнее сообщение - строка или событие. Видно и в узком окне, где нет колонки шагов.
 	context    string
@@ -137,6 +143,7 @@ func (m *model) appendLine(s string) {
 	m.lines = append(m.lines, s)
 	if len(m.lines) > maxLogLines {
 		m.lines = m.lines[len(m.lines)-maxLogLines:]
+		m.logTruncated = true
 	}
 	// Шаг - только строка с начала: строки с отступом (итог прошлого гейта в deploy) - справочные.
 	if found := stepLine.FindStringSubmatch(strings.TrimRight(s, " ")); found != nil && !strings.HasPrefix(s, " ") {
@@ -148,7 +155,7 @@ func (m *model) appendLine(s string) {
 			m.layout()
 		}
 	}
-	if strings.HasPrefix(strings.TrimSpace(s), "ВЕРДИКТ:") {
+	if strings.HasPrefix(s, "ВЕРДИКТ:") {
 		m.verdict = strings.TrimSpace(s)
 		m.markVerdict(m.verdict)
 	}
@@ -165,6 +172,9 @@ func (m *model) refreshLog() {
 func (m *model) layout() {
 	// Шапка и подсказка - по строке, рамка журнала - ещё две, панель хода - пять.
 	bodyHeight := m.height - 4
+	if eta := m.narrowETA(); eta != "" {
+		bodyHeight -= lipgloss.Height(eta)
+	}
 	if m.prog != nil {
 		bodyHeight -= lipgloss.Height(m.viewProgress())
 	}
@@ -270,6 +280,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "context":
 			m.context = ev.Text
+		case "run-log":
+			m.runLogPath = ev.Text
 		case "plan":
 			m.setPlan(ev.Steps, ev.Parallel, ev.Ops)
 			return m, m.syncOverall()
@@ -291,8 +303,11 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.layout()
 		case "progress":
 			m.prog = &progressState{title: ev.Title, elapsed: ev.Elapsed, expected: ev.Expected, done: ev.Done, total: ev.Total, detail: ev.Detail, at: time.Now()}
-			if ev.Remaining != nil && *ev.Remaining >= 0 {
-				m.eta = &runEta{seconds: *ev.Remaining, unknown: ev.RemainingUnknown, at: time.Now()}
+			if ev.Remaining != nil {
+				m.eta = nil
+				if *ev.Remaining >= 0 {
+					m.eta = &runEta{seconds: *ev.Remaining, unknown: ev.RemainingUnknown, at: time.Now()}
+				}
 			}
 			var cmds []tea.Cmd
 			if ev.Title != m.barTitle {
@@ -333,6 +348,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.running = false
 		m.exitCode = msg.code
 		m.exitErr = msg.err
+		m.appendLine(fmt.Sprintf("Код завершения: %d", msg.code))
 		m.prog = nil
 		if m.dialog != nil && m.dialog.local == "" {
 			m.dialog = nil
@@ -391,9 +407,13 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		if msg.String() == "f2" {
-			// Весь журнал - в буфер обмена. Мышь у ci.exe занята прокруткой и щелчками по пунктам, поэтому выделить
+			// Строки окна - в буфер обмена. Мышь у ci.exe занята прокруткой и щелчками по пунктам, поэтому выделить
 			// текст в окне, как в обычной консоли, нельзя. Работает и при открытом вопросе.
 			m.copyLog()
+			if m.dialog != nil {
+				m.dialog.copyNotice = m.notice
+				m.layout()
+			}
 			return m, nil
 		}
 		if m.dialog != nil && m.dialog.docked() {
@@ -446,11 +466,7 @@ func (m model) overlayMouse(msg tea.MouseMsg) tea.MouseMsg {
 
 // dockedMouse - координаты мыши внутри полосы вопроса внизу (без рамки и полей).
 func (m model) dockedMouse(msg tea.MouseMsg) tea.MouseMsg {
-	var panel string
-	if m.prog != nil {
-		panel = m.viewProgress()
-	}
-	top := lipgloss.Height(lipgloss.JoinVertical(lipgloss.Left, m.viewHeader(), m.viewBody(), panel))
+	top := lipgloss.Height(m.viewMain())
 	if total := top + lipgloss.Height(m.dialog.ViewDocked(m.width)); total > m.height {
 		top -= total - m.height
 	}
@@ -552,8 +568,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !m.starting && !m.running {
 			m.starting = true
 			m.lines = nil
+			m.logTruncated = false
 			m.resetRun()
-			m.notice = ""
 			m.refreshLog()
 			return m, m.startCmd()
 		}
@@ -580,28 +596,35 @@ func (m model) View() string {
 	if m.width == 0 {
 		return "запуск…"
 	}
-	header := m.viewHeader()
-	body := m.viewBody()
-	var panel string
-	if m.prog != nil {
-		panel = m.viewProgress()
-	}
-	footer := m.viewFooter()
-	if m.dialog != nil && m.dialog.docked() {
-		footer = m.dialog.ViewDocked(m.width)
-	}
-	screen := lipgloss.JoinVertical(lipgloss.Left, header, body, panel, footer)
 	if m.dialog != nil && !m.dialog.docked() {
 		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.dialog.View(),
 			lipgloss.WithWhitespaceChars(" "))
 	}
-	return screen
+	footer := m.viewFooter()
+	if m.dialog != nil {
+		footer = m.dialog.ViewDocked(m.width)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, m.viewMain(), footer)
+}
+
+func (m model) viewMain() string {
+	parts := []string{m.viewHeader(), m.viewBody()}
+	if m.prog != nil {
+		parts = append(parts, m.viewProgress())
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
 func (m model) viewHeader() string {
 	title := " CI · гейт и обновление расширений "
 	if m.width < minWidthForSteps {
 		title = " CI "
+	}
+	// Короткий вердикт для шапки. Подробное сообщение уже в журнале.
+	short, _, _ := strings.Cut(m.verdict, ".")
+	badge := ""
+	if short != "" {
+		badge = verdictStyle(short).Render(" " + short + " ")
 	}
 	state := ""
 	switch {
@@ -613,18 +636,20 @@ func (m model) viewHeader() string {
 		state = styleOk.Render(" " + m.spin.View() + " работает ")
 	case m.starting:
 		state = styleAccent.Render(" запускается ")
+	case badge != "":
+		state = badge
+		badge = ""
+		// Если после вердикта упал сам скрипт, его код отличается от штатного кода проверки.
+		if code, ok := verdictExitCodes[short]; ok && m.exitCode != 0 && m.exitCode != code {
+			state += styleBad.Render(" сбой после вердикта ")
+		}
 	case m.exitCode == 0:
 		state = styleOk.Render(" готово ")
 	default:
 		state = styleBad.Render(fmt.Sprintf(" завершился с кодом %d ", m.exitCode))
 	}
-	if m.verdict != "" {
-		// В шапке - только цвет вердикта, весь текст - в журнале.
-		short := m.verdict
-		if i := strings.Index(short, "."); i > 0 {
-			short = short[:i]
-		}
-		state += " " + verdictStyle(m.verdict).Render(" "+short+" ")
+	if badge != "" {
+		state += " " + badge
 	}
 	now := time.Now()
 	clockText := now.Format("15:04:05") + " "
@@ -660,6 +685,9 @@ func (m model) viewHeader() string {
 	}
 	if fit() > m.width {
 		quiet = ""
+	}
+	if over := fit() - m.width; over > 0 {
+		state = ansi.Truncate(state, max(0, lipgloss.Width(state)-over), "…")
 	}
 	left := styleHeader.Render(title)
 	if context != "" {
@@ -698,6 +726,9 @@ func (m model) quietText(now time.Time, short bool) string {
 func (m model) viewBody() string {
 	logBox := styleLog.Render(m.logView.View())
 	if m.width < minWidthForSteps {
+		if eta := m.narrowETA(); eta != "" {
+			return eta + "\n" + logBox
+		}
 		return logBox
 	}
 	content := m.viewPipe(stepsWidth-4, m.logView.Height)
@@ -761,17 +792,22 @@ func (m model) viewProgress() string {
 	return styleProgressBox.Width(m.width - 2).Render(line1 + "\n" + line2 + "\n" + line3)
 }
 
-// copyLog - весь журнал (то, что в окне справа, без раскраски) в буфер обмена; итог - строкой подсказки.
+// copyLog копирует строки, которые ещё хранятся в окне, без раскраски.
 func (m *model) copyLog() {
 	lines := make([]string, len(m.lines))
 	for i, l := range m.lines {
 		lines[i] = ansi.Strip(l)
 	}
 	if err := writeClipboard(strings.Join(lines, "\r\n")); err != nil {
-		m.notice = "журнал в буфер обмена не скопировался: " + err.Error()
-		return
+		m.notice = "Не удалось скопировать журнал: " + err.Error()
+	} else if m.logTruncated {
+		m.notice = fmt.Sprintf("Скопированы последние %d строк окна.", len(lines))
+	} else {
+		m.notice = fmt.Sprintf("Скопировано строк окна: %d.", len(lines))
 	}
-	m.notice = fmt.Sprintf("журнал в буфере обмена: строк %d", len(lines))
+	if m.runLogPath != "" {
+		m.notice += " Полный журнал: " + m.runLogPath
+	}
 }
 
 func (m model) viewFooter() string {
@@ -780,12 +816,12 @@ func (m model) viewFooter() string {
 	case m.dialog != nil || m.starting:
 		help = ""
 	case m.running:
-		help = "↑↓ PgUp PgDn журнал · f к концу · F2 журнал в буфер обмена · q остановить скрипт"
+		help = "↑↓ PgUp PgDn журнал · f к концу · F2 скопировать журнал окна · q остановить скрипт"
 		if !m.stopAsked.IsZero() && time.Since(m.stopAsked) > 20*time.Second {
 			help += " · k снять процесс"
 		}
 	default:
-		help = "enter или esc снова в меню · q выход · ↑↓ журнал · F2 журнал в буфер обмена"
+		help = "enter или esc снова в меню · q выход · ↑↓ журнал · F2 скопировать журнал окна"
 	}
 	// Строки подсказки не обрезаются: не влезает - переносится. Версия сборки - в правом нижнем углу.
 	width := max(20, m.width)

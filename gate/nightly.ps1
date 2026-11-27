@@ -1,7 +1,7 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-    Ночной прогон гейта: «как есть» на тестовой базе по расписанию Windows.
+    Ночная проверка тестовой базы: с изменениями из Git или в текущем состоянии.
 .DESCRIPTION
     Версия 00000000.000000.
 
@@ -102,7 +102,7 @@ if ($Install) {
     $trigger = New-ScheduledTaskTrigger -Daily -At $time
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 6)
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Force `
-        -Description 'Гейт расширений 1С: ночной прогон «как есть» на тестовой базе (nightly.ps1)' | Out-Null
+        -Description 'Гейт 1С проверяет тестовую базу. При настроенном репозитории сначала сверяет Git и при необходимости загружает изменения. Иначе проверяет текущее состояние базы.' | Out-Null
     Write-Host ("Задание {0}: каждый день в {1}, от пользователя {2}, пока он в системе." -f $TaskName, $time.ToString('HH:mm'), $env:USERNAME) -ForegroundColor Green
     Write-Host 'Итог - nightly\last.json, утром он виден в меню гейта.'
     exit 0
@@ -126,7 +126,10 @@ if ($Status) {
     $lastFile = Join-Path $nightlyDir 'last.json'
     if (Test-Path -LiteralPath $lastFile) {
         $last = [System.IO.File]::ReadAllText($lastFile, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
-        Write-Host ("Последний ночной прогон: {0}, вердикт {1}, прогон {2}, вывод {3}" -f $last.time, $last.verdict, $last.runId, $last.log)
+        $description = ''
+        if ($last.PSObject.Properties['mode']) { $description = ' · ' + $last.mode }
+        if ($last.PSObject.Properties['commit'] -and $last.commit) { $description += ' · ' + $last.commit }
+        Write-Host ("Последний ночной прогон: {0}{4}, вердикт {1}, прогон {2}, вывод {3}" -f $last.time, $last.verdict, $last.runId, $last.log, $description)
     }
     else { Write-Host 'Ночных прогонов ещё не было.' }
     exit 0
@@ -142,7 +145,7 @@ $logFile = Join-Path $nightlyDir ($stamp + '.log')
 if (Test-NightlyDenied $started) {
     $note = ('ночной прогон не запущен: фактический старт {0} - в запретные часы {1} (NightlyDeniedFrom/To), в них бэкап и обновление рабочей' -f $started.ToString('HH:mm'), (Get-NightlyDeniedText))
     [System.IO.File]::WriteAllLines($logFile, [string[]]@($note), $utf8Bom)
-    $record = [ordered]@{ time = $started.ToString('yyyy-MM-dd HH:mm:ss'); finished = $started.ToString('yyyy-MM-dd HH:mm:ss'); runId = ''; verdict = 'NONE'; exitCode = 0; log = $logFile; note = $note }
+    $record = [ordered]@{ time = $started.ToString('yyyy-MM-dd HH:mm:ss'); finished = $started.ToString('yyyy-MM-dd HH:mm:ss'); runId = ''; verdict = 'NONE'; exitCode = 0; log = $logFile; note = $note; mode = 'Запуск пропущен'; commit = '' }
     [System.IO.File]::WriteAllText((Join-Path $nightlyDir 'last.json'), (ConvertTo-Json -InputObject $record), $utf8Bom)
     [System.IO.File]::AppendAllText((Join-Path $nightlyDir 'history.txt'), ("{0}`t{1}`t{2}`t{3}`r`n" -f $record.time, 'NONE', '', 0), $utf8Bom)
     Write-Host $note
@@ -158,6 +161,9 @@ if (Test-Path -LiteralPath $runsRoot) { foreach ($dir in @(Get-ChildItem -Litera
 $output = @()
 $exitCode = 0
 $gitRan = $false
+$mode = 'Текущее состояние базы'
+$commit = ''
+$importRun = ''
 $extensionsRepo = [string](Get-NightlySetting 'ExtensionsRepo' '')
 if ($extensionsRepo -and (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1')) -and (Test-Path -LiteralPath (Join-Path $Root 'github.ps1'))) {
     # Сначала - «Загрузить из git» без человека. Его итог - git\<репозиторий>\last-import.json: был ли прогон гейта.
@@ -174,6 +180,11 @@ if ($extensionsRepo -and (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1'))
         try {
             $import = [System.IO.File]::ReadAllText($importFile, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF) | ConvertFrom-Json
             $gitRan = [bool]$import.ran
+            if ($gitRan) {
+                $mode = 'Прогон с изменениями из Git'
+                if ($import.PSObject.Properties['commit']) { $commit = [string]$import.commit }
+                if ($import.PSObject.Properties['run']) { $importRun = [string]$import.run }
+            }
             $output += ('Загрузка из git: {0}' -f [string]$import.note)
         }
         catch { $output += ('Итог загрузки из git не прочитан: {0}' -f $_.Exception.Message) }
@@ -196,7 +207,7 @@ if (Test-Path -LiteralPath $publishScript) {
 $runId = ''
 $verdict = 'NONE'
 if (Test-Path -LiteralPath $runsRoot) {
-    $fresh = @(Get-ChildItem -LiteralPath $runsRoot -Directory | Where-Object { -not $known.ContainsKey($_.Name) -and $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name | Select-Object -Last 1)
+    $fresh = @(Get-ChildItem -LiteralPath $runsRoot -Directory | Where-Object { (-not $importRun -or $_.Name -eq $importRun) -and -not $known.ContainsKey($_.Name) -and $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name | Select-Object -Last 1)
     if ($fresh.Count -gt 0) {
         $runId = $fresh[0].Name
         $verdictFile = Join-Path $fresh[0].FullName 'verdict.json'
@@ -211,10 +222,14 @@ $record = [ordered]@{
     finished = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     runId    = $runId
     verdict  = $verdict
+    mode     = $mode
+    commit   = $commit
     exitCode = $exitCode
     log      = $logFile
 }
 [System.IO.File]::WriteAllText((Join-Path $nightlyDir 'last.json'), (ConvertTo-Json -InputObject $record), $utf8Bom)
 [System.IO.File]::AppendAllText((Join-Path $nightlyDir 'history.txt'), ("{0}`t{1}`t{2}`t{3}`r`n" -f $record.time, $verdict, $runId, $exitCode), $utf8Bom)
-Write-Host ("Ночной прогон: вердикт {0}, прогон {1}, код {2}. Вывод - {3}" -f $verdict, $runId, $exitCode, $logFile)
+$modeText = $mode
+if ($commit) { $modeText += (' · ' + $commit) }
+Write-Host ("Ночной прогон: {4}, вердикт {0}, прогон {1}, код {2}. Вывод - {3}" -f $verdict, $runId, $exitCode, $logFile, $modeText)
 exit $exitCode

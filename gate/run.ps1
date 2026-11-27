@@ -208,6 +208,9 @@ trap {
     }
     # Итог остановленного прогона - в GitHub: причина, шаги, что успели, конец run.log.
     $reason = $_.Exception.Message
+    if (Get-Variable -Name RunLogPath -Scope Script -ErrorAction SilentlyContinue) {
+        try { Write-RunLog ('Остановлено: ' + $reason) } catch { }
+    }
     if ($script:PublishRunDir) { Invoke-RunPublish -Stage 'crash' -Message $reason }
     elseif ($null -ne $script:ResumeReport) {
         $outcome = 'failed'
@@ -2650,11 +2653,11 @@ function Get-RunListText {
     param($Verdict)
     $verdictNames = @{ GREEN = 'зелёный'; YELLOW = 'жёлтый'; RED = 'красный' }
     $decisionNames = @{ kept = 'оставлен'; rolledBack = 'откачен'; rollbackFailed = 'откат не полностью' }
-    if ($null -eq $Verdict) { return 'нет итога (остановился до вердикта)' }
+    if ($null -eq $Verdict) { return 'Вердикт недоступен' }
     $code = [string]$Verdict.verdict
     $text = $code
     if ($verdictNames.ContainsKey($code)) { $text = $verdictNames[$code] }
-    $kitText = [string]$Verdict.kit
+    $kitText = [string](Get-UiField $Verdict 'kit' '')
     if ($kitText) { $text += ' / ' + $kitText } else { $text += ' / без комплекта' }
     if ($null -ne $Verdict.PSObject.Properties['kitDecision']) {
         $decision = [string]$Verdict.kitDecision
@@ -2734,6 +2737,7 @@ function Show-RecentRuns {
             if (Test-Path -LiteralPath $verdictFile) {
                 try { $verdict = (Get-Content -LiteralPath $verdictFile -Raw -Encoding UTF8) | ConvertFrom-Json } catch { $verdict = $null }
             }
+            if (-not (Get-UiField $verdict 'verdict' '')) { $verdict = $null }
             $rows += [pscustomobject]@{ Dir = $run; Verdict = $verdict }
             $acceptedMark = ''
             if (Test-Path -LiteralPath (Join-Path $run.FullName 'accepted.txt')) { $acceptedMark = ' · принят в эталон' }
@@ -2766,6 +2770,15 @@ function Show-RecentRuns {
                 if ($code -eq 'GREEN') { $kind = 'ok' } elseif ($code -eq 'YELLOW') { $kind = 'warn' } elseif ($code -eq 'RED') { $kind = 'bad' }
             }
             $short = New-Object System.Collections.Generic.List[string]
+            if ($null -eq $row.Verdict) {
+                $logFile = Join-Path $runPath 'run.log'
+                if (Test-Path -LiteralPath $logFile -PathType Leaf) {
+                    $reasonLine = Get-Content -LiteralPath $logFile -Encoding UTF8 -Tail 40 -ErrorAction SilentlyContinue |
+                        Where-Object { $_ -match '^\d{2}:\d{2}:\d{2} Остановлено: ' } | Select-Object -Last 1
+                    if ($reasonLine) { $short.Add($reasonLine.Substring(9)) }
+                    $short.Add(('Журнал прогона — {0}' -f $logFile))
+                } else { $short.Add('Журнал run.log недоступен.') }
+            }
             if (Test-Path -LiteralPath $reportFile) {
                 $inShort = $false
                 foreach ($line in @([System.IO.File]::ReadAllLines($reportFile, [System.Text.Encoding]::UTF8))) {
@@ -2804,7 +2817,7 @@ function Show-RecentRuns {
             switch ($actions[$picked].Key) {
                 'summary' {
                     if (Test-Path -LiteralPath $summaryFile) { Show-UiPager -Lines @([System.IO.File]::ReadAllLines($summaryFile, [System.Text.Encoding]::UTF8)) -Header ('summary.txt, прогон ' + $row.Dir.Name) }
-                    else { Write-Host '  summary.txt нет: прогон остановился до вердикта, смотри run.log.' -ForegroundColor Yellow }
+                    else { Write-Host '  Итог по шагам недоступен. Подробности — в run.log этого прогона.' -ForegroundColor Yellow }
                 }
                 'report' { Show-UiPager -Lines @([System.IO.File]::ReadAllLines($reportFile, [System.Text.Encoding]::UTF8)) -Header ('report.txt, прогон ' + $row.Dir.Name) }
                 'folder' { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $runPath) }
@@ -4595,7 +4608,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             $menu.Add((New-MenuItem 'cmpext' 'Сравнить расширения' 'рабочая и temp'))
             $menu.Add((New-MenuItem 'cmpepf' 'Сравнить внешние обработки' 'рабочая и temp'))
             $menu.Add((New-MenuItem 'precheck' 'Проверка рабочей перед обновлением' 'что изменит загрузка, каких настроек нет; только читает'))
-            $menu.Add((New-MenuItem 'rollback' 'Откатить рабочую базу'))
+            $menu.Add((New-MenuItem 'rollback' 'Откатить изменения выпуска' 'выбрать выпуск и посмотреть, какие расширения и обработки вернутся'))
             $menu.Add((New-MenuItem 'pullext' 'Подтянуть расширения из рабочей' 'в inbox'))
             $menu.Add((New-MenuItem 'pullepf' 'Подтянуть обработки из рабочей' 'в inbox'))
         }
@@ -4610,6 +4623,10 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
                 $nightlyVerdict = [string]$nightly.verdict
                 if ($nightlyNames.ContainsKey($nightlyVerdict)) { $nightlyVerdict = $nightlyNames[$nightlyVerdict] }
                 $nightlyNote = "ночной прогон {0}: {1}, прогон {2}" -f $nightly.time, $nightlyVerdict, $nightly.runId
+                $nightlyMode = [string](Get-UiField $nightly 'mode' '')
+                if ($nightlyMode) { $nightlyNote += (' · ' + $nightlyMode) }
+                $nightlyCommit = [string](Get-UiField $nightly 'commit' '')
+                if ($nightlyCommit) { $nightlyNote += (' · ' + $nightlyCommit.Substring(0, [Math]::Min(7, $nightlyCommit.Length))) }
                 $nightlyTime = [datetime]::MinValue
                 if ([datetime]::TryParseExact([string]$nightly.time, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$nightlyTime) -and ((Get-Date) - $nightlyTime).TotalHours -gt 36) {
                     $nightlyNote += ' - давно: проверь задание (.\nightly.ps1 -Status)'
@@ -4876,6 +4893,7 @@ if ($Tests) { $RunDir = Join-Path (Resolve-RootPath 'tests-runs') ('{0}-{1}' -f 
 if ($SelfCheckGroup) { $RunDir = Join-Path (Resolve-RootPath 'selfcheck-runs') $runId }
 New-Item -ItemType Directory -Path $RunDir -Force | Out-Null
 $script:RunLogPath = Join-Path $RunDir 'run.log'
+if ($UiChannel) { Send-UiEvent @{ kind = 'run-log'; text = $script:RunLogPath } }
 $script:Steps = New-Object System.Collections.Generic.List[object]
 # Сведения для продолжения прогона с упавшего шага: шаги по ходу (steps.jsonl), этапы и комплект (resume.json).
 $kitItems = @()
