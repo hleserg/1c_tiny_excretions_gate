@@ -6161,7 +6161,7 @@ function Invoke-SelfCheckLanes {
             if ($lane.Finished -or $null -eq $lane.Current) { continue }
             $session = $lane.Current
             if ($lane.Number -eq 2) { $session.Waiting = (-not $go) }
-            else { $session.Waiting = ([string](Get-Setting $session.Header 'wait' '') -eq '1' -and -not $second.Finished) }
+            else { $session.Waiting = ([string](Get-Setting $session.Header 'wait' '') -eq '1' -and -not $first.Signals.Contains('done2=1')) }
             Update-SelfCheckSession $session
             if ($lane.Number -eq 1 -and -not $go -and ([string](Get-Setting $session.Header 'group' '') -eq '1' -or [string](Get-Setting $session.Header 'wait' '') -eq '1')) {
                 $go = $true
@@ -6169,6 +6169,14 @@ function Invoke-SelfCheckLanes {
                 else { Write-RunLog ("Самопроверка: первый исполнитель дошёл до группы «{0}», второму - начинать" -f $Group) }
                 Write-SelfCheckLaneSignal -Lane $second -Signal 'go=1'
             }
+            # ** Хлебников С.Ю. 20261128 Сигнал из части журнала означает, что все чтения второго закончены.
+            # После него второй обращается только к модулям. Его итог и полный список заданий проверяем как обычно.
+            if ($lane.Number -eq 2 -and $go -and ($Extra -contains 'overlapcompile=1') -and
+                -not $first.Signals.Contains('done2=1') -and [string](Get-Setting $session.Header 'compileonly' '') -eq '1') {
+                Write-SelfCheckLaneSignal -Lane $first -Signal 'done2=1'
+                Write-RunLog 'Самопроверка: второй закончил чтение данных и проверяет модули, первый продолжает основные проверки'
+            }
+            # ** Хлебников С.Ю. 20261128 конец
             if (-not $session.State) { continue }
 
             $ended = Complete-SelfCheckSession $session
@@ -6204,7 +6212,7 @@ function Invoke-SelfCheckLanes {
                 }
             }
             if ($lane.Number -eq 2 -and $lane.Finished) {
-                Write-RunLog ("Самопроверка: второй исполнитель закончил ({0}), первому - идти дальше" -f $lane.State)
+                Write-RunLog ("Самопроверка: второй исполнитель закончил ({0})" -f $lane.State)
                 Write-SelfCheckLaneSignal -Lane $first -Signal 'done2=1'
             }
             if ($lane.Number -eq 1 -and $lane.Finished -and -not $second.Finished) {
@@ -6367,7 +6375,7 @@ function Invoke-SelfCheck {
     if ($OnlyGroup) { $splitGroup = $OnlyGroup }
     elseif ($workerCount -ge 2 -and $splitGroup -and [bool](Get-Setting $cfg 'SelfCheckEarlyReads' $false)) {
         # ** Хлебников С.Ю. 20261123 Два сеанса делят чтения до перехода к операциям с документами.
-        $extraParts += 'earlyreads=1'
+        $extraParts += @('earlyreads=1', 'overlapcompile=1')
     }
     $laneRun = $null
     # ** Хлебников С.Ю. 20261120 конец
