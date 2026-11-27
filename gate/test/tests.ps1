@@ -4610,6 +4610,136 @@ $tests = @(
         }
     },
     @{
+        Name = 'git-processing-intermediate'
+        Text = 'Обработка из промежуточного коммита допускает загрузку новой версии. Старый снимок мог пропустить файл, уже совпадавший с main. Смесь версий сохраняется в PR.'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $argsGit = @{Sandbox=$sb; Script='deploy.ps1'; Fake=@{dumps=(New-GitDumps)}; Com=(New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld)))}
+            $boot = Invoke-Script @argsGit -Arguments '-GitExport' -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            $state = Read-GitStateFile $sb
+            $base = $state.commit
+            $prefix = 'processings/Печать/'
+            $code = $prefix + 'Печать/Ext/ObjectModule.bsl'
+            $form = $prefix + 'Печать.xml'
+            $one = [pscustomobject]@{Path=$code; Bytes=$utf8.GetBytes('Версия 2')}
+            $two = [pscustomobject]@{Path=$form; Bytes=$utf8.GetBytes('<Print>2</Print>')}
+            $middle = New-GhCommit $gh $base @($one,$two) 'Принятая версия обработки'
+            $head = New-GhCommit $gh $middle @([pscustomobject]@{Path=$code; Bytes=$utf8.GetBytes('Версия 3')}) 'Следующая версия'
+            Set-GhBranch $gh main $head
+            $work = Join-Path $sb 'git/ext/work'
+            $oldForm = [IO.File]::ReadAllBytes((Join-Path $work $form))
+            [IO.File]::WriteAllBytes((Join-Path $work $code), $one.Bytes)
+            [IO.File]::WriteAllBytes((Join-Path $work $form), $two.Bytes)
+            $load = @{Kind='confirm'; Header='Загрузить в erp_temp_test из main'; Yes=$true}
+            [IO.File]::WriteAllText((Join-Path $sb 'run.ps1'), $gitRunStub, $utf8Bom)
+            $r = Invoke-Script @argsGit -Arguments '-GitImport' -Answers @($load)
+            Check-DeployCommon $r -LocksExpected $false
+            Check ((Read-GitStateFile $sb).commit -eq $head) 'полная опубликованная версия обработки вызвала PR'
+            # Обновлённая форма совпадала с main и потому в старой ветке остался начальный файл.
+            $partial = New-GhCommit $gh $base @($one) 'Снимок по старым правилам'
+            Set-GhBranch $gh 'temp/old' $partial -Create
+            $state.commit = $partial
+            $state.pendingBranch = 'temp/old'
+            $state.pendingCommit = $partial
+            $stateFile = Join-Path $sb 'git/ext/state.json'
+            [IO.File]::WriteAllText($stateFile, (ConvertTo-Json $state), $utf8Bom)
+            $r = Invoke-Script @argsGit -Arguments '-GitImport' -Answers @($load)
+            Check-DeployCommon $r -LocksExpected $false
+            Check ((Read-GitStateFile $sb).commit -eq $head) 'подтверждённые файлы старого PR остановили импорт'
+            # Существующие по отдельности модуль и форма никогда не были опубликованы вместе.
+            $state.commit = $base
+            $state.pendingCommit = ''
+            [IO.File]::WriteAllText($stateFile, (ConvertTo-Json $state), $utf8Bom)
+            [IO.File]::WriteAllBytes((Join-Path $work $form), $oldForm)
+            $r = Invoke-Script @argsGit -Arguments '-GitImport -GitUnattended'
+            $state = Read-GitStateFile $sb
+            Check ($r.ExitCode -eq 0 -and $state.pendingCommit -and (Get-GhFiles $gh $state.pendingCommit)[$code] -eq (Get-GitBlobSha $one.Bytes)) 'пропущена новая комбинация файлов обработки'
+        }
+    },
+    @{
+        Name = 'git-role-dump-pair'
+        Text = 'Проверенная выгрузка роли совпадает с загруженным исходником, включая старый PR. Другая правка той же роли сохраняется.'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $dumps = New-GitDumps
+            $xmlPath = 'Roles/Admin/Ext/Rights.xml'
+            $path = 'extensions/Адаптация/' + $xmlPath
+            $put = { param($xml) [pscustomobject]@{Path=$path; Bytes=$utf8.GetBytes(([string][char]0xfeff) + $xml)} }
+            $allow = & $put '<Rights><View>true</View></Rights>'
+            $dump = & $put '<Rights/>'
+            $dumps['Адаптация'][$xmlPath] = '<Rights><View>false</View></Rights>'
+            $argsGit = @{Sandbox=$sb; Script='deploy.ps1'; Fake=@{dumps=$dumps}; Com=(New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld)))}
+            $boot = Invoke-Script @argsGit -Arguments '-GitExport' -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            $state = Read-GitStateFile $sb
+            $base = $state.commit
+            Set-GhBranch $gh main $base
+            $head = New-GhCommit $gh $base @($allow) 'Разрешить просмотр'
+            Set-GhBranch $gh main $head
+            $dumps['Адаптация'][$xmlPath] = '<Rights/>'
+            $old = Invoke-Script @argsGit -Arguments '-GitImport -GitUnattended'
+            $state = Read-GitStateFile $sb
+            Check ($state.pendingCommit -ne $base -and $state.pendingCommit) 'расхождение без подтверждения не сохранилось в PR'
+            $rule = @{Repo='owner/ext'; Path=$path; SourceBlob=(Get-GitBlobSha $allow.Bytes); DumpBlob=(Get-GitBlobSha $dump.Bytes)}
+            [IO.File]::WriteAllText((Join-Path $sb 'config.site.psd1'), (ConvertTo-Psd1 @{GitRoleDumpPairs=@($rule)}), $utf8Bom)
+            $same = Invoke-Script @argsGit -Arguments '-GitImport -GitUnattended'
+            Check-DeployCommon $same -LocksExpected $false
+            Check ([bool]($same.Output -match 'загружать нечего') -and (Read-GitStateFile $sb).commit -eq $head) 'старый PR или подтверждённая пара потребовали перезагрузки роли'
+            $dumps['Адаптация'][$xmlPath] = '<Rights><View>false</View></Rights>'
+            $changed = Invoke-Script @argsGit -Arguments '-GitImport -GitUnattended'
+            $state = Read-GitStateFile $sb
+            $files = Get-GhFiles $gh $state.pendingCommit
+            Check ($changed.ExitCode -eq 0 -and $files[$path] -eq (Get-GhFiles $gh $base)[$path]) 'изменённое право пропущено'
+        }
+    },
+    @{
+        Name = 'git-snapshot-intermediate'
+        Text = 'Версия расширения из промежуточного коммита допускает загрузку main. Свой вариант сохраняется в PR, из того же меню можно продолжить загрузку.'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $com = New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld))
+            $dumps = New-GitDumps
+            $xml = '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><Configuration><Properties><Name>Адаптация</Name><Version>1</Version></Properties></Configuration></MetaDataObject>'
+            $dumps['Адаптация']['Configuration.xml'] = $xml
+            $argsGit = @{Sandbox=$sb; Script='deploy.ps1'; Fake=@{dumps=$dumps}; Com=$com}
+            $boot = Invoke-Script @argsGit -Arguments '-GitExport' -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            $base = (Read-GitStateFile $sb).pendingCommit
+            Set-GhBranch $gh 'main' $base
+            $path = 'extensions/Адаптация/Configuration.xml'
+            $change = { param($v) [pscustomobject]@{Path=$path; Bytes=$utf8.GetBytes(([string][char]0xfeff) + $xml.Replace('>1<', ('>' + $v + '<')))} }
+            $middle = New-GhCommit $gh $base @((& $change 2)) 'Версия 2'
+            $head = New-GhCommit $gh $middle @((& $change 3)) 'Версия 3'
+            Set-GhBranch $gh 'main' $head
+            [IO.File]::WriteAllText((Join-Path $sb 'run.ps1'), $gitRunStub, $utf8Bom)
+            $dumps['Адаптация']['Configuration.xml'] = $xml.Replace('>1<','>2<')
+            $import = Invoke-Script @argsGit -Arguments '-GitImport' -Answers @(@{Kind='confirm'; Header='Загрузить в erp_temp_test из main'; Yes=$true})
+            Check-DeployCommon $import -LocksExpected $false
+            Check ((Read-GitStateFile $sb).commit -eq $head) 'промежуточный Configuration.xml заблокировал новую версию из main'
+            $dumps['Адаптация']['Configuration.xml'] = $xml.Replace('>1<','>local<')
+            $save = Invoke-Script @argsGit -Arguments '-GitImport' -Answers @(
+                @{Kind='one'; Header='правки после прошлой загрузки'; Item='^Выгрузить правки'},
+                @{Kind='one'; Header='сохранены в PR'; Item='Продолжить загрузку из Git'},
+                @{Kind='confirm'; Header='Загрузить в erp_temp_test из main'; Yes=$true})
+            Check-DeployCommon $save -LocksExpected $false
+            $state = Read-GitStateFile $sb
+            Check ($state.commit -eq $head -and -not $state.pendingCommit) 'продолжение после выгрузки не завершило загрузку main'
+            $last = Get-Content -Raw -Encoding UTF8 (Join-Path $sb 'git/ext/last-import.json') | ConvertFrom-Json
+            Check ($last.ran -and $last.commit -eq $head -and $last.outcome -eq 'loaded') 'после публикации не прошёл обычный прогон из выбранного коммита'
+            $pull = Get-GhPull $gh 2
+            $saved = Get-GhFiles $gh $pull.Head
+            Check ($utf8.GetString((Get-GhBlob $gh $saved[$path])).Contains('>local<')) 'в PR нет собственных изменений версии'
+            Check ((Get-GhHead $gh 'main').Sha -eq $head -and $pull.State -eq 'open') 'продолжение изменило main или закрыло PR'
+        }
+    },
+    @{
         Name = 'git-import-xml-roundtrip'
         Text = 'Повторная выгрузка XML проходит без PR. Изменённые типы и реквизиты сохраняются, принудительная загрузка снимает ожидание PR.'
         Run = {
@@ -4627,15 +4757,32 @@ $tests = @(
             $files[$criterion] = '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:v8="http://v8.1c.ru/8.1/data/core"><FilterCriterion><Properties><Type><v8:Type>A</v8:Type><v8:Type>B</v8:Type></Type></Properties></FilterCriterion></MetaDataObject>'
             $files[$document] = '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses" xmlns:r="http://v8.1c.ru/8.3/xcf/readable"><Document><InternalInfo><r:GeneratedType/></InternalInfo><Properties><ObjectBelonging>Adopted</ObjectBelonging></Properties></Document></MetaDataObject>'
             $files['Documents/Order/Ext/ObjectModule.bsl'] = 'Процедура Обработчик() КонецПроцедуры'
+            $links = 'Documents/Links.xml'
+            $files[$links] = '<MetaDataObject xmlns="http://v8.1c.ru/8.3/MDClasses"><Document><ChildObjects><Form>First</Form><Form>Second</Form><Attribute uuid="a"/></ChildObjects></Document></MetaDataObject>'
+            $eventA = '<Event name="Open">First</Event>'
+            $eventB = '<Event name="Close">Second</Event>'
+            $eventAfter = '<Event name="Open" callType="After">Third</Event>'
+            $stringType = '<v8:Type>xs:string</v8:Type>'
+            $stringDefault = '<v8:StringQualifiers><v8:Length>0</v8:Length><v8:AllowedLength>Variable</v8:AllowedLength></v8:StringQualifiers>'
+            $details = 'Documents/Order/Forms/Details/Ext/Form.xml'
+            $files[$details] = '<?xml version="1.0"?><Form xmlns="http://v8.1c.ru/8.3/xcf/logform" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema"><Events>' + $eventA + $eventB + $eventAfter + '</Events><Attributes><Attribute name="Memo"><Type>' + $stringType + '</Type></Attribute></Attributes></Form>' + [Environment]::NewLine
             $files[$single] = $files[$criterion].Replace('<v8:Type>B</v8:Type>','').Replace('<Type>', "<Type>`n")
             $boot = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{dumps=$dumps} -Com $com -Answers $gitBootstrapAnswers
             Check-DeployCommon $boot -LocksExpected $false
             $head = (Read-GitStateFile $sb).pendingCommit
             # Подставной конфигуратор пишет CRLF. В git этот XML хранится с LF.
             $lfSource = [pscustomobject]@{Path=('extensions/Адаптация/' + $single); Bytes=$utf8.GetBytes(([string][char]0xFEFF) + $files[$single])}
-            $head = New-GhCommit -Gh $gh -Parent $head -Changes @($lfSource) -Message 'XML критерия с LF'
+            $epfForm = 'processings/Печать/Печать/Forms/Details/Ext/Form.xml'
+            $epfSource = [pscustomobject]@{Path=$epfForm; Bytes=$utf8.GetBytes($files[$details])}
+            $head = New-GhCommit -Gh $gh -Parent $head -Changes @($lfSource, $epfSource) -Message 'XML критерия с LF и форма обработки'
             Set-GhBranch -Gh $gh -Branch 'main' -Sha $head
             [IO.File]::WriteAllText((Join-Path $sb 'run.ps1'), $gitRunStub, $utf8Bom)
+            $files[$links] = $files[$links].Replace('<Attribute uuid="a"/>','').Replace('<ChildObjects>','<ChildObjects><Attribute uuid="a"/>')
+            $files[$details] = $files[$details].TrimEnd().Replace('1.0"?>','1.0" encoding="UTF-8"?>').Replace($eventA + $eventB, $eventB + $eventA).Replace($stringType, $stringType + $stringDefault)
+            # Выгрузка того же файла обработки берётся из кэша конфигуратора.
+            $cacheForm = Join-Path (Join-Path $sb 'git/ext/work') $epfForm
+            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($cacheForm))
+            [IO.File]::WriteAllText($cacheForm, $files[$details], $utf8Bom)
             $files[$form] = $files[$form].Replace('<AutoCommandBar/>','<AutoCommandBar/><Attributes/>')
             $files[$criterion] = $files[$criterion].Replace('>A<','>TEMP<').Replace('>B<','>A<').Replace('>TEMP<','>B<')
             $files[$document] = $files[$document].Replace('</InternalInfo>','<r:PropertyState><r:Property>ObjectModule</r:Property><r:State>Extended</r:State></r:PropertyState></InternalInfo>')
@@ -4643,13 +4790,16 @@ $tests = @(
             Check ($same.ExitCode -eq 0 -and ($same.Output -match 'загружать нечего')) 'служебный XML вызвал PR или повторную загрузку'
             $export = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{dumps=$dumps} -Com $com
             Check ($export.ExitCode -eq 0 -and ($export.Output -match 'выгружать нечего')) 'ручная выгрузка предложила PR для служебного XML'
+            $files[$links] = $files[$links].Replace('<Form>First</Form><Form>Second</Form>','<Form>Second</Form><Form>First</Form>')
+            $files[$details] = $files[$details].Replace($eventA + $eventAfter, $eventAfter + $eventA)
+            [IO.File]::WriteAllText($cacheForm, $files[$details].Replace('>0<','>12<'), $utf8Bom)
             $unchanged = $files[$criterion]
             $files[$criterion] = $unchanged.Replace('>B<','>C<')
             $files[$single] = $files[$single].Replace('>A<','>C<')
             $files[$form] = $files[$form].Replace('<Attributes/>','<Attributes><Attribute name="Item"/></Attributes>')
             $offer = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitExport' -Fake @{dumps=$dumps} -Com $com -Answers @(
                 @{Kind='confirm'; Header='веткой temp/'; Yes=$false})
-            Check ($offer.ExitCode -eq 0 -and ($offer.Output -match 'изменено 3, новых 0, удалено 0')) 'выгрузка должна предложить три содержательных правки'
+            Check ($offer.ExitCode -eq 0 -and ($offer.Output -match 'изменено 5, новых 0, удалено 0') -and ($offer.Output -match 'processings/Печать: изменено 1')) 'выгрузка должна предложить пять правок расширения и форму обработки'
             $changed = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport -GitUnattended' -Fake @{dumps=$dumps} -Com $com
             $pending = (Read-GitStateFile $sb).pendingCommit
             Check ($changed.ExitCode -eq 0 -and $pending -and $pending -ne $head) 'реальные изменения не попали в PR'
@@ -5192,7 +5342,8 @@ $tests = @(
             Reset-FakeState $sb
             $dumps = New-GitDumps -Adapt 'Процедура ПравкаВTemp() КонецПроцедуры'
             $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-GitImport' -Fake @{ dumps = $dumps } -Com $com -Answers @(
-                @{ Kind = 'one'; Header = 'правки после прошлой загрузки'; Item = '^Выгрузить правки' })
+                @{ Kind = 'one'; Header = 'правки после прошлой загрузки'; Item = '^Выгрузить правки' },
+                @{ Kind = 'one'; Header = 'сохранены в PR'; Item = 'Завершить без загрузки' })
             Check-DeployCommon $r -LocksExpected $false
             $state = Read-GitStateFile $sb
             Check ((Get-GhHead -Gh $gh -Branch 'main').Sha -eq $merged) 'ручной импорт с правками двинул main'
