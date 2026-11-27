@@ -12,8 +12,8 @@
         Только показать итог гейта и сравнение, ничего не обновлять.
 
     .\deploy.ps1 -Rollback
-        Откатить рабочую базу: список прошлых обновлений, подробности, откат к состоянию до выбранного
-        (или сразу к состоянию до последнего) из резервных копий; потом можно подтянуть то же в temp.
+        Выбрать выпуск, посмотреть состав отката и вернуть перечисленные объекты.
+        После отката можно подтянуть те же объекты в тестовую базу.
 
     .\deploy.ps1 -PullExtensions / -PullProcessings
         Положить в inbox расширения (внешние обработки) рабочей базы, которые отличаются от temp.
@@ -1207,6 +1207,7 @@ else {
         catch { Write-Warning ("Не записал ссылку на отчёт операции: {0}" -f $_.Exception.Message) }
     }
 }
+if ($script:UiChannelDir) { Send-UiEvent @{ kind = 'run-log'; text = $script:RunLogPath } }
 if ($script:GateOperation) { Write-OperationEvent $script:GateOperation 'step' @{run=$runId; base=$script:ProdBase; tempBase=$script:TempBase} } # ** Хлебников С.Ю. 20261124
 $runsRoot = Resolve-RootPath ([string](Get-Setting $cfg 'RunsDir' 'runs'))
 
@@ -4816,8 +4817,8 @@ function Invoke-GitTypical {
     # Колонка шагов ci.exe: весь путь типовой виден заранее. Названия - заголовки операций ниже; шаг, которого не
     # было (коммит уже сделан прошлым запуском), останется «не выполнялся».
     Send-UiPlan -Operations -StepNames @(
-        ('Выгрузить типовую {0} в файлы' -f $script:TempBase), 'Типовая: git fetch (что сейчас в GitHub)', 'Типовая: git add (файлы - в pack)',
-        'Типовая: git commit', 'Типовая: git repack (сжать объекты перед отправкой)', 'Типовая: git push (отправка в GitHub)')
+        ('Выгрузить типовую {0} в файлы' -f $script:TempBase), 'Типовая: git fetch (что сейчас в GitHub)', 'Подготовить файлы к коммиту (git add)',
+        'Типовая: git commit', 'Упаковать объекты перед отправкой (git repack)', 'Типовая: git push (отправка в GitHub)')
     Update-TypicalDump -Dir $dump
     # Конфигуратор может оставить повреждённый XML даже при наличии Configuration.xml.
     # Прочитать потоками до записи git-индекса. Пути с # и % передавать как файлы, а не URI.
@@ -4875,7 +4876,7 @@ function Invoke-GitTypical {
     # антивирус при записи и при чтении: первая выгрузка 19.11.2026 упаковывала их часами. В таком pack нет
     # дельта-сжатия - его делает пережатие перед первой отправкой (ниже), уже из одного файла.
     Write-Line '  складываю в git: сотня тысяч файлов - в первый раз десятки минут'
-    $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('add', '-A') -TimeoutSec 14400 -Title 'Типовая: git add (файлы - в pack)' -Config @('core.bigFileThreshold=1')
+    $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('add', '-A') -TimeoutSec 14400 -Title 'Подготовить файлы к коммиту (git add)' -Config @('core.bigFileThreshold=1')
     $staged = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('diff', '--cached', '--quiet') -AllowFail
     $hasHead = ((Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('rev-parse', '--verify', '--quiet', 'HEAD') -AllowFail).ExitCode -eq 0)
     if ($staged.ExitCode -eq 0 -and $fetch.ExitCode -eq 0) {
@@ -4898,7 +4899,7 @@ function Invoke-GitTypical {
         # пересчитывать всю типовую ради нескольких тысяч изменённых файлов незачем. Не вышло - отправка упакует сама.
         $repackArgs = @('repack', '-a', '-d', '-q')
         if ($fetch.ExitCode -ne 0) { $repackArgs = @('repack', '-a', '-d', '-f', '-q') }
-        $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments $repackArgs -TimeoutSec 14400 -AllowFail -Title 'Типовая: git repack (сжать объекты перед отправкой)'
+        $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments $repackArgs -TimeoutSec 14400 -AllowFail -Title 'Упаковать объекты перед отправкой (git repack)'
         Write-Line ("  отправляю в {0} (ветка {1}; первый раз - надолго)" -f $repo, $branch)
         $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('push', '--no-verify', $url, ('HEAD:refs/heads/' + $branch)) -Token $token -TimeoutSec 14400 -Title 'Типовая: git push (отправка в GitHub)'
         $state['commit'] = (Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('rev-parse', 'HEAD')).Output.Trim()
@@ -5047,7 +5048,7 @@ function Get-PreparedRollbackFailedText {
     if ($null -eq $failure) { return '' }
     $items = @(Get-JsonValue $failure 'items' @()) -join '; '
     if (-not $items) { $items = 'по элементам - в журнале запуска' }
-    return ("откат обновления подготовленным {0} (запуск {1}) прошёл не полностью: {2}. Рабочая частично на новых версиях, новые изменения не начинаю. Восстановить - «Откатить рабочую базу» (вернутся объекты с копией), журнал - deploy\{1}" -f $script:ProdBase, (Get-JsonValue $failure 'run' '?'), $items)
+    return ("откат обновления подготовленным {0} (запуск {1}) прошёл не полностью: {2}. Рабочая частично на новых версиях, новые изменения не начинаю. Для восстановления выбери «Откатить изменения выпуска» и проверь список объектов, журнал - deploy\{1}" -f $script:ProdBase, (Get-JsonValue $failure 'run' '?'), $items)
 }
 
 function Set-PreparedRollbackFailed {
@@ -5340,7 +5341,7 @@ function Resolve-InterruptedDeploys {
         Write-RunLog ("Прерванное обновление {0}: {1}" -f $dir.Name, ($lines -join ' | '))
         $more = @($lines.ToArray()) + @(
             'Блокировки, которые ставил этот запуск, - выше, отдельным вопросом; остальные - «Состояние баз» и консоль кластера.',
-            'Откатить то, что успело, - «Откатить рабочую базу»: это обновление в списке с пометкой ПРЕРВАНО (вернутся только объекты с копией).',
+            'Для отката выбери «Откатить изменения выпуска», затем выпуск с пометкой ПРЕРВАНО. Перед подтверждением появится список объектов.',
             'Проверить рабочую - «Проверить рабочую базу (только читает)».')
         Show-UiTitle -Text ("Обновление {0} {1} прервано (процесс не закончил)" -f $script:ProdBase, $dir.Name) -Kind 'bad' -More $more
     }
@@ -5388,27 +5389,20 @@ if ($Rollback) {
     Write-Host ''
     Write-Host ("ОТКАТ {0}" -f $script:ProdBase) -ForegroundColor Cyan
 
-    # Экран отката - всегда: сверху большая красная кнопка «Откатить последние изменения» (сразу из резервных
-    # копий, снятых перед последним обновлением), под ней - последние обновления рабочей с результатами
-    # лёгкого прогона. Обновлений ещё не было - экран так и говорит, кнопка ничего не делает.
+    $historyTitle = "Откат {0}: последние обновления" -f $script:ProdBase
+    if ($history.Count -eq 0) {
+        $null = Select-UiOne -Header $historyTitle -Items @('Назад') -Notes @('У гейта пока нет сохранённых выпусков для отката.')
+        Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не откатывал.'
+        exit 0
+    }
     $target = $null
     while ($null -eq $target) {
         $items = New-Object System.Collections.Generic.List[string]
-        $notes = @()
-        if ($history.Count -gt 0) {
-            $items.Add(("ОТКАТИТЬ ПОСЛЕДНИЕ ИЗМЕНЕНИЯ - к состоянию до обновления {0:dd.MM.yyyy HH:mm}" -f [datetime]::ParseExact([string]$history[0].runId, 'yyyyMMdd-HHmmss', $null)))
-            foreach ($record in $history) { $items.Add((Get-DeployLabel $record)) }
-            $notes += 'Выбери обновление, чтобы посмотреть подробно и откатить именно его.'
-        }
-        else {
-            $items.Add('ОТКАТИТЬ ПОСЛЕДНИЕ ИЗМЕНЕНИЯ - не к чему: обновлений рабочей скриптом ещё не было')
-            $notes += ("Обновлений {0} скриптом обновления ещё не было: резервных копий перед обновлением нет, откатывать не к чему." -f $script:ProdBase)
-            $notes += 'Список появится после первого «Обновить рабочую базу» - каждое обновление сохраняет резервные копии и итог лёгкого прогона.'
-        }
-        $items.Add('Отмена')
-        $index = Select-UiOne -Header ("Откат {0}: последние обновления" -f $script:ProdBase) -Items $items.ToArray() -Notes $notes -Danger @(0)
+        $items.Add(("Откатить изменения последнего выпуска ({0:dd.MM.yyyy HH:mm})" -f [datetime]::ParseExact([string]$history[0].runId, 'yyyyMMdd-HHmmss', $null)))
+        foreach ($record in $history) { $items.Add((Get-DeployLabel $record)) }
+        $items.Add('Назад')
+        $index = Select-UiOne -Header $historyTitle -Items $items.ToArray() -Notes @('Выбери выпуск. Перед откатом гейт покажет состав изменений.') -Danger @(0)
         if ($index -lt 0 -or $index -eq $items.Count - 1) { Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не откатывал.'; exit 0 }
-        if ($history.Count -eq 0) { continue }
         if ($index -eq 0) { $target = $history[0]; break }
         # Подробно об обновлении - и две кнопки на том же экране: «Откатить» и «Отмена».
         $record = $history[$index - 1]
@@ -5471,12 +5465,14 @@ if ($Rollback) {
     if ($selected.Count -eq 0 -and $selectedProcessings.Count -eq 0) { Write-Line 'В этом обновлении нет ни расширений, ни обработок с резервной копией: откатывать нечего.' 'Yellow'; Set-DeployReportResult 'unchanged'; exit 0 }
 
     $returned = @(@($selected | ForEach-Object { $_.Name }) + @($selectedProcessings | Where-Object { $_.Action -eq 'register' } | ForEach-Object { $_.ObjName }))
-    $question = "Точно откатить {0} к состоянию до обновления {1}? Вернутся: {2}." -f $script:ProdBase, (Get-DeployLabel $target), ($returned -join ', ')
+    $changes = New-Object System.Collections.Generic.List[string]
+    $changes.Add(("Точно откатить изменения выпуска {0} в базе {1}?" -f $target.runId, $script:ProdBase))
+    if ($returned.Count -gt 0) { $changes.Add(('Восстановить из копий: ' + ($returned -join ', '))) }
     $removed = @($selectedProcessings | Where-Object { $_.Action -eq 'unregister' } | ForEach-Object { $_.ObjName })
-    if ($removed.Count -gt 0) { $question += (" Снимутся из справочника новые обработки: {0}." -f ($removed -join ', ')) }
-    if ($skippedNew.Count -gt 0) { $question += (" Новые в том обновлении ({0}) останутся: удалять их - руками." -f ($skippedNew -join ', ')) }
-    if ($skippedProcessings.Count -gt 0) { $question += (" Обработки без резервной копии ({0}) останутся как есть." -f ($skippedProcessings -join ', ')) }
-    $sure = Confirm-Ui -Question $question -Yes 'Да, откатить' -No 'Отмена'
+    if ($removed.Count -gt 0) { $changes.Add(('Снять новые обработки из справочника: ' + ($removed -join ', '))) }
+    if ($skippedNew.Count -gt 0) { $changes.Add(('Останутся в базе новые расширения: ' + ($skippedNew -join ', '))) }
+    if ($skippedProcessings.Count -gt 0) { $changes.Add(('Останутся обработки без копий: ' + ($skippedProcessings -join ', '))) }
+    $sure = Confirm-Ui -Question ($changes -join [Environment]::NewLine) -Yes 'Откатить изменения выпуска' -No 'Отмена' -DangerYes -DefaultNo
     if ($sure -ne $true) { Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не откатывал.'; exit 0 }
     $mode = 'rollback'
     $rollbackOf = [string]$target.runId
@@ -5484,7 +5480,7 @@ if ($Rollback) {
     $rollbackNames = @(@($selected | ForEach-Object { $_.Name }) + @($selectedProcessings | ForEach-Object { $_.ObjName })) -join ', '
     Write-RunLog ("Откат к состоянию до {0}: {1}" -f $target.runId, $rollbackNames)
     Write-Host ''
-    Write-Line ("Откатываю {0} к состоянию до {1}: {2}" -f $script:ProdBase, $target.runId, $rollbackNames) 'Cyan'
+    Write-Line ("Откатываю изменения выпуска {1} в базе {0}: {2}" -f $script:ProdBase, $target.runId, $rollbackNames) 'Cyan'
 }
 else {
     $lastRun = $null

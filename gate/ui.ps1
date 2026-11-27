@@ -570,7 +570,11 @@ function Write-UiProgress {
             if ($Total -gt 0 -and $Done -ge 0) { $text += (', {0} из {1}' -f $Done, $Total) }
             if ($Detail) { $text += (', ' + $Detail) }
             $uiRemaining = Get-UiRunRemaining -Title $Title -Elapsed $Elapsed -Expected $Expected
-            if ($uiRemaining.Seconds -ge 0) { $text += ('; весь прогон - ещё ~{0}' -f (Format-UiDuration $uiRemaining.Seconds)) }
+            if ($uiRemaining.Seconds -ge 0) {
+                if ($uiRemaining.Unknown -gt 0) {
+                    $text += ('. По известным шагам осталось ~{0}. Без оценки: {1}' -f (Format-UiDuration $uiRemaining.Seconds), $uiRemaining.Unknown)
+                } else { $text += ('. До конца прогона ~{0}' -f (Format-UiDuration $uiRemaining.Seconds)) }
+            }
             Write-Host $text
         }
         return

@@ -432,8 +432,8 @@ if ($added.Count -gt 0) {
 
 $groups = @($catalog | ForEach-Object { $_[0] } | Select-Object -Unique)
 while ($true) {
-    # «Показать канарейку» - временный пункт: посмотреть экран канарейки, ничего не меняет.
-    $groupIndex = Select-UiOne -Header ("Настройки: {0}" -f $configPath) -Items (@($groups) + @('Показать канарейку (временно: открыть её в temp)', 'Готово'))
+    $groupIndex = Select-UiOne -Header ("Настройки: {0}" -f $configPath) -Items (@($groups) + @('Демонстрация экрана проверки входа', 'Готово')) `
+        -Hints (@($groups | ForEach-Object { '' }) + @('Откроется клиент тестовой базы. Результат демонстрационный.', ''))
     if ($groupIndex -eq $groups.Count) { Show-Canary; continue }
     if ($groupIndex -lt 0 -or $groupIndex -ge $groups.Count) { break }
     $group = $groups[$groupIndex]

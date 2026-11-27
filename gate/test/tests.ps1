@@ -759,6 +759,35 @@ function New-FakeGateRelease {
 
 $tests = @(
     @{
+        Name = 'operator-history-and-ci'
+        Text = 'Чтение истории без вердикта и ожидание CI без ложного процента'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $run = Join-Path $sb 'runs/20000101-010101'
+            New-Item -ItemType Directory -Path $run -Force | Out-Null
+            [IO.File]::WriteAllText((Join-Path $run 'run.log'), '13:05:16 Остановлено: прервана связь с тестовой базой', $utf8)
+            $history = Invoke-Script -Sandbox $sb -Answers @(
+                @{ Kind = 'one'; Header = '^Гейт расширений'; Item = 'Результаты последних прогонов' },
+                @{ Kind = 'one'; Header = 'Последние прогоны'; Index = 0 },
+                @{ Kind = 'one'; Header = 'Что сделать'; Item = 'Назад к списку' },
+                @{ Kind = 'one'; Header = 'Последние прогоны'; Cancel = $true },
+                @{ Kind = 'one'; Header = '^Гейт расширений'; Item = '^Выход$' })
+            $shown = $history.Output -join ' '
+            Check ($shown.Contains('Вердикт недоступен') -and $shown.Contains('run.log') -and $shown.Contains('прервана связь с тестовой базой')) 'у недоступного вердикта нет ссылки на журнал'
+            Check (-not $shown.Contains('остановился до вердикта')) 'из отсутствия вердикта сделан вывод о причине'
+            . (Join-Path $sb 'delivery.ps1')
+            function Get-GhPull { return @{ Mergeable = $true; Merge = ''; Head = 'abc' } }
+            function Write-UiProgress {
+                param($Title, $Elapsed, $Expected, $Detail)
+                Check (-not $Expected -and $Title.Contains('#7') -and $Detail.Contains('30 мин')) 'лимит ожидания CI выведен как прогноз готовности'
+                throw 'конец проверки подписи'
+            }
+            try { Wait-DeliveryCi -D @{ CiWaitSec = 1800 } -State @{} -Setup @{ Gh = @{} } -Number 7 }
+            catch { Check ($_.Exception.Message -eq 'конец проверки подписи') $_.Exception.Message }
+        }
+    },
+    @{
         Name = 'gate-asis-green'
         Text = 'прогон на том, что есть в базе: всё зелёное'
         Run = {
@@ -2110,6 +2139,7 @@ $tests = @(
             $lastFile = Join-Path $sb 'nightly\last.json'
             if (Test-Path -LiteralPath $lastFile) {
                 $last = [System.IO.File]::ReadAllText($lastFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check ($last.mode -eq 'Текущее состояние базы') 'не указан фактический режим ночной проверки'
                 Check ($last.verdict -eq 'GREEN') ("вердикт ночного прогона {0}, ждали GREEN" -f $last.verdict)
                 Check ($last.runId -match '^\d{8}-\d{6}$' -and (Test-Path -LiteralPath (Join-Path $sb ('runs\' + $last.runId + '\verdict.json')))) ("нет прогона {0}" -f $last.runId)
                 Check (Test-Path -LiteralPath ([string]$last.log)) 'нет файла вывода ночного прогона'
@@ -3374,7 +3404,7 @@ $tests = @(
                     Check ($labels[$labels.Count - 1] -eq 'Выход') ("последний пункт - «{0}», ждали «Выход»" -f $labels[$labels.Count - 1])
                     Check ((& $keyOf $menu '^Прогон на том, что есть в базе$') -eq '2') ("«Прогон на том, что есть в базе»: клавиша «{0}», ждали «2»" -f (& $keyOf $menu '^Прогон на том, что есть в базе$'))
                     Check ((& $keyOf $menu '^Обновить рабочую базу$') -eq 'd') ("«Обновить рабочую базу»: клавиша «{0}», ждали «d»" -f (& $keyOf $menu '^Обновить рабочую базу$'))
-                    Check ((& $keyOf $menu '^Откатить рабочую базу$') -eq 'e') ("«Откатить рабочую базу»: клавиша «{0}», ждали «e»" -f (& $keyOf $menu '^Откатить рабочую базу$'))
+                    Check ((& $keyOf $menu '^Откатить изменения выпуска$') -eq 'e') ("«Откатить изменения выпуска»: клавиша «{0}», ждали «e»" -f (& $keyOf $menu '^Откатить изменения выпуска$'))
                     Check ((& $keyOf $menu '^Настройки гейта$') -eq 'l') ("«Настройки гейта»: клавиша «{0}», ждали «l»" -f (& $keyOf $menu '^Настройки гейта$'))
                     Check ((& $keyOf $menu '^Прогон с обновлением из inbox') -eq '') 'в пустом inbox есть пункт «Прогон с обновлением из inbox»'
                     # Подписи постоянные: без чисел, имён баз и версий; переменное и подробности - в пояснениях.
@@ -3535,6 +3565,9 @@ $tests = @(
             param($Name)
             $sb = New-Sandbox $Name -Config $deployConfig
             $com = New-ComState -TempProcessings @((New-PrintProcessing '2' $printNew)) -ProdProcessings @((New-PrintProcessing '1' $printOld))
+            $empty = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Rollback' -Com $com -Answers @(@{ Kind = 'one'; Header = '^Откат '; Cancel = $true })
+            $pick = @($empty.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('последние обновления') } | ForEach-Object { $_.Substring(5) | ConvertFrom-Json })
+            Check ($pick.Count -eq 1 -and ($pick[0].items -join '') -eq 'Назад' -and @($pick[0].danger).Count -eq 0) 'при пустой истории предлагается откат'
             $fake = @{ regepf = @(@{ status = 'done'; old = 'прежняя печать'; objversion = '2'; oldversion = '1' }) }
             $first = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Fake $fake -Com $com -Answers @(
                 @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить все' },
@@ -3554,6 +3587,8 @@ $tests = @(
                 @{ Kind = 'confirm'; Header = 'подтянуть изменения в темп'; Yes = $false })
             Check-DeployCommon $r
             Check ($r.ExitCode -eq 0) ("код возврата {0}, ждали 0" -f $r.ExitCode)
+            $confirm = @($r.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('Точно откатить') })
+            Check ($confirm.Count -eq 1 -and $confirm[0].Contains($firstRecord.runId) -and $confirm[0].Contains('erp_base') -and $confirm[0].Contains('Восстановить') -and $confirm[0].Contains('Адаптация')) 'перед откатом не видны выпуск, база и состав возврата'
             $record = Get-DeployRecord $sb
             if ($null -ne $record) {
                 Check ($record.mode -eq 'rollback' -and $record.rollbackOf -eq $firstRecord.runId) ("режим {0}, откат к {1}, ждали rollback к {2}" -f $record.mode, $record.rollbackOf, $firstRecord.runId)
@@ -3657,6 +3692,8 @@ $tests = @(
         Run = {
             param($Name)
             $sb = New-Sandbox $Name
+            $screen = Invoke-Script -Sandbox $sb -Script 'settings.ps1' -Answers @(@{ Kind = 'one'; Header = '^Настройки: '; Item = '^Готово$' })
+            Check (($screen.Output -join ' ') -match 'Демонстрация экрана проверки входа' -and ($screen.Output -join ' ') -match 'демонстрационный') 'при выборе канарейки не видно режима демонстрации'
             $r = Invoke-Script -Sandbox $sb -Script 'settings.ps1' -Answers @(
                 @{ Kind = 'one'; Header = '^Настройки: '; Item = '^Базы$' },
                 @{ Kind = 'one'; Header = '^Настройки, Базы: '; Item = '^UnlockCode ' },
@@ -4974,7 +5011,7 @@ $tests = @(
                 Check (@($stepEvents | Where-Object { $_ -match 'git add' -and $_ -match '"status"\s*:\s*"OK"' }).Count -eq 1) ('события step с итогом git add для колонки шагов: ' + @($stepEvents | Where-Object { $_ -match 'git add' }).Count)
                 # Будущие шаги видны заранее: план операций (ops) - выгрузки расширений, потом весь путь типовой.
                 $opsPlans = @($first.Output | Where-Object { $_.StartsWith('@@ui:') -and $_ -match '"kind"\s*:\s*"plan"' -and $_ -match '"ops"\s*:\s*true' })
-                Check (@($opsPlans | Where-Object { $_ -match 'Типовая: git push' -and $_ -match 'Типовая: git add' -and $_ -match 'Выгрузить типовую' }).Count -eq 1) ('планов операций типовой для колонки шагов: ' + @($opsPlans | Where-Object { $_ -match 'git push' }).Count)
+                Check (@($opsPlans | Where-Object { $_ -match 'Типовая: git push' -and $_ -match 'Подготовить файлы к коммиту' -and $_ -match 'Упаковать объекты перед отправкой' -and $_ -match 'Выгрузить типовую' }).Count -eq 1) ('планов операций типовой для колонки шагов: ' + @($opsPlans | Where-Object { $_ -match 'git push' }).Count)
                 Check (@($opsPlans | Where-Object { $_ -match 'Выгрузить .+ из erp_temp_test' -and $_ -notmatch 'git push' }).Count -eq 1) ('планов выгрузки расширений для колонки шагов: ' + @($opsPlans | Where-Object { $_ -notmatch 'git push' }).Count)
                 $tree = @(& $gitExe --git-dir=$bare ls-tree -r --name-only main 2>&1 | ForEach-Object { [string]$_ })
                 foreach ($path in @('README.md', 'Configuration.xml', 'Catalogs/Items.xml', 'CommonModules/Common/Ext/Module.bsl')) { Check ($tree -contains $path) ("в репозитории типовой нет {0}: {1}" -f $path, ($tree -join ' ')) }
@@ -5262,6 +5299,8 @@ $tests = @(
             Check (Test-Path -LiteralPath $lastFile) 'нет nightly\last.json'
             if ((Test-Path -LiteralPath $lastFile) -and $runs.Count -ge 1) {
                 $last = [System.IO.File]::ReadAllText($lastFile, $utf8).TrimStart([char]0xFEFF) | ConvertFrom-Json
+                Check ($last.mode -like '*Git*' -and $last.commit -eq $merged) 'ночной результат не называет режим Git и фактический коммит'
+                Check (($r.Output -join ' ') -match $merged.Substring(0, 7)) 'короткий итог ночной загрузки без коммита'
                 Check ($last.runId -eq $runs[0].Name -and $last.verdict -eq 'GREEN') ("ночной итог: прогон {0}, вердикт {1}" -f $last.runId, $last.verdict)
             }
             Check ((Read-GitStateFile $sb).commit -eq $merged) 'после ночного прогона state.json не на main'
@@ -5278,6 +5317,8 @@ $tests = @(
             Check ($runs2.Count -eq 2) ("прогонов после второй ночи {0}, ждали два" -f $runs2.Count)
             if ($runs2.Count -eq 2) {
                 $stub2 = [System.IO.File]::ReadAllText((Join-Path $runs2[1].FullName 'stub.txt'), $utf8)
+                $lastAsIs = Get-Content -LiteralPath $lastFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                Check ($lastAsIs.mode -eq 'Текущее состояние базы' -and -not $lastAsIs.commit) 'прежний коммит показан для прогона текущего состояния'
                 Check ($stub2 -match '(?m)^Kit=\s*$' -and $stub2 -notmatch 'dir=') ("второй ночью грузился комплект, ждали «как есть»: " + $stub2)
             }
             $importFile = Join-Path $sb 'git\ext\last-import.json'
