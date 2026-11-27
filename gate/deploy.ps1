@@ -4008,7 +4008,7 @@ function Invoke-GitExport {
         }
     }
     if ($changes.Count -eq 0) {
-        if ($comparison.PublishedVersion) { Write-Line ("Версия расширения уже есть в истории {0}: выгружать нечего." -f $Setup.Branch) 'Green' }
+        if ($comparison.PublishedVersion) { Write-Line ("Версия из базы уже есть в истории {0}: выгружать нечего." -f $Setup.Branch) 'Green' }
         else { Write-Line ("{0} совпадает с git (коммит {1}): выгружать нечего." -f $script:TempBase, (Get-GitShort $base)) 'Green' }
         if (-not [string]$State['commit'] -and $base) { $State['commit'] = $base; $State['how'] = 'export'; Save-GitState $Setup $State }
         $script:DeployBranchOutcome = 'unchanged'
@@ -4243,8 +4243,47 @@ function Get-GitDumpComparisonFiles {
 function Test-GitPublishedVersion {
     param($Setup, [string]$Path, [byte[]]$Bytes, [string]$Blob, [string]$Before, [string]$Known, [string]$Head)
     if (-not (Test-GitDumpXmlMatch $Setup $Bytes 'version' $Before)) { return $false }
-    try { return (Test-GhFileInRange $Setup.Gh $Known $Head $Path $Blob) }
+    try { return (Test-GhPathInRange $Setup.Gh $Known $Head $Path { param($revision) (Get-GhFileAtRevision $Setup.Gh $revision $Path) -eq $Blob }) }
     catch { Write-RunLog ("git: история {0} не подтверждена, сохраняю изменение: {1}" -f $Path, $_.Exception.Message); return $false }
+}
+
+function Get-GitRelativeFiles {
+    param([hashtable]$Files, [string]$Folder)
+    $result = [hashtable]::new([StringComparer]::Ordinal)
+    $prefix = $Folder + '/'
+    foreach ($path in $Files.Keys) {
+        if ($path.StartsWith($prefix, [StringComparison]::Ordinal)) { $result[$path.Substring($prefix.Length)] = $Files[$path] }
+    }
+    return $result
+}
+
+function Test-GitPublishedProcessing {
+    param($Setup, [string]$Folder, [hashtable]$Files, [string]$KnownCommit, [string]$HeadCommit, [hashtable]$Before, [hashtable]$Current)
+    $expected = Get-GitRelativeFiles $Files $Folder
+    if ($expected.Count -eq 0) { return $false }
+    # При старой выгрузке в PR не попадали файлы из main. Для неизменённого пути снимка допускаем
+    # также версию из main, но все файлы вместе должны совпасть с одной опубликованной обработкой.
+    $alternates = @{}
+    if ($null -ne $Before -and $null -ne $Current) {
+        foreach ($rel in $expected.Keys) {
+            $path = $Folder + '/' + $rel
+            if ($Before[$path] -eq $expected[$rel] -and $Current[$path]) { $alternates[$rel] = $Current[$path] }
+        }
+    }
+    try {
+        return (Test-GhPathInRange $Setup.Gh $KnownCommit $HeadCommit $Folder {
+            param($revision)
+            if ($Setup.Gh.FakeDir) { $tree = Get-GitRelativeFiles (Get-GhFiles $Setup.Gh $revision) $Folder }
+            else { $tree = Get-GhFiles $Setup.Gh ([uri]::EscapeDataString($revision + ':' + $Folder)) }
+            if ($tree.Count -ne $expected.Count) { return $false }
+            foreach ($rel in $tree.Keys) {
+                if (-not $expected.ContainsKey($rel)) { return $false }
+                if ($tree[$rel] -ne $expected[$rel] -and $tree[$rel] -ne $alternates[$rel]) { return $false }
+            }
+            return $true
+        })
+    }
+    catch { Write-RunLog ("git: не подтвердил версию {0} в истории: {1}" -f $Folder, $_.Exception.Message); return $false }
 }
 
 function Get-GitSnapshotComparison {
@@ -4262,6 +4301,17 @@ function Get-GitSnapshotComparison {
     if ($KnownCommit -and $HeadCommit -and $KnownCommit -ne $HeadCommit) {
         # Для загрузки остаются байты текущего main. История влияет только на поиск прямых правок.
         $known = $known.Clone()
+        $folders = @{}
+        foreach ($path in @($Local.Keys) + @($known.Keys)) {
+            if ($path -cmatch '^(processings/[^/]+)/' -and $localShas[$path] -ne $known[$path] -and $localShas[$path] -ne $head[$path]) { $folders[$Matches[1]] = $true }
+        }
+        foreach ($folder in $folders.Keys) {
+            if (-not (Test-GitPublishedProcessing $Setup $folder $localShas $KnownCommit $HeadCommit)) { continue }
+            foreach ($rel in (Get-GitRelativeFiles $known $folder).Keys) { $known.Remove($folder + '/' + $rel) }
+            foreach ($rel in (Get-GitRelativeFiles $localShas $folder).Keys) { $path = $folder + '/' + $rel; $known[$path] = $localShas[$path] }
+            $publishedVersion = $true
+            Write-RunLog ("git: все файлы {0} совпали с одной опубликованной версией" -f $folder)
+        }
         foreach ($path in $Local.Keys) {
             if ($path -notmatch '^extensions/[^/]+/Configuration\.xml$' -or -not $known.ContainsKey($path) -or $localShas[$path] -eq $known[$path]) { continue }
             if (Test-GitPublishedVersion $Setup $path ([IO.File]::ReadAllBytes($Local[$path])) $localShas[$path] $known[$path] $KnownCommit $HeadCommit) {
@@ -4296,6 +4346,7 @@ function Test-GitPendingSourceChanges {
     $after = Get-GhFiles -Gh $Setup.Gh -Commit $pending
     if ($before.Count -eq 0 -or $before.Count -ne $after.Count) { return $true }
     $targetFiles = $null
+    $publishedFolders = @{}
     foreach ($path in $after.Keys) {
         if (-not $before.ContainsKey($path)) { return $true }
         if ($after[$path] -eq $before[$path]) { continue }
@@ -4311,8 +4362,14 @@ function Test-GitPendingSourceChanges {
         }
         if ($path -match '^extensions/[^/]+/Configuration\.xml$' -and (Test-GitPublishedVersion $Setup $path (Get-GhBlob $Setup.Gh $after[$path]) $after[$path] $before[$path] $base $Head)) { continue }
         $kind = Get-GitDumpXmlKind $path $after $before
-        if (-not $kind) { return $true }
-        if (-not (Test-GitDumpXmlMatch $Setup (Get-GhBlob -Gh $Setup.Gh -Sha $after[$path]) $kind $before[$path])) { return $true }
+        if ($kind -and (Test-GitDumpXmlMatch $Setup (Get-GhBlob -Gh $Setup.Gh -Sha $after[$path]) $kind $before[$path])) { continue }
+        if ($path -cnotmatch '^(processings/[^/]+)/') { return $true }
+        $folder = $Matches[1]
+        if (-not $publishedFolders.ContainsKey($folder)) {
+            if ($null -eq $targetFiles) { $targetFiles = Get-GhFiles $Setup.Gh $Head }
+            $publishedFolders[$folder] = Test-GitPublishedProcessing $Setup $folder $after $base $Head $before $targetFiles
+        }
+        if (-not $publishedFolders[$folder]) { return $true }
     }
     return $false
 }
@@ -4390,7 +4447,7 @@ function Invoke-GitImport {
     }
     # Итог сверки - на экран и когда правок нет: иначе по выводу не понять, чем кончилась проверка.
     if ($drift.Count -eq 0) {
-        if ($comparison.PublishedVersion) { Write-Line ("  новых правок нет. Версия расширения из {0} уже есть в истории {1}." -f $script:TempBase, $Setup.Branch) 'Green' }
+        if ($comparison.PublishedVersion) { Write-Line ("  новых правок нет. Версия из {0} уже есть в истории {1}." -f $script:TempBase, $Setup.Branch) 'Green' }
         else { Write-Line ("  правок нет: {0} совпадает с коммитом {1}" -f $script:TempBase, $knownName) 'Green' }
     }
     if ($drift.Count -gt 0) {

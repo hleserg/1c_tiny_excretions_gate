@@ -4605,6 +4605,56 @@ $tests = @(
         }
     },
     @{
+        Name = 'git-processing-intermediate'
+        Text = 'Обработка из промежуточного коммита допускает загрузку новой версии. Старый снимок мог пропустить файл, уже совпадавший с main. Смесь версий сохраняется в PR.'
+        Run = {
+            param($Name)
+            $sb = New-GitSandbox $Name
+            $gh = Get-FakeGh $sb
+            $argsGit = @{Sandbox=$sb; Script='deploy.ps1'; Fake=@{dumps=(New-GitDumps)}; Com=(New-ComState -TempProcessings @((New-PrintProcessing '1' $printOld)))}
+            $boot = Invoke-Script @argsGit -Arguments '-GitExport' -Answers $gitBootstrapAnswers
+            Check-DeployCommon $boot -LocksExpected $false
+            $state = Read-GitStateFile $sb
+            $base = $state.commit
+            $prefix = 'processings/Печать/'
+            $code = $prefix + 'Печать/Ext/ObjectModule.bsl'
+            $form = $prefix + 'Печать.xml'
+            $one = [pscustomobject]@{Path=$code; Bytes=$utf8.GetBytes('Версия 2')}
+            $two = [pscustomobject]@{Path=$form; Bytes=$utf8.GetBytes('<Print>2</Print>')}
+            $middle = New-GhCommit $gh $base @($one,$two) 'Принятая версия обработки'
+            $head = New-GhCommit $gh $middle @([pscustomobject]@{Path=$code; Bytes=$utf8.GetBytes('Версия 3')}) 'Следующая версия'
+            Set-GhBranch $gh main $head
+            $work = Join-Path $sb 'git/ext/work'
+            $oldForm = [IO.File]::ReadAllBytes((Join-Path $work $form))
+            [IO.File]::WriteAllBytes((Join-Path $work $code), $one.Bytes)
+            [IO.File]::WriteAllBytes((Join-Path $work $form), $two.Bytes)
+            $load = @{Kind='confirm'; Header='Загрузить в erp_temp_test из main'; Yes=$true}
+            [IO.File]::WriteAllText((Join-Path $sb 'run.ps1'), $gitRunStub, $utf8Bom)
+            $r = Invoke-Script @argsGit -Arguments '-GitImport' -Answers @($load)
+            Check-DeployCommon $r -LocksExpected $false
+            Check ((Read-GitStateFile $sb).commit -eq $head) 'полная опубликованная версия обработки вызвала PR'
+            # Обновлённая форма совпадала с main и потому в старой ветке остался начальный файл.
+            $partial = New-GhCommit $gh $base @($one) 'Снимок по старым правилам'
+            Set-GhBranch $gh 'temp/old' $partial -Create
+            $state.commit = $partial
+            $state.pendingBranch = 'temp/old'
+            $state.pendingCommit = $partial
+            $stateFile = Join-Path $sb 'git/ext/state.json'
+            [IO.File]::WriteAllText($stateFile, (ConvertTo-Json $state), $utf8Bom)
+            $r = Invoke-Script @argsGit -Arguments '-GitImport' -Answers @($load)
+            Check-DeployCommon $r -LocksExpected $false
+            Check ((Read-GitStateFile $sb).commit -eq $head) 'подтверждённые файлы старого PR остановили импорт'
+            # Существующие по отдельности модуль и форма никогда не были опубликованы вместе.
+            $state.commit = $base
+            $state.pendingCommit = ''
+            [IO.File]::WriteAllText($stateFile, (ConvertTo-Json $state), $utf8Bom)
+            [IO.File]::WriteAllBytes((Join-Path $work $form), $oldForm)
+            $r = Invoke-Script @argsGit -Arguments '-GitImport -GitUnattended'
+            $state = Read-GitStateFile $sb
+            Check ($r.ExitCode -eq 0 -and $state.pendingCommit -and (Get-GhFiles $gh $state.pendingCommit)[$code] -eq (Get-GitBlobSha $one.Bytes)) 'пропущена новая комбинация файлов обработки'
+        }
+    },
+    @{
         Name = 'git-role-dump-pair'
         Text = 'Проверенная выгрузка роли совпадает с загруженным исходником, включая старый PR. Другая правка той же роли сохраняется.'
         Run = {
