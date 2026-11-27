@@ -4320,7 +4320,7 @@ $tests = @(
         Text = 'файлы прогона в git (RunFilesRepo): текстовые файлы папки прогона - в ветку-сироту gate-runs, папка runs/<прогон>, README.md и latest.txt, ссылка в итоге, main не тронут; файлы не ушли - досылаются следующим запуском; двоичные и файл с токеном не выкладываются, README.md говорит почему'
         Run = {
             param($Name)
-            $sb = New-Sandbox $Name -Config @{ RunReportRepo = 'owner/repo'; RunFilesRepo = 'owner/ext'; GitHubTokenPassFile = 'secrets\github.txt' }
+            $sb = New-Sandbox $Name -Config @{ RunReportRepo = 'owner/repo'; RunFilesRepo = 'owner/ext'; GitHubTokenPassFile = 'secrets\github.txt'; UnlockCode = '307' }
             New-Item -ItemType Directory -Path (Join-Path $sb 'secrets') -Force | Out-Null
             $secret = 'tok-файлы-прогона-321'
             [System.IO.File]::WriteAllText((Join-Path $sb 'secrets\github.txt'), (ConvertFrom-SecureString -SecureString (ConvertTo-SecureString $secret -AsPlainText -Force)))
@@ -4401,6 +4401,14 @@ $tests = @(
                 $ansi = [System.Text.Encoding]::GetEncoding(1251)
                 [System.IO.File]::WriteAllText((Join-Path $r.RunDir 'designer.log'), ('пароль ' + $secret), $ansi)
                 [System.IO.File]::WriteAllText((Join-Path $r.RunDir 'clean.log'), 'обычный журнал', $ansi)
+            $plan = "307`t2`tФорма/Документ.Пример`r`n308`t1`tКомпиляцияМодулей/Менеджер|Документы.Пример"
+            [IO.File]::WriteAllText((Join-Path $r.RunDir 'plan.txt'), $plan, $utf8Bom)
+            [IO.File]::WriteAllText((Join-Path $r.RunDir 'p000307.txt'), "@@piece=307`r`n@@journal`r`nАртикул 5030711, версия 1.307.0", $utf8Bom)
+            [IO.File]::WriteAllText((Join-Path $r.RunDir 'catalog.json'), '{"version":"2026307","count":307}', $utf8Bom)
+            [IO.File]::WriteAllText((Join-Path $r.RunDir 'connection.log'), '1cv8c.exe /UC"307"', $utf8Bom)
+            [IO.File]::WriteAllText((Join-Path $r.RunDir 'settings.json'), '{"UnlockCode":307}', $utf8Bom)
+            [IO.File]::WriteAllText((Join-Path $r.RunDir 'lock.log'), 'код разрешения входа: 307', $ansi)
+            [IO.File]::WriteAllText((Join-Path $r.RunDir 'bare.txt'), '307', $utf8Bom)
                 New-Item -ItemType Directory -Path (Join-Path $r.RunDir 'epf') -Force | Out-Null
                 [System.IO.File]::WriteAllBytes((Join-Path $r.RunDir 'epf\old.txt'), [byte[]]@(65, 66))
                 [System.IO.File]::WriteAllBytes((Join-Path $r.RunDir 'saved.cfe'), [byte[]]@(0, 1, 2, 3))
@@ -4417,6 +4425,16 @@ $tests = @(
                 Check (-not $files.ContainsKey(('runs/{0}/leak.txt' -f $id))) 'выложен файл с токеном'
                 Check (-not $files.ContainsKey(('runs/{0}/designer.log' -f $id))) 'выложен журнал Windows-1251 с секретом'
                 Check ($files.ContainsKey(('runs/{0}/clean.log' -f $id))) 'чистый журнал Windows-1251 пропущен'
+                foreach ($ordinary in @('plan.txt', 'p000307.txt', 'catalog.json')) {
+                    $path = 'runs/{0}/{1}' -f $id, $ordinary
+                    Check ($files.ContainsKey($path)) ("Короткий код в числовых данных помешал выгрузить {0}" -f $ordinary)
+                    if ($files.ContainsKey($path)) {
+                        Check ([Convert]::ToBase64String((Get-GhBlob $gh $files[$path])) -ceq [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $r.RunDir $ordinary)))) ("Изменились данные {0}" -f $ordinary)
+                    }
+                }
+                foreach ($sensitive in @('connection.log', 'settings.json', 'lock.log', 'bare.txt')) {
+                    Check (-not $files.ContainsKey(('runs/{0}/{1}' -f $id, $sensitive))) ("Опубликован файл с кодом входа {0}" -f $sensitive)
+                }
                 Check (-not $files.ContainsKey(('runs/{0}/saved.cfe' -f $id)) -and -not $files.ContainsKey(('runs/{0}/epf/old.txt' -f $id))) 'выложены двоичные файлы или папка epf'
                 $readmeKey = 'runs/{0}/README.md' -f $id
                 $readme = ''
