@@ -726,7 +726,7 @@ function Get-DeliveryTempDrift {
     Initialize-GitBinaryShas -Setup $Setup -FileSets @($knownFiles, $HeadFiles)
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$withProcessings
     $skipped = Get-GitSkippedPaths $snapshot $knownFiles
-    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $knownFiles $HeadFiles
+    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $knownFiles $HeadFiles $known $Head
     $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $comparison.Known -Prefixes $snapshot.Prefixes -Ignore (@('processings/manifest.json') + @($skipped)) -LocalShas $comparison.LocalShas
     if ($drift.Count -gt 0 -and $known -ne $Head) { $drift = @($drift | Where-Object { -not (Test-GitSameAsHead $_ $comparison.Head) }) }
     if ($drift.Count -gt 0) {

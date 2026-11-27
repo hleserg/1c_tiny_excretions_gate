@@ -3951,7 +3951,7 @@ function New-GitTempBranch {
     $State['pendingCommit'] = $sha
     Save-GitState $Setup $State
     Write-Line ("Выгрузил: ветка {0}, коммит {1}, pull request #{2}: {3}" -f $branchName, (Get-GitShort $sha), $pull.Number, $pull.Url) 'Green'
-    Write-Line ("Проверь изменения и дождись зелёного CI в PR. Затем слей его в {0} через Create a merge commit и повтори «Загрузить из git»." -f $Setup.Branch)
+    Write-Line ("Чтобы включить снимок в {0}, проверь изменения, дождись успешного CI и выбери Create a merge commit." -f $Setup.Branch)
     return [pscustomobject]@{ Branch = $branchName; Sha = $sha; Number = $pull.Number; Url = $pull.Url; Continued = $false }
 }
 
@@ -3993,7 +3993,7 @@ function Invoke-GitExport {
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$tracked.HasProcessings
     foreach ($item in $snapshot.Missing) { Write-Line ("  в {0} нет: {1} - в git остаётся как есть" -f $script:TempBase, $item) 'Yellow' }
     # Без @(): функция возвращает массив запятой, @() завернул бы его ещё раз.
-    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $baseFiles $baseFiles
+    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $baseFiles $baseFiles $base $head.Sha
     $changes = Compare-GitSnapshot -Local $snapshot.Files -Remote $comparison.Known -Prefixes $snapshot.Prefixes -Ignore (Get-GitSkippedPaths $snapshot $baseFiles) -LocalShas $comparison.LocalShas
     $manifest = 'processings/manifest.json'
     if ($snapshot.Files.ContainsKey($manifest) -and $baseFiles.ContainsKey($manifest) -and $comparison.LocalShas[$manifest] -ne $baseFiles[$manifest]) {
@@ -4062,6 +4062,14 @@ function Save-GitImportResult {
     [System.IO.File]::WriteAllText((Join-Path $Setup.Root 'last-import.json'), (ConvertTo-Json -InputObject $record), $Utf8Bom)
 }
 
+function Remove-GitXmlDumpNode {
+    param([System.Xml.XmlNode]$Node)
+    $parent = $Node.ParentNode
+    $indent = $Node.PreviousSibling
+    if ($null -ne $indent -and $indent.NodeType -eq 'Whitespace') { $null = $parent.RemoveChild($indent) }
+    $null = $parent.RemoveChild($Node)
+}
+
 function Get-GitDumpComparisonXml {
     # Меняем только служебные узлы выгрузки. Пробелы в значениях, комментарии, порядок команд и реквизитов сохраняются.
     param([byte[]]$Bytes, [string]$Kind, [bool]$FromDump)
@@ -4090,20 +4098,58 @@ function Get-GitDumpComparisonXml {
         for ($i = 0; $i -lt $nodes.Count; $i++) { $nodes[$i].InnerText = $names[$i] }
     }
     else {
-        $xpath = '/f:Form/f:Attributes[not(@*|node())] | /f:Form/f:BaseForm/f:Attributes[not(@*|node())]'
-        if ($Kind -eq 'module') {
-            if (-not $FromDump) { return $xml.OuterXml }
-            $xpath = "/m:MetaDataObject/m:Document[m:Properties/m:ObjectBelonging='Adopted']/m:InternalInfo/r:PropertyState[not(@*) and count(*)=2 and r:Property='ObjectModule' and r:State='Extended' and not(*/@* | */* | .//comment() | .//processing-instruction() | text()[normalize-space()])]"
+        if ($Kind -eq 'version') {
+            $versions = $xml.SelectNodes('/m:MetaDataObject/m:Configuration/m:Properties/m:Version', $ns)
+            if ($versions.Count -ne 1 -or $versions[0].HasAttributes -or $versions[0].ChildNodes.Count -ne 1 -or $versions[0].FirstChild.NodeType -ne 'Text') { return $null }
+            $versions[0].InnerText = ''
+            return $xml.OuterXml
         }
-        $optional = $xml.SelectNodes($xpath, $ns)
-        if ($FromDump -and $optional.Count -eq 0) { return $null }
-        foreach ($node in $optional) {
-            $parent = $node.ParentNode
-            if ($Kind -eq 'form' -and $parent.SelectNodes('f:Attributes', $ns).Count -ne 1) { return $null }
-            if ($Kind -eq 'module' -and $parent.SelectNodes("r:PropertyState[r:Property='ObjectModule']", $ns).Count -ne 1) { return $null }
-            $indent = $node.PreviousSibling
-            if ($null -ne $indent -and $indent.NodeType -eq 'Whitespace') { $null = $parent.RemoveChild($indent) }
-            $null = $parent.RemoveChild($node)
+        if ($Kind -in @('module', 'document')) {
+            if (-not $xml.SelectSingleNode('/m:MetaDataObject/m:Document', $ns)) { return $null }
+            # Конфигуратор группирует ссылки на формы. Порядок самих форм и остальных объектов остаётся значимым.
+            $forms = $xml.SelectNodes('/m:MetaDataObject/m:Document/m:ChildObjects/m:Form', $ns)
+            foreach ($form in @($forms)) {
+                if ($form.HasAttributes -or $form.ChildNodes.Count -ne 1 -or $form.FirstChild.NodeType -ne 'Text') { return $null }
+                $parent = $form.ParentNode
+                Remove-GitXmlDumpNode $form
+                $null = $parent.AppendChild($form)
+            }
+            if ($Kind -eq 'module' -and $FromDump) {
+                $markers = $xml.SelectNodes("/m:MetaDataObject/m:Document[m:Properties/m:ObjectBelonging='Adopted']/m:InternalInfo/r:PropertyState[r:Property='ObjectModule']", $ns)
+                if ($markers.Count -eq 1 -and $markers[0].SelectSingleNode("self::*[not(@*) and count(*)=2 and r:State='Extended' and not(*/@* | */* | .//comment() | .//processing-instruction() | text()[normalize-space()])]", $ns)) {
+                    Remove-GitXmlDumpNode $markers[0]
+                }
+            }
+            return $xml.OuterXml
+        }
+        if (-not $xml.SelectSingleNode('/f:Form', $ns)) { return $null }
+        $decl = $xml.FirstChild
+        if ($decl.NodeType -eq 'XmlDeclaration' -and $decl.Encoding -ieq 'utf-8') { $decl.Encoding = '' }
+        if ($xml.LastChild.NodeType -eq 'Whitespace') { $null = $xml.RemoveChild($xml.LastChild) }
+
+        foreach ($form in $xml.SelectNodes('/f:Form | /f:Form/f:BaseForm', $ns)) {
+            $empty = $form.SelectSingleNode('f:Attributes[not(@*|node())]', $ns)
+            if ($empty -and $form.SelectNodes('f:Attributes', $ns).Count -eq 1) { Remove-GitXmlDumpNode $empty }
+            # События с разными именами независимы. Обработчики одного события остаются в исходном порядке.
+            $events = $form.SelectNodes('f:Events/f:Event', $ns)
+            $byName = [Collections.Generic.SortedDictionary[string,Collections.ArrayList]]::new([StringComparer]::Ordinal)
+            foreach ($event in $events) {
+                $name = $event.GetAttribute('name')
+                if (-not $name) { return $null }
+                if (-not $byName.ContainsKey($name)) { $byName.Add($name, [Collections.ArrayList]::new()) }
+                $null = $byName[$name].Add($event.CloneNode($true))
+            }
+            $i = 0
+            foreach ($group in $byName.Values) {
+                foreach ($copy in $group) {
+                    $event = $events[$i++]
+                    $null = $event.ParentNode.ReplaceChild($copy, $event)
+                }
+            }
+            $qualifiers = $form.SelectNodes("f:Attributes/f:Attribute/f:Type[count(*)=2 and v:Type='xs:string']/v:StringQualifiers[count(*)=2 and v:Length='0' and v:AllowedLength='Variable' and not(@* | */@* | */* | .//comment() | .//processing-instruction() | text()[normalize-space()])]", $ns)
+            foreach ($q in $qualifiers) {
+                if ($q.ParentNode.SelectSingleNode('v:Type', $ns).GetNamespaceOfPrefix('xs') -ceq 'http://www.w3.org/2001/XMLSchema') { Remove-GitXmlDumpNode $q }
+            }
         }
     }
     return $xml.OuterXml
@@ -4138,11 +4184,12 @@ function Get-GitComparisonManifest {
 
 function Get-GitDumpXmlKind {
     param([string]$Path, [hashtable]$Local, [hashtable]$Remote)
-    if ($Path -match '^extensions/[^/]+/(?:.+/)?Forms/[^/]+/Ext/Form\.xml$') { return 'form' }
+    if ($Path -match '^(?:extensions|processings)/[^/]+/(?:.+/)?Forms/[^/]+/Ext/Form\.xml$') { return 'form' }
     if ($Path -match '^extensions/[^/]+/FilterCriteria/[^/]+\.xml$') { return 'criterion' }
     if ($Path -match '^extensions/[^/]+/Documents/[^/]+\.xml$') {
         $module = $Path.Substring(0, $Path.Length - 4) + '/Ext/ObjectModule.bsl'
         if ($Local.ContainsKey($module) -and $Remote.ContainsKey($module)) { return 'module' }
+        return 'document'
     }
     return ''
 }
@@ -4152,7 +4199,9 @@ function Test-GitDumpXmlMatch {
     $dump = Get-GitDumpComparisonXml $Bytes $Kind $true
     if (-not $dump) { return $false }
     $source = Get-GitDumpComparisonXml (Get-GhBlob -Gh $Setup.Gh -Sha $SourceSha) $Kind $false
-    return [string]::Equals($dump, $source, [StringComparison]::Ordinal)
+    if ([string]::Equals($dump, $source, [StringComparison]::Ordinal)) { return $true }
+    # Когда отметка Extended уже есть в исходнике, сравним документ и с сохранённой отметкой.
+    return ($Kind -eq 'module' -and [string]::Equals((Get-GitDumpComparisonXml $Bytes $Kind $false), $source, [StringComparison]::Ordinal))
 }
 
 function Get-GitDumpComparisonFiles {
@@ -4172,9 +4221,16 @@ function Get-GitDumpComparisonFiles {
     return $files
 }
 
+function Test-GitPublishedVersion {
+    param($Setup, [string]$Path, [byte[]]$Bytes, [string]$Blob, [string]$Before, [string]$Known, [string]$Head)
+    if (-not (Test-GitDumpXmlMatch $Setup $Bytes 'version' $Before)) { return $false }
+    try { return (Test-GhFileInRange $Setup.Gh $Known $Head $Path $Blob) }
+    catch { Write-RunLog ("git: история {0} не подтверждена, сохраняю изменение: {1}" -f $Path, $_.Exception.Message); return $false }
+}
+
 function Get-GitSnapshotComparison {
     # Хеши выгрузки считаем один раз. Совпадающие пары XML для основы снимка и main читаем один раз.
-    param($Setup, [hashtable]$Local, [hashtable]$KnownFiles, [hashtable]$HeadFiles)
+    param($Setup, [hashtable]$Local, [hashtable]$KnownFiles, [hashtable]$HeadFiles, [string]$KnownCommit, [string]$HeadCommit)
     $localShas = @{}
     foreach ($path in $Local.Keys) { $localShas[$path] = Get-GitBlobSha ([IO.File]::ReadAllBytes($Local[$path])) }
     $cache = @{}
@@ -4182,6 +4238,17 @@ function Get-GitSnapshotComparison {
     $head = $known
     if (-not [object]::ReferenceEquals($KnownFiles, $HeadFiles)) {
         $head = Get-GitDumpComparisonFiles $Setup $Local $localShas $HeadFiles $cache
+    }
+    if ($KnownCommit -and $HeadCommit -and $KnownCommit -ne $HeadCommit) {
+        # Для загрузки остаются байты текущего main. История влияет только на поиск прямых правок.
+        $known = $known.Clone()
+        foreach ($path in $Local.Keys) {
+            if ($path -notmatch '^extensions/[^/]+/Configuration\.xml$' -or -not $known.ContainsKey($path) -or $localShas[$path] -eq $known[$path]) { continue }
+            if (Test-GitPublishedVersion $Setup $path ([IO.File]::ReadAllBytes($Local[$path])) $localShas[$path] $known[$path] $KnownCommit $HeadCommit) {
+                $known[$path] = $localShas[$path]
+                Write-RunLog ("git: {0} совпадает с опубликованной версией в истории {1}" -f $path, $Setup.Branch)
+            }
+        }
     }
     return [pscustomobject]@{ LocalShas = $localShas; Known = $known; Head = $head }
 }
@@ -4215,6 +4282,7 @@ function Test-GitPendingSourceChanges {
             if (-not (Get-GitComparisonManifest (Get-GhBlob -Gh $Setup.Gh -Sha $before[$path]))) { return $true }
             continue
         }
+        if ($path -match '^extensions/[^/]+/Configuration\.xml$' -and (Test-GitPublishedVersion $Setup $path (Get-GhBlob $Setup.Gh $after[$path]) $after[$path] $before[$path] $base $Head)) { continue }
         $kind = Get-GitDumpXmlKind $path $after $before
         if (-not $kind) { return $true }
         if (-not (Test-GitDumpXmlMatch $Setup (Get-GhBlob -Gh $Setup.Gh -Sha $after[$path]) $kind $before[$path])) { return $true }
@@ -4225,7 +4293,7 @@ function Test-GitPendingSourceChanges {
 function Invoke-GitImport {
     # «Загрузить из git»: правили ли temp после прошлой загрузки (выгрузка и сравнение с известным коммитом), не висят
     # ли правки temp в неслитом pull request, потом - обычный прогон гейта отдельным процессом с тем, что изменилось
-    # в main. Правки temp можно сохранить веткой и PR. Загрузка после слияния - при следующем запуске.
+    # в main. Правки temp можно сохранить веткой и PR. После публикации оператор может сразу продолжить загрузку выбранного коммита.
     # Комплект оставлен и загрузилось всё - temp соответствует main. Unattended - без вопросов (ночью).
     # Возвращает код прогона.
     # ExpectCommit - грузить только этот коммит (приёмка поставки: проверенный SHA); main другой - не грузить.
@@ -4275,7 +4343,7 @@ function Invoke-GitImport {
     # ** Хлебников С.Ю. 20261124 конец
     # manifest.json правкой temp не считается: версия и хеш обработки меняются от самой загрузки из git. В ветку с
     # правками он идёт, если правки есть.
-    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $knownFiles $headFiles
+    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $knownFiles $headFiles $known $head.Sha
     $localShas = $comparison.LocalShas
     $compareKnown = $comparison.Known
     $compareHead = $comparison.Head
@@ -4305,7 +4373,7 @@ function Invoke-GitImport {
         $saveDrift = $true
         if (-not $Unattended) {
             $choice = Select-UiOne -Header ("В {0} правки после прошлой загрузки из git: что делать?" -f $script:TempBase) -Items @(
-                'Выгрузить правки temp в git (ветка и pull request), загрузку не делать',
+                'Выгрузить правки temp в Git (создать или дополнить PR)',
                 ('Загрузить {0} всё равно: правки temp пропадут' -f $Setup.Branch),
                 'Отмена') -Danger @(1)
             if ($choice -ne 0 -and $choice -ne 1) { Write-Line ("Отмена: {0} не трогаю." -f $script:TempBase); Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note 'отмена' -Outcome 'cancel'; return 0 }
@@ -4316,7 +4384,11 @@ function Invoke-GitImport {
             if ($Unattended) { $note = 'выгружено ночью' }
             $made = New-GitTempBranch -Setup $Setup -State $State -Base $driftBase -Changes $drift -Note $note
             Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note ("правки temp - веткой {0}, pull request #{1}; temp не трогал" -f $made.Branch, $made.Number) -Outcome 'drift' -Commit $made.Sha
-            return 0
+            if ($Unattended) { return 0 }
+            $next = Select-UiOne -Header ("Правки {0} сохранены в PR #{1}" -f $script:TempBase, $made.Number) -Items @(
+                'Завершить без загрузки',
+                'Продолжить загрузку из Git') -Danger @(1) -Notes @($made.Url, ("В базе правки заменит версия из {0}. Снимок останется в PR." -f $Setup.Branch))
+            if ($next -ne 1) { return 0 }
         }
         Write-Line ("Загружаю {0} поверх правок {1}: так решили." -f $Setup.Branch, $script:TempBase) 'Yellow'
     }
@@ -4355,7 +4427,7 @@ function Invoke-GitImport {
             throw ("{0}: исходный EPF с SHA-256 из manifest.json не подтверждён в temp. Нужен оригинал в binaries/." -f $name)
         }
         # ** Хлебников С.Ю. 20261124 конец
-        if ((Get-GitFolderPrint $headFiles $prefix) -eq (Get-GitFolderPrint $localShas $prefix)) { continue }
+        if ((Get-GitFolderPrint $compareHead $prefix) -eq (Get-GitFolderPrint $localShas $prefix)) { continue }
         $ref = ''
         if ($manifestRefs.ContainsKey($name)) { $ref = [string]$manifestRefs[$name].ref }
         # <имя>~<ссылка> - не основной элемент с этим именем объекта: без ссылки из manifest.json загрузка писала бы в

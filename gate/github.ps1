@@ -655,6 +655,35 @@ function Get-GhCiRun {
     return [pscustomobject]@{ Status = [string]$run.status; Conclusion = [string]$run.conclusion; Title = [string]$run.display_title; Url = [string]$run.html_url; Id = [long]$run.id }
 }
 
+function Test-GhFileInRange {
+    # Ищем точные байты по тому же пути в принятых коммитах после общей основы снимка и ветки.
+    # Ограничиваем число запросов. Если подтверждения нет, гейт сохраняет расхождение для разбора.
+    param($Gh, [string]$Known, [string]$Head, [string]$Path, [string]$Blob)
+    $base = ''
+    $null = Test-GhContains -Gh $Gh -Branch '' -Commit $Known -Head $Head -MergeBase ([ref]$base)
+    if (-not $base -or $base -eq $Head) { return $false }
+    if ($Gh.FakeDir) {
+        $candidates = @(Get-GhAncestors $Gh $Head)
+    }
+    else {
+        $encoded = [uri]::EscapeDataString($Path)
+        $answer = Invoke-GhApi $Gh GET ('/repos/{0}/commits?sha={1}&path={2}&per_page=20' -f $Gh.Repo, $Head, $encoded)
+        $candidates = @(($answer.Text | ConvertFrom-Json) | ForEach-Object { $_.sha })
+        $urlPath = ($Path.Split('/') | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
+    }
+    foreach ($revision in $candidates) {
+        if ($revision -eq $base) { break }
+        if ($Gh.FakeDir) { $sha = (Read-GhFakeCommit $Gh $revision).Files[$Path] }
+        else {
+            $file = Invoke-GhApi $Gh GET ('/repos/{0}/contents/{1}?ref={2}' -f $Gh.Repo, $urlPath, $revision) -AllowStatus @(404)
+            if ($file.Status -eq 404) { continue }
+            $sha = ($file.Text | ConvertFrom-Json).sha
+        }
+        if ($sha -eq $Blob -and (Test-GhContains -Gh $Gh -Branch '' -Commit $base -Head $revision)) { return $true }
+    }
+    return $false
+}
+
 function Get-GhAncestors {
     # Коммиты истории ветки или коммита (сам и предки, не больше Limit) - от новых к старым.
     param($Gh, [string]$Sha, [int]$Limit = 300)
