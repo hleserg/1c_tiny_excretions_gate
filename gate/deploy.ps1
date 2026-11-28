@@ -1387,6 +1387,8 @@ try {
     $info.StandardOutputEncoding = $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
     $payload = [System.Management.Automation.PSSerializer]::Serialize(@{ Script = $Script.ToString(); Arguments = $Arguments }, 16)
     $watch = [Diagnostics.Stopwatch]::StartNew()
+    $plan = Get-StatPlan $Title
+    Write-UiProgress -Title $ProgressTitle -Elapsed 0 -Expected $plan
     $process = [Diagnostics.Process]::Start($info)
     $result = $null
     $errorText = ''
@@ -1397,7 +1399,7 @@ try {
         $readError = $process.StandardError.ReadToEndAsync()
         $process.StandardInput.Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload)))
         $process.StandardInput.Close()
-        if (Wait-UiProcess -Process $process -Watch $watch -TimeoutSec $TimeoutSec -Title $ProgressTitle -Expected (Get-StatPlan $Title)) {
+        if (Wait-UiProcess -Process $process -Watch $watch -TimeoutSec $TimeoutSec -Title $ProgressTitle -Expected $plan) {
             $text = $readOutput.GetAwaiter().GetResult()
             if ($process.ExitCode -eq 0) { $result = [System.Management.Automation.PSSerializer]::Deserialize($text) }
             else {
