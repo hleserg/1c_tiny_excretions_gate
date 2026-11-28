@@ -60,6 +60,7 @@ function Test-GateSessionLock {
 
 function Set-GateJobsLock {
     param($State, $Target, [scriptblock]$ReadAgain)
+    if (Get-Variable UiStopState -ErrorAction SilentlyContinue) { Test-UiStop }
     $infoBase = & $ReadAgain $Target
     if ([bool]$infoBase.ScheduledJobsDenied) { return $false }
     $infoBase.ScheduledJobsDenied = $true
@@ -76,6 +77,7 @@ function Set-GateJobsLock {
 
 function Set-GateSessionLock {
     param($State, $Target, [datetime]$From, [datetime]$Until, [string]$Code, [string]$Message, [scriptblock]$ReadAgain)
+    if (Get-Variable UiStopState -ErrorAction SilentlyContinue) { Test-UiStop }
     $infoBase = & $ReadAgain $Target
     if ($State.Expected.Count) {
         if (-not (Test-GateSessionLock $State $InfoBase)) { throw 'Блокировка начала сеансов изменилась во время обновления. Сверьте срок и сообщение блокировки в консоли кластера и согласуйте продолжение с её владельцем.' }

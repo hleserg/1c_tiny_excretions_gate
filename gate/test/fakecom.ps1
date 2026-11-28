@@ -203,6 +203,11 @@ function New-FakeComConnection {
     $extensions | Add-Member -MemberType ScriptMethod -Name Get -Value {
         param($Filter, $Source)
         $state = Read-FakeComState $this.StateFile
+        if ($state.PSObject.Properties['extensionsReadDelayMs']) {
+            [IO.File]::WriteAllText(($this.StateFile + '.reading'), [string]$PID)
+            # Не прерывается остановкой конвейера PowerShell, как синхронный вызов COM в 1С.
+            [Threading.Thread]::Sleep([int]$state.extensionsReadDelayMs)
+        }
         $items = New-Object System.Collections.Generic.List[object]
         foreach ($item in (Get-FakeComList (Get-FakeComBase $state $this.Base) 'extensions')) {
             $extension = [pscustomobject]@{ Name = [string]$item.name; Version = [string]$item.version; HashSum = [string]$item.hash }

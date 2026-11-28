@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -73,5 +75,39 @@ func TestSilentEngineFailureNamesTheScriptAndDiagnostic(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("в журнале %q нет %q", out, want)
 		}
+	}
+}
+
+func TestEmergencyStopKey(t *testing.T) {
+	q := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")}
+	for _, tc := range []struct {
+		name   string
+		dialog *dialog
+		key    tea.KeyMsg
+		stop   bool
+	}{
+		{"работает", nil, q, true},
+		{"вопрос", newDialog(uiEvent{Kind: "confirm"}, 100, 30), q, true},
+		{"ввод", newDialog(uiEvent{Kind: "text"}, 100, 30), q, false},
+		{"Ctrl+C при вводе", newDialog(uiEvent{Kind: "text"}, 100, 30), tea.KeyMsg{Type: tea.KeyCtrlC}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := testModel(100, 30)
+			m.starting, m.running = false, true
+			m.eng = &engine{channel: t.TempDir()}
+			m.dialog = tc.dialog
+			next, _ := m.Update(tc.key)
+			got := next.(model)
+			_, err := os.Stat(filepath.Join(m.eng.channel, "stop"))
+			if (err == nil) != tc.stop || got.stopSent != tc.stop {
+				t.Fatal("неверное состояние канала остановки")
+			}
+			if tc.stop {
+				next, _ = next.Update(eventMsg{ev: uiEvent{Kind: "confirm", ID: 42}})
+				if next.(model).dialog != nil {
+					t.Fatal("открылся вопрос после остановки")
+				}
+			}
+		})
 	}
 }

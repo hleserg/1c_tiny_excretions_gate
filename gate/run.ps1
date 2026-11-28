@@ -290,6 +290,11 @@ function Invoke-RunPublish {
             }
             return
         }
+        if ($Stage -eq 'crash' -and $UiStopState.Stopping) {
+            # После q отправка файлов не задерживает выход. Штатный -Pending дочитает эту запись.
+            Save-GateReportJson (Join-Path $script:PublishRunDir 'end.pending') @{ kind = 'crash'; reason = $Message }
+            return
+        }
         & $publishScript -RunDir $script:PublishRunDir -Stage $Stage -Message $Message -Config $configPath
     }
     catch { Write-Host ("Итог прогона в GitHub не ушёл: {0}" -f $_.Exception.Message) -ForegroundColor Yellow }
@@ -373,11 +378,14 @@ function Get-ExpectedStepSeconds {
 
 function Start-RunPlatformProcess {
     param([string]$Exe, [string]$ArgumentLine, [string]$Title, [Diagnostics.ProcessStartInfo]$StartInfo)
+    Test-UiStop
     try {
-        if ($null -ne $StartInfo) { return [Diagnostics.Process]::Start($StartInfo) }
-        return (Start-Process -FilePath $Exe -ArgumentList $ArgumentLine -PassThru -ErrorAction Stop)
+        if ($null -ne $StartInfo) { $process = [Diagnostics.Process]::Start($StartInfo) }
+        else { $process = Start-Process -FilePath $Exe -ArgumentList $ArgumentLine -PassThru -ErrorAction Stop }
     }
     catch { throw ("Не удалось запустить {0} для шага «{1}». Проверь путь V8Bin и право запуска программы. Причина: {2}" -f $Exe, $Title, (Get-MaskedLine $_.Exception.Message)) }
+    Register-UiProcess $process
+    return $process
 }
 
 function Invoke-V8 {
@@ -546,6 +554,7 @@ function Add-StepResult {
         # Шаг взят готовым из прежнего прогона (продолжение с упавшего шага): имя прогона, где он выполнялся.
         [string]$From = ''
     )
+    Test-UiStop
     # phase - этап прогона, к которому относится шаг: по этапам продолжение берёт шаги готовыми.
     $Detail = Get-MaskedLine $Detail
     $step = [pscustomobject]@{
@@ -2511,6 +2520,9 @@ function Test-DeliveryPath {
 . (Join-Path $Root 'post-update.ps1')
 . (Join-Path $Root 'ui.ps1')
 Initialize-Ui -Channel $UiChannel
+:GateUiWork do {
+$UiStopState.Boundary = $true
+Test-UiStop
 
 # Статистика длительностей шагов: план и факт (stats.ps1, журнал stats\durations.csv).
 . (Join-Path $Root 'stats.ps1')
@@ -3672,6 +3684,7 @@ function Set-PhaseState {
     param([string]$Phase, [string]$State, [string]$From = '')
     if ($null -eq $script:RunState) { return }
     if (-not $From) { $From = $runId }
+    Test-UiStop
     $script:RunState.phases[$Phase] = [ordered]@{ state = $State; inputs = (Get-PhaseInputs $Phase); from = $From }
     Save-RunState
 }
@@ -4134,7 +4147,7 @@ function Invoke-UtSession {
             Receive-UtConsole $consoleRead
             if (Test-Path -LiteralPath $exitFile) { $state = 'done'; break }
             if ($process.HasExited) {
-                Start-Sleep -Seconds 2
+                Wait-UiDelay -Seconds 2
                 if (Test-Path -LiteralPath $exitFile) { $state = 'done' } else { $state = 'exited' }
                 break
             }
@@ -4161,7 +4174,7 @@ function Invoke-UtSession {
         if ($state -eq 'done') {
             # Код возврата записан, отчёт - перед ним; клиент закрывается сам.
             $exitWait = [System.Diagnostics.Stopwatch]::StartNew()
-            while (-not $process.WaitForExit(250) -and $exitWait.Elapsed.TotalSeconds -lt 60) { Receive-UtConsole $consoleRead }
+            while (-not $process.WaitForExit(250) -and $exitWait.Elapsed.TotalSeconds -lt 60) { Test-UiStop; Receive-UtConsole $consoleRead }
             if (-not $process.HasExited) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
         }
         elseif ($state -eq 'junit') {
@@ -5224,7 +5237,7 @@ function Resolve-TestDesignerBusy {
     if ($answer -eq '1' -and $null -ne $link) {
         foreach ($line in @(Stop-TestBaseSessions -Link $link -Designers)) { Write-Host ('  ' + $line) }
         for ($wait = 0; $wait -lt 10; $wait++) {
-            Start-Sleep -Seconds 3
+            Wait-UiDelay -Seconds 3
             if (@(Get-TestBaseSessions $link | Where-Object { -not $_.IsError -and $_.IsDesigner }).Count -eq 0) { break }
         }
     }
@@ -5533,7 +5546,7 @@ function Invoke-GateActionsStep {
         Add-StepResult -Name $stepName -Status 'FAIL' -Detail ('за {0} с итога нет: {1}' -f $seconds, $stage) -Log $paramsFile -Seconds $seconds
         return
     }
-    if (-not $process.WaitForExit(60000)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
+    if (-not (Wait-UiProcess -Process $process -TimeoutSec 60)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
     $result = @([System.IO.File]::ReadAllLines($outFile, [System.Text.Encoding]::UTF8) | ForEach-Object { $_.TrimStart([char]0xFEFF) })
     $value = { param([string]$Key) $row = @($result | Where-Object { $_.StartsWith($Key + '=') } | Select-Object -Last 1); if ($row.Count -eq 0) { return '' }; return $row[0].Substring($Key.Length + 1) }
     $status = & $value 'status'
@@ -6106,13 +6119,14 @@ function Update-SelfCheckSession {
     # части журнала - в Header. Waiting - сеанс ждёт сигнала гейта (второй исполнитель до старта, первый - пока
     # второй не закончил): так он не считается зависшим.
     param($Session)
+    Test-UiStop
     if ($Session.State) { return }
     $OutDir = $Session.OutDir
     $Title = $Session.Title
     if (Test-Path -LiteralPath $Session.ResultFile) { $Session.State = 'result'; return }
     if ($Session.Process.HasExited) {
         # Итог мог записаться в последний момент.
-        Start-Sleep -Seconds 2
+        Wait-UiDelay -Seconds 2
         if (Test-Path -LiteralPath $Session.ResultFile) { $Session.State = 'result' } else { $Session.State = 'exited' }
         return
     }
@@ -6154,13 +6168,14 @@ function Complete-SelfCheckSession {
     # Сеанс кончился (State не пустой): закрыть клиент, снять окна, если он не дописал итог, прочитать последнюю
     # целую часть журнала. Ответ - тот же, что у Invoke-SelfCheckSession.
     param($Session)
+    Test-UiStop
     $state = $Session.State
     $process = $Session.Process
     $OutDir = $Session.OutDir
     $windows = @()
     if ($state -eq 'result') {
         # После записи итога обработка закрывает 1С сама.
-        if (-not $process.WaitForExit(60000)) {
+        if (-not (Wait-UiProcess -Process $process -TimeoutSec 60)) {
             try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { }
         }
     }
@@ -6172,7 +6187,7 @@ function Complete-SelfCheckSession {
     }
     $Session.Watch.Stop()
     # Сеанс на сервере закрывается не мгновенно: следующий шаг не должен на него наткнуться.
-    Start-Sleep -Seconds 5
+    Wait-UiDelay -Seconds 5
 
     # Последняя целая часть журнала говорит, какое задание выполнялось.
     $lastN = -1
@@ -6938,10 +6953,11 @@ function Set-TestBaseSessionLock {
 
 function Clear-TestBaseLocks {
     $state = $script:TestLockState
-    if ($null -eq $state -or (-not $state.Expected.Count -and -not ($state.JobsSet -and $script:JobsLockRelease))) { return }
+    $releaseJobs = $script:JobsLockRelease -or $UiStopState.Stopping
+    if ($null -eq $state -or (-not $state.Expected.Count -and -not ($state.JobsSet -and $releaseJobs))) { return }
     try {
         $target = Get-TestBaseInfoBase (Connect-TestBaseAgent)
-        $released = Restore-GateLocks $state $target $script:JobsLockRelease { param($t) Read-TestBaseInfoBase $t }
+        $released = Restore-GateLocks $state $target $releaseJobs { param($t) Read-TestBaseInfoBase $t }
         if ($released) {
             $text = "Снял у {0}: {1}." -f $script:Base, $released
             Write-Host $text
@@ -6979,6 +6995,7 @@ function Stop-TestBaseSessions {
             continue
         }
         try {
+            Test-UiStop
             $Link.Agent.TerminateSession($target.Cluster, $session)
             $killed++
             $lines.Add(("{0} - завершён" -f $description))
@@ -7026,7 +7043,7 @@ function Get-BlockingSessions {
         $lines.Add(("кто мешает, узнать не получилось: вход в базу за {0} с не удался" -f [int]$watch.Elapsed.TotalSeconds))
         return $lines.ToArray()
     }
-    if (-not $process.WaitForExit(60000)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
+    if (-not (Wait-UiProcess -Process $process -TimeoutSec 60)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
 
     $content = @(Get-Content -LiteralPath $outFile -Encoding UTF8)
     $sessions = @($content | Where-Object { $_ -like 'session=*' })
@@ -7107,6 +7124,7 @@ function Complete-ProcessingBuild {
     $timedOut = $build.TimedOut -or ($seconds -gt $build.TimeoutSec)
     $wait.Stop()
     $code = $build.Process.ExitCode
+    $null = $UiStopState.Children.Remove($build.Process)
     $build.Process.Dispose()
     $script:ProcessingBuild = $null
     Write-RunLog ("  Фоновая сборка {0}: секунд={1} ждали={2} код={3} таймаут={4}" -f $build.Title, [int]$seconds, [int]$wait.Elapsed.TotalSeconds, $code, $timedOut)
@@ -7183,7 +7201,7 @@ function Invoke-ProcessingSession {
         }
         if (Test-Path -LiteralPath $resultFile) { $state = 'result'; break }
         if ($process.HasExited) {
-            Start-Sleep -Seconds 2
+            Wait-UiDelay -Seconds 2
             if (Test-Path -LiteralPath $resultFile) { $state = 'result' } else { $state = 'exited' }
             break
         }
@@ -7201,7 +7219,7 @@ function Invoke-ProcessingSession {
     $windows = @()
     if ($state -eq 'result') {
         # Итог записан; клиент закрывается сам, файл дописан, когда процесс вышел.
-        if (-not $process.WaitForExit(60000)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
+        if (-not (Wait-UiProcess -Process $process -TimeoutSec 60)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
     }
     elseif (-not $process.HasExited) {
         $windows = @(Save-ProcessWindows -ProcessId $process.Id -FilePrefix (Join-Path $OutDir 'client'))
@@ -7745,6 +7763,7 @@ if (-not [string]::IsNullOrEmpty($script:FileBase)) {
     Add-PrepLine 'база файловая: блокировки ставятся через кластер, здесь их нет; сеансы не проверяю'
 }
 else {
+    Test-UiStop
     $prepLink = Connect-TestBaseAgent
     $prepTarget = $null
     try {
@@ -7796,7 +7815,7 @@ else {
             # Сеанс уходит не мгновенно: ждём до 30 секунд.
             $leftDesigners = @()
             for ($wait = 0; $wait -lt 10; $wait++) {
-                Start-Sleep -Seconds 3
+                Wait-UiDelay -Seconds 3
                 $prepSessions = @(Get-TestBaseSessions $prepLink | Where-Object { -not $_.IsError })
                 $leftDesigners = @($prepSessions | Where-Object { $_.IsDesigner })
                 if ($leftDesigners.Count -eq 0) { break }
@@ -8257,6 +8276,7 @@ for ($procIndex = 0; $procIndex -lt $kitProcessings.Count; $procIndex++) {
 # После ошибки записи следующая сборка могла уже начаться. Завершаем свой процесс до других вызовов конфигуратора.
 if ($null -ne $script:ProcessingBuild) {
     Stop-ProcessingBuild
+    $null = $UiStopState.Children.Remove($script:ProcessingBuild.Process)
     $script:ProcessingBuild.Process.Dispose()
     $script:ProcessingBuild = $null
 }
@@ -8433,7 +8453,7 @@ else {
         if (-not $fileAppeared -and (Test-Path -LiteralPath $outFile)) { $fileAppeared = $true }
 
         if ($fileAppeared) {
-            if (-not $process.WaitForExit(60000)) {
+            if (-not (Wait-UiProcess -Process $process -TimeoutSec 60)) {
                 try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { }
             }
             $content = @(Get-Content -LiteralPath $outFile -Encoding UTF8)
@@ -8801,12 +8821,13 @@ if ([string](Get-Setting $cfg 'ProdBase' '') -and (Test-Path -LiteralPath (Join-
     if ($Config) { $snapshotArgs += @('-Config', ('"{0}"' -f $Config)) }
     Write-Host 'Снимок temp для обновления рабочей (хеш-суммы расширений и обработок, только чтение)...' -ForegroundColor DarkGray
     try {
+        Test-UiStop
         $snapshotProcess = Start-Process -FilePath 'powershell.exe' -ArgumentList ($snapshotArgs -join ' ') -NoNewWindow -PassThru -RedirectStandardOutput $snapshotLog -RedirectStandardError ($snapshotLog + '.err')
+        Register-UiProcess $snapshotProcess
         # Ждём по секунде: остановка из ci.exe (файл stop) снимает процесс снимка и идёт дальше как обычная остановка.
         $snapshotDeadline = (Get-Date).AddSeconds([int](Get-Setting $cfg 'ComTimeoutSec' 300) * 4 + 60)
-        while (-not $snapshotProcess.WaitForExit(1000)) {
-            try { Test-UiStop }
-            catch { try { $snapshotProcess.Kill() } catch { }; throw }
+        while (-not $snapshotProcess.WaitForExit(250)) {
+            Test-UiStop
             if ((Get-Date) -gt $snapshotDeadline) { try { $snapshotProcess.Kill() } catch { }; throw 'не уложился в срок' }
         }
         if (-not (Test-Path -LiteralPath $checkedFile)) { throw ('файла снимка нет (код {0}), см. checked-state.log' -f $snapshotProcess.ExitCode) }
@@ -9098,3 +9119,5 @@ Invoke-RunPublish -Stage 'final'
 exit $exitCode
 
 #endregion
+} while ($false)
+if ($UiStopState.Stopping) { throw [OperationCanceledException]::new('остановлено из интерфейса ci.exe') }

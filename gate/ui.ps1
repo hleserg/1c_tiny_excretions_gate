@@ -17,6 +17,11 @@
 
 $script:UiOperation = Get-Variable -Name GateOperation -ValueOnly -ErrorAction SilentlyContinue # ** Хлебников С.Ю. 20261124
 $script:UiChannelDir = ''
+$script:UiParentStopState = Get-Variable UiStopState -ValueOnly -ErrorAction SilentlyContinue
+$script:UiStopState = [pscustomobject]@{
+    Path = ''; Boundary = $false; Stopping = $false
+    Children = New-Object 'System.Collections.Generic.List[System.Diagnostics.Process]'
+}
 $script:UiQuestionId = 0
 $script:UiSubPlanSent = ''
 $script:UiProgressSent = $null
@@ -27,6 +32,10 @@ function Initialize-Ui {
     param([string]$Channel = '')
     if ($Channel) {
         $script:UiChannelDir = $Channel
+        $UiStopState.Path = Join-Path $Channel 'stop'
+        if ($script:UiParentStopState -and $script:UiParentStopState.Path -eq $UiStopState.Path) {
+            $UiStopState.Children = $script:UiParentStopState.Children
+        }
         $script:UiAnimate = $false
         [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
     }
@@ -133,14 +142,50 @@ function Get-UiField {
     return $property.Value
 }
 
-function Test-UiStop {
-    # Просьба остановиться из ci.exe: файл stop в папке канала. Остановка - исключением, дальше trap и finally.
-    if (-not $script:UiChannelDir) { return }
-    $stopFile = Join-Path $script:UiChannelDir 'stop'
-    if (Test-Path -LiteralPath $stopFile) {
-        Remove-Item -LiteralPath $stopFile -Force -ErrorAction SilentlyContinue
-        throw [OperationCanceledException]::new('остановлено из интерфейса ci.exe') # ** Хлебников С.Ю. 20261124
+function Register-UiProcess {
+    # Только процессы, запущенные самим гейтом. Удерживаем дескриптор, в том числе у фоновых исполнителей.
+    param([Diagnostics.Process]$Process)
+    if (-not $UiStopState.Path) { return }
+    for ($i = $UiStopState.Children.Count - 1; $i -ge 0; $i--) {
+        if ($UiStopState.Children[$i].HasExited) { $UiStopState.Children.RemoveAt($i) }
     }
+    $null = $Process.Handle
+    $UiStopState.Children.Add($Process)
+    Test-UiStop
+}
+
+function Test-UiStop {
+    # Файл принадлежит ci.exe и действует до выхода из этого канала, в том числе во вложенном run.ps1.
+    if (-not $UiStopState.Path -or $UiStopState.Stopping -or -not [IO.File]::Exists($UiStopState.Path)) { return }
+    foreach ($child in $UiStopState.Children) {
+        if ($child.HasExited) { continue }
+        try {
+            # В Windows PowerShell 5.1 Kill() завершает только корень. У Git и запуска платформы бывают дочерние процессы.
+            $null = & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $child.Id /T /F 2>&1
+        } catch { }
+        try {
+            if (-not $child.HasExited) { $child.Kill() }
+            if (-not $child.WaitForExit(3000)) { Write-Warning ("Процесс {0} не подтвердил завершение." -f $child.Id) }
+        } catch { if (-not $child.HasExited) { Write-Warning ("Не удалось завершить процесс {0}: {1}" -f $child.Id, $_.Exception.Message) } }
+    }
+    if ($UiStopState.Boundary) {
+        # Выход из рабочего блока проходит через finally. Обычный catch шага не сможет принять q за сбой и повторить запись.
+        $UiStopState.Stopping = $true
+        break GateUiWork
+    }
+    throw [OperationCanceledException]::new('остановлено из интерфейса ci.exe')
+}
+
+function Wait-UiDelay {
+    param([int]$Seconds)
+    if (-not $UiStopState.Path) { Start-Sleep -Seconds $Seconds; return }
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        Test-UiStop
+        $left = $Seconds * 1000 - $timer.ElapsedMilliseconds
+        if ($left -le 0) { return }
+        Start-Sleep -Milliseconds ([Math]::Min(250, $left))
+    } while ($true)
 }
 
 function Test-UiCanAsk {
@@ -179,6 +224,7 @@ function Request-UiAnswer {
     # Вопрос в ci.exe и ожидание ответа. Poll - проверка раз в 3 секунды: вернула непустое - вопрос снимается,
     # ответ - объект с полем polled.
     param([hashtable]$Question, [scriptblock]$Poll = $null)
+    Test-UiStop
     $script:UiQuestionId++
     $id = $script:UiQuestionId
     $Question['id'] = $id
@@ -189,6 +235,7 @@ function Request-UiAnswer {
     Send-UiEvent $Question
     $nextPoll = (Get-Date).AddSeconds(3)
     while ($true) {
+        Test-UiStop
         if (Test-Path -LiteralPath $answerFile) {
             Start-Sleep -Milliseconds 50
             $text = [System.IO.File]::ReadAllText($answerFile, [System.Text.Encoding]::UTF8)
@@ -196,7 +243,6 @@ function Request-UiAnswer {
             Stop-UiAskLog $askLog # ** Хлебников С.Ю. 20261120
             return ($text | ConvertFrom-Json)
         }
-        Test-UiStop
         if ($null -ne $Poll -and (Get-Date) -ge $nextPoll) {
             $nextPoll = (Get-Date).AddSeconds(3)
             $polled = ''
@@ -654,9 +700,10 @@ function Complete-UiProgress {
 
 function Wait-UiProcess {
     # Ждёт процесс до $TimeoutSec, рисуя строку хода. Возвращает $true, если процесс завершился сам.
-    param($Process, [System.Diagnostics.Stopwatch]$Watch, [int]$TimeoutSec, [string]$Title, [double]$Expected = 0)
+    param($Process, [System.Diagnostics.Stopwatch]$Watch = [Diagnostics.Stopwatch]::StartNew(), [int]$TimeoutSec, [string]$Title, [double]$Expected = 0)
     while ($true) {
-        if ($Process.WaitForExit(250)) { Complete-UiProgress; return $true }
+        Test-UiStop
+        if ($Process.WaitForExit(250)) { Test-UiStop; Complete-UiProgress; return $true }
         if ($Watch.Elapsed.TotalSeconds -ge $TimeoutSec) { Complete-UiProgress; return $false }
         if ($Title) { Write-UiProgress -Title $Title -Elapsed $Watch.Elapsed.TotalSeconds -Expected $Expected }
     }

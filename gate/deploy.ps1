@@ -297,7 +297,9 @@ function Invoke-V8 {
         Write-Host ("  ...  {0}: начато в {1}, жду не дольше {2} мин" -f $Title, (Get-Date -Format 'HH:mm:ss'), [int]($TimeoutSec / 60)) -ForegroundColor DarkGray
     }
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    Test-UiStop
     $process = Start-Process -FilePath $Exe -ArgumentList $argLine -PassThru
+    Register-UiProcess $process
     $null = $process.Handle
     # Строка хода (ui.ps1): полоса по прогнозу из статистики (stats.ps1) или бегающий блок.
     $finished = Wait-UiProcess -Process $process -Watch $watch -TimeoutSec $TimeoutSec -Title $Title -Expected (Get-StatPlan $Title)
@@ -375,7 +377,7 @@ function Resolve-DesignerBusy {
     if ($answer -eq '1') {
         foreach ($line in @(Stop-BaseSessions -Link $link -BaseName $BaseName -Designers)) { Write-Line ('  ' + $line) }
         for ($wait = 0; $wait -lt 10; $wait++) {
-            Start-Sleep -Seconds 3
+            Wait-UiDelay -Seconds 3
             if (@(Get-BaseSessions $link $BaseName | Where-Object { -not $_.IsError -and $_.IsDesigner }).Count -eq 0) { break }
         }
     }
@@ -590,6 +592,7 @@ function Stop-BaseSessions {
         $isDesigner = ([string]$session.AppID -eq 'Designer')
         if ([bool]$Designers -ne $isDesigner) { continue }
         $description = Format-ClusterSession $session
+        Test-UiStop
         try { $Link.Agent.TerminateSession($target.Cluster, $session); $lines.Add(("{0} - команда завершения принята" -f $description)) }
         catch { $lines.Add(("{0} - не завершился: {1}" -f $description, $_.Exception.Message)) }
     }
@@ -634,6 +637,7 @@ function Wait-DeploySessions {
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $nextReport = 0
     do {
+        Test-UiStop
         $sessions = @(Get-BaseSessions $Link $BaseName -Target $Target)
         $errors = @($sessions | Where-Object IsError)
         if ($errors.Count) { throw ("Не удалось прочитать сеансы {0}: {1}" -f $BaseName, ($errors.Text -join '; ')) }
@@ -988,6 +992,11 @@ $cfg = Read-DeployConfig
 # ** Хлебников С.Ю. 20261124 Один журнал на вызов из меню, CMD или планировщика. Код возврата сохраняется.
 . (Join-Path $Root 'operations.ps1')
 $script:GateOperation = $OperationContext
+. (Join-Path $Root 'ui.ps1')
+Initialize-Ui -Channel $UiChannel
+:GateUiWork do {
+$UiStopState.Boundary = $true
+Test-UiStop
 if (-not $OperationContext -and $cfg['PublishOperations'] -and -not $SnapshotTemp) {
     $kind = 'Deploy'
     foreach ($flag in 'Prepare','ApplyPrepared','CancelPrepared','Resume','Rollback','StatusOnly','CompareExtensions','CompareProcessings','BaseState','ProdPreCheck','ComCheck','ManualLocks','CloseBase','OpenBase','PullExtensions','PullProcessings','GitExport','GitImport','GitProd','GitTypical','Delivery') {
@@ -1038,8 +1047,7 @@ if (-not $SnapshotTemp) {
 . (Join-Path $Root 'locks.ps1')
 . (Join-Path $Root 'canary-users.ps1')
 . (Join-Path $Root 'post-update.ps1')
-. (Join-Path $Root 'ui.ps1')
-Initialize-Ui -Channel $UiChannel
+
 
 $script:Server = [string](Get-Setting $cfg 'Server' '')
 $script:TempBase = [string](Get-Setting $cfg 'Base' '')
@@ -1324,6 +1332,7 @@ function Get-TreeHashes {
     $prefixLength = (Resolve-Path -LiteralPath $Dir).ProviderPath.TrimEnd('\').Length + 1
     $sha = [System.Security.Cryptography.SHA256]::Create()
     foreach ($file in @(Get-ChildItem -LiteralPath $Dir -Recurse -File)) {
+        Test-UiStop
         $relative = $file.FullName.Substring($prefixLength).Replace('\', '/')
         if ($relative -eq 'ConfigDumpInfo.xml') { continue }
         $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
@@ -1346,51 +1355,77 @@ function Get-ExtensionVersion {
 }
 
 function Invoke-UiBackground {
-    # Долгий вызов (внешнее соединение 1С) - в отдельном потоке, а в окне - строка хода с временем.
-    # Не уложился в TimeoutSec - не ждём (поток бросается), Ok = $false. Ошибка внутри - Ok = $false и её текст.
+    # У зависшего вызова COM нет кооперативной отмены. Отдельный STA-процесс можно снять, оставив родителю блокировки.
     param([scriptblock]$Script, [object[]]$Arguments, [string]$Title, [int]$TimeoutSec, [string]$ProgressTitle = $Title)
-    $runspace = [runspacefactory]::CreateRunspace()
-    $runspace.ApartmentState = 'STA'
-    $runspace.Open()
-    $shell = [powershell]::Create()
-    $shell.Runspace = $runspace
-    [void]$shell.AddScript($Script.ToString())
-    foreach ($argument in $Arguments) { [void]$shell.AddArgument($argument) }
-    $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $handle = $shell.BeginInvoke()
+    Test-UiStop
+    $worker = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+try {
+    # Windows PowerShell пишет stdin в кодировке родителя, включая BOM на консоли UTF-8/UTF-16.
+    $reader = [IO.StreamReader]::new([Console]::OpenStandardInput(), [Text.Encoding]::ASCII, $true)
+    try { $xml = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($reader.ReadToEnd())) } finally { $reader.Dispose() }
+    $call = [System.Management.Automation.PSSerializer]::Deserialize($xml)
+    $values = [object[]]$call.Arguments
+    $output = @(& ([scriptblock]::Create($call.Script)) @values)
+    $result = $null
+    if ($output.Count) { $result = $output[-1] }
+    [Console]::Out.Write([System.Management.Automation.PSSerializer]::Serialize($result, 16))
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
+'@
+    # В аргументах процесса только постоянный код. Строка подключения передаётся по pipe, без файла и журнала.
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = Join-Path $PSHOME 'powershell.exe'
+    $info.Arguments = '-NoLogo -NoProfile -NonInteractive -STA -OutputFormat Text -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($worker))
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.StandardOutputEncoding = $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    $payload = [System.Management.Automation.PSSerializer]::Serialize(@{ Script = $Script.ToString(); Arguments = $Arguments }, 16)
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     $plan = Get-StatPlan $Title
-    while (-not $handle.IsCompleted) {
-        if ($watch.Elapsed.TotalSeconds -ge $TimeoutSec) {
-            Complete-UiProgress
-            try { [void]$shell.BeginStop($null, $null) } catch { }
-            Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status 'TIMEOUT'
-            return [pscustomobject]@{ Ok = $false; Error = ("нет ответа за {0} с (настройка ComTimeoutSec)" -f $TimeoutSec); Result = $null }
-        }
-        Write-UiProgress -Title $ProgressTitle -Elapsed $watch.Elapsed.TotalSeconds -Expected $plan
-        Start-Sleep -Milliseconds 250
-    }
-    Complete-UiProgress
+    Write-UiProgress -Title $ProgressTitle -Elapsed 0 -Expected $plan
+    $process = [Diagnostics.Process]::Start($info)
     $result = $null
     $errorText = ''
-    try {
-        $output = $shell.EndInvoke($handle)
-        if ($output.Count -gt 0) { $result = $output[$output.Count - 1] }
-        # .PSObject.BaseObject, а не .BaseObject: у хеш-таблицы точка ищет ключ, и под StrictMode это ошибка.
-        if ($result -is [System.Management.Automation.PSObject]) { $result = $result.PSObject.BaseObject }
-        if ($shell.Streams.Error.Count -gt 0) { $errorText = [string]$shell.Streams.Error[0] }
-    }
-    catch {
-        $errorText = $_.Exception.Message
-        if ($null -ne $_.Exception.InnerException) { $errorText = $_.Exception.InnerException.Message }
-    }
-    finally {
-        $shell.Dispose()
-        $runspace.Dispose()
-    }
     $status = 'OK'
-    if ($errorText) { $status = 'FAIL' }
+    try {
+        Register-UiProcess $process
+        $readOutput = $process.StandardOutput.ReadToEndAsync()
+        $readError = $process.StandardError.ReadToEndAsync()
+        $process.StandardInput.Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload)))
+        $process.StandardInput.Close()
+        if (Wait-UiProcess -Process $process -Watch $watch -TimeoutSec $TimeoutSec -Title $ProgressTitle -Expected $plan) {
+            $text = $readOutput.GetAwaiter().GetResult()
+            if ($process.ExitCode -eq 0) { $result = [System.Management.Automation.PSSerializer]::Deserialize($text) }
+            else {
+                $errorText = $readError.GetAwaiter().GetResult().Trim()
+                if (-not $errorText) { $errorText = "процесс чтения 1С завершился с кодом $($process.ExitCode)" }
+                $status = 'FAIL'
+            }
+        } else {
+            $status = 'TIMEOUT'
+            $errorText = "нет ответа за $TimeoutSec с (настройка ComTimeoutSec)"
+        }
+    } catch {
+        $errorText = $_.Exception.GetBaseException().Message
+        $status = 'FAIL'
+    } finally {
+        if (-not $process.HasExited) {
+            try { $process.Kill() } catch [InvalidOperationException] { }
+            $process.WaitForExit()
+        }
+        $null = $UiStopState.Children.Remove($process)
+        $process.Dispose()
+    }
     Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status $status
-    return [pscustomobject]@{ Ok = (-not $errorText); Error = $errorText; Result = $result }
+    return [pscustomobject]@{ Ok = ($status -eq 'OK'); Error = $errorText; Result = $result }
 }
 
 function New-V8Connector {
@@ -1428,7 +1463,7 @@ function Get-ExtensionStates {
     # ComTimeoutSec: первое внешнее соединение к большой базе бывает долгим. Не получилось - Ok = $false.
     param([string]$BaseName, [string]$User, [string]$Password)
     $reader = {
-        # FakeScript и FakeFile - подставной COM тестов (см. New-V8Connector): в фоновом потоке функций скрипта нет.
+        # FakeScript и FakeFile - подставной COM тестов (см. New-V8Connector): в дочернем процессе функций скрипта нет.
         param([string]$Line, [string]$FakeScript, [string]$FakeFile)
         $items = @{}
         if ($FakeScript) { . $FakeScript; $connector = New-FakeComConnector $FakeFile }
@@ -1982,7 +2017,9 @@ function Invoke-ProdClient {
     Write-RunLog ("> 1cv8c.exe {0}" -f (Format-GateCanaryCommand $argList))
     Write-Host ("  ...  {0}: начато в {1}, жду не дольше {2} мин" -f $Title, (Get-Date -Format 'HH:mm:ss'), [int]($TimeoutSec / 60)) -ForegroundColor DarkGray
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    Test-UiStop
     $process = Start-Process -FilePath $script:V8C -ArgumentList $argLine -PassThru
+    Register-UiProcess $process
     $null = $process.Handle
     # Строка хода. У самопроверки - настоящая полоса по заданиям: последняя часть журнала в папке итога.
     $outDir = Split-Path -Parent $DoneFile
@@ -2023,7 +2060,7 @@ function Invoke-ProdClient {
     }
     Complete-UiProgress
     $done = Test-Path -LiteralPath $DoneFile
-    if ($done) { if (-not $process.WaitForExit(60000)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } } }
+    if ($done) { if (-not (Wait-UiProcess -Process $process -TimeoutSec 60)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } } }
     elseif (-not $process.HasExited) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
     $statStatus = 'TIMEOUT'
     if ($done) { $statStatus = 'OK' }
@@ -2902,6 +2939,7 @@ function Invoke-CloseBase {
         $info['status'] = 'closed'
         $info['closedAt'] = (Get-Date).ToString('dd.MM.yyyy HH:mm:ss')
         Save-CloseRecord $baseName $state $info
+        Test-UiStop
         $keep = $true
         $jobsText = 'регламентные задания запрещены'
         if (-not $state.JobsSet) { $jobsText = 'регламентные задания были запрещены до закрытия' }
@@ -2921,7 +2959,7 @@ function Invoke-CloseBase {
                 }
                 catch { Write-Line ('  завершить сеансы не смог: ' + $_.Exception.Message) 'Yellow' }
             }
-            Start-Sleep -Seconds 3
+            Wait-UiDelay -Seconds 3
             $seen = Get-UserSessions $link $baseName
         }
         $sessionsDone = (-not $seen.Failed -and $seen.Users.Count -eq 0)
@@ -3763,6 +3801,7 @@ function Add-GitSnapshotFiles {
     param([hashtable]$Files, [string]$Dir, [string]$Prefix)
     $full = [System.IO.Path]::GetFullPath($Dir).TrimEnd('\', '/')
     foreach ($file in @(Get-ChildItem -LiteralPath $Dir -Recurse -File)) {
+        Test-UiStop
         $relative = $file.FullName.Substring($full.Length + 1).Replace('\', '/')
         if ($relative -eq 'ConfigDumpInfo.xml') { continue }
         $Files[$Prefix + $relative] = $file.FullName
@@ -3840,6 +3879,7 @@ function Add-GitProcessingSnapshot {
     $toDump = @($withFile | Where-Object { -not (& $isFresh $_) }).Count
     if ($toDump -gt 0) { Write-Line ("  обработок {0} с файлом {1}: выгрузить в файлы {2}, остальные - с прошлого раза" -f $BaseName, $withFile.Count, $toDump) }
     foreach ($item in $withFile) {
+        Test-UiStop
         $folder = [string]$folders[[string]$item.Ref]
         $dir = Join-Path $Root $folder
         $key = '{0}|{1}' -f $item.Hash, $script:V8
@@ -4438,6 +4478,7 @@ function Get-GitRelativeFiles {
     $result = [hashtable]::new([StringComparer]::Ordinal)
     $prefix = $Folder + '/'
     foreach ($path in $Files.Keys) {
+        Test-UiStop
         if ($path.StartsWith($prefix, [StringComparison]::Ordinal)) { $result[$path.Substring($prefix.Length)] = $Files[$path] }
     }
     return $result
@@ -4476,7 +4517,10 @@ function Get-GitSnapshotComparison {
     # Хеши выгрузки считаем один раз. Совпадающие пары XML для основы снимка и main читаем один раз.
     param($Setup, [hashtable]$Local, [hashtable]$KnownFiles, [hashtable]$HeadFiles, [string]$KnownCommit, [string]$HeadCommit)
     $localShas = @{}
-    foreach ($path in $Local.Keys) { $localShas[$path] = Get-GitBlobSha ([IO.File]::ReadAllBytes($Local[$path])) }
+    foreach ($path in $Local.Keys) {
+        Test-UiStop
+        $localShas[$path] = Get-GitBlobSha ([IO.File]::ReadAllBytes($Local[$path]))
+    }
     $cache = @{}
     $known = Get-GitDumpComparisonFiles $Setup $Local $localShas $KnownFiles $cache
     $head = $known
@@ -4822,9 +4866,11 @@ function Invoke-GitImport {
     if (Test-Path -LiteralPath $runsRoot) { foreach ($dir in @(Get-ChildItem -LiteralPath $runsRoot -Directory)) { $before[$dir.Name] = $true } }
     if ($toLoad.Count -gt 0) { Write-Line ("Прогон гейта с комплектом из git: {0}" -f $kitDir) 'Cyan' }
     else { Write-Line ("Прогон гейта с действиями после обновления из git: {0}" -f $actionsDir) 'Cyan' }
+    Test-UiStop
     $process = Start-Process -FilePath 'powershell.exe' -ArgumentList ($runArgs -join ' ') -NoNewWindow -PassThru
     $null = $process.Handle
-    $process.WaitForExit()
+    $process.WaitForExit()  # вложенный гейт сам снимает свои блокировки
+    Test-UiStop
     $runCode = $process.ExitCode
     $fresh = @()
     if (Test-Path -LiteralPath $runsRoot) { $fresh = @(Get-ChildItem -LiteralPath $runsRoot -Directory | Where-Object { -not $before.ContainsKey($_.Name) -and $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name | Select-Object -Last 1) }
@@ -4982,8 +5028,7 @@ function Get-ComConfigInfo {
                 }
             }
             $metadata = & $get $connection 'Metadata'
-            # Массивом: Invoke-UiBackground берёт у результата .PSObject.BaseObject, а у одиночного pscustomobject
-            # там голый объект без свойств.
+            # Вызывающий код читает первую запись массива.
             return , @([pscustomobject]@{ Name = [string](& $get $metadata 'Name'); Synonym = [string](& $get $metadata 'Synonym'); Version = [string](& $get $metadata 'Version') })
         }
         finally {
@@ -6995,7 +7040,7 @@ if ($needExclusive) {
             foreach ($line in @(Stop-BaseSessions -Link $prepLink -BaseName $script:ProdBase -Designers)) { Write-Line ('  ' + $line) }
             $left = @()
             for ($wait = 0; $wait -lt 10; $wait++) {
-                Start-Sleep -Seconds 3
+                Wait-UiDelay -Seconds 3
                 $left = @(Get-BaseSessions $prepLink $script:ProdBase | Where-Object { -not $_.IsError -and $_.IsDesigner })
                 if ($left.Count -eq 0) { break }
             }
@@ -7023,7 +7068,7 @@ if ($needExclusive) {
             foreach ($line in @(Stop-BaseSessions -Link $prepLink -BaseName $script:TempBase -Designers)) { Write-Line ('  ' + $line) }
             $left = @()
             for ($wait = 0; $wait -lt 10; $wait++) {
-                Start-Sleep -Seconds 3
+                Wait-UiDelay -Seconds 3
                 $left = @(Get-BaseSessions $prepLink $script:TempBase | Where-Object { -not $_.IsError -and $_.IsDesigner })
                 if ($left.Count -eq 0) { break }
             }
@@ -8327,5 +8372,7 @@ catch {
 }
 finally {
     if ($null -ne $deployGuard) { $deployGuard.Dispose() }
-    if ($script:DeployReportOutcome) { Complete-DeployReport $script:DeployReportOutcome }
+    if ($script:DeployReportOutcome -and -not $UiStopState.Stopping) { Complete-DeployReport $script:DeployReportOutcome }
 }
+} while ($false)
+if ($UiStopState.Stopping) { throw [OperationCanceledException]::new('остановлено из интерфейса ci.exe') }

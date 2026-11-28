@@ -23,7 +23,7 @@ var writeClipboard = clipboard.WriteAll
 
 type dialog struct {
 	ev       uiEvent
-	local    string // не пусто - вопрос самого ci.exe (остановка), не движка
+	local    string // не пусто - вопрос самого ci.exe (например, журнал тестов), не движка
 	cursor   int
 	offset   int
 	marks    map[int]bool

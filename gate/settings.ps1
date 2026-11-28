@@ -28,6 +28,9 @@ $configPath = Join-Path $Root 'config.psd1'
 
 . (Join-Path $Root 'ui.ps1')
 Initialize-Ui -Channel $UiChannel
+:GateUiWork do {
+$UiStopState.Boundary = $true
+Test-UiStop
 
 if (-not (Test-UiCanAsk)) { throw 'Для изменения настроек откройте «Настройки» в ci.exe или запустите settings.cmd в интерактивной консоли.' }
 if (-not (Test-Path -LiteralPath $configPath)) {
@@ -375,7 +378,9 @@ function Show-Canary {
     $arguments.Add(('/Execute "{0}"' -f $epf))
     # demo: канарейка посидит, «проверит» и случайно покажет успех или провал; сервер не зовёт, файл не пишет.
     $arguments.Add(('/C"canary;demo;out={0};wait=6"' -f $outFile))
+    Test-UiStop
     $process = Start-Process -FilePath $client -ArgumentList ($arguments -join ' ') -PassThru
+    Register-UiProcess $process
     # Ждём отметку «канарейка открылась» (файл .started): так видно, вошёл ли клиент в базу.
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $started = $false
@@ -464,3 +469,5 @@ while ($true) {
 }
 if ($script:SettingsBackupDone) { Write-Host ("Настройки сохранены в {0}, прежний файл - config.psd1.bak." -f $configPath) }
 else { Write-Host 'Настройки не менялись.' }
+} while ($false)
+if ($UiStopState.Stopping) { throw [OperationCanceledException]::new('остановлено из интерфейса ci.exe') }
