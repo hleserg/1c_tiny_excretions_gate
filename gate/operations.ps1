@@ -16,7 +16,7 @@ function Start-OperationSender {
         $scriptFile = Join-Path $PSScriptRoot 'publish.ps1'
         $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -WatchOperations -Config "{1}"' -f $scriptFile, $ConfigPath
         Start-Process -FilePath powershell.exe -ArgumentList $arguments -WindowStyle Hidden -ErrorAction Stop
-    } catch { Write-Warning 'Не удалось запустить отправку журнала операций. Записи останутся на диске.' }
+    } catch { Write-Warning ("Не удалось запустить отправку журнала операций с профилем {0}. Проверьте доступность powershell.exe и publish.ps1 и повторите publish.ps1 -Pending с этим профилем. {1}" -f $ConfigPath, $_.Exception.GetBaseException().Message) }
 }
 
 function Write-OperationEvent {
@@ -31,7 +31,7 @@ function Write-OperationEvent {
         $source = Join-Path $Operation.Dir ([guid]::NewGuid().ToString('N') + '.tmp')
         [IO.File]::WriteAllText($source, $text, [Text.UTF8Encoding]::new($false))
         [IO.File]::Move($source, (Join-Path $Operation.Dir $leaf))
-    } catch { Write-Warning 'Не удалось записать событие в локальный журнал операций.' }
+    } catch { Write-Warning ("Не удалось записать событие {0} в {1}. Проверьте право записи и свободное место в этой папке. {2}" -f $Event, $Operation.Dir, $_.Exception.GetBaseException().Message) }
 }
 
 function Start-GateOperation {
@@ -46,7 +46,7 @@ function Start-GateOperation {
         Write-OperationEvent $op 'start'
         Start-OperationSender $Settings $ConfigPath
         return $op
-    } catch { Write-Warning 'Не удалось открыть локальный журнал операций.' }
+    } catch { Write-Warning ("Не удалось открыть локальный журнал операции {0}. Проверьте путь DeployDir в {1} и права на создание папок. {2}" -f $Name, $ConfigPath, $_.Exception.GetBaseException().Message) }
 }
 
 function Send-OperationBatch {
@@ -54,7 +54,7 @@ function Send-OperationBatch {
     param($Gh, [string]$Branch, $Batch)
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         $head = Get-GhHead -Gh $Gh -Branch $Branch
-        if ($head.Empty) { throw 'Репозиторий журнала пуст' }
+        if ($head.Empty) { throw 'В репозитории журнала ещё нет коммитов. Создайте начальный коммит в основной ветке и повторите отправку.' }
         $commit = New-GhCommit -Gh $Gh -Parent $head.Sha -Changes @($Batch | ForEach-Object { $_.Change }) -Message 'Журнал заводских операций'
         try {
             if ($head.Sha) { Set-GhBranch -Gh $Gh -Branch $Branch -Sha $commit }
@@ -165,7 +165,7 @@ function Watch-GateOperations {
         $gh = New-GhContext -Repo $repo -Token $token
         if (-not $gh.FakeDir) {
             $info = (Invoke-GhApi -Gh $gh -Method GET -Path ('/repos/' + $repo)).Text | ConvertFrom-Json
-            if (-not $info.private -or $info.default_branch -eq $branch) { throw 'Журналу нужна отдельная ветка закрытого репозитория' }
+            if (-not $info.private -or $info.default_branch -eq $branch) { throw 'Журналу нужна отдельная ветка закрытого репозитория. Проверьте RunFilesRepo и укажите в RunFilesBranch ветку, отличную от основной.' }
         }
         $secretPatterns = New-Object System.Collections.Generic.List[string]
         foreach ($secret in (Get-PublishSecrets -Settings $Settings -Token $token)) {

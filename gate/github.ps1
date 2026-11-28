@@ -122,7 +122,7 @@ function Invoke-GhApi {
     catch {
         $exception = $_.Exception
         while ($null -ne $exception -and -not ($exception -is [System.Net.WebException])) { $exception = $exception.InnerException }
-        if ($null -eq $exception -or $null -eq $exception.Response) { throw ("нет связи с api.github.com: {0}" -f $_.Exception.Message) }
+        if ($null -eq $exception -or $null -eq $exception.Response) { throw ("Не удалось соединиться с api.github.com. Проверьте доступ по HTTPS и настройки прокси пользователя гейта. {0}" -f $_.Exception.Message) }
         $response = $exception.Response
     }
     try {
@@ -134,7 +134,7 @@ function Invoke-GhApi {
             $found = [regex]::Match($text, '"message"\s*:\s*"((?:[^"\\]|\\.)*)"')
             if ($found.Success) { $apiText = ConvertFrom-GhJsonString $found.Groups[1].Value }
             $hint = ''
-            if ($code -eq 401) { $hint = ': токен не подходит или истёк' }
+            if ($code -eq 401) { $hint = ': токен не подходит или истёк. Обновите его в разделе «Настройки — Обновление гейта и git»' }
             elseif ($code -eq 403 -or $code -eq 404) { $hint = (': у токена нет прав на {0} (нужны Contents и Pull requests: чтение и запись) или нет такого репозитория' -f $Gh.Repo) }
             throw ("GitHub ответил {0} на {1} {2}{3} ({4})" -f $code, $Method, $Path, $hint, $apiText)
         }
@@ -247,7 +247,7 @@ function Get-GhHead {
     if ($answer.Status -eq 409) { return [pscustomobject]@{ Sha = ''; Empty = $true } }
     if ($answer.Status -eq 404) { return [pscustomobject]@{ Sha = ''; Empty = $false } }
     $found = [regex]::Match($answer.Text, '"object"\s*:\s*\{[^}]*"sha"\s*:\s*"([0-9a-f]{40})"')
-    if (-not $found.Success) { throw ("GitHub: не понял ответ про ветку {0}" -f $Branch) }
+    if (-not $found.Success) { throw ("GitHub не вернул хеш для ветки {0}. Проверьте имя ветки и её последний коммит в репозитории." -f $Branch) }
     return [pscustomobject]@{ Sha = $found.Groups[1].Value; Empty = $false }
 }
 
@@ -260,7 +260,7 @@ function Get-GhFiles {
         return (Read-GhFakeCommit $Gh $Commit).Files
     }
     $answer = Invoke-GhApi -Gh $Gh -Method 'GET' -Path ('/repos/{0}/git/trees/{1}?recursive=1' -f $Gh.Repo, $Commit)
-    if ($answer.Text -match '"truncated"\s*:\s*true') { throw 'GitHub отдал дерево не целиком (слишком большое)' }
+    if ($answer.Text -match '"truncated"\s*:\s*true') { throw 'GitHub вернул неполное дерево файлов. Сверьте размер и структуру репозитория и передайте разработчику номер коммита для проверки выгрузки.' }
     $files = @{}
     $entries = [regex]::Matches($answer.Text, '\{"path":"((?:[^"\\]|\\.)*)","mode":"(\d+)","type":"(\w+)","sha":"([0-9a-f]{40})"')
     foreach ($entry in $entries) {
@@ -382,7 +382,7 @@ function New-GhPull {
     $body = '{"title":' + (ConvertTo-GhJsonString $Title) + ',"head":' + (ConvertTo-GhJsonString $Head) + ',"base":' + (ConvertTo-GhJsonString $Base) + ',"body":' + (ConvertTo-GhJsonString $Body) + '}'
     $answer = Invoke-GhApi -Gh $Gh -Method 'POST' -Path ('/repos/{0}/pulls' -f $Gh.Repo) -Body $body
     $number = [int](($answer.Text | ConvertFrom-Json).number)
-    if ($number -lt 1) { throw 'GitHub не вернул номер созданного PR' }
+    if ($number -lt 1) { throw 'GitHub не вернул номер созданного PR. Перед повтором проверьте в репозитории, появился ли PR с выбранной исходной веткой.' }
     $url = ('https://github.com/{0}/pull/{1}' -f $Gh.Repo, $number)
     return [pscustomobject]@{ Number = [int]$number; Url = $url }
 }
@@ -758,7 +758,7 @@ function Invoke-GhDownload {
                 $current = $next
                 continue
             }
-            if ($code -ge 400) { throw ("GitHub ответил {0} на {1}" -f $code, $current) }
+            if ($code -ge 400) { throw ("GitHub ответил {0} при скачивании с {1}. Проверьте доступ к файлу релиза и повторите скачивание." -f $code, ([uri]$current).Host) }
             $stream = $response.GetResponseStream()
             if ($OutFile) {
                 $target = [System.IO.File]::Create($OutFile)
@@ -770,7 +770,7 @@ function Invoke-GhDownload {
         }
         finally { $response.Close() }
     }
-    throw ("слишком много переадресаций: {0}" -f $Url)
+    throw ("Превышен предел переадресаций при скачивании. Проверьте адрес релиза и настройки прокси. Узел: {0}" -f ([uri]$Url).Host)
 }
 
 function Get-PortableGit {
@@ -885,7 +885,7 @@ function Invoke-GitCli {
             & $stopGit
             if ($showProgress) { Complete-UiProgress }
             if ($showResult) { Write-UiOperationResult -Title $Title -Status 'FAIL' -Seconds $watch.Elapsed.TotalSeconds -Problem ('не закончил за {0} мин, git снят' -f [int]($TimeoutSec / 60)) }
-            throw ('git {0}: не закончил за {1} мин' -f $Arguments[0], [int]($TimeoutSec / 60))
+            throw ('git {0} не завершился за {1} мин. Проверьте доступ к репозиторию и повторите операцию.' -f $Arguments[0], [int]($TimeoutSec / 60))
         }
         if ($showProgress) {
             # Строка хода проверяет и просьбу остановиться (файл stop канала ci.exe): тогда git снимается.

@@ -68,11 +68,11 @@ function ConvertTo-NightlyTime {
     param([string]$Text)
     $parsed = [datetime]::MinValue
     if (-not [datetime]::TryParseExact($Text.Trim(), 'H:mm', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
-        throw ("время «{0}» не в виде ЧЧ:ММ" -f $Text)
+        throw ("Значение «{0}» не задаёт время запуска. Укажите время в формате ЧЧ:ММ в NightlyAt или в параметре -At." -f $Text)
     }
     # ** Хлебников С.Ю. 20261120 Запретные часы ночного прогона - из настроек (по умолчанию 22-02, как было).
     if (Test-NightlyDenied $parsed) {
-        throw ("время {0} попадает в часы {1} (NightlyDeniedFrom/To): в них бэкап и обновление рабочей, ночной прогон там мешает" -f $parsed.ToString('HH:mm'), (Get-NightlyDeniedText))
+        throw ("Время {0} попадает в часы {1}, отведённые для резервного копирования и обновления (NightlyDeniedFrom/To). Выберите время за пределами этого интервала." -f $parsed.ToString('HH:mm'), (Get-NightlyDeniedText))
     }
     # ** Хлебников С.Ю. 20261120 конец
     return $parsed
@@ -187,7 +187,7 @@ if ($extensionsRepo -and (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1'))
             }
             $output += ('Загрузка из git: {0}' -f [string]$import.note)
         }
-        catch { $output += ('Итог загрузки из git не прочитан: {0}' -f $_.Exception.Message) }
+        catch { $output += ('Не удалось прочитать итог загрузки из Git. Проверьте файл {0} и вывод импорта в {1}. {2}' -f $importFile, $logFile, $_.Exception.Message) }
     }
     else { $output += 'Загрузка из git не дошла до итога (см. вывод выше): ночной прогон - «как есть».' }
 }
@@ -201,7 +201,7 @@ if (-not $gitRan) {
 # Прогон оборвался (упал процесс, его сняли) - итог в GitHub отправит publish.ps1 -Pending, если отправка включена.
 $publishScript = Join-Path $Root 'publish.ps1'
 if (Test-Path -LiteralPath $publishScript) {
-    try { & $publishScript -Pending } catch { Write-Host ("Итог прогона в GitHub не ушёл: {0}" -f $_.Exception.Message) }
+    try { & $publishScript -Pending } catch { Write-Host ("Итог ночного прогона в GitHub не ушёл. После исправления причины запустите publish.ps1 -Pending с тем же профилем. {0}" -f $_.Exception.Message) }
 }
 
 $runId = ''

@@ -56,7 +56,11 @@ print(json.dumps({"ok": bool(sys.flags.isolated), "exe": sys.executable, "arg": 
     [IO.File]::WriteAllText($versionFile, $invalid)
     $rejected = $false
     try { & (Join-Path $kit 'install.ps1') -Target $target -Unattended }
-    catch { if ($_.Exception.Message -notlike '*Не запустился комплектный Python*') { throw }; $rejected = $true }
+    catch {
+        $reason = $_.Exception.Message
+        if (-not ($reason.Contains($current) -and $reason.Contains($invalid) -and $reason.Contains('ZIP'))) { throw }
+        $rejected = $true
+    }
     if (-not $rejected -or (Test-Path -LiteralPath (Join-Path $target ('runtime/python-' + $invalid)))) { throw 'неполный runtime принят' }
     if ((Get-DeliveryPython '') -cne $expected) { throw 'после ошибки изменился действующий Python' }
     Write-Host 'Занятый python.exe сохранился при обновлении, неисправная следующая версия отвергнута.'

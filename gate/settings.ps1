@@ -29,10 +29,10 @@ $configPath = Join-Path $Root 'config.psd1'
 . (Join-Path $Root 'ui.ps1')
 Initialize-Ui -Channel $UiChannel
 
-if (-not (Test-UiCanAsk)) { throw 'настройки правятся только из консоли или ci.exe' }
+if (-not (Test-UiCanAsk)) { throw 'Для изменения настроек откройте «Настройки» в ci.exe или запустите settings.cmd в интерактивной консоли.' }
 if (-not (Test-Path -LiteralPath $configPath)) {
     $example = Join-Path $Root 'config.example.psd1'
-    if (-not (Test-Path -LiteralPath $example)) { throw "нет ни config.psd1, ни config.example.psd1 в $Root" }
+    if (-not (Test-Path -LiteralPath $example)) { throw "В $Root нет config.psd1 и образца config.example.psd1. Восстановите config.example.psd1 из комплекта своей версии и снова откройте «Настройки»." }
     Copy-Item -LiteralPath $example -Destination $configPath
     Write-Host 'config.psd1 не было: создан из config.example.psd1.'
 }
@@ -211,7 +211,7 @@ function Set-ConfigValue {
             throw "значение $Key в config.psd1 сложнее одной строки: поправь файл руками"
         }
         $end = $text.LastIndexOf('}')
-        if ($end -lt 0) { throw 'config.psd1: не нашёл закрывающую скобку' }
+        if ($end -lt 0) { throw "Не удалось добавить $Key в $configPath. Проверьте закрывающую фигурную скобку таблицы настроек." }
         $text = $text.Substring(0, $end).TrimEnd() + "`r`n    $Key = $Literal`r`n" + $text.Substring($end)
     }
     if (-not $script:SettingsBackupDone) {
@@ -259,13 +259,20 @@ function Save-PasswordFile {
     if ($null -eq $first) { return $null }
     $second = Read-UiText -Prompt 'Ещё раз тот же пароль' -Secret -CancelAsNull
     if ($null -eq $second) { return $null }
-    if ($first -cne $second) { Show-UiTitle -Text 'Пароли не совпали: ничего не сохранил.' -Kind 'warn'; return $null }
+    if ($first -cne $second) { Show-UiTitle -Text 'Пароли не совпали. Выберите «Ввести пароль» и повторите ввод в обоих полях.' -Kind 'warn'; return $null }
     $path = $relative
     if (-not [System.IO.Path]::IsPathRooted($path)) { $path = Join-Path $Root $path }
     $folder = Split-Path -Parent $path
-    if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
-    $secure = ConvertTo-SecureString -String $first -AsPlainText -Force
-    [System.IO.File]::WriteAllText($path, (ConvertFrom-SecureString -SecureString $secure))
+    if (-not $first) { Show-UiTitle -Text 'Пароль пуст. Чтобы отключить пароль, выберите «Очистить (без пароля)».' -Kind 'warn'; return $null }
+    try {
+        if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+        $secure = ConvertTo-SecureString -String $first -AsPlainText -Force
+        [System.IO.File]::WriteAllText($path, (ConvertFrom-SecureString -SecureString $secure))
+    }
+    catch {
+        Show-UiTitle -Text ("Не удалось сохранить файл пароля {0}. Проверьте права на запись в {1} и повторите ввод под учётной записью Windows, которая запускает гейт." -f $path, $folder) -Kind 'bad'
+        return $null
+    }
     return $relative
 }
 
@@ -293,7 +300,7 @@ function Edit-Setting {
             $typed = Read-UiText -Prompt ($header + '. Новое значение (целое число)') -Default ([string]$Current) -CancelAsNull
             if ($null -ne $typed) {
                 $number = 0
-                if (-not [int]::TryParse($typed.Trim(), [ref]$number) -or $number -lt 0) { Show-UiTitle -Text ("«{0}» - не целое число: не сохранил." -f $typed) -Kind 'warn'; return }
+                if (-not [int]::TryParse($typed.Trim(), [ref]$number) -or $number -lt 0) { Show-UiTitle -Text ("Для {0} введите целое число от 0 до 2147483647. Введено «{1}»." -f $Key, $typed) -Kind 'warn'; return }
                 $literal = ConvertTo-PsdLiteral $number 'int'
             }
         }
@@ -338,7 +345,7 @@ function Show-Canary {
     $cfgNow = Read-SettingsConfig
     $binDir = [string]$cfgNow['V8Bin']
     $client = Join-Path $binDir '1cv8c.exe'
-    if (-not $binDir -or -not (Test-Path -LiteralPath $client)) { Show-UiTitle -Text ("Нет тонкого клиента: {0} (настройка V8Bin)" -f $client) -Kind 'warn'; return }
+    if (-not $binDir -or -not (Test-Path -LiteralPath $client)) { Show-UiTitle -Text ("Тонкий клиент не найден по пути {0}. Укажите в V8Bin папку bin установленной платформы 1С." -f $client) -Kind 'warn'; return }
     $epf = [string]$cfgNow['CanaryEpf']
     if (-not $epf) { $epf = 'tools\Канарейка.epf' }
     if (-not [System.IO.Path]::IsPathRooted($epf)) { $epf = Join-Path $Root $epf }

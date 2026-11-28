@@ -359,6 +359,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.running = false
 		m.exitCode = msg.code
 		m.exitErr = msg.err
+		if msg.err != nil && msg.code != 0 && len(m.lines) == 0 {
+			m.appendLine(fmt.Sprintf("%s завершился без вывода. Откройте «Просмотр событий» Windows и проверьте ошибки PowerShell и журнала «Приложение» за время запуска. Причина завершения процесса: %v", m.script, msg.err))
+		}
 		m.appendLine(fmt.Sprintf("Код завершения: %d", msg.code))
 		m.prog = nil
 		if m.dialog != nil && m.dialog.local == "" {

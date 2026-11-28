@@ -66,13 +66,7 @@ function Get-UpdateToken {
     if (-not $PassFile) { return '' }
     $path = $PassFile
     if (-not [System.IO.Path]::IsPathRooted($path)) { $path = Join-Path $Root $path }
-    if (-not (Test-Path -LiteralPath $path)) {
-        throw ("нет файла токена {0}: введи токен в «Настройки - Обновление гейта и git» (GitHubTokenPassFile)" -f $path)
-    }
-    $encrypted = (Get-Content -LiteralPath $path -Raw).Trim()
-    $credential = New-Object System.Management.Automation.PSCredential('token', (ConvertTo-SecureString -String $encrypted))
-    # Пробел или перевод строки по краям (скопировали со страницы вместе с ним) - GitHub ответит 401.
-    return $credential.GetNetworkCredential().Password.Trim()
+    return (Read-GateTokenFile $path)
 }
 
 #endregion
@@ -160,7 +154,7 @@ function Invoke-UpdateHttp {
         }
         finally { $response.Close() }
     }
-    throw ("слишком много переадресаций: {0}" -f $Url)
+    throw ("Превышен предел переадресаций при скачивании с {0}. Проверьте адрес релиза и настройки прокси." -f ([uri]$Url).Host)
 }
 
 #endregion
@@ -222,19 +216,21 @@ function Install-GateRelease {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
     $zip = Join-Path $dir $Release.AssetName
     Write-Host ("Скачиваю {0} ({1:N1} МБ)..." -f $Release.AssetName, ($Release.Size / 1MB))
-    $null = Invoke-UpdateHttp -Url $Release.AssetUrl -Accept 'application/octet-stream' -Token $Token -OutFile $zip
+    try { $null = Invoke-UpdateHttp -Url $Release.AssetUrl -Accept 'application/octet-stream' -Token $Token -OutFile $zip }
+    catch { throw ("Скачивание {0} прервано. Проверьте доступ к файлу релиза и право записи в {1}, затем повторите обновление. {2}" -f $Release.AssetName, $dir, $_.Exception.Message) }
     if ($Release.Digest -match '^sha256:([0-9a-fA-F]{64})$') {
         $expected = $Matches[1].ToLowerInvariant()
         $actual = Get-FileSha256 $zip
-        if ($actual -ne $expected) { throw ("контрольная сумма {0} не та: {1}, в релизе {2}" -f $Release.AssetName, $actual, $expected) }
+        if ($actual -ne $expected) { throw ("Контрольная сумма SHA-256 файла {0} не совпала. Получено {1}, в релизе {2}. Установщик не запускался. Скачайте комплект повторно через обновление гейта. Если суммы снова различаются, передайте их автору релиза." -f $Release.AssetName, $actual, $expected) }
         Write-Host 'Контрольная сумма совпала.' -ForegroundColor Green
     }
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $unpacked = Join-Path $dir 'kit'
-    [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $unpacked, [System.Text.Encoding]::UTF8)
+    try { [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $unpacked, [System.Text.Encoding]::UTF8) }
+    catch { throw ("Не удалось распаковать {0} в {1}. Проверьте целостность архива, свободное место и право записи в эту папку. {2}" -f $zip, $unpacked, $_.Exception.Message) }
     $installer = Join-Path $unpacked 'install.ps1'
     if (-not (Test-Path -LiteralPath $installer) -or -not (Test-Path -LiteralPath (Join-Path $unpacked 'ci\run.ps1'))) {
-        throw ("в {0} нет install.ps1 и ci\run.ps1 - это не комплект гейта" -f $Release.AssetName)
+        throw ("В {0} отсутствует install.ps1 или ci\run.ps1. Выберите релиз с полным комплектом гейта." -f $Release.AssetName)
     }
     # Во время скачивания или распаковки оператор мог нажать «Стоп». Файлы установленной версии пока целы.
     Test-UiStop
@@ -245,11 +241,13 @@ function Install-GateRelease {
         if (Test-Path -LiteralPath $old) {
             try { Remove-Item -LiteralPath $old -Force } catch { $old = Join-Path $Root ('ci.exe.old-{0:yyyyMMddHHmmss}' -f (Get-Date)) }
         }
-        Move-Item -LiteralPath $exe -Destination $old -Force
+        try { Move-Item -LiteralPath $exe -Destination $old -Force }
+        catch { throw ("Не удалось переименовать {0} в {1} перед установкой. Проверьте право изменения файлов в папке гейта и повторите обновление. {2}" -f $exe, $old, $_.Exception.Message) }
     }
     # Установщик - в этом же процессе: вывод идёт в ci.exe той же кодировкой (дочерний powershell писал бы в OEM).
     Write-Host ("Ставлю {0} в {1}..." -f $Release.Tag, $Root)
-    & $installer -Target $Root -Unattended
+    try { & $installer -Target $Root -Unattended }
+    catch { throw ("Установщик {0} прервал обновление в {1}. Проверьте причину ниже и повторите установку из того же комплекта. {2}" -f $installer, $Root, $_.Exception.Message) }
     $record = "{0}`t{1:yyyy-MM-dd HH:mm:ss}`t{2}`r`n" -f $Release.Tag, (Get-Date), $env:USERNAME
     [System.IO.File]::AppendAllText((Join-Path $updates 'installed.txt'), $record, (New-Object System.Text.UTF8Encoding($true)))
 }
@@ -267,21 +265,23 @@ $updateOutcome = 'cancelled'
 $updateResult = 'Установка отменена.'
 $installedText = 'неизвестно'
 $targetVersion = $Tag
+$token = ''
 # Просмотр релизов и проверка при старте, если обновления нет, - без отдельного итога.
 if ($Startup) { $startupLaunch = New-GateLaunchMetadata -Operation 'update-gate' }
 elseif (-not $List) { $updateReport = Start-GateOperationReport -Operation 'update-gate' -Config $configPath }
 try {
     $installed = Get-InstalledVersion
     if ($installed) { $installedText = $installed }
-    if (-not (Test-Path -LiteralPath $configPath)) { throw "нет файла настроек: $configPath" }
+    if (-not (Test-Path -LiteralPath $configPath)) { throw "Нет файла настроек $configPath. Откройте «Настройки» для создания config.psd1 или укажите существующий файл через -Config." }
     $cfg = Read-UpdateConfig -Path $configPath
     $repo = [string](Get-UpdateSetting $cfg 'UpdateRepo' '')
     if (-not $repo) { throw 'не задан UpdateRepo (владелец/репозиторий с релизами гейта): «Настройки - Обновление гейта и git»' }
     $api = [string](Get-UpdateSetting $cfg 'UpdateApi' 'https://api.github.com')
     $prefix = [string](Get-UpdateSetting $cfg 'UpdateTagPrefix' 'gate-')
     $token = Get-UpdateToken ([string](Get-UpdateSetting $cfg 'GitHubTokenPassFile' ''))
-    $releases = Get-GateReleases -Api $api -Repo $repo -Prefix $prefix -Token $token
-    if ($releases.Count -eq 0) { throw ("в {0} нет релизов {1}* с комплектом ci-gate_*.zip" -f $repo, $prefix) }
+    try { $releases = Get-GateReleases -Api $api -Repo $repo -Prefix $prefix -Token $token }
+    catch { throw ("Не удалось получить список релизов {0}. Проверьте доступ к API GitHub и значения UpdateRepo и UpdateApi. Причина: {1}" -f $repo, $_.Exception.Message) }
+    if ($releases.Count -eq 0) { throw ("В {0} нет подходящего релиза с тегом {1}* и файлом ci-gate_*.zip. Сверьте UpdateRepo и UpdateTagPrefix с опубликованным комплектом." -f $repo, $prefix) }
     $newest = $releases[0]
     Write-Host ("Гейт: установлен {0}, последний в {1} - {2}" -f $installedText, $repo, $newest.Version)
 
@@ -301,7 +301,7 @@ try {
     }
     elseif ($Tag) {
         $chosen = @($releases | Where-Object { $_.Tag -eq $Tag -or $_.Version -eq $Tag }) | Select-Object -First 1
-        if ($null -eq $chosen) { throw ("релиза {0} нет среди последних в {1}" -f $Tag, $repo) }
+        if ($null -eq $chosen) { throw ("Релиза {0} нет среди последних в {1}. Запустите update.ps1 -List и выберите тег из списка." -f $Tag, $repo) }
     }
     elseif ($Latest) {
         if ($installed -and $newest.Version -le $installed) {
@@ -347,10 +347,10 @@ try {
     }
 }
 catch {
-    $reason = $_.Exception.Message
+    $reason = Protect-GateReportText -Text $_.Exception.Message -LiteralValues @($token)
     if ($Startup -and $null -eq $updateReport) { $updateReport = Start-GateOperationReport -Operation 'update-gate' -Config $configPath -Launch $startupLaunch }
     if ($reason -ne 'остановлено из интерфейса ci.exe') { $updateOutcome = 'failed' }
-    $updateResult = 'Обновление не вышло: {0}' -f $reason
+    $updateResult = 'Обновление гейта прервано. {0}' -f $reason
     Write-Host $updateResult -ForegroundColor Red
     $exitCode = 1
 }

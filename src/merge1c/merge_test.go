@@ -407,3 +407,14 @@ func TestDiffPaths(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+func TestDamagedHistoryNamesTheLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n\n{broken}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := loadHistory(path)
+	if err == nil || !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "строка 3") || !strings.Contains(err.Error(), "JSON") {
+		t.Fatalf("причина не указывает файл и строку повреждённого JSON: %v", err)
+	}
+}

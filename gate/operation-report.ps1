@@ -41,6 +41,16 @@ function Read-PublishSecretFile {
     catch { return '' }
 }
 
+function Read-GateTokenFile {
+    param([string]$Path)
+    if (-not [IO.File]::Exists($path)) { throw "Нет файла токена $path. Проверьте GitHubTokenPassFile в разделе «Настройки — Обновление гейта и git»." }
+    $token = Read-PublishSecretFile $path
+    if (-not $token -or -not $token.Trim()) {
+        throw "Не удалось прочитать токен из $path под текущей учётной записью Windows. Откройте «Настройки — Обновление гейта и git» под пользователем, который запускает гейт, и сохраните токен заново."
+    }
+    return $token.Trim()
+}
+
 function Get-PublishSecrets {
     # Чего не должно быть в выложенных файлах: токен GitHub, пароли из файлов *PassFile (и у пользователей вроде
     # CanaryUsers - PassFile в таблице), код разрешения входа UnlockCode. Name - имя настройки, значение не выводится.
@@ -131,7 +141,7 @@ function Start-GateOperationReport {
         $repo = [string](Get-PublishSetting $settings 'RunReportRepo' '')
         if (-not $repo) { return }
         # Досылаем из того же профиля. Ошибка старого отчёта не мешает завести новый.
-        try { & (Join-Path $PSScriptRoot 'publish.ps1') -Pending -Config $Config } catch { Write-Warning 'Не удалось проверить очередь отчётов.' }
+        try { & (Join-Path $PSScriptRoot 'publish.ps1') -Pending -Config $Config } catch { Write-Warning ("Не удалось проверить очередь отчётов для {0}. Проверьте доступ к папке RunsDir из этого профиля, затем повторите publish.ps1 -Pending." -f $Config) }
         if ($null -eq $Launch) { $Launch = New-GateLaunchMetadata $Operation }
         $id = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N')
         $dir = Join-Path (Join-Path (Get-GateReportRoot $settings) 'operations') $id
@@ -147,7 +157,7 @@ function Start-GateOperationReport {
             $publisher = (Get-Command (Join-Path $PSScriptRoot 'publish.ps1')).ScriptBlock
         }
         return [pscustomobject]@{ Publisher = $publisher; Dir = $dir; Config = $Config; Launch = $Launch; Secrets = $secrets; Done = $false }
-    } catch { Write-Warning 'Не удалось открыть журнал операции для отправки в GitHub.' }
+    } catch { Write-Warning ("Не удалось открыть журнал операции {0} для GitHub ({1}). Проверьте файл настроек {2} и право записи в папку RunsDir." -f $Operation, $_.Exception.GetBaseException().GetType().Name, $Config) }
 }
 
 function Add-GateOperationLine {
@@ -156,7 +166,7 @@ function Add-GateOperationLine {
     try {
         $safe = Protect-GateReportText $Text $Context.Secrets
         [IO.File]::AppendAllText((Join-Path $Context.Dir 'summary.txt'), $safe + [Environment]::NewLine, [Text.UTF8Encoding]::new($true))
-    } catch { Write-Warning 'Не удалось дополнить журнал операции для GitHub.' }
+    } catch { Write-Warning ("Не удалось дополнить {0}\summary.txt. Проверьте место и права записи в папку операции. {1}" -f $Context.Dir, (Protect-GateReportText $_.Exception.GetBaseException().Message $Context.Secrets)) }
 }
 
 function Move-GateOperationToRun {
@@ -170,7 +180,7 @@ function Move-GateOperationToRun {
         Save-GateReportJson (Join-Path $Context.Dir 'forward.json') @{ run = $id }
         Save-GateReportJson (Join-Path $RunDir 'run-launch.json') $Context.Launch
         $Context.Done = $true
-    } catch { Write-Warning 'Не удалось привязать отчёт о продолжении к папке прогона.' }
+    } catch { Write-Warning ("Не удалось связать отчёт {0} с прогоном {1}. Проверьте имя папки прогона и права записи в обе папки. {2}" -f $Context.Dir, $RunDir, (Protect-GateReportText $_.Exception.GetBaseException().Message $Context.Secrets)) }
 }
 
 function Complete-GateOperation {
@@ -182,5 +192,5 @@ function Complete-GateOperation {
         $Context.Done = $true
         if ($null -ne $Context.Publisher) { & $Context.Publisher -OperationDir $Context.Dir -Config $Context.Config -OperationHelpersLoaded }
         else { & (Join-Path $PSScriptRoot 'publish.ps1') -OperationDir $Context.Dir -Config $Context.Config }
-    } catch { Write-Warning 'Итог операции не отправлен. Очередь будет проверена при следующем запуске.' }
+    } catch { Write-Warning ("Не удалось завершить отчёт в {0}. Проверьте result.json в этой папке и повторите публикацию через publish.ps1 -Pending с тем же профилем. {1}" -f $Context.Dir, (Protect-GateReportText $_.Exception.GetBaseException().Message $Context.Secrets)) }
 }

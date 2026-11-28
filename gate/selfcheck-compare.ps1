@@ -43,7 +43,7 @@ function Resolve-Run {
         $Path = $candidate
     }
     $Path = $Path.TrimEnd('\', '/')
-    if (-not (Test-Path -LiteralPath (Join-Path $Path 'group-run.txt'))) { throw "В папке $Path нет group-run.txt: это не замер группы (run.cmd -SelfCheckGroup)." }
+    if (-not (Test-Path -LiteralPath (Join-Path $Path 'group-run.txt'))) { throw "В папке $Path нет group-run.txt. Выбери две папки замеров одной группы из selfcheck-runs. Замер создаёт run.cmd -SelfCheckGroup." }
     return $Path
 }
 

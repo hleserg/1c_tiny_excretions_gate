@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -54,5 +57,29 @@ func TestNotifyHandlerProblems(t *testing.T) {
 		if got := notifyHandlerProblems(module); len(got) == 0 {
 			t.Errorf("%s: ошибка не найдена", name)
 		}
+	}
+}
+
+func TestInvalidPackageManifestNamesTheFile(t *testing.T) {
+	const helper = "GATE_TEST_INVALID_MANIFEST"
+	if dir := os.Getenv(helper); dir != "" {
+		root = dir
+		loadPackages()
+		return
+	}
+	dir := t.TempDir()
+	packDir := filepath.Join(dir, "packages", "Sample")
+	if err := os.MkdirAll(packDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(packDir, "package.json")
+	if err := os.WriteFile(path, []byte("{broken}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestInvalidPackageManifestNamesTheFile$")
+	cmd.Env = append(os.Environ(), helper+"="+dir)
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), path) || !strings.Contains(string(out), "JSON") || !strings.Contains(string(out), "invalid character") {
+		t.Fatalf("ошибка чтения пакета должна назвать файл и причину: %s (%v)", out, err)
 	}
 }

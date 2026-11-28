@@ -19,7 +19,7 @@ function Get-GateCanaryProfiles {
         [pscustomobject]@{ Name = $name; Label = $name; PassFile = $passFile; Mode = $mode; Optional = [bool]$entry['Optional']; Expected = $name }
     }
     if ($priority.Count -gt 0 -and @($priority | Where-Object { -not [bool]$_['Optional'] }).Count -eq 0) {
-        throw 'В PriorityCanaryUsers нужен хотя бы один обязательный вход.'
+        throw 'В PriorityCanaryUsers нужен хотя бы один обязательный вход. Для обязательного пользователя установите Optional = $false.'
     }
     if ($Deploy) {
         if ($priority.Count -eq 0) {
@@ -38,8 +38,14 @@ function Get-GateCanaryProfiles {
 
 function Get-GateCanaryAuthArgs {
     param($Profile)
+    trap {
+        if ($Profile.PassFile) {
+            throw ("Проверка входа пользователя {0} остановлена. Проверьте файл {1} под пользователем Windows, который запускает гейт. {2}" -f $Profile.Name, $Profile.PassFile, $_.Exception.Message)
+        }
+        throw ("Проверка входа пользователя {0} остановлена. Сверьте способ входа и доступность учётных данных для этого пользователя. {1}" -f $Profile.Name, $_.Exception.Message)
+    }
     switch ($Profile.Mode) {
-        'Missing' { throw ('Нет подходящей доменной учётки или файла пароля для {0}. Файл: {1}' -f $Profile.Name, $Profile.PassFile) }
+        'Missing' { throw ('Нет подходящей доменной учётки или файла пароля для {0}. Проверьте WindowsAccount и путь PassFile в PriorityCanaryUsers. Настроенный файл: {1}' -f $Profile.Name, $Profile.PassFile) }
         'Windows' { return '/WA+' }
         'DeployAdmin' { return }
     }

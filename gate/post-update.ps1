@@ -14,26 +14,44 @@ function Get-ActionErrorSummary {
 }
 # ** Хлебников С.Ю. 20261124 конец
 
+function Get-ActionRegisterProblem {
+    param([string]$Status, [string]$Register)
+    $name = $Register
+    if (-not $name) { $name = 'из настройки ActionsRegister' }
+    switch -CaseSensitive ($Status) {
+        'missing' { return ("регистра {0} в базе нет" -f $name) }
+        'notset' { return 'не задан ActionsRegister' }
+        'nodimension' { return ("в регистре {0} нет измерения Действие" -f $name) }
+    }
+}
+
 function Assert-ActionResult {
-    param([string[]]$Lines, [string[]]$Ids)
+    param([string[]]$Lines, [string[]]$Ids, [string]$Register = '')
     $states = @($Lines | Where-Object { $_ -like 'status=*' })
     if ($states.Count -ne 1 -or $states[0] -cne 'status=ok' -or $Lines -cnotcontains 'done-register=ok') {
         # ** Хлебников С.Ю. 20261124 Показываем оператору действие и причину перед служебными статусами.
         foreach ($line in $Lines) {
             if ($line -cmatch '^action=([^|]+)\|failed\|(.+)$') {
-                throw ('действие {0}: {1}' -f $Matches[1], (Get-ActionErrorSummary $Matches[2]))
+                throw ('действие {0}: {1}. Перед повтором сверь идентификатор в регистре выполненных действий.' -f $Matches[1], (Get-ActionErrorSummary $Matches[2]))
             }
         }
         # ** Хлебников С.Ю. 20261124 конец
+        $registerRows = @($Lines | Where-Object { $_ -clike 'done-register=*' })
+        if ($registerRows.Count -eq 1) {
+            $problem = Get-ActionRegisterProblem $registerRows[0].Substring('done-register='.Length) $Register
+            if ($problem) { throw ("Проверка регистра выполненных действий не прошла: {0} ({1}). Задайте в ActionsRegister имя регистра сведений с измерением Действие и сверьте его с установленной конфигурацией." -f $problem, $registerRows[0]) }
+        }
         $reason = @($Lines | Where-Object { $_ -match '^(error=|action=.*\|failed\||done-register=|status=)' })
-        throw ('действия не подтверждены: ' + ($reason -join '; '))
+        $detail = 'обработка не записала статус'
+        if ($reason.Count) { $detail = Get-ActionErrorSummary ($reason -join '; ') }
+        throw ("Действия не подтверждены: {0}. Перед повтором сверь протокол обработки с регистром выполненных действий." -f $detail)
     }
     $rows = @($Lines | Where-Object { $_.StartsWith('action=') })
-    if ($rows.Count -ne $Ids.Count) { throw 'число результатов отличается от числа действий' }
+    if ($rows.Count -ne $Ids.Count) { throw ('Обработка вернула результатов: {0}, ожидалось: {1}. Перед повтором сверь список запрошенных действий с протоколом обработки и регистром выполненных действий.' -f $rows.Count, $Ids.Count) }
     for ($i = 0; $i -lt $Ids.Count; $i++) {
         $parts = $rows[$i].Substring(7).Split([char[]]@('|'), 3)
         if ($parts.Count -lt 2 -or $parts[0] -cne $Ids[$i] -or $parts[1] -cnotin @('done', 'already')) {
-            throw ('нет подтверждения для действия ' + $Ids[$i])
+            throw ('Нет подтверждения для действия {0} в строке результата {1}. Сверь порядок действий в протоколе и их отметки в регистре выполненных действий.' -f $Ids[$i], ($i + 1))
         }
     }
 }
@@ -95,6 +113,6 @@ function Copy-VerifiedActionEpf {
     $source = Join-Path $RunDirectory 'actions\ДействияПослеОбновления.epf'
     Copy-Item -LiteralPath $source -Destination $Destination -Force -ErrorAction Stop
     if ((Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash -ine $Hash) {
-        throw 'обработка действий отличается от проверенной в тестовой базе'
+        throw ("Контрольная сумма {0} отличается от проверенной в тестовой базе. Сверь файл {1} с комплектом этого прогона и повтори проверку действий в тестовой базе." -f $Destination, $source)
     }
 }
