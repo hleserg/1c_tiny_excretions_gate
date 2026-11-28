@@ -15,7 +15,9 @@
             [IO.File]::WriteAllText($token, 'broken-secret-marker')
             $bad = Invoke-Script -Sandbox $sb -Script 'update.ps1' -Arguments '-List'
             $message = (@($bad.Output) + @($bad.Stderr)) -join "`n"
-            Check ($bad.ExitCode -eq 1 -and $message.Contains($token) -and $message -match 'Windows' -and $message -match 'Настройки') 'при нечитаемом токене нет файла и способа записать токен заново'
+            $shownPath = [regex]::Match($message, 'токен из (?<path>[^\r\n]+?) под текущей').Groups['path'].Value
+            Check ($bad.ExitCode -eq 1 -and $message -match 'Windows' -and $message -match 'Настройки') 'при нечитаемом токене нет способа записать токен заново'
+            Check ([IO.Path]::IsPathRooted($shownPath) -and [IO.File]::Exists($shownPath) -and [IO.File]::ReadAllText($shownPath) -ceq 'broken-secret-marker') 'путь из сообщения не ведёт к файлу токена этой песочницы'
             Check (-not $message.Contains('broken-secret-marker')) 'содержимое файла токена попало на экран'
         }
     }
