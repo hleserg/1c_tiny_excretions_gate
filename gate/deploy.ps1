@@ -1363,7 +1363,9 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 try {
-    $xml = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd()))
+    # Windows PowerShell пишет stdin в кодировке родителя, включая BOM на консоли UTF-8/UTF-16.
+    $reader = [IO.StreamReader]::new([Console]::OpenStandardInput(), [Text.Encoding]::ASCII, $true)
+    try { $xml = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($reader.ReadToEnd())) } finally { $reader.Dispose() }
     $call = [System.Management.Automation.PSSerializer]::Deserialize($xml)
     $values = [object[]]$call.Arguments
     $output = @(& ([scriptblock]::Create($call.Script)) @values)
