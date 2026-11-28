@@ -24,22 +24,22 @@ function Assert-PrivateWorkerGit {
     try {
         $response = $request.GetResponse()
         $response.Close()
-        throw 'Анонимное чтение репозитория открыто. Обмен остановлен.'
+        throw 'Анонимное чтение репозитория открыто. Обмен остановлен. Выберите закрытый репозиторий очереди в профиле исполнителя.'
     }
     catch [Net.WebException] {
         $response = $_.Exception.Response
         if ($null -eq $response) { throw }
         try {
-            if ([int]$response.StatusCode -ne 401 -or $response.Headers['WWW-Authenticate'] -notmatch '^Basic realm="GitHub"$') { throw 'Не подтверждена приватность Git-репозитория очереди' }
+            if ([int]$response.StatusCode -ne 401 -or $response.Headers['WWW-Authenticate'] -notmatch '^Basic realm="GitHub"$') { throw 'Не подтверждена приватность Git-репозитория очереди. Проверьте адрес Repo и ответ сервера GitHub на анонимный запрос.' }
         } finally { $response.Close() }
     }
     $marker = Join-Path $Gh.GitCache 'delivery-repo.txt'
     if (-not [IO.File]::Exists($marker)) {
         [void][IO.Directory]::CreateDirectory($Gh.GitCache)
-        if (@([IO.Directory]::GetFileSystemEntries($Gh.GitCache)).Count) { throw 'Для кеша очереди нужна отдельная пустая папка' }
+        if (@([IO.Directory]::GetFileSystemEntries($Gh.GitCache)).Count) { throw "Для кеша очереди нужна отдельная пустая папка. Укажите в GitCache новый путь. Текущий путь: $($Gh.GitCache)." }
         [IO.File]::WriteAllText($marker,$Gh.Repo)
     }
-    if ([IO.File]::ReadAllText($marker) -cne $Gh.Repo) { throw 'Кеш очереди принадлежит другому репозиторию' }
+    if ([IO.File]::ReadAllText($marker) -cne $Gh.Repo) { throw 'Кеш очереди принадлежит другому репозиторию. Укажите в GitCache отдельную папку для этой очереди.' }
     if (-not [IO.File]::Exists((Join-Path $Gh.GitCache 'objects.git\HEAD'))) {
         $null = Invoke-WorkerGit $Gh @('init','--template=')
     }
@@ -80,7 +80,7 @@ function Get-GitWorkerBlob {
         $proc.StandardOutput.BaseStream.CopyTo($buffer)
         $proc.WaitForExit()
         $bytes = $buffer.ToArray()
-        if ($proc.ExitCode -ne 0 -or $bytes.Length -ne $size -or (Get-GitBlobSha $bytes) -cne $Sha) { throw 'Ошибка чтения объекта Git' }
+        if ($proc.ExitCode -ne 0 -or $bytes.Length -ne $size -or (Get-GitBlobSha $bytes) -cne $Sha) { throw "Не удалось прочитать объект $Sha или подтвердить его размер и хеш. Проверьте доступность объекта в закрытом репозитории очереди и целостность локального GitCache." }
         return ,$bytes
     } finally { $proc.Dispose(); $buffer.Dispose() }
 }

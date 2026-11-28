@@ -61,10 +61,7 @@ function Get-PublishToken {
     if (-not $PassFile) { throw 'нет токена GitHub: «Настройки - Обновление гейта и git», GitHubTokenPassFile' }
     $path = $PassFile
     if (-not [System.IO.Path]::IsPathRooted($path)) { $path = Join-Path $Root $path }
-    if (-not (Test-Path -LiteralPath $path)) { throw ("нет файла токена {0}: «Настройки - Обновление гейта и git», GitHubTokenPassFile" -f $path) }
-    $encrypted = (Get-Content -LiteralPath $path -Raw).Trim()
-    $credential = New-Object System.Management.Automation.PSCredential('token', (ConvertTo-SecureString -String $encrypted))
-    return $credential.GetNetworkCredential().Password.Trim()
+    return (Read-GateTokenFile $path)
 }
 
 #endregion
@@ -428,7 +425,7 @@ function Publish-RunFiles {
     $result = [pscustomobject]@{ Url = (Get-RunFilesUrl -Repo $Repo -Branch $Branch -Id $id); Changed = 0; Skipped = $list.Skipped.Count; Secrets = $list.Secrets }
     for ($try = 1; $try -le 2; $try++) {
         $head = Get-GhHead -Gh $gh -Branch $Branch
-        if ($head.Empty) { throw ('в репозитории {0} ещё нет ни одного коммита - файлы прогона класть некуда' -f $Repo) }
+        if ($head.Empty) { throw ('В репозитории {0} ещё нет ни одного коммита. Создайте начальный коммит в основной ветке и повторите отправку файлов.' -f $Repo) }
         $existing = @{}
         if ($head.Sha) { $existing = Get-GhFiles -Gh $gh -Commit $head.Sha }
         $changes = New-Object System.Collections.Generic.List[object]
@@ -490,10 +487,11 @@ function Invoke-RunFilesUpload {
         return ('**Файлы прогона:** {0}{1}' -f $url, $note)
     }
     catch {
-        $State['filesError'] = $_.Exception.Message
-        Write-Host ("Файлы прогона {0} в git не ушли: {1}. Уйдут при следующем запуске гейта." -f $id, $_.Exception.Message) -ForegroundColor Yellow
-        Write-PublishLog $Dir ("Файлы прогона в git не ушли ({0}): {1}" -f $Kind, $_.Exception.Message)
-        return ('**Файлы прогона в git не ушли:** {0}. Уйдут при следующем запуске гейта, сюда: {1}' -f $_.Exception.Message, $url)
+        $reason = Protect-GateReportText $_.Exception.Message (Get-PublishSecrets -Settings $Settings -Token $Token)
+        $State['filesError'] = $reason
+        Write-Host ("Не удалось выложить файлы прогона {0} в {1}, ветка {2}. {3}. После исправления запустите publish.ps1 -Pending с тем же профилем." -f $id, $repo, $branch, $reason) -ForegroundColor Yellow
+        Write-PublishLog $Dir ("Файлы прогона в git не ушли ({0}): {1}" -f $Kind, $reason)
+        return ('**Файлы прогона в git не ушли:** {0}. При следующем запуске гейт повторит отправку в {1}.' -f $reason, $url)
     }
 }
 
@@ -664,7 +662,7 @@ function Send-ReportParts {
         $packet.part = $i + 1
         $packet.body = $parts[$i]
         $json = ConvertTo-Json -InputObject @{ event_type = 'gate-run'; client_payload = $packet } -Compress -Depth 6
-        if ($Utf8NoBom.GetByteCount($json) -gt $PayloadLimitBytes) { throw 'часть отчёта превышает предел GitHub' }
+        if ($Utf8NoBom.GetByteCount($json) -gt $PayloadLimitBytes) { throw 'Размер части отчёта после упаковки превышает предел GitHub. Откройте локальный отчёт и передайте его номер разработчику гейта для проверки разбиения.' }
         Send-RunEvent -Repo $Repo -Token $Token -Json $json
         $State['sentPart'] = $i + 1
         Save-PublishState $Dir $State
@@ -675,6 +673,8 @@ function Publish-Operation {
     param([string]$Dir, [string]$Repo, [string]$TokenFile, [hashtable]$Settings, [switch]$Recover)
     # Такой же вызов из -Pending может идти одновременно. Файловую блокировку отпустит и убитый процесс.
     $lease = $null
+    $secrets = $null
+    $token = ''
     try {
         try { $lease = [IO.File]::Open((Join-Path $Dir 'publish.lock'), 'OpenOrCreate', 'ReadWrite', 'None') }
         catch [IO.IOException] { return $true }
@@ -714,11 +714,15 @@ function Publish-Operation {
         Save-PublishState $Dir $state
         return $true
     } catch {
+        $reason = $_.Exception.Message
+        if ($null -eq $secrets) { $secrets = Get-PublishSecrets -Settings $Settings -Token '' }
+        $message = 'Не удалось отправить итог операции {0} в {1}. {2}. После исправления запустите publish.ps1 -Pending с тем же профилем или дождитесь следующего запуска гейта.' -f (Split-Path -Leaf $Dir), $Repo, $reason
+        $message = Protect-GateReportText $message $secrets -LiteralValues @($token)
         if ($null -ne (Get-Variable state -Scope Local -ErrorAction SilentlyContinue)) {
-            $state['error'] = 'Не удалось отправить итог. При следующем запуске отправка повторится.'
+            $state['error'] = $message
             Save-PublishState $Dir $state
         }
-        Write-Warning ('Итог операции {0} не ушёл в GitHub. Он остался в очереди.' -f (Split-Path -Leaf $Dir))
+        Write-Warning $message
         return $false
     } finally { if ($null -ne $lease) { $lease.Dispose() } }
 }
@@ -746,6 +750,7 @@ function Publish-Run {
         $state['wanted'] = $Kind
         $state['message'] = $Reason
         Save-PublishState $Dir $state
+        $token = ''
         try {
             $token = Get-PublishToken $TokenFile
             $filesLine = ''
@@ -762,9 +767,9 @@ function Publish-Run {
             return $true
         }
         catch {
-            $state['error'] = Protect-GateReportText $_.Exception.Message $secrets
+            $state['error'] = Protect-GateReportText $_.Exception.Message $secrets -LiteralValues @($token)
             Save-PublishState $Dir $state
-            Write-Host ("Итог прогона {0} в GitHub не ушёл: {1}. Уйдёт при следующем запуске гейта." -f (Split-Path -Leaf $Dir), $state['error']) -ForegroundColor Yellow
+            Write-Host ("Итог прогона {0} в GitHub не ушёл: {1}. После исправления запустите publish.ps1 -Pending с тем же профилем. Гейт также повторит отправку при следующем запуске." -f (Split-Path -Leaf $Dir), $state['error']) -ForegroundColor Yellow
             Write-PublishLog $Dir ("Итог прогона в GitHub не ушёл ({0}): {1}" -f $Kind, $state['error'])
             return $false
         }
@@ -890,5 +895,5 @@ if ($Pending) {
     return
 }
 
-if (-not $RunDir -or -not (Test-Path -LiteralPath $RunDir)) { throw ("нет папки прогона: {0}" -f $RunDir) }
+if (-not $RunDir -or -not (Test-Path -LiteralPath $RunDir)) { throw ("Не найдена папка прогона {0}. Укажите в -RunDir существующую папку этого прогона." -f $RunDir) }
 $null = Publish-Run -Dir $RunDir -Kind $Stage -Reason $Message -Repo $repoName -TokenFile $tokenFile -Settings $cfg

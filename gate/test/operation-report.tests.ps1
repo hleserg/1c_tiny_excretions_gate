@@ -10,9 +10,10 @@
             $profile = @{
                 RunReportRepo = 'owner/reports'; GitHubTokenPassFile = 'token.dat'; AdminPassFile = 'admin.dat'
                 CanaryUsers = @(@{ Name = ''; PassFile = 'reader.dat' }); UnlockCode = 'u-7'
+                ClusterAdminPassFile = 'cluster.dat'
             }
             $sb = New-Sandbox $Name -Config $profile
-            foreach ($entry in @(@('token.dat', 'token-marker'), @('admin.dat', 'k!'), @('reader.dat', 'read-marker'))) {
+            foreach ($entry in @(@('token.dat', 'token-marker'), @('admin.dat', 'k!'), @('reader.dat', 'read-marker'), @('cluster.dat', 'подставной'))) {
                 $encoded = ConvertTo-SecureString $entry[1] -AsPlainText -Force | ConvertFrom-SecureString
                 [IO.File]::WriteAllText((Join-Path $sb $entry[0]), $encoded)
             }
@@ -33,6 +34,8 @@
                 $stateFile = Join-Path $op.Dir 'publish.json'
                 $state = [IO.File]::ReadAllText($stateFile) | ConvertFrom-Json
                 Check ($state.wanted -eq 'final' -and -not $state.sent -and $state.sentPart -eq 1) 'не запомнилась принятая часть'
+                Check ($state.error -match 'сбой отправки части' -and $state.error -match 'следующем запуске|-Pending') 'очередь не сохранила причину и способ досылки'
+                Check (-not $state.error.Contains('подставной') -and $state.error.Contains('***')) 'причина от сервера записана без маскирования известного секрета'
                 $first = @(Get-ChildItem $http -Filter 'dispatch-*.json')
                 Check ($first.Count -eq 1) 'до обрыва должна уйти только первая часть'
                 Remove-Item -LiteralPath $fail

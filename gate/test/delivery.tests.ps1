@@ -340,6 +340,10 @@ function Check-DeliveryCommon {
             Set-GhBranch $gh $branch $foreign -Create
             $blocked = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Delivery' -Fake @{dumps=$dumps} -Com $null
             Check (($blocked.Output -join '|') -match 'чужие изменения' -and (Get-GhHead $gh $branch).Sha -ceq $foreign) 'гейт должен сохранить постороннюю ветку'
+            $report = [IO.File]::ReadAllText((Join-Path $sb ('deliveries\' + $state.id + '\report.md')))
+            foreach ($text in @(($blocked.Output -join '|'), $report)) {
+                Check ($text -match 'публикация кандидата' -and $text -match 'чужие изменения' -and $text -match 'Приёмка поставок') 'в отчёте или на экране нет этапа, причины и способа продолжить ту же поставку'
+            }
             $refs = Read-GhFakeRefs $gh
             $refs.Remove($branch)
             Save-GhFakeRefs $gh $refs

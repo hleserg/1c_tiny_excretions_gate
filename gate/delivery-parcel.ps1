@@ -63,7 +63,7 @@ function Assert-ParcelRepo {
     if ($Gh.PSObject.Properties['GitCache']) { Assert-PrivateWorkerGit $Gh; return }
     if ($Gh.FakeDir) { return }
     $repo = (Invoke-GhApi $Gh GET ('/repos/' + $Gh.Repo)).Text | ConvertFrom-Json
-    if ($repo.private -ne $true -or $repo.full_name -ine $Gh.Repo) { throw 'Для обмена поставками нужен приватный репозиторий' }
+    if ($repo.private -ne $true -or $repo.full_name -ine $Gh.Repo) { throw 'Обмен поставками остановлен. Укажите в DeliveryWorkerRepo закрытый репозиторий очереди и проверьте его доступность для токена исполнителя.' }
 }
 
 function Read-ParcelQueue {
@@ -90,7 +90,7 @@ function Get-ParcelJson {
 function Read-ParcelPayload {
     param($Gh,$Queue,[string]$Path,[string]$Hash)
     $bytes = Get-ParcelBytes $Gh $Queue.Files[$Path]
-    if ((Get-ParcelHash $bytes) -cne $Hash) { throw "Не совпал SHA-256 $Path" }
+    if ((Get-ParcelHash $bytes) -cne $Hash) { throw "Не совпал SHA-256 $Path. Сверьте файл очереди с манифестом задания перед повторной приёмкой." }
     return ,$bytes
 }
 
@@ -116,10 +116,10 @@ function Invoke-ParcelRequest {
     $gh = $D.Remote
     Assert-ParcelRepo $gh
     $cfgInfo = Get-ComConfigInfo -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
-    if (-not $cfgInfo.Ok -or -not $cfgInfo.Name -or -not $cfgInfo.Version) { throw 'Не удалось определить версию конфигурации temp' }
+    if (-not $cfgInfo.Ok -or -not $cfgInfo.Name -or -not $cfgInfo.Version) { throw 'Перед отправкой задания не удалось узнать имя и версию конфигурации тестовой базы. Проверьте подключение к ней под учётной записью гейта.' }
     $bytes = [IO.File]::ReadAllBytes($Path)
     $job = [ordered]@{version=1; delivery=$State.id; index=$Index; operation=$Operation; config=($cfgInfo.Name+' '+$cfgInfo.Version); input=(Get-ParcelHash $bytes)}
-    if ($Operation.StartsWith('expand-') -and $job.input -ne $State.files[$Index-1].sha256) { throw 'Оригинал поставки изменился после приёма' }
+    if ($Operation.StartsWith('expand-') -and $job.input -ne $State.files[$Index-1].sha256) { throw 'Оригинал изменился после приёма. Сверьте сохранённый файл с SHA-256 в реестре. Исправленный комплект подайте как новую поставку.' }
     $key = Get-ParcelId $job
     $prefix = "jobs/$key"
     $queue = Read-ParcelQueue $gh
@@ -138,12 +138,12 @@ function Invoke-ParcelRequest {
             Write-DeliveryEvent $D $State 'worker' ("{0}: задание {1}, результат SHA-256 {2}" -f $Operation,$key,$result.output)
             return ,$output
         }
-        if ($queue.Files.ContainsKey("$prefix/problem.json")) { throw "Исполнитель остановил задание $key. Подробности в problem.json на стенде." }
+        if ($queue.Files.ContainsKey("$prefix/problem.json")) { throw "Исполнитель остановил $Operation. Откройте на стенде Spool\$key\problem.json и журнал попытки в WorkRoot. После устранения причины уберите локальную отметку problem.json этого задания и повторите Work, затем Sync." }
         if ([DateTime]::UtcNow -ge $deadline) { break }
         Start-Sleep -Seconds 15
         $queue = Read-ParcelQueue $gh
     } while ($true)
-    $pending = [Exception]::new("Ждём исполнителя: $Operation, задание $key")
+    $pending = [Exception]::new("Ждём исполнителя: $Operation, задание $key. Проверьте, что на стенде работают Work и Sync. После получения ответа повторите «Приёмку поставок».")
     $pending.Data['DeliveryPending'] = $true
     throw $pending
 }

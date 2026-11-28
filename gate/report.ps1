@@ -36,10 +36,11 @@ trap {
     break
 }
 
+. (Join-Path $PSScriptRoot 'operation-report.ps1')
 $Utf8Bom = New-Object System.Text.UTF8Encoding($true)
 if (-not [System.IO.Path]::IsPathRooted($RunDir)) { $RunDir = Join-Path $PSScriptRoot $RunDir }
 $RunDir = $RunDir.TrimEnd('\', '/')
-if (-not (Test-Path -LiteralPath (Join-Path $RunDir 'verdict.json'))) { throw "В папке $RunDir нет verdict.json: это не папка прогона гейта." }
+if (-not (Test-Path -LiteralPath (Join-Path $RunDir 'verdict.json'))) { throw "В папке $RunDir нет verdict.json. Проверь, что выбрана папка нужного прогона. Если он прервался до вердикта, открой run.log и steps.jsonl этой папки." }
 
 # Клиентские методы платформы: в режимах «Сервер» и «Внешнее соединение» их нет.
 $ClientOnly = @('ОткрытьФорму', 'ОткрытьФормуМодально', 'ПолучитьФорму', 'ПоказатьОповещениеПользователя', 'ПоказатьПредупреждение',
@@ -317,6 +318,7 @@ function Get-SeenBefore {
 
 function Format-Short {
     param([string]$Text, [int]$Max = 220)
+    $Text = Protect-GateReportText $Text
     if ($Text.Length -gt $Max) { return $Text.Substring(0, $Max) + '...' }
     return $Text
 }
@@ -328,7 +330,7 @@ function Format-Short {
 function ConvertTo-JUnitText {
     # Управляющие символы из консольного лога недопустимы в XML 1.0.
     param([string]$Value)
-    return ($Value -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]', [string][char]0xFFFD)
+    return ((Protect-GateReportText $Value) -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]', [string][char]0xFFFD)
 }
 
 function Get-JUnitCases {
@@ -447,7 +449,9 @@ function Write-GateJUnit {
     }
 }
 
-$meta = Get-Content -LiteralPath (Join-Path $RunDir 'verdict.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$verdictFile = Join-Path $RunDir 'verdict.json'
+try { $meta = Get-Content -LiteralPath $verdictFile -Raw -Encoding UTF8 | ConvertFrom-Json }
+catch { throw ("Не удалось прочитать вердикт из {0}. Для архивного прогона проверь, что файл скопирован целиком. Причина: {1}" -f $verdictFile, $_.Exception.Message) }
 $runId = [string](Get-JsonProperty $meta 'runId' (Split-Path -Leaf $RunDir))
 $baseKey = [string](Get-JsonProperty $meta 'baseKey' '')
 $kitText = [string](Get-JsonProperty $meta 'kit' '')
@@ -522,37 +526,36 @@ foreach ($step in $steps) {
     }
     $why = $detail
     $todo = ''
-    if ($logTail) { $todo = 'Последние строки лога: ' + $logTail }
     $lock = [regex]::Match($logTail, 'компьютер: ([^,]+), сеанс ?: ?(\d+), начат: ([^,]+), приложение: (.+)$')
-    if (($detail + $logTail).Contains('исключительной блокировки')) {
+    if ($name -like '*Обновить конфигурацию БД*' -and ($detail + $logTail).Contains('исключительной блокировки')) {
         $why = 'Для обновления конфигурации БД нужен монопольный доступ к базе, а в ней были другие сеансы.'
         if ($lock.Success) {
             $why += (" Мешал сеанс {0} ({1}, компьютер {2}, начат {3})." -f $lock.Groups[2].Value, $lock.Groups[4].Value.Trim(), $lock.Groups[1].Value, $lock.Groups[3].Value.Trim())
             if ($lock.Groups[4].Value.Contains('Фонов')) {
-                $why += ' Фоновое задание - это регламентные задания самой erp_temp: в копии рабочей базы они работают по тому же расписанию.'
+                $why += ' Проверь, какое фоновое задание занимало базу в это время.'
             }
         }
-        $todo = 'Расширение уже загружено в конфигурацию, но к базе не применено. Повторить прогон, когда в erp_temp нет сеансов, или включить для erp_temp блокировку регламентных заданий в консоли кластера.'
+        $todo = 'Сверь текущую версию расширения и список сеансов тестовой базы. Повтори обновление, когда освободится монопольный доступ.'
         $blockersAt = $detail.IndexOf('. Мешали: ')
         if ($blockersAt -ge 0) { $why += (' Опрос сеансов после отказа: ' + $detail.Substring($blockersAt + 10) + '.') }
     }
     elseif (($detail + $logTail) -match 'Начало сеанса .*запрещено|сеансов .*заблокирован|Установлена блокировка') {
-        $why = 'В базе установлена блокировка начала сеансов, и запуск шёл без кода разрешения или с неверным кодом.'
-        $todo = 'Вписать код разрешения в настройку UnlockCode в config.psd1 (тот, что указан при установке блокировки) и повторить прогон.'
+        $why = '1С сообщила о блокировке начала сеансов.'
+        $todo = 'Сверь выбранную тестовую базу, период блокировки и настройку UnlockCode. Повтори вход с согласованным кодом или после окончания блокировки.'
     }
     elseif ($detail.Contains('открыт в другом сеансе') -or $logTail.Contains('уже открыта Конфигуратором')) {
-        $why = 'Конфигурация erp_temp была открыта в конфигураторе, пакетный режим не смог её захватить.'
-        $todo = 'Закрыть конфигуратор erp_temp (в логе названы компьютер и сеанс) и повторить прогон.'
+        $why = 'Тестовая база была открыта в другом конфигураторе.'
+        $todo = 'Сверь компьютер и сеанс в журнале шага. После закрытия конфигуратора повтори прогон.'
     }
-    elseif ($detail.Contains('таймаут')) {
-        $why = 'Шаг не уложился в отведённое время, процесс 1С снят.'
-        $todo = 'Посмотреть, не был ли занят сервер; при необходимости увеличить таймаут шага в config.psd1.'
+    elseif ($detail -like 'таймаут, процесс снят*') {
+        # Старые прогоны сохраняли только эту короткую причину.
+        $todo = 'Сверь последнюю запись журнала и длительность предыдущих прогонов перед изменением таймаута.'
     }
-    elseif ($detail.Contains('NOT_APPLIED')) {
-        $why = 'Расширение включено, но в сеансе не применилось: у нового расширения стоит безопасный режим или защита от опасных действий, либо оно не прошло проверку применимости.'
-        $todo = 'В списке расширений erp_temp снять «Безопасный режим» и «Защита от опасных действий»; посмотреть шаг «Проверка применимости».'
+    elseif ($name.StartsWith('Канареечный вход') -and ($detail + $logTail).Contains('NOT_APPLIED')) {
+        $why = 'Проверка входа обнаружила расширение, которое не применилось в сеансе.'
+        $todo = 'Открой шаг «Проверка применимости» и найди ошибку расширения в журнале регистрации за время входа.'
     }
-    elseif ($logTail -match 'не является|еверный формат') {
+    elseif ($name.StartsWith('Загрузить ') -and $logTail -match 'не является.*расширени|[Нн]еверный формат.*(?:расширени|файла)') {
         $why = 'Файл комплекта не читается как расширение: битый файл или выгрузка конфигурации вместо расширения.'
         $todo = 'Попросить выгрузку заново (Конфигурация - Расширения конфигурации - Сохранить в файл).'
     }
@@ -562,10 +565,13 @@ foreach ($step in $steps) {
 
     $mark = 'ЖЁЛТ'
     if ($status -eq 'FAIL') { $mark = 'КРАСН' }
-    $summary.Add(("[{0}] {1}: {2}" -f $mark, $name, ($why.Split('.')[0])))
+    $summary.Add(("[{0}] {1}: {2}" -f $mark, $name, ((Protect-GateReportText $why).Split('.')[0])))
     $body.Add(("== {0} ({1})" -f $name, $status))
     $body.Add(('   Почему: ' + $why))
+    if ($why -ne $detail -and $detail) { $body.Add(('   Сообщение шага: ' + $detail)) }
     if ($todo) { $body.Add(('   Что делать: ' + $todo)) }
+    if ($logPath) { $body.Add(('   Файл шага: ' + $logPath)) }
+    if ($logTail -and -not $detail.Contains($logTail)) { $body.Add(('   Последние строки журнала: ' + $logTail)) }
     $body.Add('')
 }
 
@@ -1209,7 +1215,9 @@ if ($snapshotKeyLines.Count -gt 0) {
 $report.Add('Подробности: summary.txt, *.new.txt, selfcheck-after.journal.txt в папке прогона. Разбор строится только по файлам прогона, без 1С.')
 
 $reportPath = Join-Path $RunDir 'report.txt'
-[System.IO.File]::WriteAllLines($reportPath, $report.ToArray(), $Utf8Bom)
+# Реквизиты могут прийти из разных файлов, в том числе из архивного jUnit или TSV. Для сравнения их читали в исходном виде.
+$reportText = ($report -join [Environment]::NewLine) + [Environment]::NewLine
+[System.IO.File]::WriteAllText($reportPath, (Protect-GateReportText $reportText), $Utf8Bom)
 Write-GateJUnit -Directory $RunDir -Run $runId -Checks $steps
 
 if (-not $Quiet) {
@@ -1220,7 +1228,7 @@ if (-not $Quiet) {
         $color = 'Gray'
         if ($line.StartsWith('[КРАСН]')) { $color = 'Red' }
         elseif ($line.StartsWith('[ЖЁЛТ]') -or $line.StartsWith('[ВНИМ]')) { $color = 'Yellow' }
-        Write-Host ('  ' + $line) -ForegroundColor $color
+        Write-Host ('  ' + (Protect-GateReportText $line)) -ForegroundColor $color
     }
     Write-Host ("Разбор целиком: {0}" -f $reportPath)
 }

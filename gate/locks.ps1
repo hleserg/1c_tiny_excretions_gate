@@ -69,7 +69,7 @@ function Set-GateJobsLock {
     $check = & $ReadAgain $Target
     if (-not [bool]$check.ScheduledJobsDenied) {
         $State.JobsSet = $false
-        throw 'запрет регламентных заданий не записался'
+        throw 'Запрет регламентных заданий не записался. Проверьте свойства базы в консоли кластера и права пользователя на их изменение.'
     }
     return $true
 }
@@ -78,10 +78,10 @@ function Set-GateSessionLock {
     param($State, $Target, [datetime]$From, [datetime]$Until, [string]$Code, [string]$Message, [scriptblock]$ReadAgain)
     $infoBase = & $ReadAgain $Target
     if ($State.Expected.Count) {
-        if (-not (Test-GateSessionLock $State $InfoBase)) { throw 'блокировка начала сеансов изменилась во время обновления' }
+        if (-not (Test-GateSessionLock $State $InfoBase)) { throw 'Блокировка начала сеансов изменилась во время обновления. Сверьте срок и сообщение блокировки в консоли кластера и согласуйте продолжение с её владельцем.' }
     }
     else {
-        if ([bool]$InfoBase.SessionsDenied) { throw 'блокировка начала сеансов уже установлена' }
+        if ([bool]$InfoBase.SessionsDenied) { throw 'Блокировка начала сеансов уже установлена. Проверьте срок и сообщение блокировки в консоли кластера. Согласуйте время повтора с её владельцем.' }
         $State.Before = Get-GateSessionSettings $InfoBase
     }
 
@@ -96,7 +96,7 @@ function Set-GateSessionLock {
     $State.Expected = @($State.Expected) + @($next)
     $null = $Target.Process.UpdateInfoBase($InfoBase)
     $check = & $ReadAgain $Target
-    if (-not (Test-GateOwnWrite $Code $State.Marker $check)) { throw 'запись блокировки начала сеансов не подтверждена' }
+    if (-not (Test-GateOwnWrite $Code $State.Marker $check)) { throw 'Кластер не подтвердил запись блокировки начала сеансов. Проверьте фактический срок и сообщение блокировки в свойствах базы перед повтором.' }
     # Своя блокировка - в том виде, в каком её вернул кластер: с ним и сверяется перед переносом и снятием.
     $State.Expected = @(Get-GateSessionSettings $check)
 }
@@ -131,7 +131,7 @@ function Restore-GateLocks {
         if ($jobs) { Write-Warning 'Снятие запрета регламентных заданий не подтверждено. Проверь свойства базы в консоли кластера.' }
         throw
     }
-    if ($State.Expected.Count -and (Test-GateSessionLock $State $check)) { throw 'после записи всё ещё стоит наша блокировка начала сеансов' }
+    if ($State.Expected.Count -and (Test-GateSessionLock $State $check)) { throw 'После попытки снятия всё ещё стоит наша блокировка начала сеансов. Проверьте её срок и сообщение в свойствах базы в консоли кластера.' }
     if ($State.Expected.Count -and -not (Test-GateSessionSettings $State.Before $check)) {
         Write-Warning 'Исходные параметры запрета сеансов не подтверждены. Проверь свойства базы в консоли кластера.'
     }

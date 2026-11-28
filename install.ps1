@@ -62,7 +62,7 @@ function Set-ConfigValue {
     $valuePattern = '(?:''(?:[^'']|'''')*''|\$(?:true|false)|-?\d+|@\([^()\r\n]*\))'
     $pattern = '(?m)^(?<lead>[ \t]*' + [regex]::Escape($Key) + '[ \t]*=[ \t]*)' + $valuePattern
     $found = [regex]::Matches($Text, $pattern)
-    if ($found.Count -ne 1) { throw "в образце настроек $Key найдено $($found.Count) раз" }
+    if ($found.Count -ne 1) { throw "В config.example.psd1 ключ $Key должен встречаться один раз. Найдено записей: $($found.Count). Восстановите образец из комплекта этой версии и повторите установку." }
     $match = $found[0]
     return $Text.Substring(0, $match.Index) + $match.Groups['lead'].Value + $Literal + $Text.Substring($match.Index + $match.Length)
 }
@@ -98,10 +98,10 @@ function Install-GatePythonRuntime {
     param([string]$Package, [string]$Destination)
     $marker = 'python-version.txt'
     $version = [IO.File]::ReadAllText((Join-Path $Package $marker)).Trim()
-    if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Некорректная версия Python в комплекте' }
+    if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "В файле $Package\$marker версия Python должна иметь вид X.Y.Z. Распакуйте полный ZIP релиза заново." }
     $folder = 'python-' + $version
     $src = Join-Path $Package $folder
-    if (-not (Test-Path -LiteralPath (Join-Path $src 'python.exe') -PathType Leaf)) { throw 'Нет python.exe в комплекте гейта' }
+    if (-not (Test-Path -LiteralPath (Join-Path $src 'python.exe') -PathType Leaf)) { throw "В комплекте отсутствует $src\python.exe. Распакуйте полный ZIP релиза и повторите установку." }
     $null = New-Item -ItemType Directory -Path $Destination -Force
     $lock = [IO.File]::Open((Join-Path $Destination '.python-install.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
     $stage = Join-Path $Destination ('.python-' + [guid]::NewGuid())
@@ -115,10 +115,11 @@ function Install-GatePythonRuntime {
             }
         } else {
             Copy-Item -LiteralPath $src -Destination $stage -Recurse -ErrorAction Stop
-            if (-not (Test-GatePythonFiles $src $stage)) { throw 'Не все файлы Python скопированы' }
+            if (-not (Test-GatePythonFiles $src $stage)) { throw "Копия Python в $stage не совпала с комплектом. Проверьте свободное место и права записи в $Destination, затем повторите установку." }
             $exe = Join-Path $stage 'python.exe'
             $actual = & $exe -I -X utf8 -c 'import argparse, json, ssl, sys, urllib.request; print(sys.version.split()[0])'
-            if ($LASTEXITCODE -ne 0 -or [string]$actual -cne $version) { throw ("Не запустился комплектный Python {0}" -f $version) }
+            if ($LASTEXITCODE -ne 0) { throw ("Проверка комплектного Python {0} завершилась с кодом {1}. Проверьте ошибки запуска выше и доступность python.exe в {2}." -f $version, $LASTEXITCODE, $Destination) }
+            if ([string]$actual -cne $version) { throw ("Комплектный Python сообщил версию «{0}», ожидалась {1}. Распакуйте полный ZIP этого релиза и повторите установку." -f $actual, $version) }
             [IO.Directory]::Move($stage, $final)
         }
         $active = Join-Path $Destination $marker

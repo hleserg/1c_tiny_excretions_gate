@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -46,5 +47,31 @@ func TestInitialLaunchIgnoresRestartAndQuitUntilStarted(t *testing.T) {
 	next, wait := m.Update(engineStartedMsg{eng: eng})
 	if wait == nil || !next.(model).running || next.(model).eng != eng {
 		t.Fatal("скрипт должен быть зарегистрирован к началу чтения его вывода")
+	}
+}
+
+func TestEngineStartupFailureExplainsHowToRetry(t *testing.T) {
+	t.Setenv("CI_ENGINE", "missing-gate-test-engine")
+	_, err := startEngine(t.TempDir(), "run.ps1", nil)
+	if err == nil {
+		t.Fatal("ожидался отказ при запуске")
+	}
+	for _, want := range []string{"run.ps1", "missing-gate-test-engine", "Enter"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("в причине %q нет %q", err, want)
+		}
+	}
+}
+
+func TestSilentEngineFailureNamesTheScriptAndDiagnostic(t *testing.T) {
+	m := testModel(100, 30)
+	m.script = "deploy.ps1"
+	m.lines = nil
+	next, _ := m.Update(exitMsg{code: 7, err: errors.New("exit status 7")})
+	out := strings.Join(next.(model).lines, "\n")
+	for _, want := range []string{"deploy.ps1", "Просмотр событий", "Код завершения: 7"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("в журнале %q нет %q", out, want)
+		}
 	}
 }

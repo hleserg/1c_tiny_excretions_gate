@@ -41,7 +41,8 @@ function Get-UtXml {
     param([string]$Path)
     $xml = New-Object System.Xml.XmlDocument
     $xml.PreserveWhitespace = $true
-    $xml.LoadXml((Get-UtText $Path))
+    try { $xml.LoadXml((Get-UtText $Path)) }
+    catch { throw ("Не удалось прочитать XML тестового расширения {0}. Проверь файл выгрузки. Причина: {1}" -f $Path, $_.Exception.Message) }
     return $xml
 }
 
@@ -220,7 +221,7 @@ function Get-UtCatalog {
     $problems = New-Object System.Collections.Generic.List[object]
     $configFile = Join-Path $Dir 'Configuration.xml'
     if (-not (Test-Path -LiteralPath $configFile)) {
-        return [pscustomobject]@{ Extension = $Extension; Dir = $Dir; Ok = $false; Error = 'нет Configuration.xml'; Modules = @(); Tests = @(); Problems = @() }
+        return [pscustomobject]@{ Extension = $Extension; Dir = $Dir; Ok = $false; Error = ('Нет файла {0}. Укажи каталог выгрузки тестового расширения с корневым Configuration.xml.' -f $configFile); Modules = @(); Tests = @(); Problems = @() }
     }
     $config = Get-UtXml $configFile
     if (-not $Extension) {

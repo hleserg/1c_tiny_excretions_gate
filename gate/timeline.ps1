@@ -45,15 +45,15 @@ $Invariant = [Globalization.CultureInfo]::InvariantCulture
 if (-not $RunDir) {
     $runsRoot = Join-Path $PSScriptRoot 'runs'
     $last = @(Get-ChildItem -LiteralPath $runsRoot -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name -Descending | Select-Object -First 1)
-    if ($last.Count -eq 0) { throw "В $runsRoot нет папок прогонов." }
+    if ($last.Count -eq 0) { throw "В $runsRoot нет папок прогонов. Укажите в -RunDir папку нужного прогона с run.log." }
     $RunDir = $last[0].FullName
 }
 if (-not [System.IO.Path]::IsPathRooted($RunDir)) { $RunDir = Join-Path $PSScriptRoot $RunDir }
 $RunDir = $RunDir.TrimEnd('\', '/')
 $runLog = Join-Path $RunDir 'run.log'
-if (-not (Test-Path -LiteralPath $runLog)) { throw "В папке $RunDir нет run.log: это не папка прогона гейта." }
+if (-not (Test-Path -LiteralPath $runLog)) { throw "В папке $RunDir не найден run.log. Укажите в -RunDir папку прогона, в которой сохранён журнал." }
 $runName = Split-Path -Leaf $RunDir
-if ($runName -notmatch '^\d{8}-\d{6}$') { throw "Имя папки $runName не похоже на прогон (ГГГГММДД-ЧЧММСС)." }
+if ($runName -notmatch '^\d{8}-\d{6}$') { throw "В имени папки $runName не удалось определить время старта. Выберите исходную папку прогона с именем ГГГГММДД-ЧЧММСС." }
 $runStartName = [datetime]::ParseExact($runName, 'yyyyMMdd-HHmmss', $Invariant)
 
 function Format-Seconds {
@@ -83,7 +83,7 @@ foreach ($line in [System.IO.File]::ReadAllLines($runLog, [System.Text.Encoding]
     $previous = $time
     $events.Add([pscustomobject]@{ Time = $time; Text = $m.Groups[4].Value })
 }
-if ($events.Count -eq 0) { throw 'В run.log нет строк с отметкой времени.' }
+if ($events.Count -eq 0) { throw "В $runLog нет строк с отметкой времени ЧЧ:ММ:СС. Откройте исходный run.log нужного прогона и проверьте его содержимое." }
 $runStart = $events[0].Time
 if ($runStartName -lt $runStart -and ($runStart - $runStartName).TotalMinutes -lt 10) { $runStart = $runStartName }
 

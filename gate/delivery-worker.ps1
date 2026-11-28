@@ -13,7 +13,8 @@ $spool = [IO.Path]::GetFullPath($settings.Spool)
 [void][IO.Directory]::CreateDirectory($spool)
 
 function Read-WorkerSecret([string]$Path) {
-    $secure = ConvertTo-SecureString ([IO.File]::ReadAllText($Path))
+    try { $secure = ConvertTo-SecureString ([IO.File]::ReadAllText($Path)) }
+    catch { throw "Не удалось прочитать файл секрета $Path. Проверьте путь и сохраните секрет под учётной записью Windows, которая запускает исполнителя." }
     try { return [Net.NetworkCredential]::new('',$secure).Password }
     finally { $secure.Dispose() }
 }
@@ -37,7 +38,7 @@ function Sync-WorkerQueue($Gh) {
         }
         $problem = Join-Path $dir 'problem.json'
         if ([IO.File]::Exists($problem) -and -not $queue.Files.ContainsKey("jobs/$key/problem.json")) {
-            $notice = @{version=1; job=$key; input=$job.input; note='Ошибка исполнителя. Проверьте журнал на стенде и повторите задание.'}
+            $notice = @{version=1; job=$key; input=$job.input; note="Исполнитель остановил задание. Откройте на стенде Spool\$key\problem.json и журнал попытки в WorkRoot."}
             Publish-Parcel $Gh $queue $key problem $notice @()
             $queue = Read-ParcelQueue $Gh
         }
@@ -57,8 +58,9 @@ function Invoke-WorkerJob($Profile,$Job,[string]$Key,[string]$Dir) {
     if ((Get-ParcelId $Job) -cne $Key) { throw 'Изменился манифест задания' }
     $file = Join-Path $Dir 'job.bin'
     $inputBytes = [IO.File]::ReadAllBytes($file)
-    if ((Get-ParcelHash $inputBytes) -cne $Job.input) { throw 'Изменился входной файл' }
-    if ((Get-WorkerMetadata $Profile) -cne $Job.config) { throw 'Имя или версия конфигурации отличаются от temp' }
+    if ((Get-ParcelHash $inputBytes) -cne $Job.input) { throw "Контрольная сумма $file не совпала с job.json. Сверьте оригинал с файлом задания в очереди." }
+    $actualConfig = Get-WorkerMetadata $Profile
+    if ($actualConfig -cne $Job.config) { throw ("Для задания нужна конфигурация «{0}», на стенде «{1}». Сверьте GateProfile и версию выделенной тестовой копии." -f $Job.config, $actualConfig) }
     $attempt = Join-Path $Profile.WorkRoot ([Guid]::NewGuid().ToString('N'))
     [void][IO.Directory]::CreateDirectory($attempt)
     $type = $Job.operation.Split('-')[1]
@@ -81,7 +83,7 @@ function Invoke-WorkerJob($Profile,$Job,[string]$Key,[string]$Dir) {
         if ($type -eq 'cfe') { Invoke-WorkerExtension $Profile build $tree $binary $attempt }
         else {
             $roots = @([IO.Directory]::GetFiles($tree,'*.xml'))
-            if ($roots.Count -ne 1) { throw 'Неоднозначный корень выгрузки обработки' }
+            if ($roots.Count -ne 1) { throw "Для сборки обработки нужен один корневой XML. Найдено $($roots.Count) в $tree. Проверьте состав выгрузки." }
             Invoke-WorkerDesigner $Profile @('/LoadExternalDataProcessorOrReportFromFiles',('"{0}"' -f $roots[0]),('"{0}"' -f $binary)) (Join-Path $attempt 'build.log')
         }
         $output = $binary
@@ -109,7 +111,7 @@ else {
         ($db.Server.Split(':')[0] -notin @($env:COMPUTERNAME,'localhost','127.0.0.1')) -or
         $db.ForbiddenBases -contains $db.Base -or $db.Server -notmatch '^[\w.-]+(:\d+)?$' -or
         $db.Base -notmatch '^[\w]+$' -or $db.Base -notmatch 'temp|test|copy|tmp|dev|sandbox|stand|тест|копи|стенд|песочниц') {
-        throw 'Цель исполнителя не совпала с разрешённой серверной тестовой базой'
+        throw 'Цель исполнителя не совпала с разрешённой серверной тестовой базой. Сверьте Server и Base в профиле исполнителя и GateProfile. Выберите выделенную тестовую копию на этом компьютере.'
     }
     $passFile = Join-Path (Split-Path -Parent $settings.GateProfile) $db.AdminPassFile
     $profile = @{Server=$db.Server; Base=$db.Base; Designer=(Join-Path $db.V8Bin '1cv8.exe'); User=$db.AdminUser
@@ -118,7 +120,9 @@ else {
     $guardDir = $profile.WorkRoot
     [void][IO.Directory]::CreateDirectory($guardDir)
 }
-$guard = [IO.File]::Open((Join-Path $guardDir ("delivery-$Mode.lock")),'OpenOrCreate','ReadWrite','None')
+$guardFile = Join-Path $guardDir ("delivery-$Mode.lock")
+try { $guard = [IO.File]::Open($guardFile,'OpenOrCreate','ReadWrite','None') }
+catch { throw ("Не удалось открыть {0} для режима {1}. Проверьте, запущен ли второй исполнитель в этом режиме, и права на папку. {2}" -f $guardFile, $Mode, $_.Exception.Message) }
 try {
     do {
         if ($Mode -eq 'Sync') { Sync-WorkerQueue $gh }
@@ -130,9 +134,11 @@ try {
                     if ([IO.File]::Exists($problem)) { continue }
                     try { Invoke-WorkerJob $profile ([IO.File]::ReadAllText($ready) | ConvertFrom-Json) $dir.Name $dir.FullName }
                     catch {
-                        [IO.File]::WriteAllText("$problem.tmp",(@{error=$_.Exception.Message} | ConvertTo-Json))
+                        $reason = $_.Exception.Message
+                        if ($profile.Password) { $reason = $reason.Replace($profile.Password, '***') }
+                        [IO.File]::WriteAllText("$problem.tmp",(@{error=$reason} | ConvertTo-Json))
                         [IO.File]::Move("$problem.tmp",$problem)
-                        throw
+                        throw ("Задание {0} остановлено. Откройте {1}. {2}" -f $dir.Name, $problem, $reason)
                     }
                 }
             }

@@ -323,14 +323,14 @@ function Initialize-TechBase {
     New-Item -ItemType Directory -Path (Split-Path -Parent $D.Tech) -Force | Out-Null
     $cf = Join-Path $script:RunDir 'tech-config.cf'
     $dump = Invoke-Designer -BaseName $script:TempBase -Command @('/DumpCfg', ('"{0}"' -f $cf)) -LogName 'tech_dumpcfg.log' -TimeoutSec $timeoutLoadSec -Title ('Основная конфигурация {0} в файл' -f $script:TempBase)
-    if ($dump.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $cf)) { return [pscustomobject]@{ Ok = $false; Note = ('основная конфигурация temp не выгрузилась: ' + $dump.Text) } }
+    if ($dump.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $cf)) { return [pscustomobject]@{ Ok = $false; Note = ("Не удалось выгрузить конфигурацию тестовой базы. Откройте {0} и проверьте появление {1}. {2}" -f (Join-Path $script:RunDir 'tech_dumpcfg.log'), $cf, $dump.Text) } }
     $createLog = Join-Path $script:RunDir 'tech_create.log'
     $created = Invoke-V8 -Exe $script:V8 -Arguments @('CREATEINFOBASE', ('File="{0}"' -f $D.Tech), '/Out', ('"{0}"' -f $createLog)) -TimeoutSec 600 -Title 'Создать техническую базу'
-    if ($created.ExitCode -ne 0) { return [pscustomobject]@{ Ok = $false; Note = ('техническая база не создалась: ' + ((@(Read-V8Log $createLog) | Where-Object { $_ }) -join ' ')) } }
+    if ($created.ExitCode -ne 0) { return [pscustomobject]@{ Ok = $false; Note = ("Не удалось создать техническую базу {0}. Проверьте право записи в её папку и откройте {1}. {2}" -f $D.Tech, $createLog, ((@(Read-V8Log $createLog) | Where-Object { $_ }) -join ' ')) } }
     $load = Invoke-TechDesigner -D $D -Command @('/LoadCfg', ('"{0}"' -f $cf)) -LogName 'tech_loadcfg.log' -TimeoutSec $timeoutLoadSec -Title 'Конфигурация в техническую базу'
-    if ($load.ExitCode -ne 0) { return [pscustomobject]@{ Ok = $false; Note = ('конфигурация в техническую базу не загрузилась: ' + $load.Text) } }
+    if ($load.ExitCode -ne 0) { return [pscustomobject]@{ Ok = $false; Note = ("Не удалось загрузить конфигурацию в техническую базу. Откройте {0}. {1}" -f $load.Log, $load.Text) } }
     $update = Invoke-TechDesigner -D $D -Command @('/UpdateDBCfg') -LogName 'tech_updatedb.log' -TimeoutSec $timeoutUpdateSec -Title 'Обновить конфигурацию БД технической базы'
-    if ($update.ExitCode -ne 0) { return [pscustomobject]@{ Ok = $false; Note = ('конфигурация БД технической базы не обновилась: ' + $update.Text) } }
+    if ($update.ExitCode -ne 0) { return [pscustomobject]@{ Ok = $false; Note = ("Не удалось обновить конфигурацию БД технической базы. Откройте {0}. {1}" -f $update.Log, $update.Text) } }
     Remove-Item -LiteralPath $cf -Force -ErrorAction SilentlyContinue
     [System.IO.File]::WriteAllText($marker, (ConvertTo-Json -InputObject ([ordered]@{ config = $version; created = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') })), $Utf8Bom)
     return [pscustomobject]@{ Ok = $true; Note = ('техническая база создана: ' + $version) }
@@ -909,10 +909,10 @@ function Invoke-MergeCheckedScript {
     $info.EnvironmentVariables['MERGE_CHECKED_TOKEN'] = [string]$Setup.Gh.Token
     Write-RunLog ("> {0} {1}" -f $info.FileName, $info.Arguments)
     try { $process = [System.Diagnostics.Process]::Start($info) }
-    catch { return [pscustomobject]@{ Ok = $false; Error = ("не запустился {0}: {1} (DeliveryPython)" -f $info.FileName, $_.Exception.Message); Data = $null } }
+    catch { return [pscustomobject]@{ Ok = $false; Error = ("Не запустился Python {0}. Проверьте путь DeliveryPython и право запуска. {1}" -f $info.FileName, $_.Exception.Message); Data = $null } }
     $outTask = $process.StandardOutput.ReadToEndAsync()
     $errTask = $process.StandardError.ReadToEndAsync()
-    if (-not $process.WaitForExit(300000)) { try { $process.Kill() } catch { }; return [pscustomobject]@{ Ok = $false; Error = 'merge_checked.py не ответил за 5 минут'; Data = $null } }
+    if (-not $process.WaitForExit(300000)) { try { $process.Kill() } catch { }; return [pscustomobject]@{ Ok = $false; Error = 'merge_checked.py не ответил за 5 минут. Перед повторной приёмкой проверьте состояние PR в GitHub и доступ исполнителя к API.'; Data = $null } }
     $out = [string]$outTask.Result
     $err = [string]$errTask.Result
     if ($Setup.Gh.Token) { $out = $out.Replace($Setup.Gh.Token, '***'); $err = $err.Replace($Setup.Gh.Token, '***') }
@@ -1010,7 +1010,7 @@ function Invoke-DeliveryMerge {
         $output = (& $D.Merge merge -spec $specFile 2>&1) | Out-String
         $code = $LASTEXITCODE
         Write-RunLog ("merge1c: код {0}: {1}" -f $code, $output.Trim())
-        if ($code -ne 0 -and $code -ne 3) { Write-DeliveryEvent $D $State 'merge-error' ("объединение не выполнилось: {0}" -f $output.Trim()) 'Red'; return $null }
+        if ($code -ne 0 -and $code -ne 3) { Write-DeliveryEvent $D $State 'merge-error' ("Объединение прервано. merge1c завершился с кодом {0}. Проверьте входные файлы, перечисленные в {1}. {2}" -f $code, $specFile, $output.Trim()) 'Red'; return $null }
         $result = ConvertTo-DeliveryData ([System.IO.File]::ReadAllText($resultFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json)
         if ([int]$result['pending'] -eq 0) { return $result }
         $decided = Request-MergeDecisions -D $D -State $State -Result $result -DecisionsFile $decisionsFile -Unattended:$Unattended
@@ -1699,15 +1699,17 @@ function Restore-DeliveryPull {
 
 function Invoke-DeliveryStep {
     # Одна поставка - от текущего статуса как можно дальше. Каждый шаг сверяет фактическое состояние.
-    param($D, $Setup, $GitState, [string]$Id, [switch]$Unattended)
+    param($D, $Setup, $GitState, [string]$Id, [switch]$Unattended, [ref]$Stage)
     $State = Read-DeliveryState $D $Id
     if ($null -eq $State) { return }
     if ([string]$State['status'] -eq 'done') { return }
     Write-Line ("Поставка {0}: {1}" -f $Id, [string]$State['status']) 'Cyan'
+    $Stage.Value = 'сверка поставки с PR'
     if ($null -ne $D.Remote) { Restore-DeliveryPull $D $State $Setup }
     # 1. Разбор - один раз (результат - в state.json).
     $needDump = @(@($State['files']) | Where-Object { -not [string]$_['actualKind'] -and -not [bool]$_['opaque'] })
     if ($needDump.Count -gt 0) {
+        $Stage.Value = 'подготовка технической базы'
         $tech = Initialize-TechBase $D
         Write-DeliveryEvent $D $State 'tech' $tech.Note
         if (-not $tech.Ok) { Set-DeliveryStatus $D $State 'received' ('техническая база: ' + $tech.Note); return }
@@ -1715,6 +1717,7 @@ function Invoke-DeliveryStep {
         foreach ($file in @($State['files'])) {
             $index++
             if ([string]$file['actualKind'] -or [bool]$file['opaque']) { continue }
+            $Stage.Value = 'разбор файла ' + $file['name']
             $expanded = Expand-DeliveryFile -D $D -State $State -File $file -Index $index
             if ($expanded.Ok) {
                 $file['actualKind'] = $expanded.Kind
@@ -1746,11 +1749,12 @@ function Invoke-DeliveryStep {
     if ($cfeOpaque.Count -gt 0) {
         Write-DeliveryEvent $D $State 'failed' ("не разобралось ни как расширение, ни как обработка: {0} - поставка остановлена, файл сохранён в реестре" -f (@($cfeOpaque | ForEach-Object { '{0} ({1})' -f $_['name'], $_['opaqueReason'] }) -join '; ')) 'Red'
         $State['verdict'] = 'FAILED'
-        Set-DeliveryStatus $D $State 'done' 'не разобралось'
+        Set-DeliveryStatus $D $State 'done' 'Формат файла не распознан. Запросите исправленный оригинал у поставщика и поместите его во «Входящие».'
         return
     }
     for ($round = 0; $round -lt 4; $round++) {
         # 2. temp и main: правки temp - в git, дальше - поверх них.
+        $Stage.Value = 'сверка тестовой базы с Git'
         $sync = Sync-DeliveryTemp -D $D -State $State -Setup $Setup -GitState $GitState -Unattended:$Unattended
         if (-not $sync.Ready) { return }
         $base = (Get-GhHead -Gh $Setup.Gh -Branch $Setup.Branch).Sha
@@ -1767,6 +1771,7 @@ function Invoke-DeliveryStep {
         if ([string]$State['status'] -eq 'loading' -and $null -ne $State['load']) { $ready = $true }
         if (-not $ready) {
             # 3. Сопоставление (карточки - по справочнику temp, только что прочитанному).
+            $Stage.Value = 'сопоставление объектов поставки'
             $oursProbe = Join-Path (Join-Path $D.Root $Id) 'ours-probe'
             if (Test-Path -LiteralPath $oursProbe) { Remove-Item -LiteralPath $oursProbe -Recurse -Force }
             $baseFiles = Get-GhFiles -Gh $Setup.Gh -Commit $base
@@ -1787,8 +1792,9 @@ function Invoke-DeliveryStep {
                 Rename-ProcessingDump -Dir ([string]$file['dump']) -RootName $rootName
             }
             # 4. Объединение.
+            $Stage.Value = 'объединение исходников'
             $result = Invoke-DeliveryMerge -D $D -State $State -Setup $Setup -Base $base -Unattended:$Unattended
-            if ($null -eq $result) { Set-DeliveryStatus $D $State 'received' 'объединение не выполнилось'; return }
+            if ($null -eq $result) { Set-DeliveryStatus $D $State 'received' 'Объединение не выполнилось. Откройте запись merge-error в журнале поставок.'; return }
             $counts = @{}
             foreach ($object in @($result['objects'])) { foreach ($key in @($object['counts'].Keys)) { $counts[$key] = [int]$counts[$key] + [int]$object['counts'][$key] } }
             $State['mergeSummary'] = ('принято из поставки {0}, оставлено наше {1}, решено человеком {2}, ждёт решения {3}' -f ([int]$counts['theirs-new'] + [int]$counts['theirs-changed']), ([int]$counts['ours-only'] + [int]$counts['stale'] + [int]$counts['rejected-again']), [int]$counts['decided'], [int]$result['pending'])
@@ -1808,14 +1814,17 @@ function Invoke-DeliveryStep {
                 return
             }
             # 5. Сборка и применимость.
-            if (-not (Test-DeliveryBuild -D $D -State $State -Result $result)) { Set-DeliveryStatus $D $State 'received' 'объединённое не собралось'; return }
+            $Stage.Value = 'сборка объединённых объектов'
+            if (-not (Test-DeliveryBuild -D $D -State $State -Result $result)) { Set-DeliveryStatus $D $State 'received' 'Сборка не прошла. Откройте раздел «Сборка в технической базе» в report.md этой поставки.'; return }
             foreach ($file in @(Get-DeliveryObjects $State)) { $file['status'] = 'accepted' }
             # 6. Кандидат и PR.
+            $Stage.Value = 'публикация кандидата'
             $pr = Publish-DeliveryCandidate -D $D -State $State -Setup $Setup -Result $result -Base $base
             if ($null -eq $pr) { Set-DeliveryStatus $D $State 'done' 'нечего коммитить'; return }
             Set-DeliveryStatus $D $State 'pr' ('PR #{0}' -f $pr['number'])
         }
         # 7. CI - без блокировки temp: ждать проверку, держа базу закрытой, нельзя.
+        $Stage.Value = 'проверки PR перед загрузкой'
         $pull = Get-GhPull -Gh $Setup.Gh -Number ([int]$State['pr']['number'])
         $inMain = ($pull.Merged -or (Test-GhContains -Gh $Setup.Gh -Branch $Setup.Branch -Commit ([string]$State['pr']['head'])))
         if (-not $inMain -and [string]$State['status'] -ne 'loading') {
@@ -1827,13 +1836,14 @@ function Invoke-DeliveryStep {
                 continue
             }
             if ($ci.Result -eq 'failure') {
-                Write-DeliveryEvent $D $State 'ci-red' ("CI красный для merge {0}: загрузка в temp не начинается. Разбор - в PR #{1}" -f $ci.Merge, $State['pr']['number']) 'Red'
-                Set-DeliveryStatus $D $State 'ci-red' 'CI красный: в temp не грузилось'
+                Write-DeliveryEvent $D $State 'ci-red' ("CI красный для merge {0}. Откройте неудачную проверку в PR #{1}. После исправления и успешной проверки повторите приёмку." -f $ci.Merge, $State['pr']['number']) 'Red'
+                Set-DeliveryStatus $D $State 'ci-red' ("CI красный: в temp не грузилось. Проверьте результаты CI в PR #{0}." -f $State['pr']['number'])
                 return
             }
             if ($ci.Result -ne 'success') { Set-DeliveryStatus $D $State 'ci' 'CI ещё идёт'; return }
         }
         # 8. Применение под блокировкой temp.
+        $Stage.Value = 'применение поставки на тестовой базе'
         $applied = Invoke-DeliveryApply -D $D -State $State -Setup $Setup -GitState $GitState -Unattended:$Unattended
         if ($applied -ne 'rebuild' -and $applied -ne 'waiting-temp') { return }
         $State = Read-DeliveryState $D $Id
@@ -1875,7 +1885,8 @@ function Invoke-Delivery {
             $state = Read-DeliveryState $D $id
             if ($null -eq $state -or [string]$state['status'] -eq 'done') { continue }
             $worked++
-            try { Invoke-DeliveryStep -D $D -Setup $setup -GitState $gitState -Id $id -Unattended:$Unattended }
+            $stage = 'чтение состояния поставки'
+            try { Invoke-DeliveryStep -D $D -Setup $setup -GitState $gitState -Id $id -Unattended:$Unattended -Stage ([ref]$stage) }
             catch {
                 # Сбой этапа: причина и место - в журнал поставки; состояние остаётся как было, следующий проход
                 # начинает с проверки фактического состояния.
@@ -1888,9 +1899,16 @@ function Invoke-Delivery {
                 }
                 $failed++
                 $where = ([string]$_.ScriptStackTrace -split "`r?`n" | Select-Object -First 3) -join ' <- '
+                $reason = Get-MaskedLine $_.Exception.Message
+                Write-RunLog ("Поставка {0}, {1}: {2} ({3})" -f $id, $stage, $reason, $where)
+                $message = "Этап «$stage» прерван. $reason После устранения причины выберите «Приёмка поставок» ещё раз."
                 $state = Read-DeliveryState $D $id
-                if ($null -ne $state) { Write-DeliveryEvent $D $state 'error' ("сбой: {0} ({1})" -f $_.Exception.Message, $where) 'Red' }
-                else { Write-Line ("Поставка {0}: сбой: {1} ({2})" -f $id, $_.Exception.Message, $where) 'Red' }
+                if ($null -ne $state) {
+                    $state['note'] = $message
+                    Write-DeliveryEvent $D $state 'error' $message 'Red'
+                    Save-DeliveryState $D $state
+                }
+                else { Write-Line ("Поставка {0}. {1}" -f $id, $message) 'Red' }
                 if ($null -ne $script:DeliveryTempLock) { Unlock-DeliveryTemp $script:DeliveryTempLock }
             }
             $gitState = Read-GitState $setup

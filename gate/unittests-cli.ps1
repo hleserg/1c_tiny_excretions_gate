@@ -70,6 +70,11 @@ try {
     exit 2
 }
 catch {
-    Write-Host ("Не получилось: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    $operation = 'проверить описания тестов'
+    $location = $Check
+    if ($Catalog) { $operation = 'собрать каталог тестов'; $location = $Catalog }
+    if ($NewModule) { $operation = "создать тестовый модуль «$NewModule»"; $location = $Dir }
+    if ($NewTest) { $operation = "добавить тест «$NewTest» в модуль «$Module»"; $location = $Dir }
+    Write-Host ("Не удалось {0}. Каталог выгрузки: {1}. Причина: {2}" -f $operation, $location, $_.Exception.Message) -ForegroundColor Red
     exit 1
 }

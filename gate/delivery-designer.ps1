@@ -5,16 +5,20 @@ function Invoke-WorkerDesigner {
     $argList = @('DESIGNER', ('/S"{0}\{1}"' -f $Profile.Server,$Profile.Base),
         ('/N"{0}"' -f $Profile.User), ('/P"{0}"' -f $Profile.Password),
         '/DisableStartupDialogs', '/DisableStartupMessages') + $Command + @('/Out', ('"{0}"' -f $Log))
-    $proc = Start-Process -FilePath $Profile.Designer -ArgumentList $argList -WindowStyle Hidden -PassThru
+    try { $proc = Start-Process -FilePath $Profile.Designer -ArgumentList $argList -WindowStyle Hidden -PassThru -ErrorAction Stop }
+    catch { throw ("Конфигуратор не запустился для {0}. Проверьте наличие {1} и право запуска под пользователем исполнителя. {2}" -f $Command[0], $Profile.Designer, $_.Exception.GetBaseException().Message) }
     try {
         $null = $proc.Handle
         if (-not $proc.WaitForExit(1200000)) {
             $proc.Kill()
             $proc.WaitForExit()
-            throw "Таймаут Конфигуратора. Журнал $Log"
+            throw ("Операция Конфигуратора {0} заняла больше 20 минут. Проверьте блокировки тестовой базы и последние записи в {1}, прежде чем повторять задание." -f $Command[0], $Log)
         }
-        if ($proc.ExitCode -ne 0 -or -not [IO.File]::Exists($Log)) {
-            throw ("Конфигуратор завершил {0} с кодом {1}. Журнал {2}" -f $Command[0],$proc.ExitCode,$Log)
+        if (-not [IO.File]::Exists($Log)) {
+            throw ("Конфигуратор завершил {0} с кодом {1}, но не создал журнал {2}. Проверьте право записи в папку журнала под пользователем исполнителя." -f $Command[0], $proc.ExitCode, $Log)
+        }
+        if ($proc.ExitCode -ne 0) {
+            throw ("Конфигуратор завершил {0} с кодом {1}. Откройте {2} и устраните указанную там ошибку 1С." -f $Command[0], $proc.ExitCode, $Log)
         }
     }
     finally { $proc.Dispose() }
@@ -34,7 +38,7 @@ function Invoke-WorkerExtension {
     param($Profile, [ValidateSet('expand','build')][string]$Operation, [string]$Source, [string]$Output, [string]$Work)
     $slot = 'GateJob' + [Guid]::NewGuid().ToString('N')
     $guardPath = Join-Path $Profile.WorkRoot 'active-extension.json'
-    if ([IO.File]::Exists($guardPath)) { throw "Есть незавершённая операция. Сверьте $guardPath с базой." }
+    if ([IO.File]::Exists($guardPath)) { throw "Осталась отметка незавершённой операции с расширением. Откройте $guardPath и сверьте сервер, базу, имя расширения и журналы попытки перед продолжением." }
     $before = @(Get-WorkerInventory $Profile (Join-Path $Work 'before.log'))
     if ($before -contains $slot) { throw "Служебное имя $slot уже занято" }
     $operationLog = Join-Path $Work 'load.log'
@@ -54,12 +58,12 @@ function Invoke-WorkerExtension {
         if ($Operation -eq 'expand') {
             [void][IO.Directory]::CreateDirectory($Output)
             Invoke-WorkerDesigner $Profile @('/DumpConfigToFiles', ('"{0}"' -f $Output), '-Extension', $slot) (Join-Path $Work 'dump.log')
-            if (-not [IO.File]::Exists((Join-Path $Output 'Configuration.xml'))) { throw 'Не выгрузился Configuration.xml' }
+            if (-not [IO.File]::Exists((Join-Path $Output 'Configuration.xml'))) { throw "После выгрузки расширения в $Output нет Configuration.xml. Откройте журнал $Work\dump.log и проверьте результат выгрузки." }
             [IO.File]::Delete((Join-Path $Output 'ConfigDumpInfo.xml'))
         }
         else {
             Invoke-WorkerDesigner $Profile @('/DumpCfg', ('"{0}"' -f $Output), '-Extension', $slot) (Join-Path $Work 'build.log')
-            if (-not [IO.File]::Exists($Output)) { throw 'Собранный CFE отсутствует' }
+            if (-not [IO.File]::Exists($Output)) { throw "После сборки расширения нет файла $Output. Откройте журнал $Work\build.log и проверьте результат сборки." }
         }
     }
     finally {
@@ -77,7 +81,7 @@ function Invoke-WorkerExtension {
         [xml]$xml = [IO.File]::ReadAllText((Join-Path $Source 'Configuration.xml'))
         $expected = $xml.SelectSingleNode("/*[local-name()='MetaDataObject']/*[local-name()='Configuration']/*[local-name()='Properties']/*[local-name()='Name']")
         if ($null -eq $expected -or (Get-WorkerMetadata $Profile $Output -Check) -cne $expected.InnerText) {
-            throw 'Проверенный CFE не соответствует исходному расширению'
+            throw "Собранный CFE и Configuration.xml содержат разные имена расширения или в XML нет имени. Сверьте $Output с $Source\Configuration.xml перед новой сборкой."
         }
     }
 }
@@ -118,7 +122,7 @@ function Get-WorkerMetadata {
             }
             $issues = Get-WorkerMember $target 'CheckCanApply' @($data)
             $count = Get-WorkerMember $issues 'Count' @()
-            if ($count -ne 0) { throw "1С вернула замечания применимости для $name ($count)" }
+            if ($count -ne 0) { throw "1С вернула замечания применимости для $name ($count). Проверьте применимость этого CFE в Конфигураторе тестовой копии с тем же порядком расширений." }
         }
         return $name
     }

@@ -106,6 +106,12 @@ func engineCommand(baseDir, script string, extra []string, channel string) *exec
 func startEngine(baseDir, script string, extra []string) (*engine, error) {
 	// Папка канала - в папке гейта (ui\), а не в %TEMP%: сессионную временную папку RDP Windows чистит при
 	// отключении, и вопрос, оставшийся без ответа на ночь, уже не получал ответа. Не вышло - %TEMP%, как раньше.
+	if os.Getenv("CI_ENGINE") == "" {
+		scriptPath := filepath.Join(baseDir, script)
+		if _, err := os.Stat(scriptPath); err != nil {
+			return nil, fmt.Errorf("не удалось открыть %s. Проверьте путь и восстановите скрипт из установленного комплекта. Затем нажмите Enter. Причина: %w", scriptPath, err)
+		}
+	}
 	uiDir := filepath.Join(baseDir, "ui")
 	_ = os.MkdirAll(uiDir, 0o755)
 	channel, err := os.MkdirTemp(uiDir, "ci-ui-")
@@ -113,22 +119,26 @@ func startEngine(baseDir, script string, extra []string) (*engine, error) {
 		channel, err = os.MkdirTemp("", "ci-ui-")
 	}
 	if err != nil {
-		return nil, fmt.Errorf("не создал папку канала: %w", err)
+		return nil, fmt.Errorf("не удалось создать папку для связи с %s. Проверьте свободное место и право записи в %s или временную папку Windows. Затем нажмите Enter. Причина: %w", script, uiDir, err)
 	}
 	cmd := engineCommand(baseDir, script, extra, channel)
 	cmd.Dir = baseDir
 	cmd.Stdin = nil
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, err
+		_ = os.Remove(channel)
+		return nil, fmt.Errorf("не удалось подключить вывод %s. Повторите запуск клавишей Enter. Причина: %w", script, err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return nil, err
+		_ = stdout.Close()
+		_ = os.Remove(channel)
+		return nil, fmt.Errorf("не удалось подключить поток ошибок %s. Повторите запуск клавишей Enter. Причина: %w", script, err)
 	}
 	hideChildWindow(cmd)
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("не запустился %s: %w", script, err)
+		_ = os.Remove(channel)
+		return nil, fmt.Errorf("не запустился %s. Проверьте, что программа %s доступна и разрешена к запуску из %s. Затем нажмите Enter. Причина: %w", script, cmd.Path, baseDir, err)
 	}
 	return &engine{cmd: cmd, stdout: stdout, stderr: stderr, channel: channel, started: time.Now(), script: script}, nil
 }

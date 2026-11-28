@@ -194,22 +194,29 @@ $script:PlanActionsDir = ''
 # Итог прогона в GitHub (publish.ps1, настройка RunReportRepo): папка прогона, когда она есть и отправка включена.
 $script:PublishRunDir = ''
 $script:ResumeReport = $null
+$script:MaskValues = @()
 
 # Скрипт остановился: причина одной строкой. Место в скрипте показывается только для неожиданной
 # ошибки. У остановки по throw с текстом оно ничего не объясняет; отличить её можно по тому,
 # что идентификатор ошибки совпадает с её текстом.
 trap {
     Write-Host ''
-    Write-Host ("Остановлено: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    $reason = $_.Exception.Message
+    if (Get-Command Protect-GateReportText -CommandType Function -ErrorAction SilentlyContinue) {
+        $reason = Protect-GateReportText -Text $reason -LiteralValues $script:MaskValues
+    }
+    Write-Host ("Остановлено: {0}" -f $reason) -ForegroundColor Red
     # Проверка конфигурации, запущенная параллельно (ParallelCheckConfig), не должна пережить скрипт.
     if ($null -ne $script:BackgroundCheck) { try { Stop-Process -Id $script:BackgroundCheck.Process.Id -Force -ErrorAction Stop } catch { } }
     if ([string]$_.FullyQualifiedErrorId -ne [string]$_.Exception.Message -and $null -ne $_.InvocationInfo) {
         Write-Host ("  {0}" -f ($_.InvocationInfo.PositionMessage -split "`r?`n")[0]) -ForegroundColor DarkGray
     }
     # Итог остановленного прогона - в GitHub: причина, шаги, что успели, конец run.log.
-    $reason = $_.Exception.Message
     if (Get-Variable -Name RunLogPath -Scope Script -ErrorAction SilentlyContinue) {
-        try { Write-RunLog ('Остановлено: ' + $reason) } catch { }
+        try {
+            Write-RunLog ('Остановлено: ' + $reason)
+            Write-Host ("Журнал прогона: {0}. Сверь последний выполненный шаг перед повторным запуском." -f $script:RunLogPath) -ForegroundColor Yellow
+        } catch { }
     }
     if ($script:PublishRunDir) { Invoke-RunPublish -Stage 'crash' -Message $reason }
     elseif ($null -ne $script:ResumeReport) {
@@ -250,8 +257,6 @@ function Get-Setting {
 }
 
 # Значения, которые в выводе и журнале заменяются звёздочками целиком (Get-MaskedLine): код разрешения входа.
-$script:MaskValues = @()
-
 function Get-MaskedLine {
     # Чувствительное - звёздочками, одной обработкой на консоль, run.log и всё, что из них собирается (отчёты, итог
     # в GitHub): пароль и код разрешения входа в ключах запуска 1С (/P, /UC) и в строке соединения (Pwd=, UC=) и
@@ -297,8 +302,13 @@ function Get-PlainPassword {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "Нет файла пароля: $path. Создай его: .\run.ps1 -SavePassword `"$PassFile`""
     }
-    $encrypted = (Get-Content -LiteralPath $path -Raw).Trim()
-    $secure = ConvertTo-SecureString -String $encrypted
+    try {
+        $encrypted = (Get-Content -LiteralPath $path -Raw).Trim()
+        $secure = ConvertTo-SecureString -String $encrypted
+    }
+    catch {
+        throw ("Не удалось прочитать сохранённый пароль из {0}. Проверь доступ к файлу и учётную запись Windows, под которой его сохранили. При смене пользователя или компьютера сохрани пароль заново через -SavePassword. Причина: {1}" -f $path, $_.Exception.Message)
+    }
     $credential = New-Object System.Management.Automation.PSCredential('user', $secure)
     return $credential.GetNetworkCredential().Password
 }
@@ -361,6 +371,15 @@ function Get-ExpectedStepSeconds {
     return 0
 }
 
+function Start-RunPlatformProcess {
+    param([string]$Exe, [string]$ArgumentLine, [string]$Title, [Diagnostics.ProcessStartInfo]$StartInfo)
+    try {
+        if ($null -ne $StartInfo) { return [Diagnostics.Process]::Start($StartInfo) }
+        return (Start-Process -FilePath $Exe -ArgumentList $ArgumentLine -PassThru -ErrorAction Stop)
+    }
+    catch { throw ("Не удалось запустить {0} для шага «{1}». Проверь путь V8Bin и право запуска программы. Причина: {2}" -f $Exe, $Title, (Get-MaskedLine $_.Exception.Message)) }
+}
+
 function Invoke-V8 {
     # Запускает 1С и ждёт завершения не дольше таймаута. По таймауту процесс снимается.
     param([string]$Exe, [string[]]$Arguments, [int]$TimeoutSec, [string]$Title = '')
@@ -374,7 +393,7 @@ function Invoke-V8 {
     }
 
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $process = Start-Process -FilePath $Exe -ArgumentList $argLine -PassThru
+    $process = Start-RunPlatformProcess -Exe $Exe -ArgumentLine $argLine -Title $Title
     $null = $process.Handle   # без этого ExitCode после ожидания может оказаться пустым
 
     # Строка хода: полоса по времени прошлых прогонов этого шага или бегающий блок (ui.ps1).
@@ -528,6 +547,7 @@ function Add-StepResult {
         [string]$From = ''
     )
     # phase - этап прогона, к которому относится шаг: по этапам продолжение берёт шаги готовыми.
+    $Detail = Get-MaskedLine $Detail
     $step = [pscustomobject]@{
         name    = $Name
         status  = $Status
@@ -550,6 +570,12 @@ function Add-StepResult {
     Write-Host ("[{0,-4}] {1}{2}" -f $Status, $Name, $fromMark) -ForegroundColor $color
     if ($Detail) { Write-Host ("       {0}" -f $Detail) }
     Write-RunLog ("[{0}] {1}{2}: {3}" -f $Status, $Name, $fromMark, $Detail)
+    if ($Log -and $Status -in @('WARN', 'FAIL')) {
+        $location = "Файл шага: $Log"
+        if (-not (Test-Path -LiteralPath $Log -PathType Leaf -ErrorAction SilentlyContinue)) { $location = "Ожидался файл шага: $Log" }
+        Write-Host ('       ' + (Get-MaskedLine $location))
+        Write-RunLog $location
+    }
 }
 
 $script:WinApiReady = $false
@@ -2383,7 +2409,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Accept') {
 
 #region Подготовка прогона
 
-if (-not (Test-Path -LiteralPath $configPath)) { throw "Нет файла настроек: $configPath" }
+if (-not (Test-Path -LiteralPath $configPath)) { throw "Нет файла настроек: $configPath. Проверь путь в -Config или создай config.psd1 по config.example.psd1 и укажи подключение к тестовой базе." }
 $configPath = (Get-Item -LiteralPath $configPath).FullName
 $cfg = Import-PowerShellDataFile -LiteralPath $configPath
 # Настройки площадки из поставки гейта (config.site.psd1 рядом с run.ps1, его кладёт установщик и заменяет
@@ -2425,14 +2451,15 @@ else {
 # Главная защита: этот скрипт загружает расширения и обновляет конфигурацию базы данных.
 $baseNameToCheck = $baseKey
 if ($baseNameToCheck -notmatch $TestBasePattern) {
-    throw "База «$baseNameToCheck» не похожа на тестовую (в имени нет temp, test, copy, stand и т. п.). С рабочей базой скрипт не работает."
+    throw "База «$baseNameToCheck» не похожа на тестовую. Проверь Server и Base (или File) в $configPath и выбери тестовую копию. Подключение остановлено до запуска 1С."
 }
 $forbidden = @(Get-Setting $cfg 'ForbiddenBases' @() | Where-Object { $_ })
 foreach ($name in $forbidden) {
-    if ($baseNameToCheck -ieq $name) { throw "База «$baseNameToCheck» в списке запрещённых (ForbiddenBases)." }
+    if ($baseNameToCheck -ieq $name) { throw "База «$baseNameToCheck» в списке запрещённых (ForbiddenBases). Выбери разрешённую тестовую копию в $configPath. Подключение остановлено до запуска 1С." }
 }
 
 $binDir = [string](Get-Setting $cfg 'V8Bin' '')
+if ([string]::IsNullOrWhiteSpace($binDir)) { throw "В $configPath не задан V8Bin. Укажи каталог bin установленной платформы 1С с 1cv8.exe и 1cv8c.exe." }
 $v8 = Join-Path $binDir '1cv8.exe'
 $v8c = Join-Path $binDir '1cv8c.exe'
 if (-not (Test-Path -LiteralPath $v8)) { throw "Не нашёл конфигуратор: $v8. Поправь V8Bin в config.psd1." }
@@ -4058,12 +4085,12 @@ function Invoke-UtSession {
         $info.CreateNoWindow = $true
         $info.RedirectStandardOutput = $true
         $info.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-        $process = [System.Diagnostics.Process]::Start($info)
+        $process = Start-RunPlatformProcess -Exe $v8c -StartInfo $info -Title $Title
         $reader = $process.StandardOutput
         $consoleRead = @{ Reader = $reader; Next = $reader.ReadLineAsync() }
         Send-UiEvent @{kind = 'test-log'; title = 'YAxUnit · вывод клиента'}
     } else {
-        $process = Start-Process -FilePath $v8c -ArgumentList $argLine -PassThru
+        $process = Start-RunPlatformProcess -Exe $v8c -ArgumentLine $argLine -Title $Title
     }
     $null = $process.Handle
     $state = ''
@@ -4175,22 +4202,22 @@ function Invoke-UtStep {
                     Add-StepResult -Name $StepName -Status 'WARN' -Detail ("в {0} нет расширения {1} (движок YAxUnit ставится руками, см. readme.txt): тесты не прогнаны" -f $baseKey, $unitTestEngine) -Seconds $session.Seconds
                     return
                 }
-                $text = 'за {0} с YAxUnit не начал работу (нет его лога): нет расширения {1} в {2}, окно при входе или параметр запуска не дошёл{3}' -f $session.Seconds, $unitTestEngine, $baseKey, $windowsText
+                $text = 'За {0} с YAxUnit не создал yaxunit.log. Проверь вход тонким клиентом в {2}, подключение расширения {1} и путь к unittests\yaxunit.json в run.log{3}.' -f $session.Seconds, $unitTestEngine, $baseKey, $windowsText
             }
-            'exited' { $text = 'клиент закрылся без итога YAxUnit (код {0}); лог движка - unittests\yaxunit.log' -f $session.ExitCode }
-            default { $text = 'за {0} с итога нет, клиент снят (таймаут UnitTestTimeoutMin){1}' -f $session.Seconds, $windowsText }
+            'exited' { $text = 'Клиент закрылся без итога YAxUnit (код {0}). Сверь последние события в unittests\yaxunit.log и журнале регистрации 1С, затем повтори модульные тесты.' -f $session.ExitCode }
+            default { $text = 'За {0} с YAxUnit не завершил тесты (UnitTestTimeoutMin){1}. Посмотри последнее задание в unittests\yaxunit.log и проверь, дошло ли оно до конца в журнале регистрации 1С.' -f $session.Seconds, $windowsText }
         }
         Add-StepResult -Name $StepName -Status 'FAIL' -Detail $text -Log $session.Log -Seconds $session.Seconds
         return
     }
     if (-not (Test-Path -LiteralPath $session.Junit)) {
-        Add-StepResult -Name $StepName -Status 'FAIL' -Detail ("YAxUnit закончил (код {0}), а отчёта jUnit нет: {1}" -f $session.Code, $session.Junit) -Log $session.Log -Seconds $session.Seconds
+        Add-StepResult -Name $StepName -Status 'FAIL' -Detail ("YAxUnit записал код {0}, но отчёта jUnit нет: {1}. Проверь запись файла по журналу unittests\yaxunit.log и повтори модульные тесты." -f $session.Code, $session.Junit) -Log $session.Log -Seconds $session.Seconds
         return
     }
     $results = @()
     try { $results = Read-UtJUnit $session.Junit }
     catch {
-        Add-StepResult -Name $StepName -Status 'FAIL' -Detail ("отчёт jUnit не разобрался: {0}" -f $_.Exception.Message) -Log $session.Junit -Seconds $session.Seconds
+        Add-StepResult -Name $StepName -Status 'FAIL' -Detail ("Не удалось прочитать отчёт jUnit. Проверь завершение записи в unittests\yaxunit.log и повтори модульные тесты. Ошибка чтения: {0}" -f $_.Exception.Message) -Log $session.Junit -Seconds $session.Seconds
         return
     }
     # Для карты покрытия: что выполнилось и с каким итогом (одиночный тест кнопкой карту не строит).
@@ -4214,6 +4241,7 @@ function Invoke-UtStep {
     }
     if ($issue) {
         # Отчёт остаётся в папке прогона. unittests.txt доступен для принятия вручную только после этой проверки.
+        $issue += '. Сверь unittests\exitcode.txt, junit.xml и последние записи yaxunit.log. После устранения расхождения повтори модульные тесты.'
         Add-StepResult -Name $StepName -Status 'FAIL' -Detail $issue -Log $session.Junit -Seconds $session.Seconds
         return
     }
@@ -4243,6 +4271,7 @@ function Invoke-UtStep {
     $status = 'OK'
     if (@($comparison.NewFailed).Count -gt 0) {
         $status = 'FAIL'
+        $detail += ' Открой unittests.new.txt и полный стек в unittests\junit.xml. После исправления повтори упавшие тесты.'
         $newLines = @($comparison.NewFailed | ForEach-Object { Format-UtResultLine $_ })
         [System.IO.File]::WriteAllLines((Join-Path $RunDir 'unittests.new.txt'), [string[]]$newLines, $Utf8Bom)
     }
@@ -4574,7 +4603,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         @('gitimport', 'Тестовая база', '4'), @('gitexport', 'Тестовая база', '5'), @('delivery', 'Тестовая база', 's'), @('accept', 'Тестовая база', '6'),
         @('runs', 'Тестовая база', '7'), @('tests', 'Тестовая база', '8'), @('templocks', 'Тестовая база', 'q'),
         @('precheck', 'Рабочая база', '9'), @('applyprep', 'Рабочая база', 'a'), @('prepare', 'Рабочая база', 'b'),
-        @('cancelprep', 'Рабочая база', 'c'), @('deploy', 'Рабочая база', 'd'), @('rollback', 'Рабочая база', 'e'),
+        @('cancelprep', 'Рабочая база', 'c'), @('deploy', 'Рабочая база', 'd'), @('resumedeploy', 'Рабочая база', 'v'), @('rollback', 'Рабочая база', 'e'),
         @('basestate', 'Рабочая база', 'f'), @('prodclose', 'Рабочая база', 't'), @('prodopen', 'Рабочая база', 'u'), @('prodlocks', 'Рабочая база', 'r'),
         @('cmpext', 'Сравнить и забрать', 'g'), @('cmpepf', 'Сравнить и забрать', 'h'), @('pullext', 'Сравнить и забрать', 'i'),
         @('pullepf', 'Сравнить и забрать', 'j'), @('gitprod', 'Сравнить и забрать', 'k'),
@@ -4620,6 +4649,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         if ([string](Get-Setting $cfg 'UpdateRepo' '')) { $menu.Add((New-MenuItem 'update' 'Обновить гейт из GitHub' ('стоит {0}' -f $script:GateVersion))) }
         if (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1')) {
             $menu.Add((New-MenuItem 'deploy' 'Обновить рабочую базу' 'за один заход, без подготовки'))
+            $menu.Add((New-MenuItem 'resumedeploy' 'Продолжить обновление с проваленного шага' 'последняя установка этой рабочей базы'))
             # Обновление в два приёма (deploy.ps1 -Prepare/-ApplyPrepared/-CancelPrepared): подготовка - без блокировок,
             # пользователи работают; что подготовлено - в deploy\prepared.json.
             $preparedFile = Join-Path (Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))) 'prepared.json'
@@ -4738,6 +4768,10 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         # ** Хлебников С.Ю. 20261124 конец
         if ($choice -eq 'deploy') {
             if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -UiChannel $UiChannel } else { & (Join-Path $Root 'deploy.ps1') }
+            exit $LASTEXITCODE
+        }
+        if ($choice -eq 'resumedeploy') {
+            if ($UiChannel) { & (Join-Path $Root 'deploy.ps1') -Resume -UiChannel $UiChannel -Config $configPath } else { & (Join-Path $Root 'deploy.ps1') -Resume -Config $configPath }
             exit $LASTEXITCODE
         }
         if ($choice -eq 'applyprep') {
@@ -5434,7 +5468,7 @@ function Invoke-GateActionsStep {
     Write-RunLog ("> 1cv8c.exe {0}" -f (Get-MaskedLine $argLine))
     Write-Host ("  ...  {0}: клиент запущен в {1}, жду не дольше {2} с" -f $stepName, (Get-Date -Format 'HH:mm:ss'), $timeoutSec) -ForegroundColor DarkGray
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $process = Start-Process -FilePath $v8c -ArgumentList $argLine -PassThru
+    $process = Start-RunPlatformProcess -Exe $v8c -ArgumentLine $argLine -Title $stepName
     $null = $process.Handle
     $appeared = $false
     while ($watch.Elapsed.TotalSeconds -lt $timeoutSec) {
@@ -5448,15 +5482,19 @@ function Invoke-GateActionsStep {
     $seconds = [int]$watch.Elapsed.TotalSeconds
     if (-not $appeared) {
         $windows = @()
-        if (-not $process.HasExited) {
+        $exitedBeforeStop = $process.HasExited
+        if (-not $exitedBeforeStop) {
             $windows = @(Save-ProcessWindows -ProcessId $process.Id -FilePrefix (Join-Path $RunDir 'actions\client'))
             try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { }
         }
-        $stage = 'обработка не открылась (ошибка в коде действий? окна клиента: {0})' -f ($windows -join '; ')
-        if (Test-Path -LiteralPath ($outFile + '.started')) { $stage = 'обработка открылась, но итог не записала: действия могли выполниться частично, смотри регистр выполненных' }
-        if ($process.HasExited -and -not $windows) { $stage = ('клиент закрылся сам, итога нет (код {0})' -f $process.ExitCode) }
+        $stage = 'нет отметки об открытии обработки. Проверь вход в базу и запуск обработки по журналу регистрации 1С'
+        if (Test-Path -LiteralPath ($outFile + '.started')) {
+            $stage = 'обработка открылась, но не записала actions.txt. Действия могли выполниться частично. Перед повтором сверь идентификаторы из actions\params.txt с регистром выполненных действий'
+        }
+        if ($exitedBeforeStop) { $stage += ('. Клиент закрылся с кодом {0}' -f $process.ExitCode) }
+        if ($windows.Count -gt 0) { $stage += ('. Окна клиента: ' + ($windows -join ' | ')) }
         Add-StatFact -Title $stepName -Seconds $watch.Elapsed.TotalSeconds -Status 'FAIL'
-        Add-StepResult -Name $stepName -Status 'FAIL' -Detail ('за {0} с итога нет: {1}' -f $seconds, $stage) -Seconds $seconds
+        Add-StepResult -Name $stepName -Status 'FAIL' -Detail ('за {0} с итога нет: {1}' -f $seconds, $stage) -Log $paramsFile -Seconds $seconds
         return
     }
     if (-not $process.WaitForExit(60000)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
@@ -5523,6 +5561,7 @@ function Invoke-GateActionsStep {
             [IO.File]::WriteAllText($proofFile, ($script:VerifiedActionPackage | ConvertTo-Json -Depth 3), $Utf8Bom)
         } catch { $script:VerifiedActionPackage = $null; $stepStatus = 'FAIL'; $parts.Add($_.Exception.Message) }
     }
+    if ($stepStatus -eq 'FAIL') { $parts.Add('Перед повтором сверь идентификаторы из actions.txt с регистром выполненных действий.') }
     if ($historyText) { $parts.Add($historyText) }
     if ($logRows.Count -gt 0) { $parts.Add(('журнал действий - actions\log.txt: {0}' -f ((@($logRows | Select-Object -First 3)) -join ' | '))) }
     Add-StatFact -Title $stepName -Seconds $watch.Elapsed.TotalSeconds -Status $stepStatus
@@ -5547,7 +5586,7 @@ function Start-DesignerBackground {
     $expected = [double](Get-ExpectedStepSeconds $Title)
     $startedUtc = [datetime]::UtcNow
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $process = Start-Process -FilePath $v8 -ArgumentList $argLine -PassThru
+    $process = Start-RunPlatformProcess -Exe $v8 -ArgumentLine $argLine -Title $Title
     $null = $process.Handle
     return [pscustomobject]@{
         Process = $process; Watch = $watch; Log = $logPath; TimeoutSec = $TimeoutSec; Title = $Title; FileKey = $FileKey; TimedOut = $false
@@ -5672,7 +5711,8 @@ function Add-SimpleStep {
     $badStatus = 'WARN'
     if ($Blocking) { $badStatus = 'FAIL' }
     if ($Result.TimedOut) {
-        Add-StepResult -Name $Name -Status $badStatus -Detail 'таймаут, процесс снят' -Log $Result.Log -Seconds $Result.Seconds
+        $detail = "Таймаут конфигуратора через {0} с. Последние строки: {1}. Перед повтором проверь журнал и какие изменения шага успели примениться." -f $Result.Seconds, (Get-LogTail $Result.Lines)
+        Add-StepResult -Name $Name -Status $badStatus -Detail $detail -Log $Result.Log -Seconds $Result.Seconds
         return $false
     }
     if ($Result.ExitCode -eq 0) {
@@ -5685,7 +5725,7 @@ function Add-SimpleStep {
         Add-StepResult -Name $Name -Status 'FAIL' -Detail $detail -Log $Result.Log -Seconds $Result.Seconds
         return $false
     }
-    $detail = "код {0}: {1}" -f $Result.ExitCode, (Get-LogTail $Result.Lines)
+    $detail = "Конфигуратор вернул код {0}. Сообщение 1С: {1}. Проверь журнал шага и устрани указанную причину перед повтором." -f $Result.ExitCode, (Get-LogTail $Result.Lines)
     Add-StepResult -Name $Name -Status $badStatus -Detail $detail -Log $Result.Log -Seconds $Result.Seconds
     return $false
 }
@@ -5700,7 +5740,7 @@ function Add-CheckStep {
     $records = @(ConvertTo-CheckRecords $Result.Lines)
     if ($Result.ExitCode -eq 101 -and $records.Count -eq 0 -and -not $Result.TimedOut) {
         # До исключения известных сообщений: у выполненной проверки с кодом 101 должна быть хотя бы одна запись.
-        Add-StepResult -Name $Name -Status $badStatus -Detail 'код 101, но в журнале конфигуратора нет замечаний или файл /Out отсутствует' -Log $Result.Log -Seconds $Result.Seconds
+        Add-StepResult -Name $Name -Status $badStatus -Detail 'Код 101, но в журнале конфигуратора нет замечаний или файл /Out отсутствует. Проверь право записи в папку прогона и повтори проверку. Сравнение с эталоном не выполнено.' -Log $Result.Log -Seconds $Result.Seconds
         return
     }
     # Замечания по модулям тестовых расширений (Get-UtCheckIgnorePattern) - не в счёт: их видно в шаге «Модульные тесты».
@@ -5714,7 +5754,8 @@ function Add-CheckStep {
     }
 
     if ($Result.TimedOut) {
-        Add-StepResult -Name $Name -Status $badStatus -Detail 'таймаут, процесс снят' -Log $Result.Log -Seconds $Result.Seconds
+        $detail = "Таймаут проверки конфигуратором через {0} с. Последние строки: {1}. Проверь журнал и длительность предыдущего прогона, затем повтори проверку (TimeoutCheckMin)." -f $Result.Seconds, (Get-LogTail $Result.Lines)
+        Add-StepResult -Name $Name -Status $badStatus -Detail $detail -Log $Result.Log -Seconds $Result.Seconds
         return
     }
     if (Test-DesignerBusy $Result.Lines) {
@@ -5725,7 +5766,7 @@ function Add-CheckStep {
     }
     # 0 - чисто, 101 - проверка выполнена и нашла замечания. Любой другой код - проверка не выполнилась.
     if ($Result.ExitCode -ne 0 -and $Result.ExitCode -ne 101) {
-        $detail = "код {0}, проверка не выполнилась: {1}" -f $Result.ExitCode, (Get-LogTail $Result.Lines 3)
+        $detail = "код {0}, проверка не выполнилась: {1}. Устрани причину из журнала конфигуратора и повтори проверку." -f $Result.ExitCode, (Get-LogTail $Result.Lines 3)
         Add-StepResult -Name $Name -Status $badStatus -Detail $detail -Log $Result.Log -Seconds $Result.Seconds
         return
     }
@@ -5742,7 +5783,7 @@ function Add-CheckStep {
             Add-StepResult -Name $Name -Status 'OK' -Detail ("замечаний нет, {0} с" -f $Result.Seconds) -Log $Result.Log -Seconds $Result.Seconds
             return
         }
-        $detail = "замечаний: {0}, эталона нет. Посмотри лог и прими эталон: дальше будет видно только новое" -f $records.Count
+        $detail = "замечаний: {0}, эталона нет. Открой журнал, исправь ошибки и повтори проверку. Известные замечания можно принять после проверки. Первая запись: {1}" -f $records.Count, $records[0]
         Add-StepResult -Name $Name -Status $badStatus -Detail $detail -Log $Result.Log -Seconds $Result.Seconds
         return
     }
@@ -6016,7 +6057,7 @@ function Start-SelfCheckSession {
 
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $idle = [System.Diagnostics.Stopwatch]::StartNew()
-    $process = Start-Process -FilePath $v8c -ArgumentList $argLine -PassThru
+    $process = Start-RunPlatformProcess -Exe $v8c -ArgumentLine $argLine -Title $Title
     $null = $process.Handle
 
     return [pscustomobject]@{
@@ -6530,7 +6571,7 @@ function Invoke-SelfCheck {
             $piece = $null
             try { $piece = Read-SelfCheckPiece $file.FullName }
             catch {
-                $problems.Add(("сеанс {0}: часть журнала {1} не прочитана" -f $number, $file.Name))
+                $problems.Add(("сеанс {0}: часть журнала {1} не прочитана: {2}. Проверь доступ к файлу." -f $number, $file.FullName, (Get-MaskedLine $_.Exception.Message)))
                 continue
             }
             foreach ($line in $piece.Body) { $journal.Add($line) }
@@ -6616,13 +6657,14 @@ function Get-SelfCheckFailure {
     param($Run)
     if ($Run.State -eq 'nostart') {
         $text = "обработка не открылась за {0} с: нет файла started.txt (нет права открывать внешние обработки, включена защита от опасных действий, либо сеанс не стартовал)" -f $selfCheckStartTimeoutSec
+        $text += '. Проверь вход в тестовую базу под пользователем прогона и его право открыть обработку.'
         if ($Run.Windows.Count -gt 0) { $text += ("; окна клиента: {0}" -f ($Run.Windows -join '; ')) }
         return $text
     }
-    if ($Run.State -eq 'refused') { return ("обработка отказалась работать: {0}" -f $Run.Message) }
+    if ($Run.State -eq 'refused') { return ("обработка отказалась работать: {0}. Сверь базу и параметры самопроверки в run.log, затем повтори шаг." -f $Run.Message) }
     $reason = $Run.Message
     if ([string]::IsNullOrEmpty($reason)) { $reason = ($Run.Problems -join ' | ') }
-    return ("обработка открылась, но тестирование не началось: {0}" -f $reason)
+    return ("обработка открылась, но тестирование не началось: {0}. Проверь журнал регистрации 1С за время запуска и результат сеанса в папке самопроверки." -f $reason)
 }
 
 function Test-KitBackupFile {
@@ -6941,7 +6983,7 @@ function Get-BlockingSessions {
     Write-Host ("  ...  Смотрю, кто сидит в базе: вход в {0}" -f (Get-Date -Format 'HH:mm:ss')) -ForegroundColor DarkGray
     $timeoutSec = [int](Get-Setting $cfg 'CanaryTimeoutSec' 300)
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $process = Start-Process -FilePath $v8c -ArgumentList $argLine -PassThru
+    $process = Start-RunPlatformProcess -Exe $v8c -ArgumentLine $argLine -Title 'Получить список сеансов'
     $null = $process.Handle
     while ($watch.Elapsed.TotalSeconds -lt $timeoutSec -and -not (Test-Path -LiteralPath $outFile) -and -not $process.HasExited) {
         Write-UiProgress -Title 'Смотрю, кто сидит в базе' -Elapsed $watch.Elapsed.TotalSeconds
@@ -7099,7 +7141,7 @@ function Invoke-ProcessingSession {
     $expected = Get-ExpectedStepSeconds $Title
 
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $process = Start-Process -FilePath $v8c -ArgumentList $argLine -PassThru
+    $process = Start-RunPlatformProcess -Exe $v8c -ArgumentLine $argLine -Title $Title
     $null = $process.Handle
     $state = ''
     while ($true) {
@@ -7168,14 +7210,14 @@ function Get-ProcessingFailure {
     param($Session)
     switch ($Session.State) {
         'nostart' {
-            return ("за {0} с обработка «Выполнить после обновления» не открылась: нет входа в базу, окно при запуске или старая сборка обработки (режимы regepf и unregepf - со сборки 20261117)" -f $Session.Seconds)
+            return ("За {0} с обработка «Выполнить после обновления» не подтвердила запуск. Проверь вход в базу тем же пользователем и версию обработки (режимы regepf и unregepf - со сборки 20261117)." -f $Session.Seconds)
         }
         'exited' {
             if ($Session.Started) { return ("клиент закрылся без итога (код {0}); сборка обработки {1}: если она старше 20261117, режима regepf в ней нет" -f $Session.ExitCode, $Session.Started) }
-            return ("клиент закрылся без итога (код {0}), обработка не отметила запуск" -f $Session.ExitCode)
+            return ("Клиент закрылся без итога (код {0}), обработка не отметила запуск. Сверь журнал регистрации 1С за время входа и версию обработки." -f $Session.ExitCode)
         }
         'timeout' {
-            return ("за {0} с итога нет, клиент снят. Окна клиента: {1}" -f $Session.Seconds, (@($Session.Windows) -join '; '))
+            return ("За {0} с итога нет. Перед повтором сверь версию карточки в справочнике дополнительных обработок и журнал регистрации 1С. Окна клиента: {1}" -f $Session.Seconds, (@($Session.Windows) -join '; '))
         }
     }
     return $Session.Message
@@ -8058,12 +8100,12 @@ for ($procIndex = 0; $procIndex -lt $kitProcessings.Count; $procIndex++) {
         continue
     }
     if ($selfCheckOff -and -not (Test-Path -LiteralPath $selfCheckEpf)) {
-        Add-StepResult -Name $registerName -Status 'FAIL' -Detail ("записать некому: нет обработки {0}" -f $selfCheckEpf)
+        Add-StepResult -Name $registerName -Status 'FAIL' -Detail ("Регистрация не началась: нет обработки {0}. Восстанови её из той же версии поставки гейта и повтори шаг." -f $selfCheckEpf)
         $proceed = $false
         continue
     }
     if (-not (Test-Path -LiteralPath $v8c)) {
-        Add-StepResult -Name $registerName -Status 'FAIL' -Detail ("записать некому: нет тонкого клиента {0}" -f $v8c)
+        Add-StepResult -Name $registerName -Status 'FAIL' -Detail ("Регистрация не началась: нет тонкого клиента {0}. Проверь V8Bin и установку тонкого клиента." -f $v8c)
         $proceed = $false
         continue
     }
@@ -8076,7 +8118,7 @@ for ($procIndex = 0; $procIndex -lt $kitProcessings.Count; $procIndex++) {
         $builtFile = Join-Path $procDir $proc.FileName
         $result = Complete-ProcessingBuild $buildArgs
         if ($result.ExitCode -eq 0 -and -not $result.TimedOut -and -not (Test-Path -LiteralPath $builtFile)) {
-            Add-StepResult -Name $buildName -Status 'FAIL' -Detail ("конфигуратор отработал без ошибки, а файла {0} нет" -f $proc.FileName) -Log $result.Log -Seconds $result.Seconds
+            Add-StepResult -Name $buildName -Status 'FAIL' -Detail ("Конфигуратор завершился с кодом 0, но не создал {0}. Проверь журнал сборки, XML выгрузки и доступ на запись в папку прогона." -f $proc.FileName) -Log $result.Log -Seconds $result.Seconds
             $proceed = $false
             continue
         }
@@ -8090,7 +8132,7 @@ for ($procIndex = 0; $procIndex -lt $kitProcessings.Count; $procIndex++) {
         $sha = [System.Security.Cryptography.SHA256]::Create()
         try { $actualSha = -join @($sha.ComputeHash([System.IO.File]::ReadAllBytes($proc.File)) | ForEach-Object { $_.ToString('x2') }) } finally { $sha.Dispose() }
         if ($actualSha -ne $proc.ExpectSha256) {
-            Add-StepResult -Name $registerName -Status 'FAIL' -Detail ("sha256 файла {0}, а в git записан {1}: не ставлю" -f $actualSha, $proc.ExpectSha256)
+            Add-StepResult -Name $registerName -Status 'FAIL' -Detail ("SHA-256 файла {0}, а в Git записан {1}. Регистрация остановлена до записи. Получи заново файл из проверяемого коммита и сверь его контрольную сумму." -f $actualSha, $proc.ExpectSha256)
             $proceed = $false
             continue
         }
@@ -8305,10 +8347,10 @@ elseif (-not $proceed) {
     $canaryState = 'skipped'
 }
 elseif ($canaryUsers.Count -eq 0) {
-    Add-StepResult -Name 'Канареечный вход' -Status 'WARN' -Detail 'в config.psd1 пустой список CanaryUsers'
+    Add-StepResult -Name 'Канареечный вход' -Status 'WARN' -Detail 'Проверка входа пропущена: в config.psd1 пустой список CanaryUsers. Укажи пользователей для проверки и повтори вход.'
 }
 elseif (-not (Test-Path -LiteralPath $canaryEpf)) {
-    Add-StepResult -Name 'Канареечный вход' -Status 'WARN' -Detail "нет обработки $canaryEpf (как собрать, см. README)"
+    Add-StepResult -Name 'Канареечный вход' -Status 'WARN' -Detail "Проверка входа пропущена. Восстанови обработку $canaryEpf из поставки гейта и повтори вход."
 }
 elseif (-not (Test-Path -LiteralPath $v8c)) {
     Add-StepResult -Name 'Канареечный вход' -Status 'WARN' -Detail "нет тонкого клиента $v8c"
@@ -8341,9 +8383,9 @@ else {
 
         Write-Host ("  ...  {0}: клиент запущен в {1}, жду не дольше {2} с" -f $stepName, (Get-Date -Format 'HH:mm:ss'), $canaryTimeoutSec) -ForegroundColor DarkGray
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
-        try { $process = Start-Process -FilePath $v8c -ArgumentList $argLine -PassThru -ErrorAction Stop }
+        try { $process = Start-RunPlatformProcess -Exe $v8c -ArgumentLine $argLine -Title $stepName }
         catch {
-            Add-StepResult -Name $stepName -Status 'FAIL' -Detail 'Тонкий клиент не запустился.'
+            Add-StepResult -Name $stepName -Status 'FAIL' -Detail $_.Exception.Message
             continue
         }
         $null = $process.Handle
@@ -8383,7 +8425,7 @@ else {
                 Add-StepResult -Name $stepName -Status 'FAIL' -Detail ("сеанс стартовал, но канарейка сообщила: {0}" -f ($content -join ' | ')) -Log $outFile -Seconds $seconds
             }
             elseif ($notApplied.Count -gt 0) {
-                Add-StepResult -Name $stepName -Status 'FAIL' -Detail ("расширения есть в базе, но не применились в сеансе: {0}" -f ($notApplied -join ', ')) -Log $outFile -Seconds $seconds
+                Add-StepResult -Name $stepName -Status 'FAIL' -Detail ("Расширения есть в базе, но не применились в сеансе: {0}. Сверь шаг «Проверка применимости» и журнал регистрации под этим пользователем." -f ($notApplied -join ', ')) -Log $outFile -Seconds $seconds
             }
             elseif ($extensionError.Count -gt 0) {
                 # Вход удался, а применились ли расширения, неизвестно: список не прочитан. Это не OK (#17).
@@ -8394,7 +8436,7 @@ else {
             }
         }
         elseif ($process.HasExited) {
-            Add-StepResult -Name $stepName -Status 'FAIL' -Detail ("клиент закрылся сам, результата нет (код {0})" -f $process.ExitCode) -Seconds ([int]$watch.Elapsed.TotalSeconds)
+            Add-StepResult -Name $stepName -Status 'FAIL' -Detail ("Клиент закрылся сам, результата нет (код {0}). Проверь вход под пользователем этого шага и журнал регистрации базы за время запуска." -f $process.ExitCode) -Seconds ([int]$watch.Elapsed.TotalSeconds)
         }
         else {
             # Сначала снимаем окна клиента, потом закрываем его.
@@ -8408,7 +8450,8 @@ else {
             else {
                 $stage = 'обработка не открылась, либо не сработал её обработчик ПриОткрытии, либо до неё не дошёл параметр запуска'
             }
-            $detail = "за {0} с результата нет: {1}. Окна клиента: {2}" -f $canaryTimeoutSec, $stage, ($windows -join '; ')
+            $detail = "За {0} с результата нет: {1}. Проверь журнал регистрации за время входа и список окон клиента canary_{2}_windows.txt." -f $canaryTimeoutSec, $stage, $userNumber
+            if ($windows.Count -gt 0) { $detail += (' Окна клиента: ' + ($windows -join ' | ')) }
             Add-StepResult -Name $stepName -Status 'FAIL' -Detail $detail -Seconds ([int]$watch.Elapsed.TotalSeconds)
         }
     }
