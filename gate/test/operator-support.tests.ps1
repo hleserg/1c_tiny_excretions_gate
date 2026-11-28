@@ -20,6 +20,21 @@
         }
     }
     @{
+        Name = 'operator-support-action-register'
+        Text = 'Ответы BSL о регистре выполненных действий объясняются в сообщении рабочей проверки.'
+        Run = {
+            param($Name)
+            . (Join-Path $ciRoot 'post-update.ps1')
+            $cases = @{ notset = 'задайте'; missing = 'в базе нет'; nodimension = 'измерения Действие' }
+            foreach ($status in $cases.Keys) {
+                $protocol = @("done-register=$status", 'action=sample|notrun', 'status=failed')
+                $reason = try { Assert-ActionResult -Lines $protocol -Ids @('sample'); '' } catch { $_.Exception.Message }
+                Check ($reason -match 'ActionsRegister' -and $reason -match $cases[$status]) ("для done-register={0} нет причины и настройки для исправления" -f $status)
+            }
+            Assert-ActionResult -Lines @('done-register=ok','action=sample|already','status=ok') -Ids @('sample')
+        }
+    }
+    @{
         Name = 'operator-support-maintenance'
         Text = 'Ошибки расписания, локального журнала и блокировки показывают место проверки и дальнейшее действие.'
         Run = {

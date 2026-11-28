@@ -1586,7 +1586,20 @@ function Get-DeployHistory {
         if (Test-Path -LiteralPath $jsonFile) {
             try { $record = (Get-Content -LiteralPath $jsonFile -Raw -Encoding UTF8) | ConvertFrom-Json } catch { $record = $null }
             # Прерванное (после разбора при старте deploy - 'interrupted') тоже в списке: откат вернёт то, что успело.
-            if ($null -eq $record -or @('updated', 'interrupted', 'actionsFailed') -notcontains [string](Get-JsonValue $record 'outcome' '')) { continue }
+            if ($null -eq $record -or -not (Get-JsonValue $record 'outcome' '')) { continue }
+            if ($record.outcome -eq 'failed') {
+                # После частичного выпуска копии остаются у того запуска, который записывал объект.
+                $saved = Get-JsonValue $record 'checkpoint' $null
+                if (-not $saved -or $saved.runId -cne $dir.Name -or $saved.base -ine $record.base -or $saved.target -cne $record.target -or
+                    $saved.step -notin @('applied','writing','written') -or @($saved.extensions | Where-Object stage -ne 'applied').Count) { continue }
+                $record.extensions = @($saved.extensions)
+                $record.processings = @(foreach ($item in $saved.processings) {
+                    try { $stage = Resolve-ResumeProcessingStage $item $dir.Name } catch { continue }
+                    if ($stage -eq 'written') { $item }
+                })
+                if ((@($record.extensions).Count + @($record.processings).Count) -eq 0) { continue }
+            }
+            elseif ($record.outcome -notin @('updated', 'interrupted', 'actionsFailed', 'checksFailed')) { continue }
             if ([string](Get-JsonValue $record 'base' '') -ne $script:ProdBase) { continue }
         }
         else {
@@ -1617,7 +1630,7 @@ function Get-DeployHistory {
 function Get-DeployModeText {
     param($Record)
     $mode = [string](Get-JsonValue $Record 'mode' '')
-    $names = @{ '1' = 'все из temp'; '2' = 'выбранные из temp'; 'epf' = 'только внешние обработки'; 'actions' = 'проверенные действия'; 'asis' = 'как есть'; 'rollback' = 'откат'; 'prepared' = 'подготовленным' }
+    $names = @{ '1' = 'все из temp'; '2' = 'выбранные из temp'; 'epf' = 'только внешние обработки'; 'actions' = 'проверенные действия'; 'resume-cards' = 'оставшиеся обработки выпуска'; 'asis' = 'как есть'; 'rollback' = 'откат'; 'prepared' = 'подготовленным' }
     if ($names.ContainsKey($mode)) { return $names[$mode] }
     return 'обновление'
 }
@@ -1640,6 +1653,7 @@ function Get-DeployLabel {
     $flag = ''
     if ([bool](Get-JsonValue $Record 'riskAccepted' $false)) { $flag = ', НЕСМОТРЯ НА ГЕЙТ' }
     if ([string](Get-JsonValue $Record 'outcome' '') -eq 'interrupted') { $flag += ', ПРЕРВАНО' }
+    if ([string](Get-JsonValue $Record 'outcome' '') -eq 'failed') { $flag += ', ПРИМЕНЕНО ЧАСТИЧНО' }
     return ("{0:dd.MM.yyyy HH:mm}  расширений {1}, обработок {2}  ({3}{4}; {5})" -f $when, $extCount, $epfCount, (Get-DeployModeText $Record), $flag, $lightText)
 }
 
@@ -1651,6 +1665,8 @@ function Get-DeployDetailLines {
     $lines.Add(("Обновление {0} от {1:dd.MM.yyyy HH:mm} ({2})" -f $script:ProdBase, $when, (Get-DeployModeText $Record)))
     $user = [string](Get-JsonValue $Record 'user' '')
     if ($user) { $lines.Add("Выполнил: $user") }
+    $origin = [string](Get-JsonValue $Record 'resumeOf' '')
+    if ($origin) { $lines.Add(("Продолжение выпуска {0}. Здесь перечислены записи этой попытки. Для полного отката выбирай попытки от последней к исходной." -f $origin)) }
     $rollbackOf = [string](Get-JsonValue $Record 'rollbackOf' '')
     if ($rollbackOf) { $lines.Add("Это был откат к состоянию до обновления $rollbackOf") }
     $lines.Add("Папка: $($Record.Dir)")
@@ -2100,16 +2116,22 @@ function Format-ProcessingDate {
 function Compare-Processings {
     # Внешние обработки temp против рабочей: изменённые в temp и новые. Те, что есть только в рабочей,
     # не трогаются: скрипт обновления обработки из рабочей не удаляет.
-    param($TempExport, $ProdExport)
+    param($TempExport, $ProdExport, [array]$PinnedCards = @())
     $prodByRef = @{}
     foreach ($item in $ProdExport.Items) { $prodByRef[$item.Ref] = $item }
     $list = New-Object System.Collections.Generic.List[object]
     foreach ($item in @($TempExport.Items | Sort-Object ObjName, Ref)) {
         $prodItem = $prodByRef[$item.Ref]
+        $confirmedDuplicates = $false
+        $sameName = @($ProdExport.Items | Where-Object ObjName -eq $item.ObjName)
+        if ($sameName.Count -gt 1 -and @($PinnedCards | Where-Object { $_.name -eq $item.ObjName -and $_.ref -eq $item.Ref }).Count) {
+            $active = Resolve-ActionProcessingCard -Items $sameName -Name $item.ObjName -Ref $item.Ref
+            $confirmedDuplicates = $active.Ref -eq $item.Ref
+        }
         # ** Хлебников С.Ю. 20261124 Совпадение имён карточек или непонятная версия требуют решения.
         if ($vendorProcessings -contains $item.ObjName) {
             if (@($TempExport.Items | Where-Object ObjName -eq $item.ObjName).Count -ne 1 -or
-                @($ProdExport.Items | Where-Object ObjName -eq $item.ObjName).Count -gt 1) {
+                ($sameName.Count -gt 1 -and -not $confirmedDuplicates)) {
                 throw ("{0}: несколько карточек с одним именем объекта, выпуск остановлен" -f $item.ObjName)
             }
         }
@@ -2123,7 +2145,7 @@ function Compare-Processings {
             }
         }
         if (@($TempExport.Items | Where-Object ObjName -eq $item.ObjName).Count -gt 1 -or
-            @($ProdExport.Items | Where-Object { $_.ObjName -eq $item.ObjName -and $_.Ref -ne $item.Ref }).Count -gt 0 -or
+            (-not $confirmedDuplicates -and @($sameName | Where-Object Ref -ne $item.Ref).Count -gt 0) -or
             ($prodItem -and $prodItem.ObjName -ne $item.ObjName)) {
             Write-Line ("  {0} [{1}]: расходятся ссылки или имена карточек; пропускаю до сверки" -f $item.ObjName, $item.Ref) 'Yellow'
             continue
@@ -2168,15 +2190,44 @@ function Assert-ActionExtensionState {
     }
 }
 
+function Resolve-ActionProcessingCard {
+    param([array]$Items, [string]$Name, [string]$Ref)
+    $cards = @($Items | Where-Object ObjName -eq $Name)
+    if ($cards.Count -eq 0) { return $null }
+    $card = $null
+    if ($cards.Count -eq 1) { return $cards[0] }
+    if ($Ref) {
+        $byRef = @($cards | Where-Object Ref -eq $Ref)
+        if ($byRef.Count -eq 1) { $card = $byRef[0] }
+    }
+    if ($card) {
+        if ($card.Use -ne 'Используется') {
+            $state = if ($card.Use) { $card.Use } else { 'не указана' }
+            throw ("«{0}»: в {1} целевая карточка «{2}» [{3}], публикация «{4}». Сверь её назначение и статус публикации перед повтором." -f $Name,$script:ProdBase,$card.Title,$card.Ref,$state)
+        }
+        $other = @($cards | Where-Object { $_.Ref -ne $card.Ref -and $_.Use -ne 'Отключена' })
+        if ($other.Count -eq 0) { return $card }
+    }
+    $listed = @($cards | ForEach-Object {
+        $state = if ($_.Use) { $_.Use } else { 'не указана' }
+        '«{0}» [{1}], версия {2}, публикация «{3}»' -f $_.Title,$_.Ref,$_.Version,$state
+    })
+    throw ("«{0}»: в {1} несколько одноимённых карточек. Ссылка проверенного файла [{2}]. {3}. Сверь ссылки и назначение. При нескольких карточках у целевой должна быть публикация «Используется», у остальных — «Отключена»." -f $Name,$script:ProdBase,$Ref,($listed -join '. '))
+}
+
 function Get-ActionProcessingProblems {
     param($Verdict, $ProdExport, [array]$Planned, [array]$Candidates, $TempExport, [switch]$AfterWrite)
     $snapshot = $Verdict.checkedState
     foreach ($proc in @(Get-JsonValue $Verdict 'kitProcessings' @() | Where-Object { $_ })) {
-        $name = $proc.objectName
+        $name = [string](Get-JsonValue $proc 'objectName' '')
+        if (-not $name) {
+            "В прогоне $($lastRun.Name) не записано имя объекта для файла $(Get-JsonValue $proc 'fileName' 'комплекта'). Повтори тестовый прогон перед выполнением действий."
+            continue
+        }
         $ref = [string](Get-JsonValue $proc 'targetRef' '')
         if (-not $ref) { $ref = [string](Get-JsonValue $proc 'ref' '') }
         $byRef = Get-JsonValue $snapshot 'processingCards' $null
-        $expected = Get-JsonValue $snapshot.processings $name $null
+        $expected = Get-JsonValue (Get-JsonValue $snapshot 'processings' $null) $name $null
         if ($byRef -and -not $ref) {
             $sameName = @($byRef.PSObject.Properties | Where-Object { $_.Value.name -eq $name })
             if ($sameName.Count -ne 1) {
@@ -2204,32 +2255,30 @@ function Get-ActionProcessingProblems {
                 continue
             }
         }
-        $installed = @($ProdExport.Items | Where-Object ObjName -eq $name)
+        try { $card = Resolve-ActionProcessingCard -Items $ProdExport.Items -Name $name -Ref $ref }
+        catch { $_.Exception.Message; continue }
         $selectedFile = @($Planned | Where-Object { $_.ObjName -eq $name -and (-not $ref -or $_.RefAtComparison -eq $ref) })
         if ($selectedFile.Count -eq 1 -and $selectedFile[0].TempHash -eq $expected.hash) { continue }
         $retained = $retainedVendorProcessings[$name]
-        if ($installed.Count -eq 1) {
-            $card = $installed[0]
+        if ($null -ne $card) {
             if ($card.Hash -eq $expected.hash) { continue }
             if ($retained -and $retained.TempHash -eq $expected.hash -and $card.Hash -eq $retained.ProdHash -and $card.Version -eq $retained.Version) { continue }
             $actual = "в $script:ProdBase версия $($card.Version), файл отличается от проверенного"
-        } elseif ($installed.Count -eq 0) {
-            $actual = "в $script:ProdBase нет карточки с файлом"
         } else {
-            $actual = "в $script:ProdBase несколько карточек с файлами: " + (($installed | ForEach-Object { "$($_.Title) $($_.Version) [$($_.Ref)]" }) -join ', ')
+            $actual = "в $script:ProdBase нет карточки с файлом"
         }
         $candidate = @($Candidates | Where-Object { $_.ObjName -eq $name -and $_.TempHash -eq $expected.hash -and (-not $ref -or $_.RefAtComparison -eq $ref) })
         if (-not $AfterWrite -and $candidate.Count -eq 1) {
             $remedy = "Выбери этот файл в списке выпуска или в «Обновить только внешние обработки», затем повтори действия."
-        } elseif ($installed.Count -eq 1) {
+        } elseif ($null -ne $card) {
             $source = [string](Get-JsonValue $proc 'file' '')
-            $remedy = "Сверь назначение карточки «$($installed[0].Title)». Если это нужная карточка, выбери в ней «Обновить из файла…», запиши и повтори действия."
+            $remedy = "Сверь назначение карточки «$($card.Title)». Если это нужная карточка, выбери в ней «Обновить из файла…», запиши и повтори действия."
             if ($source) { $remedy += " Файл прогона: $source." }
         } else {
             $remedy = "Сверь карточки по ссылке и назначению в справочнике «Дополнительные отчёты и обработки». Подготовь однозначное соответствие проверенному файлу, затем повтори действия."
         }
         $why = ''
-        if ($installed.Count -eq 1 -and $ref -and $card.Ref -ne $ref) {
+        if ($null -ne $card -and $ref -and $card.Ref -ne $ref) {
             $why = " У карточек разные ссылки: $script:ProdBase [$($card.Ref)], $script:TempBase [$ref]. Гейт не выбирает получателя по одному названию."
         } elseif ($null -ne $TempExport -and @($TempExport.Items | Where-Object ObjName -eq $name).Count -gt 1) {
             $why = " В $script:TempBase несколько карточек с этим именем. Ссылка проверенной карточки [$ref]."
@@ -5505,9 +5554,62 @@ if ($CancelPrepared) {
 # у обработок writing, written) - заменой файла целиком, так что на диске всегда целый JSON. Процесс погиб
 # (окно закрыли, машина перезагрузилась) - при следующем запуске deploy журнал разбирается: что успело, сверка
 # рабочей по хеш-суммам (только чтение), запись становится «прервано» и попадает в список откатов.
+function Resolve-ResumeProcessingStage {
+    param($Item,[string]$Attempt)
+    $stage = [string](Get-JsonValue $Item 'stage' 'written')
+    if ($stage -ne 'writing') { return $stage }
+    $name = [string]$Item.name
+    if ($name -notmatch '^[\p{L}_][\p{L}\p{Nd}_]*$') { throw 'Продолжение: неверное имя обработки в журнале.' }
+    $path = Join-Path (Join-Path $deployRoot $Attempt) ("epf\{0}\result.txt" -f $name)
+    if ([IO.File]::Exists($path)) {
+        $receipt = [IO.File]::ReadAllLines($path)
+        # Сервер заполняет ref после фиксации. При отмене транзакции возвращается структура с objname и пустым ref.
+        if ($receipt -ccontains ('objname=' + $name) -and @($receipt | Where-Object { $_ -clike 'status=*' }).Count -eq 1 -and
+            @($receipt | Where-Object { $_ -clike 'ref=*' }).Count -eq 1) {
+            if ($receipt -ccontains 'status=failed' -and $receipt -ccontains 'ref=' -and $receipt -ccontains 'check=') { return 'pending' }
+            if ($receipt -ccontains 'status=done' -and $receipt -ccontains ('ref=' + $Item.cardRef)) {
+                $Item.ref = $Item.cardRef
+                if ($receipt -ccontains 'isnew=1') { $Item | Add-Member -NotePropertyName isNew -NotePropertyValue 'yes' -Force }
+                return 'written'
+            }
+        }
+    }
+    throw ("Продолжение: исход записи «{0}» неизвестен. Сверь рабочую карточку и квитанцию {1}." -f $name,$path)
+}
+
+function Merge-ResumeProcessingStages {
+    param($Record,[string]$Attempt,$Updates)
+    $byRef = @{}
+    foreach ($item in $Record.processings) {
+        $ref = [string](Get-JsonValue $item 'cardRef' '')
+        if (-not $ref -or $byRef.ContainsKey($ref)) { throw 'Продолжение: нет однозначной ссылки для каждой выбранной обработки.' }
+        $byRef.Add($ref,$item)
+        $item | Add-Member -NotePropertyName receiptRun -NotePropertyValue $Attempt -Force
+    }
+    # От исходной установки к последней попытке: уже записанная карточка больше не может стать ожидающей.
+    for ($i = $Updates.Count - 1; $i -ge 0; $i--) {
+        $later = $Updates[$i]
+        if ($later.gate.run -cne $Record.gate.run -or $later.gate.verdictHash -ine $Record.gate.verdictHash -or @($later.extensions).Count -ne 0) { throw 'Продолжение: состав промежуточной попытки не соответствует исходному выпуску.' }
+        foreach ($next in $later.processings) {
+            $ref = [string](Get-JsonValue $next 'cardRef' '')
+            $prior = $byRef[$ref]
+            $priorStage = ''
+            if ($null -ne $prior) { $priorStage = Resolve-ResumeProcessingStage $prior $prior.receiptRun }
+            if ($null -eq $prior -or $prior.name -cne $next.name -or $prior.newHash -ne $next.newHash -or
+                $priorStage -eq 'written') { throw 'Продолжение: нарушена последовательность записей карточки в журналах попыток.' }
+            $stage = Resolve-ResumeProcessingStage $next $later.runId
+            $prior.stage = $stage
+            $prior.ref = $next.ref
+            $prior.receiptRun = $later.runId
+        }
+    }
+    foreach ($item in $Record.processings) { $item.stage = Resolve-ResumeProcessingStage $item $item.receiptRun }
+}
+
 function Get-DeployResumeSource {
     # Под deploy.lock берём последнюю установку этой базы. Поздний откат или другой выпуск закрывает прежний повтор.
     $originalId = ''
+    $attempts = New-Object System.Collections.Generic.List[object]
     foreach ($dir in @(Get-ChildItem -LiteralPath $deployRoot -Directory | Where-Object Name -match '^\d{8}-\d{6}$' | Sort-Object Name -Descending)) {
         $path = Join-Path $dir.FullName 'deploy.json'
         if (-not [IO.File]::Exists($path)) {
@@ -5524,7 +5626,10 @@ function Get-DeployResumeSource {
             [string](Get-JsonValue $record 'tempBase' '') -ine $script:TempBase) {
             throw ("Продолжение: журнал {0} не подтверждает регистрацию рабочей базы и имя тестовой в этом профиле." -f $path)
         }
-        if ($outcome -eq 'updated' -and $record.mode -eq 'epf' -and @($record.extensions).Count -eq 0 -and @($record.processings).Count) {
+        $keptChecks = $outcome -eq 'updated' -and $record.mode -notin @('rollback','asis') -and
+            ((Get-JsonValue $record 'pendingStep' '') -eq 'checks' -or @(Get-JsonValue $record 'light' @() | Where-Object status -eq 'FAIL').Count -gt 0)
+        if ($keptChecks) { $outcome = 'checksFailed' }
+        if ($outcome -eq 'updated' -and -not (Get-JsonValue $record 'resumeOf' '') -and $record.mode -eq 'epf' -and @($record.extensions).Count -eq 0 -and @($record.processings).Count) {
             foreach ($repair in $record.processings) { $resumeRepairs.Add($repair) }
             continue
         }
@@ -5533,8 +5638,10 @@ function Get-DeployResumeSource {
         if ($outcome -eq 'interrupted' -and $step -eq 'start' -and (Get-JsonValue $record 'resumeOf' '') -and
             (@($record.extensions).Count + @($record.processings).Count) -eq 0) { $completedWrites = $true }
         if ($outcome -eq 'checksFailed' -or ($outcome -eq 'interrupted' -and $step -in @('checks','checksPending'))) { $script:resumeChecksOnly = $true }
-        if ($outcome -eq 'failed' -and (Get-JsonValue $record 'checkpoint' $null) -and (Get-JsonValue $record.checkpoint 'step' '') -eq 'start') {
+        if ($outcome -eq 'failed' -and (Get-JsonValue $record 'checkpoint' $null) -and (Get-JsonValue $record.checkpoint 'step' '') -in @('start','applied','writing','written')) {
+            $preparation = [string](Get-JsonValue $record 'preparedRun' '')
             $record = $record.checkpoint
+            if ($preparation -and -not (Get-JsonValue $record 'preparedRun' '')) { $record | Add-Member -NotePropertyName preparedRun -NotePropertyValue $preparation -Force }
             if ($record.runId -cne $dir.Name -or $record.target -cne $deployTarget.Identity -or $record.tempBase -ine $script:TempBase -or $record.base -ine $script:ProdBase) {
                 throw ("Продолжение: сохранённая стадия не относится к установке {0} этой базы." -f $dir.Name)
             }
@@ -5545,12 +5652,24 @@ function Get-DeployResumeSource {
             (@($record.extensions).Count + @($record.processings).Count) -gt 0 -and
             @($record.extensions | Where-Object { $_.stage -notin @('pending','backup') }).Count -eq 0 -and
             @($record.processings | Where-Object stage -ne 'pending').Count -eq 0
-        if ($beforeWrite) { $script:resumeBeforeWrite = $true }
+        $parentId = [string](Get-JsonValue $record 'resumeOf' '')
         if ($outcome -eq 'interrupted' -and $step -in @('actions','applied','written','checks','checksPending')) {
             $completedWrites = @($record.extensions | Where-Object stage -ne 'applied').Count -eq 0 -and
                 @($record.processings | Where-Object stage -ne 'written').Count -eq 0
         }
-        if (-not $completedWrites -and -not $beforeWrite) {
+        $atCards = $outcome -eq 'interrupted' -and $step -in @('start','applied','writing','written') -and
+            @($record.extensions | Where-Object stage -ne 'applied').Count -eq 0 -and @($record.processings).Count -gt 0 -and
+            @($record.processings | Where-Object { $_.stage -notin @('written','writing','pending') }).Count -eq 0
+        if (-not $parentId) {
+            if ($beforeWrite) { $script:resumeBeforeWrite = $true }
+            elseif ($atCards) {
+                Merge-ResumeProcessingStages $record $dir.Name $attempts
+                $script:resumeCardWork = @($record.processings | Where-Object stage -eq 'pending').Count -gt 0
+                if ($script:resumeCardWork -and $script:resumeChecksOnly) { throw 'Продолжение: журнал проверок противоречит незавершённой записи карточек.' }
+                $completedWrites = -not $script:resumeCardWork
+            }
+        }
+        if (-not $completedWrites -and -not $beforeWrite -and -not $atCards) {
             throw ("Продолжение: итог последней установки {0} — {1} ({2}). Для сверки открой {3}. После незавершённой записи проверь состояние базы и резервные копии этого выпуска в меню отката." -f $dir.Name,$outcome,$step,$path)
         }
         $resultFile = Join-Path $dir.FullName 'actions\result.txt'
@@ -5559,9 +5678,8 @@ function Get-DeployResumeSource {
                 if ($line -cmatch '^action=([^|]+)\|(done|already)(\||$)') { $resumeDoneEvidence[$Matches[1]] = $true }
             }
         }
-        $parentId = [string](Get-JsonValue $record 'resumeOf' '')
         if ($parentId) {
-            if ($beforeWrite) { throw 'Продолжение: ссылка на иной выпуск у незаписанной выборки.' }
+            if (@($record.processings).Count) { $attempts.Add($record) }
             if ($parentId -cnotmatch '^\d{8}-\d{6}$' -or $parentId -ge $dir.Name -or ($originalId -and $parentId -cne $originalId)) {
                 throw ("Продолжение: нарушена связь с исходной установкой в журнале {0}." -f $path)
             }
@@ -5569,10 +5687,11 @@ function Get-DeployResumeSource {
             continue
         }
         $gateRun = [string](Get-JsonValue (Get-JsonValue $record 'gate' $null) 'run' '')
-        $checkWithoutActions = $outcome -eq 'interrupted' -and $completedWrites -and $record.mode -in @('1','2','epf','prepared') -and
+        $checkWithoutActions = ($outcome -in @('interrupted','checksFailed')) -and ($completedWrites -or $script:resumeCardWork) -and $record.mode -in @('1','2','epf','prepared') -and
             [string](Get-JsonValue $record.gate 'verdictHash' '') -match '^[a-f0-9]{64}$' -and
             (Get-JsonValue $record 'actionsRequired' $true) -eq $false
-        if ($checkWithoutActions) { $script:resumeChecksOnly = $true }
+        if ($keptChecks -and -not (Get-JsonValue $record 'actions' $null) -and (@($record.extensions).Count + @($record.processings).Count) -gt 0) { $checkWithoutActions = $true }
+        if ($checkWithoutActions -and -not $script:resumeCardWork) { $script:resumeChecksOnly = $true }
         if (($originalId -and $dir.Name -cne $originalId) -or $gateRun -cnotmatch '^\d{8}-\d{6}$' -or
             (-not $beforeWrite -and -not $checkWithoutActions -and [string](Get-JsonValue (Get-JsonValue $record 'actions' $null) 'gateRun' '') -cne $gateRun)) {
             throw ("Продолжение: журнал {0} не подтверждает прогон и исполнитель исходной установки." -f $path)
@@ -5588,8 +5707,8 @@ function Assert-ResumeProof {
     $ids = @(Get-JsonValue $proof 'ids' @())
     $savedActions = Get-JsonValue $Record 'actions' $null
     $savedHash = [string](Get-JsonValue $Record.gate 'verdictHash' (Get-JsonValue $savedActions 'verdictHash' ''))
-    if ($resumeBeforeWrite -and -not $savedHash) { throw 'Продолжение: в журнале нет хеша проверенного прогона до записи.' }
-    $needsActions = $null -ne $savedActions -or (-not $resumeBeforeWrite -and -not $resumeChecksOnly)
+    if (($resumeBeforeWrite -or $resumeCardWork) -and -not $savedHash) { throw 'Продолжение: в журнале нет хеша проверенного прогона до записи.' }
+    $needsActions = $null -ne $savedActions -or (-not $resumeBeforeWrite -and -not $resumeChecksOnly -and -not $resumeCardWork)
     if (($needsActions -and (-not $ids.Count -or ([string]$Record.actions.sha256) -notmatch '^[0-9a-f]{64}$' -or
         $Record.actions.sha256 -ine (Get-JsonValue $proof 'sha256' '') -or
         ($Record.actions.ids -join '|') -cne ($ids -join '|'))) -or
@@ -5648,7 +5767,11 @@ function Assert-ResumeProgress {
     foreach ($id in $progress.Result.Keys) { $resumeDoneEvidence[$id] = $true }
     $remaining = @($prodActions.ids | Where-Object { -not $progress.Result.ContainsKey($_) })
     if ($resumeChecksOnly -and $remaining.Count) { throw 'Продолжение проверок: регистр не подтверждает все действия исходного выпуска.' }
-    Write-Line ("По регистру выполнено {0} из {1}. Осталось: {2}." -f $progress.Result.Count,$prodActions.ids.Count,($remaining -join ', '))
+    if ($remaining.Count) {
+        Write-Line ("По регистру выполнено {0} из {1}. Осталось: {2}." -f $progress.Result.Count,$prodActions.ids.Count,($remaining -join ', '))
+    } else {
+        Write-Line ("По регистру выполнено {0} из {1}. Повторная запись этих действий не требуется." -f $progress.Result.Count,$prodActions.ids.Count)
+    }
 }
 
 function Get-ResumeProcessingProof {
@@ -5683,7 +5806,7 @@ function Get-ResumeProcessingProof {
 
 function Assert-ResumeBeforeWrite {
     param($TempStates,$ProdStates,$ProdProcessings)
-    foreach ($prior in $resumeSource.extensions) {
+    foreach ($prior in @($resumeSource.extensions | Where-Object { -not $resumeCardWork })) {
         $name = $prior.name
         $expected = Get-JsonValue $lastVerdict.checkedState.extensions $name $null
         $old = [string]$prior.oldHash
@@ -5694,11 +5817,14 @@ function Assert-ResumeBeforeWrite {
             throw ("Продолжение: {0}, прежнее состояние рабочей или проверенная версия тестовой не совпадают с журналом." -f $name)
         }
     }
-    foreach ($prior in $resumeSource.processings) {
+    foreach ($prior in @($resumeSource.processings | Where-Object { -not $resumeCardWork -or $_.stage -eq 'pending' })) {
         $name = $prior.name
         $choice = @($selectedProcessings | Where-Object ObjName -eq $name)
         $expected = Get-ResumeProcessingProof $prior
-        $actual = @($ProdProcessings.Items | Where-Object { $_.Ref -eq $prior.cardRef -or $_.ObjName -eq $name })
+        $sameRef = @($ProdProcessings.Items | Where-Object Ref -eq $prior.cardRef)
+        if (@($sameRef | Where-Object ObjName -ne $name).Count) { throw ("Продолжение: ссылка {0} принадлежит другой обработке." -f $prior.cardRef) }
+        $actual = @(Resolve-ActionProcessingCard -Items $ProdProcessings.Items -Name $name -Ref $prior.cardRef | Where-Object { $_ })
+        if ($prior.oldHash -eq 'absent' -and @($ProdProcessings.Items | Where-Object ObjName -eq $name).Count) { throw ("Продолжение: карточка {0} уже существует." -f $name) }
         if (-not $ProdProcessings.Ok -or -not $prior.oldHash -or -not $prior.cardRef -or $prior.action -ne 'register' -or
             -not $expected -or -not $expected.hash -or $prior.newHash -ne $expected.hash -or $choice.Count -ne 1 -or
             $choice[0].ExpectedTargetHash -ine $prior.oldHash -or $choice[0].TempHash -ne $prior.newHash -or
@@ -5722,13 +5848,14 @@ function Assert-ResumeInstalled {
             throw ("Продолжение: установленное расширение {0} не совпадает с проверенным выпуском. Сверь журнал установки и версию в рабочей." -f $name)
         }
     }
-    foreach ($item in @($resumeSource.processings) + $resumeRepairs.ToArray()) {
+    foreach ($item in @($resumeSource.processings | Where-Object { -not $resumeCardWork -or $_.stage -eq 'written' }) + $resumeRepairs.ToArray()) {
         $name = [string]$item.name
         $expected = Get-ResumeProcessingProof $item
-        $actual = @($ProcessingExport.Items | Where-Object ObjName -eq $name)
+        $actual = @(Resolve-ActionProcessingCard -Items $ProcessingExport.Items -Name $name -Ref $item.ref | Where-Object { $_ })
         if ((Get-JsonValue $item 'stage' '') -eq 'written' -and @($resumeRepairs | Where-Object { $_.ref -eq $item.ref -and $_.name -eq $name }).Count -eq 0) {
             if ($name -notmatch '^[\p{L}_][\p{L}\p{Nd}_]*$') { throw 'Продолжение: в журнале неверное имя объекта обработки.' }
-            $receiptPath = Join-Path (Join-Path (Join-Path $deployRoot $resumeOf) ('epf\' + $name)) 'result.txt'
+            $attempt = [string](Get-JsonValue $item 'receiptRun' $resumeOf)
+            $receiptPath = Join-Path (Join-Path (Join-Path $deployRoot $attempt) ('epf\' + $name)) 'result.txt'
             if (-not [IO.File]::Exists($receiptPath)) { throw ("Продолжение: для {0} нет результата подключения и проверки форм в {1}." -f $name,$receiptPath) }
             $receipt = [IO.File]::ReadAllLines($receiptPath)
             if ($receipt -cnotcontains 'status=done' -or $receipt -cnotcontains ('ref=' + $item.ref) -or
@@ -5761,7 +5888,7 @@ function Save-DeployJournal {
         runId = $runId; time = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss'); base = $script:ProdBase; tempBase = $script:TempBase
         user = $env:USERNAME; mode = $mode; outcome = 'inProgress'; step = $Step; rollbackOf = $rollbackOf
         pid = $PID; processStart = $script:JournalProcessStart
-        target = $deployTarget.Identity; actionsRequired = ($null -ne $prodActions)
+        target = $deployTarget.Identity; preparedRun = $preparedRunId; actionsRequired = ($null -ne $prodActions)
         gate = $script:JournalGate; riskAccepted = $riskAccepted; risks = @($gateRisks); riskReason = $riskReason
         extensions = @(foreach ($journalEntry in $selected) {
                 $journalBackup = ''
@@ -5897,6 +6024,8 @@ $resumeDoneEvidence = @{}
 $resumeRepairs = New-Object System.Collections.Generic.List[object]
 $resumeChecksOnly = $false
 $resumeBeforeWrite = $false
+$resumeCardWork = $false
+$resumePreparedHash = ''
 $actionVerdictHash = ''
 $resumeOf = ''
 $resumeChecks = $false
@@ -6033,7 +6162,7 @@ else {
         $lastRun = Get-Item -LiteralPath (Split-Path -Parent $verdictPath)
         $lastVerdict = [IO.File]::ReadAllText($verdictPath) | ConvertFrom-Json
         Assert-ResumeProof $resumeSource $lastVerdict $verdictPath
-        $resumeStep = if ($resumeBeforeWrite) { 'загрузка исходной выборки' } elseif ($resumeChecksOnly) { 'проверки после обновления' } else { 'действия после обновления' }
+        $resumeStep = if ($resumeBeforeWrite) { 'загрузка исходной выборки' } elseif ($resumeCardWork) { 'оставшиеся выбранные внешние обработки' } elseif ($resumeChecksOnly) { 'проверки после обновления' } else { 'действия после обновления' }
         Write-Line ("Продолжение обновления {0}. Следующий шаг: {1}. Проверенный прогон: {2}." -f $resumeOf,$resumeStep,$gateId)
     }
     elseif (Test-Path -LiteralPath $runsRoot) {
@@ -6273,7 +6402,15 @@ else {
     if ($Resume -and -not $resumeBeforeWrite) { Assert-ResumeInstalled $prodStates $prodProcExport }
     if ($tempProcExport.Ok -and $prodProcExport.Ok) {
         # Сравнить не удалось - обработки не предлагаются: вслепую в рабочую их не пишем.
-        $processingsPending = Compare-Processings -TempExport $tempProcExport -ProdExport $prodProcExport
+        $pinnedCards = @(if ($Resume) {
+            foreach ($row in @($resumeSource.processings) + $resumeRepairs.ToArray()) {
+                [pscustomobject]@{name=$row.name; ref=(Get-JsonValue $row 'cardRef' (Get-JsonValue $row 'ref' ''))}
+            }
+            foreach ($row in @(Get-JsonValue $lastVerdict 'kitProcessings' @())) {
+                [pscustomobject]@{name=$row.objectName;ref=(Get-JsonValue $row 'targetRef' (Get-JsonValue $row 'ref' ''))}
+            }
+        })
+        $processingsPending = Compare-Processings -TempExport $tempProcExport -ProdExport $prodProcExport -PinnedCards $pinnedCards
         Write-Line ("  в {0}: {1}, в {2}: {3}, изменены или новые в temp: {4}" -f $script:TempBase, $tempProcExport.Items.Count, $script:ProdBase, $prodProcExport.Items.Count, $processingsPending.Count)
         foreach ($proc in $processingsPending) { Write-Line ("  {0} ({1}): {2}" -f $proc.ObjName, $proc.Title, $proc.Text) 'Yellow' }
         if ($processingsPending.Count -gt 0 -and -not (Test-Path -LiteralPath $selfCheckEpf)) {
@@ -6297,7 +6434,7 @@ else {
 
     if ($null -ne $lastVerdict -and (-not $ApplyPrepared -or (Get-JsonValue $prepared 'gate' ''))) {
         $prodActions = Get-JsonValue $lastVerdict 'verifiedActions' $null
-        if ($resumeChecksOnly -and -not (Get-JsonValue $resumeSource 'actions' $null)) { $prodActions = $null }
+        if (($resumeChecksOnly -or $resumeCardWork) -and -not (Get-JsonValue $resumeSource 'actions' $null)) { $prodActions = $null }
     }
     if ($StatusOnly) {
         Write-Host ''
@@ -6312,7 +6449,17 @@ else {
     if (-not (Test-UiCanAsk)) { throw 'обновление рабочей базы только из консоли: без человека скрипт ничего не обновляет' }
     # Прошлый откат подготовленного прошёл не полностью: ни новой подготовки, ни обновления - сначала восстановление (#10).
     if ($null -ne $prepared -and (Get-PreparedRollbackFailedText $prepared)) { throw (Get-PreparedRollbackFailedText $prepared) }
-    if ($null -ne $prepared -and -not $Prepare -and -not $ApplyPrepared) { throw (Get-PreparedBusyText 'Обновление одним проходом' $prepared) }
+    if ($null -ne $prepared -and -not $Prepare -and -not $ApplyPrepared) {
+        if (-not $Resume -or $resumeSource.mode -ne 'prepared' -or $resumeBeforeWrite -or $prepared.partial -or
+            $prepared.runId -cne (Get-JsonValue $resumeSource 'preparedRun' '') -or $prepared.gate -cne $resumeSource.gate.run -or
+            $prepared.target -cne $deployTarget.Identity -or $prepared.tempBase -ine $script:TempBase -or
+            @($prepared.extensions).Count -ne @($resumeSource.extensions).Count) { throw (Get-PreparedBusyText 'Обновление' $prepared) }
+        foreach ($item in $prepared.extensions) {
+            $applied = @($resumeSource.extensions | Where-Object { $_.name -eq $item.name -and (Get-JsonValue $_ 'stage' '') -eq 'applied' -and $_.newHash -ceq $item.tempHash })
+            if (-not $item.tempHash -or $applied.Count -ne 1) { throw (Get-PreparedBusyText 'Продолжение' $prepared) }
+        }
+        $resumePreparedHash = (Get-FileHash -LiteralPath $preparedPath).Hash
+    }
 
     # Кнопки - всегда, что бы ни показал гейт и сравнение: решает человек.
     # «Все» - все необновлённые (изменённые в temp, новые, несравнённые); если таких нет - все из temp заново.
@@ -6368,7 +6515,7 @@ else {
         else { Write-Line '  сверить с подготовкой не удалось: хеш-суммы расширений через внешнее соединение не прочитаны' 'Yellow' }
         $mode = 'prepared'
     }
-    if ($Resume) { $mode = if ($resumeBeforeWrite) { [string]$resumeSource.mode } else { 'actions' } }
+    if ($Resume) { $mode = if ($resumeBeforeWrite) { [string]$resumeSource.mode } elseif ($resumeCardWork) { 'resume-cards' } else { 'actions' } }
     if (-not $ApplyPrepared -and -not $Resume) {
     $modeMenu = New-Object System.Collections.Generic.List[object]
     $modeMenu.Add([pscustomobject]@{ Key = '1'; Label = ("Обновить все расширения из {0} в {1} ({2})" -f $script:TempBase, $script:ProdBase, (@($allTargets | ForEach-Object { $_.Name }) -join ', ')) })
@@ -6400,13 +6547,13 @@ else {
     }
 
     $selected = @()
-    if ($resumeBeforeWrite) {
-        $selected = @(foreach ($prior in $resumeSource.extensions) {
+    if ($resumeBeforeWrite -or $resumeCardWork) {
+        $selected = @(foreach ($prior in @($resumeSource.extensions | Where-Object { -not $resumeCardWork })) {
             $match = @($fromTemp | Where-Object Name -eq $prior.name)
             if ($match.Count -ne 1) { throw ("Продолжение: расширение {0} отсутствует в текущем профиле или в тестовой базе." -f $prior.name) }
             $match[0]
         })
-        $selectedProcessings = @(foreach ($prior in $resumeSource.processings) {
+        $selectedProcessings = @(foreach ($prior in @($resumeSource.processings | Where-Object { -not $resumeCardWork -or $_.stage -eq 'pending' })) {
             $match = @($processingsPending | Where-Object { $_.ObjName -eq $prior.name -and $_.RefAtComparison -eq $prior.cardRef })
             if ($match.Count -ne 1) { throw ("Продолжение: карточка {0} изменилась или исключена из сравнения." -f $prior.name) }
             $match[0]
@@ -6623,7 +6770,7 @@ if ($ApplyPrepared -and $null -ne $prepared -and $null -ne $prepared.PSObject.Pr
 # Подготовка сохраняет ссылку на проверенный прогон. Его EPF копируем при применении до первой записи.
 $actionsWithTargets = $prodActions # ** Хлебников С.Ю. 20261124 Подготовка тоже проверяет данные до загрузки.
 if ($Prepare -or $mode -in @('asis','epf','rollback')) { $prodActions = $null }
-elseif ($null -ne $lastRun -and -not $resumeChecksOnly -and (-not $ApplyPrepared -or (Get-JsonValue $prepared 'gate' ''))) {
+elseif ($null -ne $lastRun -and -not $resumeChecksOnly -and (-not $resumeCardWork -or $null -ne $prodActions) -and (-not $ApplyPrepared -or (Get-JsonValue $prepared 'gate' ''))) {
     $requested = @(Get-JsonValue $lastVerdict 'requestedActionIds' @() | Where-Object { $_ })
     $oldParams = Join-Path $lastRun.FullName 'actions\params.txt'
     if ($null -eq $prodActions -and ($requested.Count -gt 0 -or
@@ -6713,9 +6860,10 @@ if ((Test-DeployHourDenied (Get-Date)) -and -not $Prepare) { throw ("сейча�
 # ** Хлебников С.Ю. 20261120 Сводка прямо перед вводом имени: цель, операция, что было и что станет, обработки
 # (и ноль), гейт и причина выпуска - всё, что выше могло уехать за край экрана.
 $confirmLines = New-Object System.Collections.Generic.List[string]
-$operationNames = @{ 'actions' = 'выполнение проверенных действий'; '1' = 'обновление одним проходом (все из temp)'; '2' = 'обновление одним проходом (выбранные из temp)'; 'epf' = 'только внешние обработки'; 'asis' = 'обновление конфигурации БД как есть'; 'rollback' = 'откат'; 'prepared' = 'применение подготовленного' }
+$operationNames = @{ 'resume-cards' = 'запись оставшихся обработок исходного выпуска'; 'actions' = 'выполнение проверенных действий'; '1' = 'обновление одним проходом (все из temp)'; '2' = 'обновление одним проходом (выбранные из temp)'; 'epf' = 'только внешние обработки'; 'asis' = 'обновление конфигурации БД как есть'; 'rollback' = 'откат'; 'prepared' = 'применение подготовленного' }
 $operationText = 'обновление'
 if ($operationNames.ContainsKey([string]$mode)) { $operationText = $operationNames[[string]$mode] }
+if ($resumeChecksOnly) { $operationText = 'проверки оставленного обновления' }
 if ($Prepare) { $operationText = 'подготовка: загрузка в конфигурацию без применения, пользователи работают' }
 $confirmLines.Add(("Операция: {0}" -f $operationText))
 if ($Resume) { $confirmLines.Add(("Продолжение выпуска {0}. Этап: {1}." -f $resumeOf,$resumeStep)) }
@@ -7190,13 +7338,14 @@ if (-not $failed -and ($script:AwaitProdSessions -or $null -ne $prodActions -or 
 }
 # ** Хлебников С.Ю. 20261120 Пока шли вопросы и выгрузки, temp могли поменять: хеш-суммы - ещё раз, после того как
 # расширения взяты из temp. Не совпали с теми, по которым сверялся проверенный прогон, - в рабочую не грузим.
-if ($resumeBeforeWrite -and -not $failed) {
+if (($resumeBeforeWrite -or $resumeCardWork) -and -not $failed) {
     $currentTemp = Get-ExtensionStates -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword
     $currentProd = Get-ExtensionStates -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
     $currentProc = $null
     if ($selectedProcessings.Count) {
         $currentProc = Export-Processings -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword -Dir (Join-Path $script:RunDir 'resume-before-write')
     }
+    if ($resumeCardWork) { Assert-ResumeInstalled $currentProd $currentProc }
     Assert-ResumeBeforeWrite $currentTemp $currentProd $currentProc
 }
 if (-not $failed -and @('1', '2') -contains [string]$mode -and $selected.Count -gt 0 -and (Get-Variable -Name tempStates -ErrorAction SilentlyContinue) -and $null -ne $tempStates -and $tempStates.Ok) {
@@ -7542,7 +7691,7 @@ if ($outcome -eq 'updated' -and $null -ne $prodActions) {
             $client = Invoke-ProdClient -Epf $deployActionEpf -Parameter ("actions;in={0};out={1}" -f $paramsFile, $outFile) -DoneFile $outFile -TimeoutSec ([int](Get-Setting $cfg 'ActionsTimeoutSec' 1800)) -Title 'Действия после обновления'
             if (-not $client.Done) { throw 'клиент не записал итог; при повторе регистр пропустит выполненные действия' }
             $result = [IO.File]::ReadAllLines($outFile)
-            Assert-ActionResult -Lines $result -Ids $prodActions.ids
+            Assert-ActionResult -Lines $result -Ids $prodActions.ids -Register $prodActions.done
             Add-Light 'OK' 'Действия после обновления' (($result | Where-Object { $_ -like 'action=*' }) -join '; ')
             if ($prodActions.history -and $result -cnotcontains 'history=ok') { Add-Light 'WARN' 'История обновлений' 'загрузка не записана в регистр истории; подробности в actions\result.txt' }
         }
@@ -7555,7 +7704,7 @@ if ($outcome -eq 'updated' -and $null -ne $prodActions) {
 
 if ($outcome -eq 'updated') {
     Write-Host ''
-    if ($resumeChecksOnly -and $null -eq $prodActions) {
+    if (($resumeChecksOnly -or $resumeCardWork) -and $null -eq $prodActions) {
         Assert-ProdActionLock
         $lockedExt = Get-ExtensionStates -BaseName $script:ProdBase -User $script:ProdUser -Password $script:ProdPassword
         $lockedProc = $null
@@ -7926,6 +8075,10 @@ if ($outcome -eq 'updated') {
 # Откат прошёл не полностью - подготовка остаётся с отметкой: следующий запуск покажет, что рабочую надо восстановить (#10).
 if ($mode -eq 'prepared' -and $outcome -eq 'rollbackFailed' -and (Test-Path -LiteralPath $preparedPath)) { Set-PreparedRollbackFailed -Items @($script:RollbackResults) }
 if ($mode -eq 'prepared' -and $outcome -ne 'failed' -and $outcome -ne 'rollbackFailed' -and (Test-Path -LiteralPath $preparedPath)) { Remove-Item -LiteralPath $preparedPath -Force }
+if ($resumePreparedHash -and $outcome -in @('updated','actionsFailed','checksFailed') -and (Test-Path -LiteralPath $preparedPath)) {
+    if ((Get-FileHash -LiteralPath $preparedPath).Hash -eq $resumePreparedHash) { Remove-Item -LiteralPath $preparedPath -Force }
+    else { Write-Line 'Файл подготовки изменился во время продолжения. Проверь его в меню рабочей базы.' 'Yellow' }
+}
 # Восстановление после неполного отката подготовленного прошло: подготовки больше нет.
 if ($mode -eq 'rollback' -and $outcome -eq 'updated' -and $null -ne $prepared -and (Get-PreparedRollbackFailedText $prepared) -and (Test-Path -LiteralPath $preparedPath)) {
     Remove-Item -LiteralPath $preparedPath -Force
@@ -7973,6 +8126,7 @@ $summary = New-Object System.Collections.Generic.List[string]
 $summary.Add($reportTitle)
 $summary.Add(('Итог: ' + $outcomeNames[$outcome]))
 if ($Resume) { $summary.Add(('Продолжение исходного выпуска ' + $resumeOf)) }
+if ($resumeCardWork) { $summary.Add(("Резервные копии записанных в этой попытке карточек — в {0}. Копии ранее применённых объектов — в исходных установках. Откатывай попытки в обратном порядке." -f $beforeDir)) }
 if ($riskAccepted) { $summary.Add(('Несмотря на гейт: ' + ($gateRisks -join '; '))) }
 if ($riskReason) { $summary.Add(('Причина выпуска: ' + $riskReason)) }
 $summary.Add(('Расширения: ' + (@($selected | ForEach-Object { $_.Name }) -join ', ')))
@@ -8024,7 +8178,7 @@ if ($null -ne $script:DeployReport) {
 $recordGate = $null
 if ($null -ne $lastRun) {
     # ** Хлебников С.Ю. 20261120 Связь «вход - прогон - установка»: откуда комплект (полный коммит), что проверено, что выпущено.
-    $recordGate = [ordered]@{ run = $lastRun.Name; verdict = [string](Get-JsonValue $lastVerdict 'verdict' ''); kitSource = [string](Get-JsonValue $lastVerdict 'kitSource' ''); checkedNote = $checkedNote
+    $recordGate = [ordered]@{ run = $lastRun.Name; verdictHash = $actionVerdictHash; verdict = [string](Get-JsonValue $lastVerdict 'verdict' ''); kitSource = [string](Get-JsonValue $lastVerdict 'kitSource' ''); checkedNote = $checkedNote
         installed = @(foreach ($entry in $selected) { $installedHash = ''; if ($mode -eq 'asis') { $installedHash = '' } elseif ($mode -eq 'prepared') { $installedHash = [string](Get-JsonValue $preparedByName[$entry.Name] 'tempHash' '') } elseif ($null -ne $tempStates -and $tempStates.Ok -and $tempStates.Items.ContainsKey($entry.Name)) { $installedHash = [string]$tempStates.Items[$entry.Name].Hash }; [ordered]@{ name = $entry.Name; hash = $installedHash } }) }
 }
 $record = [ordered]@{
@@ -8038,6 +8192,7 @@ $record = [ordered]@{
     outcome      = $outcome
     rollbackOf   = $rollbackOf
     preparedRun  = $preparedRunId
+    actionsRequired = ($null -ne $prodActions)
     gate         = $recordGate
     riskAccepted = $riskAccepted
     risks        = @($gateRisks)
@@ -8055,6 +8210,10 @@ if ($null -ne $script:ProdClosedAt -and $null -ne $script:ProdOpenedAt) {
 }
 if ($null -ne $prodActions) { $record['actions'] = [ordered]@{ ids = @($prodActions.ids); sha256 = $prodActions.sha256; gateRun = $lastRun.Name; result = 'actions\result.txt' } }
 if ($null -ne $plainLogin) { $record['plainLogin'] = [ordered]@{ status = $plainLogin.Status; text = $plainLogin.Text } }
+if ($outcome -eq 'updated' -and $mode -notin @('rollback','asis') -and @($light | Where-Object Status -eq 'FAIL').Count) {
+    $record['pendingStep'] = 'checks'
+    Write-Line 'Обновление оставлено. После исправления выбери «Продолжить обновление с проваленного шага», чтобы повторить проверки.' 'Yellow'
+}
 if ($outcome -eq 'failed') {
     $checkpointFile = Join-Path $script:RunDir 'deploy.json'
     if ([IO.File]::Exists($checkpointFile)) { $record['checkpoint'] = [IO.File]::ReadAllText($checkpointFile) | ConvertFrom-Json }

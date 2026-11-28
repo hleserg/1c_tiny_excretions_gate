@@ -58,5 +58,30 @@
         $ok = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @($modeAnswer,$deployNameAnswer)
         Check ($ok.ExitCode -eq 0 -and $ok.Unexpected.Count -eq 0) 'проверенный файл помешал выполнению действий'
         Check (@($ok.Calls | Where-Object { $_.Line -match 'actions;in=' }).Count -eq 1) 'проверенные действия не запустились'
+        $manual.ref = $ref
+        $manual.use = 'Используется'
+        $other = New-PrintProcessing '10.0' $printOld
+        $other.ref = $archived.ref
+        $other.use = 'Отключена'
+        $other.title = 'Архивная печать'
+        $com = New-ComState -ProdHash 'h2' -TempProcessings @($current,$archived) -ProdProcessings @($manual,$other)
+        $exact = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @($modeAnswer,$deployNameAnswer)
+        Check ($exact.ExitCode -eq 0 -and $exact.Unexpected.Count -eq 0) 'отключённый дубль помешал выпуску проверенной активной карточки с тем же УИД'
+        Check (@($exact.Calls | Select-Object -Skip $ok.Calls.Count | Where-Object { $_.Line -match 'actions;in=' }).Count -eq 1) 'после сверки активной карточки действия не запустились'
+
+        $other.use = 'Используется'
+        $com = New-ComState -ProdHash 'h2' -TempProcessings @($current,$archived) -ProdProcessings @($manual,$other)
+        $twoActive = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @($modeAnswer)
+        $why = $twoActive.Output -join ' '
+        Check ($twoActive.ExitCode -ne 0 -and $twoActive.Unexpected.Count -eq 0 -and $why.Contains($ref) -and $why.Contains($other.ref) -and $why.Contains('Используется')) 'при двух действующих карточках должны быть названы обе ссылки и статусы публикации'
+        Check ((($twoActive.ComLog | Select-Object -Skip $exact.ComLog.Count) -join ' ') -notmatch 'UpdateInfoBase|TerminateSession') 'гейт закрыл базу до разрешения неоднозначности двух активных карточек'
+
+        $manual.use = 'Отключена'
+        $com = New-ComState -ProdHash 'h2' -TempProcessings @($current,$archived) -ProdProcessings @($manual,$other)
+        $inactive = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Answers @($modeAnswer)
+        $why = $inactive.Output -join ' '
+        Check ($inactive.ExitCode -ne 0 -and $inactive.Unexpected.Count -eq 0 -and $why.Contains($ref) -and $why -match 'целевая карточка.*Отключена') 'отключённая цель должна быть названа с УИД и своим состоянием'
+        Check (@($inactive.Calls | Select-Object -Skip $twoActive.Calls.Count | Where-Object { $_.Line -match 'actions;in=|/UpdateDBCfg|/LoadCfg' }).Count -eq 0) 'для отключённой целевой карточки началась запись'
+
     }
 }

@@ -119,14 +119,16 @@ func loadHistory(path string) (map[string][]historyEntry, error) {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1024*1024), 16*1024*1024)
+	lineNumber := 0
 	for sc.Scan() {
+		lineNumber++
 		line := strings.TrimSpace(strings.TrimPrefix(sc.Text(), "\ufeff"))
 		if line == "" {
 			continue
 		}
 		var e historyEntry
 		if err := json.Unmarshal([]byte(line), &e); err != nil {
-			return nil, fmt.Errorf("история %s: %v", path, err)
+			return nil, fmt.Errorf("история %s, строка %d: проверьте JSON записи о версии файла. %w", path, lineNumber, err)
 		}
 		dup := false
 		for _, x := range history[e.Path] {
@@ -138,7 +140,10 @@ func loadHistory(path string) (map[string][]historyEntry, error) {
 			history[e.Path] = append(history[e.Path], e)
 		}
 	}
-	return history, sc.Err()
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("не удалось прочитать историю %s после строки %d. Проверьте доступность файла и размер следующей записи: %w", path, lineNumber, err)
+	}
+	return history, nil
 }
 
 func runMerge(specPath string) (*result, error) {

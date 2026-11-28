@@ -3134,6 +3134,40 @@ function New-MenuItem {
     return [pscustomobject]@{ Key = $Key; Label = $Label; Hint = $Hint }
 }
 
+function Get-DeployResumeMenuHint {
+    # Здесь читаем только журнал. Проверка целевой базы и права продолжить выполняются в deploy.ps1 под блокировкой.
+    param([string]$Dir, [string]$BaseName)
+    if (-not $BaseName -or -not [IO.Directory]::Exists($Dir)) { return '' }
+    foreach ($dirInfo in @(Get-ChildItem -LiteralPath $Dir -Directory | Where-Object Name -match '^\d{8}-\d{6}$' | Sort-Object Name -Descending)) {
+        $path = Join-Path $dirInfo.FullName 'deploy.json'
+        if (-not [IO.File]::Exists($path)) {
+            if ([IO.File]::Exists((Join-Path $dirInfo.FullName 'summary.txt'))) { return '' }
+            continue
+        }
+        try { $record = [IO.File]::ReadAllText($path) | ConvertFrom-Json } catch { return '' }
+        if ((Get-UiField $record 'base' '') -ine $BaseName) { continue }
+        $outcome = Get-UiField $record 'outcome' ''
+        $label = switch ($outcome) {
+            'actionsFailed' { 'действия после обновления' }
+            'checksFailed' { 'проверки после обновления' }
+            'updated' {
+                if ((Get-UiField $record 'mode' '') -notin @('rollback','asis') -and
+                    ((Get-UiField $record 'pendingStep' '') -eq 'checks' -or
+                    @(Get-UiField $record 'light' @() | Where-Object status -eq 'FAIL').Count)) { 'проверки после обновления' }
+            }
+            'failed' { 'сверить последнюю запись выпуска' }
+            'inProgress' { 'сверить состояние незавершённой установки' }
+            'interrupted' { 'сверить состояние прерванной установки' }
+        }
+        if ($label) { return ("{0} · {1}" -f $dirInfo.Name, $label) }
+        if ($outcome -eq 'updated' -and (Get-UiField $record 'mode' '') -eq 'epf' -and
+            -not (Get-UiField $record 'resumeOf' '') -and @(Get-UiField $record 'processings' @()).Count -gt 0 -and
+            @(Get-UiField $record 'extensions' @()).Count -eq 0) { continue }
+        return ''
+    }
+    return ''
+}
+
 function Get-ResumeMenuHint {
     # Пояснение пункта меню «Продолжить прогон с упавшего шага»: какой прогон и чем кончился. Пункт есть, если
     # последний прогон этой базы не зелёный и записан гейтом с продолжением; пусто - пункта нет. Можно ли на самом
@@ -4649,7 +4683,9 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
         if ([string](Get-Setting $cfg 'UpdateRepo' '')) { $menu.Add((New-MenuItem 'update' 'Обновить гейт из GitHub' ('стоит {0}' -f $script:GateVersion))) }
         if (Test-Path -LiteralPath (Join-Path $Root 'deploy.ps1')) {
             $menu.Add((New-MenuItem 'deploy' 'Обновить рабочую базу' 'за один заход, без подготовки'))
-            $menu.Add((New-MenuItem 'resumedeploy' 'Продолжить обновление с проваленного шага' 'последняя установка этой рабочей базы'))
+            $deployDir = Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))
+            $deployHint = Get-DeployResumeMenuHint $deployDir ([string](Get-Setting $cfg 'ProdBase' ''))
+            if ($deployHint) { $menu.Add((New-MenuItem 'resumedeploy' 'Продолжить обновление с проваленного шага' $deployHint)) }
             # Обновление в два приёма (deploy.ps1 -Prepare/-ApplyPrepared/-CancelPrepared): подготовка - без блокировок,
             # пользователи работают; что подготовлено - в deploy\prepared.json.
             $preparedFile = Join-Path (Resolve-RootPath ([string](Get-Setting $cfg 'DeployDir' 'deploy'))) 'prepared.json'
@@ -5525,11 +5561,6 @@ function Invoke-GateActionsStep {
     elseif ($history -eq 'missing') { $historyText = ('регистра истории {0} в базе нет' -f [string](Get-Setting $cfg 'HistoryRegister' '')) }
     elseif ($history -eq 'notset') { $historyText = 'история загрузок не задана (HistoryRegister)' }
     elseif ($history -like 'error*') { $historyText = 'загрузку в историю записать не удалось (шаг «История загрузок»)' }
-    $registerText = @{
-        missing = ('регистра {0} в базе нет' -f [string](Get-Setting $cfg 'ActionsRegister' ''))
-        notset = 'не задан ActionsRegister'
-        nodimension = ('в регистре {0} нет измерения Действие' -f [string](Get-Setting $cfg 'ActionsRegister' ''))
-    }
     $parts = New-Object System.Collections.Generic.List[string]
     $stepStatus = 'OK'
     if ($status -eq 'error') {
@@ -5538,7 +5569,7 @@ function Invoke-GateActionsStep {
     }
     elseif ($register -and $register -ne 'ok' -and $script:GateActions.Count -gt 0) {
         $stepStatus = 'FAIL'
-        $why = [string]$registerText[$register]
+        $why = Get-ActionRegisterProblem $register ([string](Get-Setting $cfg 'ActionsRegister' ''))
         if (-not $why) { $why = $register }
         $parts.Add(('{0}: действия не выполнялись ({1})' -f $why, $script:GateActions.Count))
     }

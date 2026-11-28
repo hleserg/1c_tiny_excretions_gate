@@ -228,7 +228,9 @@ func loadPackages() []pack {
 				continue
 			}
 			var p pack
-			must(json.Unmarshal([]byte(readText(manifest)), &p))
+			if err := json.Unmarshal([]byte(readText(manifest)), &p); err != nil {
+				fail("не удалось прочитать описание пакета %s. Проверьте формат JSON и типы полей: %v", manifest, err)
+			}
 			if p.Name != e.Name() || !identifier.MatchString(p.Name) {
 				fail("%s: имя пакета %q должно совпадать с папкой и быть идентификатором 1С", manifest, p.Name)
 			}

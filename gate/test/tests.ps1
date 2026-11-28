@@ -2716,6 +2716,100 @@ $tests = @(
         }
     },
     @{
+        Name = 'deploy-resume-partial'
+        Text = 'Частичный выпуск: применённое расширение и записанная карточка пропускаются, квитанция отката транзакции допускает повтор. Последующий повтор проверок читает обе попытки.'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $release = '20261117-070000'
+            $source = '20261117-080000'
+            $dir = Join-Path $sb ('runs\' + $release)
+            $dep = Join-Path $sb ('deploy\' + $source)
+            New-Item -ItemType Directory $dir,$dep -Force | Out-Null
+            $names = @('Готовая','Повтор','Осталась')
+            $refs = @('13000000-0000-0000-0000-000000000011','13000000-0000-0000-0000-000000000012','13000000-0000-0000-0000-000000000013')
+            $new = @(for ($i=0;$i -lt 3;$i++) {
+                $row = New-PrintProcessing '2' $printNew
+                $row.objName=$names[$i];$row.ref=$refs[$i];$row.use='Используется';$row
+            })
+            $old = @(foreach ($row in $new) { $copy=$row.Clone();if ($copy.objName -ne $names[0]) { $copy.content=$printOld;$copy.version='1' };$copy })
+            $disabled = $old[1].Clone()
+            $disabled.ref = '13000000-0000-0000-0000-000000000029'
+            $disabled.use = 'Отключена'
+            $com = New-ComState -ProdHash 'h2' -TempProcessings $new -ProdProcessings ($old + @($disabled))
+            $snapshotFile = Join-Path $sb 'state-test.json'
+            $null = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments ('-SnapshotTemp "{0}"' -f $snapshotFile) -Com $com
+            $snapshot = [IO.File]::ReadAllText($snapshotFile) | ConvertFrom-Json
+            $verdictFile = Join-Path $dir 'verdict.json'
+            $verdict = @{baseKey='erp_temp_test';verdict='GREEN';kit='';kitDecision='';kitSource='';steps=@();checkedState=$snapshot}
+            [IO.File]::WriteAllText($verdictFile,($verdict | ConvertTo-Json -Depth 8),$utf8)
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try { $oldHash = [BitConverter]::ToString($sha.ComputeHash($utf8.GetBytes($printOld))).Replace('-','') } finally { $sha.Dispose() }
+            $procRows = @(for ($i=0;$i -lt 3;$i++) {
+                $name = $names[$i];$ref=$refs[$i]
+                @{name=$name;fileName=($name+'.epf');action='register';cardRef=$ref;ref=$(if ($i -eq 0) {$ref} else {''})
+                    oldHash=$oldHash;newHash=$snapshot.processingCards.$ref.hash;stage=@('written','writing','pending')[$i];newVersion='2';oldVersion='1'}
+            })
+            $ck = @{runId=$source;base='erp_base';tempBase='erp_temp_test';target=$script:ProdTargetId;mode='2';outcome='inProgress';step='writing';actionsRequired=$false
+                extensions=@(@{name='Адаптация';newHash='h2';oldHash='h1';stage='applied';status='changed'});processings=$procRows
+                gate=@{run=$release;verdict='GREEN';kitSource='';verdictHash=(Get-FileHash $verdictFile).Hash}}
+            $ck.mode = 'prepared'
+            $ck.preparedRun = '20261117-073000'
+            $preparedFile = Join-Path $sb 'deploy\prepared.json'
+            $prepared = @{runId=$ck.preparedRun;base=$ck.base;tempBase=$ck.tempBase;target=$ck.target;partial=$false;gate=$release
+                extensions=@(@{name='Адаптация';tempHash='h2';prodHash='h2'});timeText='17.11.2026 07:30'}
+            [IO.File]::WriteAllText($preparedFile,($prepared | ConvertTo-Json -Depth 6),$utf8)
+            $failed = $ck.Clone();$failed.outcome='failed';$failed.checkpoint=$ck
+            [IO.File]::WriteAllText((Join-Path $dep 'deploy.json'),($failed | ConvertTo-Json -Depth 8),$utf8)
+            foreach ($name in $names[0..1]) { New-Item -ItemType Directory (Join-Path $dep ('epf\'+$name)) -Force | Out-Null }
+            [IO.File]::WriteAllLines((Join-Path $dep 'epf\Готовая\result.txt'),[string[]]@('status=done',('ref='+$refs[0]),'check=ok'),$utf8)
+            $blocked = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Resume' -Com $com
+            Check ($blocked.ExitCode -ne 0 -and (Get-Calls $blocked @('regepf;')).Count -eq 0) 'неопределённая запись повторилась'
+            [IO.File]::WriteAllLines((Join-Path $dep 'epf\Повтор\result.txt'),[string[]]@('status=failed','objname=Повтор','ref=','check='),$utf8)
+            Reset-FakeState $sb
+            $retry = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Resume' -Com $com -Answers @($deployNameAnswer) -Fake @{canary=@(@{status='error'})}
+            Check-DeployCommon $retry
+            Check ((Get-Calls $retry @('regepf;')).Count -eq 2 -and (Get-Calls $retry @('regepf;','name=Готовая')).Count -eq 0) 'должны записаться только незавершённые карточки'
+            Check ((Get-Calls $retry @('/LoadCfg')).Count -eq 0 -and (Get-Calls $retry @('/UpdateDBCfg')).Count -eq 0) 'применённое расширение установлено второй раз'
+            $latest = Get-DeployRecord $sb
+            Check ($latest.runId -ne $source -and $latest.outcome -eq 'checksFailed' -and $latest.resumeOf -eq $source) 'утрачена связь продолжения и исходной попытки'
+            Check (-not (Test-Path -LiteralPath $preparedFile)) 'завершённая подготовка не снята после применения карточек'
+            Reset-FakeState $sb
+            $verified = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Resume' -Com (New-ComState -ProdHash 'h2' -TempProcessings $new -ProdProcessings ($new + @($disabled))) -Answers @($deployNameAnswer)
+            Check-DeployCommon $verified
+            Check ($verified.ExitCode -eq 0 -and (Get-Calls $verified @('/CheckCanApplyConfigurationExtensions')).Count -eq 1) 'продолжение не дошло до оставшихся проверок'
+            Check ((Get-Calls $verified @('regepf;')).Count -eq 0) 'повторные проверки переписали рабочие карточки'
+            $undo = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Rollback' -Com $com -Answers @(@{Kind='one';Header='Откат erp_base';Cancel=$true})
+            $menu = @($undo.Output | Where-Object { $_.StartsWith('@@ui:') -and $_.Contains('последние обновления') } | ForEach-Object { $_.Substring(5) | ConvertFrom-Json })
+            Check (@($menu[0].items | Where-Object { $_ -match 'расширений 1, обработок 1.*ПРИМЕНЕНО ЧАСТИЧНО' }).Count -eq 1) 'в исходном откате должны быть только применённое расширение и одна записанная им карточка'
+            Check (@($menu[0].items | Where-Object { $_ -match 'расширений 0, обработок 2' }).Count -eq 1) 'отдельный откат двух записей продолжения отсутствует'
+        }
+    },
+    @{
+        Name = 'deploy-resume-kept-checks'
+        Text = 'Оставленное после отказа канарейки обновление продолжает только проверки исходного выпуска.'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name -Config $deployConfig
+            $dir = Join-Path $sb 'runs\20261117-090000'
+            New-Item -ItemType Directory $dir -Force | Out-Null
+            $verdict = @{baseKey='erp_temp_test';verdict='GREEN';kit='';kitDecision='';kitSource='';steps=@()
+                checkedState=@{ok=$true;extensions=@{'Адаптация'=@{hash='h2'};'Доработки'=@{hash='hd'}};processings=@{}}}
+            [IO.File]::WriteAllText((Join-Path $dir 'verdict.json'),($verdict | ConvertTo-Json -Depth 6),$utf8)
+            $run = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com (New-ComState) -Fake @{canary=@(@{status='error'})} -Answers @(
+                @{Kind='one';Header='Обновление erp_base';Item='^Обновить выбранные'},@{Kind='many';Header='необновлённые расширения';Indexes=@(0)},
+                $deployNameAnswer,@{Kind='one';Header='Оставить обновление';Item='^Оставить$'})
+            Check-DeployCommon $run
+            $record = Get-DeployRecord $sb
+            Check ($record.outcome -eq 'updated' -and $record.pendingStep -eq 'checks') 'оператор оставил применённую установку, но её проваленный шаг потерян'
+            Reset-FakeState $sb
+            $resumed = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments '-Resume' -Com (New-ComState -ProdHash 'h2') -Answers @($deployNameAnswer)
+            Check-DeployCommon $resumed
+            Check ($resumed.ExitCode -eq 0 -and (Get-Calls $resumed @('canary;')).Count -gt 0) 'канарейка оставленного выпуска не проверена повторно'
+            Check (@($resumed.Calls | Where-Object { $_.Line -match '/LoadCfg|/UpdateDBCfg|regepf;|actions;in=' }).Count -eq 0) 'повтор проверки записал данные'
+        }
+    },
+    @{
         Name = 'deploy-resume-before-write'
         Text = 'Ошибка резервной копии сохраняет стадию до записи. Продолжение проверяет обе базы и применяет ровно выбранное расширение.'
         Run = {
@@ -3596,6 +3690,7 @@ $tests = @(
                     }
                 }
             }
+            Check ((& $keyOf $menu '^Продолжить обновление') -eq '') 'меню предлагает продолжить при отсутствии выпуска'
             # В inbox появилось обновление: новый пункт - первым, со своей клавишей «1», остальные клавиши те же.
             $null = Add-InboxFile $sb $cfeName
             $k = Invoke-Script -Sandbox $sb -Answers @(@{ Kind = 'one'; Header = 'Гейт расширений'; Item = '^Выход' })

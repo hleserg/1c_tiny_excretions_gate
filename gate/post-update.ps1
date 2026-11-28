@@ -14,8 +14,19 @@ function Get-ActionErrorSummary {
 }
 # ** Хлебников С.Ю. 20261124 конец
 
+function Get-ActionRegisterProblem {
+    param([string]$Status, [string]$Register)
+    $name = $Register
+    if (-not $name) { $name = 'из настройки ActionsRegister' }
+    switch -CaseSensitive ($Status) {
+        'missing' { return ("регистра {0} в базе нет" -f $name) }
+        'notset' { return 'не задан ActionsRegister' }
+        'nodimension' { return ("в регистре {0} нет измерения Действие" -f $name) }
+    }
+}
+
 function Assert-ActionResult {
-    param([string[]]$Lines, [string[]]$Ids)
+    param([string[]]$Lines, [string[]]$Ids, [string]$Register = '')
     $states = @($Lines | Where-Object { $_ -like 'status=*' })
     if ($states.Count -ne 1 -or $states[0] -cne 'status=ok' -or $Lines -cnotcontains 'done-register=ok') {
         # ** Хлебников С.Ю. 20261124 Показываем оператору действие и причину перед служебными статусами.
@@ -25,6 +36,11 @@ function Assert-ActionResult {
             }
         }
         # ** Хлебников С.Ю. 20261124 конец
+        $registerRows = @($Lines | Where-Object { $_ -clike 'done-register=*' })
+        if ($registerRows.Count -eq 1) {
+            $problem = Get-ActionRegisterProblem $registerRows[0].Substring('done-register='.Length) $Register
+            if ($problem) { throw ("Проверка регистра выполненных действий не прошла: {0} ({1}). Задайте в ActionsRegister имя регистра сведений с измерением Действие и сверьте его с установленной конфигурацией." -f $problem, $registerRows[0]) }
+        }
         $reason = @($Lines | Where-Object { $_ -match '^(error=|action=.*\|failed\||done-register=|status=)' })
         $detail = 'обработка не записала статус'
         if ($reason.Count) { $detail = Get-ActionErrorSummary ($reason -join '; ') }
