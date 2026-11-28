@@ -56,6 +56,7 @@ func (m *model) resetRun() {
 	m.verdict = ""
 	m.eta = nil
 	m.runLogPath = ""
+	m.testLog = testLog{}
 	m.notice = ""
 }
 

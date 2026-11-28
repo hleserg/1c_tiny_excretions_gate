@@ -3994,6 +3994,31 @@ function Test-UtJunitSettled {
     return $text.TrimEnd().EndsWith('</testsuites>')
 }
 
+function Send-UtLogLines {
+    param([string[]]$Lines)
+    # Строки движка идут в отдельное окно как данные, даже если выглядят как вопрос или вердикт.
+    $safe = @(foreach ($line in $Lines) {
+        $text = Get-MaskedLine $line
+        if ($adminPassword) { $text = $text.Replace($adminPassword, '***') }
+        if ($text.Length -gt 16384) { $text.Substring(0, 16384) + '…' } else { $text }
+    })
+    if ($safe.Count -gt 0) { Send-UiEvent @{kind = 'test-log'; lines = $safe} }
+}
+
+function Receive-UtConsole {
+    param($ConsoleRead)
+    if ($null -eq $ConsoleRead) { return }
+    $lines = New-Object System.Collections.Generic.List[string]
+    while ($null -ne $ConsoleRead.Next -and $ConsoleRead.Next.IsCompleted -and $lines.Count -lt 64) {
+        if ($ConsoleRead.Next.IsFaulted -or $ConsoleRead.Next.IsCanceled) { $ConsoleRead.Next = $null; break }
+        $line = $ConsoleRead.Next.GetAwaiter().GetResult()
+        if ($null -eq $line) { $ConsoleRead.Next = $null; break }
+        $lines.Add($line)
+        $ConsoleRead.Next = $ConsoleRead.Reader.ReadLineAsync()
+    }
+    if ($lines.Count) { Send-UtLogLines $lines.ToArray() }
+}
+
 function Invoke-UtSession {
     # Сеанс YAxUnit: тонкий клиент с /C"RunUnitTests=<файл настроек>". Итог - файл кода возврата (exitcode.txt)
     # и отчёт jUnit. Начало работы движка - появился его лог. State: done, exited, nostart, timeout; junit - кода
@@ -4011,6 +4036,11 @@ function Invoke-UtSession {
         filter = $filter; reportFormat = 'jUnit'; reportPath = $junit; closeAfterTests = $true; showReport = $false
         exitCode = $exitFile; logging = [ordered]@{ file = $logFile; level = 'info' }
     }
+    $interactiveLog = [bool]$script:UiChannelDir
+    if ($interactiveLog) {
+        $settings.logging['console'] = $true
+        $priorLog = Get-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
+    }
     $configFile = Join-Path $OutDir 'yaxunit.json'
     [System.IO.File]::WriteAllText($configFile, (ConvertTo-Json -InputObject $settings -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
     if ($configFile -match '[;"]') { throw 'в пути к папке прогона не должно быть точки с запятой и кавычек' }
@@ -4020,47 +4050,82 @@ function Invoke-UtSession {
     Write-RunLog ("> 1cv8c.exe {0}" -f ([regex]::Replace([regex]::Replace($argLine, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"')))
     $expected = Get-ExpectedStepSeconds $Title
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $process = Start-Process -FilePath $v8c -ArgumentList $argLine -PassThru
+    $consoleRead = $null
+    if ($interactiveLog) {
+        $info = New-Object System.Diagnostics.ProcessStartInfo($v8c, $argLine)
+        $info.WorkingDirectory = (Get-Location).ProviderPath
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $info.RedirectStandardOutput = $true
+        $info.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $process = [System.Diagnostics.Process]::Start($info)
+        $reader = $process.StandardOutput
+        $consoleRead = @{ Reader = $reader; Next = $reader.ReadLineAsync() }
+        Send-UiEvent @{kind = 'test-log'; title = 'YAxUnit · вывод клиента'}
+    } else {
+        $process = Start-Process -FilePath $v8c -ArgumentList $argLine -PassThru
+    }
     $null = $process.Handle
     $state = ''
     $detail = 'клиент запускается'
-    while ($true) {
-        if (Test-Path -LiteralPath $exitFile) { $state = 'done'; break }
-        if ($process.HasExited) {
-            Start-Sleep -Seconds 2
-            if (Test-Path -LiteralPath $exitFile) { $state = 'done' } else { $state = 'exited' }
-            break
+    try {
+        while ($true) {
+            Receive-UtConsole $consoleRead
+            if (Test-Path -LiteralPath $exitFile) { $state = 'done'; break }
+            if ($process.HasExited) {
+                Start-Sleep -Seconds 2
+                if (Test-Path -LiteralPath $exitFile) { $state = 'done' } else { $state = 'exited' }
+                break
+            }
+            $started = Test-Path -LiteralPath $logFile
+            if (-not $started -and $watch.Elapsed.TotalSeconds -ge $selfCheckStartTimeoutSec) { $state = 'nostart'; break }
+            if ($watch.Elapsed.TotalSeconds -ge $unitTestTimeoutSec) { $state = 'timeout'; break }
+            # Отчёт jUnit дописан, а кода возврата нет и через 15 с: движок упал после отчёта (прогон 19.11 - не смог
+            # дописать свой лог). Итог - по отчёту.
+            if (Test-UtJunitSettled -Path $junit -SettleSec 15) { $state = 'junit'; break }
+            if ($started) {
+                # Лог движка на ходу не читается: YAxUnit открывает его на запись монопольно, и чтение гейта в этот момент
+                # роняет движок («Ошибка совместного доступа к файлу»). Размер файла берётся без открытия.
+                $detail = 'тесты идут'
+                try { $detail = 'тесты идут, лог движка {0} КБ' -f [int]((Get-Item -LiteralPath $logFile -ErrorAction Stop).Length / 1024) } catch { }
+            }
+            Write-UiProgress -Title $Title -Elapsed $watch.Elapsed.TotalSeconds -Expected $expected -Detail $detail
+            if ($consoleRead -and $consoleRead.Next -and $consoleRead.Next.IsCompleted) { continue }
+            Start-Sleep -Milliseconds 500
         }
-        $started = Test-Path -LiteralPath $logFile
-        if (-not $started -and $watch.Elapsed.TotalSeconds -ge $selfCheckStartTimeoutSec) { $state = 'nostart'; break }
-        if ($watch.Elapsed.TotalSeconds -ge $unitTestTimeoutSec) { $state = 'timeout'; break }
-        # Отчёт jUnit дописан, а кода возврата нет и через 15 с: движок упал после отчёта (прогон 19.11 - не смог
-        # дописать свой лог). Итог - по отчёту.
-        if (Test-UtJunitSettled -Path $junit -SettleSec 15) { $state = 'junit'; break }
-        if ($started) {
-            # Лог движка на ходу не читается: YAxUnit открывает его на запись монопольно, и чтение гейта в этот момент
-            # роняет движок («Ошибка совместного доступа к файлу»). Размер файла берётся без открытия.
-            $detail = 'тесты идут'
-            try { $detail = 'тесты идут, лог движка {0} КБ' -f [int]((Get-Item -LiteralPath $logFile -ErrorAction Stop).Length / 1024) } catch { }
+        Complete-UiProgress
+        # Клиент закрылся без кода возврата, но отчёт целый - итог по отчёту.
+        if ($state -eq 'exited' -and (Test-UtJunitSettled -Path $junit -SettleSec 0)) { $state = 'junit' }
+        $windows = @()
+        if ($state -eq 'done') {
+            # Код возврата записан, отчёт - перед ним; клиент закрывается сам.
+            $exitWait = [System.Diagnostics.Stopwatch]::StartNew()
+            while (-not $process.WaitForExit(250) -and $exitWait.Elapsed.TotalSeconds -lt 60) { Receive-UtConsole $consoleRead }
+            if (-not $process.HasExited) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
         }
-        Write-UiProgress -Title $Title -Elapsed $watch.Elapsed.TotalSeconds -Expected $expected -Detail $detail
-        Start-Sleep -Milliseconds 500
+        elseif ($state -eq 'junit') {
+            Write-RunLog '  YAxUnit: отчёт jUnit есть, кода возврата нет - итог по отчёту'
+            if (-not $process.HasExited) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
+        }
+        elseif (-not $process.HasExited) {
+            $windows = @(Save-ProcessWindows -ProcessId $process.Id -FilePrefix (Join-Path $OutDir 'client'))
+            try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { }
+        }
+    } finally {
+        if ($consoleRead) { $consoleRead.Reader.Dispose() }
     }
-    Complete-UiProgress
-    # Клиент закрылся без кода возврата, но отчёт целый - итог по отчёту.
-    if ($state -eq 'exited' -and (Test-UtJunitSettled -Path $junit -SettleSec 0)) { $state = 'junit' }
-    $windows = @()
-    if ($state -eq 'done') {
-        # Код возврата записан, отчёт - перед ним; клиент закрывается сам.
-        if (-not $process.WaitForExit(60000)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
-    }
-    elseif ($state -eq 'junit') {
-        Write-RunLog '  YAxUnit: отчёт jUnit есть, кода возврата нет - итог по отчёту'
-        if (-not $process.HasExited) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
-    }
-    elseif (-not $process.HasExited) {
-        $windows = @(Save-ProcessWindows -ProcessId $process.Id -FilePrefix (Join-Path $OutDir 'client'))
-        try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { }
+    if ($interactiveLog -and $process.WaitForExit(2000)) {
+        # Только закрывшийся клиент освободил файл; там могут быть дополнительные строки с сервера.
+        $item = Get-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
+        if ($item -and ($null -eq $priorLog -or $item.LastWriteTimeUtc -ne $priorLog.LastWriteTimeUtc -or $item.Length -ne $priorLog.Length)) {
+            try {
+                $tail = @(Get-Content -LiteralPath $logFile -Tail 6000 -Encoding UTF8 -ErrorAction Stop)
+                Send-UiEvent @{kind = 'test-log'; title = 'YAxUnit · yaxunit.log'}
+                for ($i = 0; $i -lt $tail.Count; $i += 64) {
+                    Send-UtLogLines $tail[$i..([Math]::Min($i + 63, $tail.Count - 1))]
+                }
+            } catch { Write-RunLog ('  Не удалось показать журнал YAxUnit: ' + $_.Exception.Message) }
+        }
     }
     $code = ''
     if (Test-Path -LiteralPath $exitFile) { $code = ([System.IO.File]::ReadAllText($exitFile, [System.Text.Encoding]::UTF8)).Trim().TrimStart([char]0xFEFF) }

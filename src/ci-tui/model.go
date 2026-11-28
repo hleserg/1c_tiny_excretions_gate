@@ -84,6 +84,7 @@ type model struct {
 
 	logTruncated bool
 	runLogPath   string
+	testLog      testLog
 
 	// ** Хлебников С.Ю. 20261120 Для шапки (#32): с какой базой работает скрипт (событие context) и когда от него
 	// было последнее сообщение - строка или событие. Видно и в узком окне, где нет колонки шагов.
@@ -238,6 +239,13 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		// На столбец уже окна: консоль Windows переносит строку во всю ширину, и экран съезжает вниз.
 		m.width, m.height = msg.Width-1, msg.Height
+		if d := m.testLog.window; d != nil {
+			atEnd := d.view.AtBottom()
+			d.resize(m.width, m.height)
+			if atEnd {
+				d.view.GotoBottom()
+			}
+		}
 		m.layout()
 		m.refreshLog()
 		return m, nil
@@ -282,6 +290,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.context = ev.Text
 		case "run-log":
 			m.runLogPath = ev.Text
+		case "test-log":
+			m.testLog.receive(ev, m.width, m.height)
 		case "plan":
 			m.setPlan(ev.Steps, ev.Parallel, ev.Ops)
 			return m, m.syncOverall()
@@ -339,6 +349,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshLog()
 			}
 		case "one", "many", "confirm", "text", "view":
+			m.testLog.window = nil
 			m.queue = append(m.queue, ev)
 			m.openNextDialog()
 		}
@@ -392,6 +403,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmd1, cmd2)
 
 	case tea.MouseMsg:
+		if d := m.testLog.window; d != nil {
+			return m, d.mouse(msg)
+		}
 		if m.dialog != nil && m.dialog.docked() && msg.Button == tea.MouseButtonLeft {
 			// Полоса вопроса внизу: щелчок - по её кнопкам; колесо остаётся журналу.
 			return m.dialogMouse(m.dockedMouse(msg))
@@ -406,6 +420,14 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.dialogMouse(m.overlayMouse(msg))
 
 	case tea.KeyMsg:
+		if msg.Type == tea.KeyF3 {
+			m.testLog.toggle(m.width, m.height)
+			return m, nil
+		}
+		if m.testLog.window != nil {
+			cmd := m.testLog.key(msg)
+			return m, cmd
+		}
 		if msg.String() == "f2" {
 			// Строки окна - в буфер обмена. Мышь у ci.exe занята прокруткой и щелчками по пунктам, поэтому выделить
 			// текст в окне, как в обычной консоли, нельзя. Работает и при открытом вопросе.
@@ -596,8 +618,12 @@ func (m model) View() string {
 	if m.width == 0 {
 		return "запуск…"
 	}
-	if m.dialog != nil && !m.dialog.docked() {
-		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.dialog.View(),
+	d := m.dialog
+	if m.testLog.window != nil {
+		d = m.testLog.window
+	}
+	if d != nil && !d.docked() {
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, d.View(),
 			lipgloss.WithWhitespaceChars(" "))
 	}
 	footer := m.viewFooter()
@@ -822,6 +848,9 @@ func (m model) viewFooter() string {
 		}
 	default:
 		help = "enter или esc снова в меню · q выход · ↑↓ журнал · F2 скопировать журнал окна"
+	}
+	if help != "" && m.testLog.title != "" {
+		help = "F3 лог YAxUnit · " + help
 	}
 	// Строки подсказки не обрезаются: не влезает - переносится. Версия сборки - в правом нижнем углу.
 	width := max(20, m.width)

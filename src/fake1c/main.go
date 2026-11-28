@@ -1188,7 +1188,8 @@ func unitRun1(u unitRun, configPath string) {
 		ReportPath string `json:"reportPath"`
 		ExitCode   string `json:"exitCode"`
 		Logging    struct {
-			File string `json:"file"`
+			File    string `json:"file"`
+			Console bool   `json:"console"`
 		} `json:"logging"`
 	}
 	if json.Unmarshal(trimBOM(data), &cfg) != nil {
@@ -1196,6 +1197,9 @@ func unitRun1(u unitRun, configPath string) {
 	}
 	if cfg.Logging.File != "" {
 		writeUTF8(cfg.Logging.File, "------\n01.01.2026 00:00:00 [Клиент][Информация]: Инициализация")
+	}
+	if cfg.Logging.Console {
+		fmt.Println("[Клиент][INF]: Инициализация /P\"тестовый-пароль\"")
 	}
 	if u.Exited {
 		return
