@@ -12,9 +12,11 @@ function Read-ContractDeployAst {
 
 function New-ContractDeployModule {
     $tree = Read-ContractDeployAst (Join-Path $ciRoot 'deploy.ps1')
-    $definitions = @($tree.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] } | ForEach-Object { $_.Extent.Text })
-    return (New-Module -ArgumentList ($definitions -join "`n"), (Join-Path $ciRoot 'locks.ps1'), (Join-Path $ciRoot 'cluster-target.ps1') -ScriptBlock {
-            param($Source, $LocksScript, $ClusterScript)
+    # Учитываем рабочий цикл deploy.ps1, но не заходим во вложенные тела функций.
+    $definitions = @($tree.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false) | ForEach-Object { $_.Extent.Text })
+    return (New-Module -ArgumentList ($definitions -join "`n"), (Join-Path $ciRoot 'locks.ps1'), (Join-Path $ciRoot 'cluster-target.ps1'), (Join-Path $ciRoot 'ui.ps1') -ScriptBlock {
+            param($Source, $LocksScript, $ClusterScript, $UiScript)
+            . $UiScript
             . $ClusterScript
             . $LocksScript
             . ([scriptblock]::Create($Source))
