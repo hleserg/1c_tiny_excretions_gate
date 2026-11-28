@@ -5726,6 +5726,16 @@ function Assert-ResumeInstalled {
         $name = [string]$item.name
         $expected = Get-ResumeProcessingProof $item
         $actual = @($ProcessingExport.Items | Where-Object ObjName -eq $name)
+        if ((Get-JsonValue $item 'stage' '') -eq 'written' -and @($resumeRepairs | Where-Object { $_.ref -eq $item.ref -and $_.name -eq $name }).Count -eq 0) {
+            if ($name -notmatch '^[\p{L}_][\p{L}\p{Nd}_]*$') { throw 'Продолжение: в журнале неверное имя объекта обработки.' }
+            $receiptPath = Join-Path (Join-Path (Join-Path $deployRoot $resumeOf) ('epf\' + $name)) 'result.txt'
+            if (-not [IO.File]::Exists($receiptPath)) { throw ("Продолжение: для {0} нет результата подключения и проверки форм в {1}." -f $name,$receiptPath) }
+            $receipt = [IO.File]::ReadAllLines($receiptPath)
+            if ($receipt -cnotcontains 'status=done' -or $receipt -cnotcontains ('ref=' + $item.ref) -or
+                @($receipt | Where-Object { $_ -match '^(formerror=|check=error$)' }).Count) {
+                throw ("Продолжение: документированной успешной проверки карточки {0} нет. Проверь {1}." -f $name,$receiptPath)
+            }
+        }
         if ($name -in $excludedProcessings -or $item.action -ne 'register' -or -not $ProcessingExport.Ok -or
             -not (Get-JsonValue $expected 'hash' '') -or $actual.Count -ne 1 -or $actual[0].Hash -ne $expected.hash -or
             ($item.ref -and $item.ref -ne $actual[0].Ref)) {
@@ -7519,22 +7529,22 @@ if ($outcome -eq 'updated' -and $null -ne $prodActions) {
         if ($resumeChecksOnly) {
             Add-Light 'OK' 'Действия после обновления' 'Ранее закончены. Записи регистра подтверждены под блокировкой.'
         } else {
-        $paramsFile = Join-Path $workActions 'params.txt'
-        $outFile = Join-Path $workActions 'result.txt'
-        $params = @('kind=обновление рабочей', ('run=' + $runId), ('commit=' + $prodActions.commit),
-            ('branch=' + $prodActions.branch), ('gate=' + $lastVerdict.gateVersion), ('done=' + $prodActions.done),
-            ('history=' + $prodActions.history), ('items=' + ((@($selected | ForEach-Object { $_.Name }) + @($selectedProcessings | ForEach-Object { $_.ObjName })) -join ', ')))
-        $params += @($prodActions.ids | ForEach-Object { 'action=' + $_ })
-        [IO.File]::WriteAllLines($paramsFile, [string[]]$params, $Utf8Bom)
-        if (Test-Path -LiteralPath $outFile) { throw 'в каталоге этого запуска уже есть результат действий' }
-        Assert-ProdActionLock
-        $actionClientStarted = $true
-        $client = Invoke-ProdClient -Epf $deployActionEpf -Parameter ("actions;in={0};out={1}" -f $paramsFile, $outFile) -DoneFile $outFile -TimeoutSec ([int](Get-Setting $cfg 'ActionsTimeoutSec' 1800)) -Title 'Действия после обновления'
-        if (-not $client.Done) { throw 'клиент не записал итог; при повторе регистр пропустит выполненные действия' }
-        $result = [IO.File]::ReadAllLines($outFile)
-        Assert-ActionResult -Lines $result -Ids $prodActions.ids
-        Add-Light 'OK' 'Действия после обновления' (($result | Where-Object { $_ -like 'action=*' }) -join '; ')
-        if ($prodActions.history -and $result -cnotcontains 'history=ok') { Add-Light 'WARN' 'История обновлений' 'загрузка не записана в регистр истории; подробности в actions\result.txt' }
+            $paramsFile = Join-Path $workActions 'params.txt'
+            $outFile = Join-Path $workActions 'result.txt'
+            $params = @('kind=обновление рабочей', ('run=' + $runId), ('commit=' + $prodActions.commit),
+                ('branch=' + $prodActions.branch), ('gate=' + $lastVerdict.gateVersion), ('done=' + $prodActions.done),
+                ('history=' + $prodActions.history), ('items=' + ((@($selected | ForEach-Object { $_.Name }) + @($selectedProcessings | ForEach-Object { $_.ObjName })) -join ', ')))
+            $params += @($prodActions.ids | ForEach-Object { 'action=' + $_ })
+            [IO.File]::WriteAllLines($paramsFile, [string[]]$params, $Utf8Bom)
+            if (Test-Path -LiteralPath $outFile) { throw 'в каталоге этого запуска уже есть результат действий' }
+            Assert-ProdActionLock
+            $actionClientStarted = $true
+            $client = Invoke-ProdClient -Epf $deployActionEpf -Parameter ("actions;in={0};out={1}" -f $paramsFile, $outFile) -DoneFile $outFile -TimeoutSec ([int](Get-Setting $cfg 'ActionsTimeoutSec' 1800)) -Title 'Действия после обновления'
+            if (-not $client.Done) { throw 'клиент не записал итог; при повторе регистр пропустит выполненные действия' }
+            $result = [IO.File]::ReadAllLines($outFile)
+            Assert-ActionResult -Lines $result -Ids $prodActions.ids
+            Add-Light 'OK' 'Действия после обновления' (($result | Where-Object { $_ -like 'action=*' }) -join '; ')
+            if ($prodActions.history -and $result -cnotcontains 'history=ok') { Add-Light 'WARN' 'История обновлений' 'загрузка не записана в регистр истории; подробности в actions\result.txt' }
         }
     } catch {
         $outcome = if ($resumeChecksOnly) { 'checksFailed' } else { 'actionsFailed' }
@@ -7557,6 +7567,13 @@ if ($outcome -eq 'updated') {
     if ($script:JournalOn -and -not (Save-DeployJournal -Step 'checks')) { throw 'Не сохранена стадия итоговых проверок в deploy.json.' }
     Write-Host 'Лёгкий прогон (в базу ничего не пишется):'
 
+    # Если действие остановилось, оценка подключения обработок исходного выпуска ещё не попала в лёгкий прогон.
+    if ($Resume -and -not $resumeBeforeWrite) {
+        foreach ($item in @($resumeSource.processings | Where-Object { (Get-JsonValue $_ 'status' '') -eq 'WARN' })) {
+            $repair = @($resumeRepairs | Where-Object { $_.ref -eq $item.ref -and $_.name -eq $item.name })
+            if (-not $repair.Count) { Add-Light 'FAIL' $item.name ('После записи исходного выпуска: ' + (@($item.problems) -join ' | ')) }
+        }
+    }
     # Внешние обработки: подключение и формы проверил сам сеанс записи (regepf); здесь - его итог.
     if ($touchedProcessings.Count -gt 0) {
         $procProblems = @($touchedProcessings | Where-Object { @($_.Problems).Count -gt 0 })
