@@ -155,7 +155,7 @@ function Invoke-Script {
     # Запускает скрипт гейта в песочнице, как ci.exe: вывод читается построчно, на вопросы @@ui отвечают правила.
     # Com - состояние подставного COM (test\fakecom.ps1) для deploy.ps1; $null - без него. Состояние после
     # прогона и строки com.log - в ответе (ComState, ComLog); повторный запуск с $null продолжает то же состояние.
-    param([string]$Sandbox, [string]$Script = 'run.ps1', [string]$Arguments = '', [hashtable]$Fake = @{}, $Answers = @(), $Com = $null, [string]$StopAtProgress = '')
+    param([string]$Sandbox, [string]$Script = 'run.ps1', [string]$Arguments = '', [hashtable]$Fake = @{}, $Answers = @(), $Com = $null, [string]$StopAtProgress = '', [string]$StopAfterFile = '')
     $channel = Join-Path $Sandbox 'chan'
     New-Item -ItemType Directory -Path $channel -Force | Out-Null
     $scenarioFile = Join-Path $Sandbox 'fake\scenario.json'
@@ -205,7 +205,8 @@ function Invoke-Script {
         if (-not $line.StartsWith('@@ui:')) { continue }
         $message = $null
         try { $message = $line.Substring(5) | ConvertFrom-Json } catch { continue }
-        if ($StopAtProgress -and -not $stopWatch -and $message.kind -eq 'progress' -and ($message.title + ' ' + $message.detail) -match $StopAtProgress) {
+        if ($StopAtProgress -and -not $stopWatch -and $message.kind -eq 'progress' -and ($message.title + ' ' + $message.detail) -match $StopAtProgress -and
+            (-not $StopAfterFile -or [IO.File]::Exists((Join-Path $Sandbox $StopAfterFile)))) {
             $stopWatch = [Diagnostics.Stopwatch]::StartNew()
             [IO.File]::WriteAllText((Join-Path $channel 'stop'), 'stop')
         }
@@ -2288,6 +2289,24 @@ $tests = @(
             Check (@(Get-Process -Name '1cv8c' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq (Join-Path $sb 'bin\1cv8c.exe') }).Count -eq 0) 'остался исполнитель самопроверки'
             Check ([IO.File]::Exists((Join-Path $r.RunDir 'end.pending'))) 'нет итога для досылки в GitHub'
             Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0 -and -not $r.Verdict) 'после q началась загрузка или сформирован вердикт'
+        }
+    },
+    @{
+        Name = 'emergency-stop-com'
+        Text = 'q при зависшем чтении расширений через COM завершает процесс и не переходит к чтению обработок'
+        Run = {
+            param($Name)
+            $sb = New-ReportingDeploySandbox $Name
+            $com = New-ComState
+            $com['extensionsReadDelayMs'] = 30000
+            $snapshot = Join-Path $sb 'snapshot.json'
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Arguments ('-SnapshotTemp "{0}"' -f $snapshot) -Com $com `
+                -StopAtProgress 'Прочитать расширения' -StopAfterFile 'fake/com.json.reading'
+            Check ($r.StopWatch -and $r.StopWatch.Elapsed.TotalSeconds -lt 10) 'отмена ждала ответа зависшего COM'
+            Check ($r.ExitCode -ne 0 -and ($r.Output -join ' ') -match 'остановлено из интерфейса') 'нет итога остановки'
+            $readerId = [int][IO.File]::ReadAllText((Join-Path $sb 'fake/com.json.reading'))
+            Check ($null -eq (Get-Process -Id $readerId -ErrorAction SilentlyContinue)) 'соединение COM осталось после остановки'
+            Check (-not [IO.File]::Exists($snapshot)) 'после остановки записан снимок'
         }
     },
     @{

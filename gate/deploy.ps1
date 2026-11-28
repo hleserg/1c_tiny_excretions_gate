@@ -1355,55 +1355,73 @@ function Get-ExtensionVersion {
 }
 
 function Invoke-UiBackground {
-    # Долгий вызов (внешнее соединение 1С) - в отдельном потоке, а в окне - строка хода с временем.
-    # Не уложился в TimeoutSec - не ждём (поток бросается), Ok = $false. Ошибка внутри - Ok = $false и её текст.
+    # У зависшего вызова COM нет кооперативной отмены. Отдельный STA-процесс можно снять, оставив родителю блокировки.
     param([scriptblock]$Script, [object[]]$Arguments, [string]$Title, [int]$TimeoutSec, [string]$ProgressTitle = $Title)
     Test-UiStop
-    $runspace = [runspacefactory]::CreateRunspace()
-    $runspace.ApartmentState = 'STA'
-    $runspace.Open()
-    $shell = [powershell]::Create()
-    $shell.Runspace = $runspace
-    [void]$shell.AddScript($Script.ToString())
-    foreach ($argument in $Arguments) { [void]$shell.AddArgument($argument) }
-    $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $handle = $shell.BeginInvoke()
-    $plan = Get-StatPlan $Title
-    try {
-        while (-not $handle.IsCompleted) {
-            if ($watch.Elapsed.TotalSeconds -ge $TimeoutSec) {
-                Complete-UiProgress
-                Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status 'TIMEOUT'
-                return [pscustomobject]@{ Ok = $false; Error = ("нет ответа за {0} с (настройка ComTimeoutSec)" -f $TimeoutSec); Result = $null }
-            }
-            Write-UiProgress -Title $ProgressTitle -Elapsed $watch.Elapsed.TotalSeconds -Expected $plan
-            Start-Sleep -Milliseconds 250
-        }
-    } finally {
-        if (-not $handle.IsCompleted) { try { [void]$shell.BeginStop($null, $null) } catch { Write-Warning $_.Exception.Message } }
-    }
-    Complete-UiProgress
+    $worker = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+try {
+    $xml = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd()))
+    $call = [System.Management.Automation.PSSerializer]::Deserialize($xml)
+    $values = [object[]]$call.Arguments
+    $output = @(& ([scriptblock]::Create($call.Script)) @values)
+    $result = $null
+    if ($output.Count) { $result = $output[-1] }
+    [Console]::Out.Write([System.Management.Automation.PSSerializer]::Serialize($result, 16))
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
+'@
+    # В аргументах процесса только постоянный код. Строка подключения передаётся по pipe, без файла и журнала.
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = Join-Path $PSHOME 'powershell.exe'
+    $info.Arguments = '-NoLogo -NoProfile -NonInteractive -STA -OutputFormat Text -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($worker))
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $info.StandardOutputEncoding = $info.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
+    $payload = [System.Management.Automation.PSSerializer]::Serialize(@{ Script = $Script.ToString(); Arguments = $Arguments }, 16)
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $process = [Diagnostics.Process]::Start($info)
     $result = $null
     $errorText = ''
-    try {
-        $output = $shell.EndInvoke($handle)
-        if ($output.Count -gt 0) { $result = $output[$output.Count - 1] }
-        # .PSObject.BaseObject, а не .BaseObject: у хеш-таблицы точка ищет ключ, и под StrictMode это ошибка.
-        if ($result -is [System.Management.Automation.PSObject]) { $result = $result.PSObject.BaseObject }
-        if ($shell.Streams.Error.Count -gt 0) { $errorText = [string]$shell.Streams.Error[0] }
-    }
-    catch {
-        $errorText = $_.Exception.Message
-        if ($null -ne $_.Exception.InnerException) { $errorText = $_.Exception.InnerException.Message }
-    }
-    finally {
-        $shell.Dispose()
-        $runspace.Dispose()
-    }
     $status = 'OK'
-    if ($errorText) { $status = 'FAIL' }
+    try {
+        Register-UiProcess $process
+        $readOutput = $process.StandardOutput.ReadToEndAsync()
+        $readError = $process.StandardError.ReadToEndAsync()
+        $process.StandardInput.Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload)))
+        $process.StandardInput.Close()
+        if (Wait-UiProcess -Process $process -Watch $watch -TimeoutSec $TimeoutSec -Title $ProgressTitle -Expected (Get-StatPlan $Title)) {
+            $text = $readOutput.GetAwaiter().GetResult()
+            if ($process.ExitCode -eq 0) { $result = [System.Management.Automation.PSSerializer]::Deserialize($text) }
+            else {
+                $errorText = $readError.GetAwaiter().GetResult().Trim()
+                if (-not $errorText) { $errorText = "процесс чтения 1С завершился с кодом $($process.ExitCode)" }
+                $status = 'FAIL'
+            }
+        } else {
+            $status = 'TIMEOUT'
+            $errorText = "нет ответа за $TimeoutSec с (настройка ComTimeoutSec)"
+        }
+    } catch {
+        $errorText = $_.Exception.GetBaseException().Message
+        $status = 'FAIL'
+    } finally {
+        if (-not $process.HasExited) {
+            try { $process.Kill() } catch [InvalidOperationException] { }
+            $process.WaitForExit()
+        }
+        $null = $UiStopState.Children.Remove($process)
+        $process.Dispose()
+    }
     Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status $status
-    return [pscustomobject]@{ Ok = (-not $errorText); Error = $errorText; Result = $result }
+    return [pscustomobject]@{ Ok = ($status -eq 'OK'); Error = $errorText; Result = $result }
 }
 
 function New-V8Connector {
@@ -1441,7 +1459,7 @@ function Get-ExtensionStates {
     # ComTimeoutSec: первое внешнее соединение к большой базе бывает долгим. Не получилось - Ok = $false.
     param([string]$BaseName, [string]$User, [string]$Password)
     $reader = {
-        # FakeScript и FakeFile - подставной COM тестов (см. New-V8Connector): в фоновом потоке функций скрипта нет.
+        # FakeScript и FakeFile - подставной COM тестов (см. New-V8Connector): в дочернем процессе функций скрипта нет.
         param([string]$Line, [string]$FakeScript, [string]$FakeFile)
         $items = @{}
         if ($FakeScript) { . $FakeScript; $connector = New-FakeComConnector $FakeFile }
@@ -5006,8 +5024,7 @@ function Get-ComConfigInfo {
                 }
             }
             $metadata = & $get $connection 'Metadata'
-            # Массивом: Invoke-UiBackground берёт у результата .PSObject.BaseObject, а у одиночного pscustomobject
-            # там голый объект без свойств.
+            # Вызывающий код читает первую запись массива.
             return , @([pscustomobject]@{ Name = [string](& $get $metadata 'Name'); Synonym = [string](& $get $metadata 'Synonym'); Version = [string](& $get $metadata 'Version') })
         }
         finally {
