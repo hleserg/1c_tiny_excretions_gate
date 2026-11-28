@@ -519,6 +519,8 @@ function Send-RunEvent {
     # requests.log, тело - в dispatch-NN.json; файл dispatch-fail.txt в той же папке - «нет связи».
     param([string]$Repo, [string]$Token, [string]$Json)
     if ($Repo -notmatch '^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$') { throw 'RunReportRepo: требуется имя в виде владелец/репозиторий' }
+    $canStop = $null -ne (Get-Variable UiStopState -ErrorAction SilentlyContinue) -and [bool]$UiStopState.Path
+    if ($canStop) { Test-UiStop }
     $url = 'https://api.github.com/repos/{0}/dispatches' -f $Repo
     if ($env:CI_FAKE_HTTP) {
         $auth = 'нет'
@@ -547,9 +549,9 @@ function Send-RunEvent {
     $request.ContentLength = $bytes.Length
     $response = $null
     try {
-        $stream = $request.GetRequestStream()
-        try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
-        $response = $request.GetResponse()
+        $stream = Wait-GhIO ($request.GetRequestStreamAsync()) $request $request.Timeout $canStop
+        try { $null = Wait-GhIO ($stream.WriteAsync($bytes, 0, $bytes.Length)) $request $request.ReadWriteTimeout $canStop } finally { $stream.Dispose() }
+        $response = Wait-GhIO ($request.GetResponseAsync()) $request $request.Timeout $canStop
     }
     catch {
         $exception = $_.Exception

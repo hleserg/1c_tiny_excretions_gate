@@ -80,6 +80,7 @@ type model struct {
 	width     int
 	height    int
 	stopAsked time.Time
+	stopSent  bool
 	notice    string
 
 	logTruncated bool
@@ -265,6 +266,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.exitCode = 0
 		m.exitErr = nil
 		m.stopAsked = time.Time{}
+		m.stopSent = false
 		m.closeAfter = false
 		m.restartAfter = false
 		m.touchActive()
@@ -349,6 +351,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshLog()
 			}
 		case "one", "many", "confirm", "text", "view":
+			if m.stopSent {
+				return m, nil
+			}
 			m.testLog.window = nil
 			m.queue = append(m.queue, ev)
 			m.openNextDialog()
@@ -359,6 +364,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.running = false
 		m.exitCode = msg.code
 		m.exitErr = msg.err
+		if m.stopSent {
+			m.notice = ""
+		}
 		if msg.err != nil && msg.code != 0 && len(m.lines) == 0 {
 			m.appendLine(fmt.Sprintf("%s завершился без вывода. Откройте «Просмотр событий» Windows и проверьте ошибки PowerShell и журнала «Приложение» за время запуска. Причина завершения процесса: %v", m.script, msg.err))
 		}
@@ -423,6 +431,11 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.dialogMouse(m.overlayMouse(msg))
 
 	case tea.KeyMsg:
+		// В поле текста и среди явно назначенных букв меню q остаётся вводом. Ctrl+C останавливает и там.
+		key := msg.String()
+		if m.running && (key == "ctrl+c" || (key == "q" && (m.dialog == nil || (m.dialog.ev.Kind != "text" && m.dialog.keyItem(key) < 0)))) {
+			return m.handleKey(msg)
+		}
 		if msg.Type == tea.KeyF3 {
 			m.testLog.toggle(m.width, m.height)
 			return m, nil
@@ -503,22 +516,7 @@ func (m model) dockedMouse(msg tea.MouseMsg) tea.MouseMsg {
 func (m *model) finishDialog() {
 	d := m.dialog
 	m.dialog = nil
-	if d.local == "stop" {
-		if !d.result.Cancel && d.result.Yes && m.eng != nil && m.running {
-			if err := m.eng.requestStop(); err != nil {
-				// Просьба не дошла - ждать нечего: снять процесс можно сразу.
-				m.stopAsked = time.Now().Add(-time.Minute)
-				m.appendLine("Не смог попросить остановку: " + err.Error())
-				m.notice = "просьба остановиться не дошла: k - снять процесс (блокировки тогда снимать руками)"
-				m.refreshLog()
-			} else {
-				m.stopAsked = time.Now()
-				m.notice = "просьба остановиться отправлена: скрипт снимет блокировки и остановится"
-			}
-		}
-		m.openNextDialog()
-		return
-	}
+
 	if m.eng != nil {
 		if err := m.eng.answerQuestion(d.ev.ID, d.result); err != nil {
 			m.appendLine("Ответ не записался: " + err.Error())
@@ -573,14 +571,21 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !m.running {
 			return m, tea.Quit
 		}
-		if !m.stopAsked.IsZero() && time.Since(m.stopAsked) > 20*time.Second {
-			m.notice = "скрипт не остановился сам: k - снять процесс (блокировки тогда снимать руками)"
+		if m.eng == nil || m.stopSent {
 			return m, nil
 		}
-		d := newDialog(uiEvent{Kind: "confirm", Header: "Остановить скрипт? Он снимет свои блокировки и остановится; процесс 1С, если идёт, может доработать.", Yes: "Остановить", No: "Продолжить"}, m.width, m.height)
-		d.local = "stop"
-		d.yes = false
-		m.dialog = d
+		if err := m.eng.requestStop(); err != nil {
+			m.stopAsked = time.Now().Add(-time.Minute)
+			m.notice = "Не удалось передать остановку: " + err.Error() + ". q — повторить, k — снять процесс"
+		} else {
+			m.stopAsked = time.Now()
+			m.stopSent = true
+			m.dialog, m.queue, m.testLog.window = nil, nil, nil
+			m.notice = "Останавливаю текущую операцию. Результат снятия блокировок появится в журнале."
+		}
+		m.appendLine(m.notice)
+		m.layout()
+		m.refreshLog()
 		return m, nil
 	case "k":
 		if m.running && !m.stopAsked.IsZero() && time.Since(m.stopAsked) > 20*time.Second {
@@ -657,7 +662,7 @@ func (m model) viewHeader() string {
 	}
 	state := ""
 	switch {
-	case m.running && !m.stopAsked.IsZero():
+	case m.running && m.stopSent:
 		state = styleWarn.Render(" останавливается ")
 	case m.running && m.dialog != nil:
 		state = styleWarn.Render(" ждёт ответа ")

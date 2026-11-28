@@ -833,7 +833,7 @@ function Wait-DeliveryCi {
         }
         $detail = 'Жду результат проверки ERP static. Лимит ожидания {0} мин.' -f ($limit / 60)
         Write-UiProgress -Title $title -Elapsed $watch.Elapsed.TotalSeconds -Detail $detail
-        Start-Sleep -Seconds 10
+        Wait-UiDelay -Seconds 10
     }
 }
 
@@ -908,11 +908,15 @@ function Invoke-MergeCheckedScript {
     $info.StandardErrorEncoding = [System.Text.Encoding]::UTF8
     $info.EnvironmentVariables['MERGE_CHECKED_TOKEN'] = [string]$Setup.Gh.Token
     Write-RunLog ("> {0} {1}" -f $info.FileName, $info.Arguments)
+    $withUi = $null -ne (Get-Command Register-UiProcess -CommandType Function -ErrorAction SilentlyContinue)
+    if ($withUi) { Test-UiStop }
     try { $process = [System.Diagnostics.Process]::Start($info) }
     catch { return [pscustomobject]@{ Ok = $false; Error = ("Не запустился Python {0}. Проверьте путь DeliveryPython и право запуска. {1}" -f $info.FileName, $_.Exception.Message); Data = $null } }
+    if ($withUi) { Register-UiProcess $process }
     $outTask = $process.StandardOutput.ReadToEndAsync()
     $errTask = $process.StandardError.ReadToEndAsync()
-    if (-not $process.WaitForExit(300000)) { try { $process.Kill() } catch { }; return [pscustomobject]@{ Ok = $false; Error = 'merge_checked.py не ответил за 5 минут. Перед повторной приёмкой проверьте состояние PR в GitHub и доступ исполнителя к API.'; Data = $null } }
+    $finished = if ($withUi) { Wait-UiProcess -Process $process -TimeoutSec 300 } else { $process.WaitForExit(300000) }
+    if (-not $finished) { try { $process.Kill() } catch { }; return [pscustomobject]@{ Ok = $false; Error = 'merge_checked.py не ответил за 5 минут. Перед повторной приёмкой проверьте состояние PR в GitHub и доступ исполнителя к API.'; Data = $null } }
     $out = [string]$outTask.Result
     $err = [string]$errTask.Result
     if ($Setup.Gh.Token) { $out = $out.Replace($Setup.Gh.Token, '***'); $err = $err.Replace($Setup.Gh.Token, '***') }
@@ -1449,9 +1453,11 @@ function Invoke-DeliveryVerifyRun {
     $before = @{}
     if (Test-Path -LiteralPath $runsRoot) { foreach ($dir in @(Get-ChildItem -LiteralPath $runsRoot -Directory)) { $before[$dir.Name] = $true } }
     Write-DeliveryEvent $D $State 'verify' ("всё из {0} уже в temp, итога проверки нет: прогон гейта на temp как есть" -f (Get-GitShort $Commit)) 'Cyan'
+    Test-UiStop
     $process = Start-Process -FilePath 'powershell.exe' -ArgumentList ($runArgs -join ' ') -NoNewWindow -PassThru
     $null = $process.Handle
     $process.WaitForExit()
+    Test-UiStop
     $fresh = @()
     if (Test-Path -LiteralPath $runsRoot) { $fresh = @(Get-ChildItem -LiteralPath $runsRoot -Directory | Where-Object { -not $before.ContainsKey($_.Name) -and $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name | Select-Object -Last 1) }
     if ($fresh.Count -eq 0) { return [pscustomobject]@{ outcome = 'nostart'; run = ''; note = 'прогон проверки не начался' } }

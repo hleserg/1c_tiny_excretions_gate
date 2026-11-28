@@ -297,7 +297,9 @@ function Invoke-V8 {
         Write-Host ("  ...  {0}: начато в {1}, жду не дольше {2} мин" -f $Title, (Get-Date -Format 'HH:mm:ss'), [int]($TimeoutSec / 60)) -ForegroundColor DarkGray
     }
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    Test-UiStop
     $process = Start-Process -FilePath $Exe -ArgumentList $argLine -PassThru
+    Register-UiProcess $process
     $null = $process.Handle
     # Строка хода (ui.ps1): полоса по прогнозу из статистики (stats.ps1) или бегающий блок.
     $finished = Wait-UiProcess -Process $process -Watch $watch -TimeoutSec $TimeoutSec -Title $Title -Expected (Get-StatPlan $Title)
@@ -375,7 +377,7 @@ function Resolve-DesignerBusy {
     if ($answer -eq '1') {
         foreach ($line in @(Stop-BaseSessions -Link $link -BaseName $BaseName -Designers)) { Write-Line ('  ' + $line) }
         for ($wait = 0; $wait -lt 10; $wait++) {
-            Start-Sleep -Seconds 3
+            Wait-UiDelay -Seconds 3
             if (@(Get-BaseSessions $link $BaseName | Where-Object { -not $_.IsError -and $_.IsDesigner }).Count -eq 0) { break }
         }
     }
@@ -590,6 +592,7 @@ function Stop-BaseSessions {
         $isDesigner = ([string]$session.AppID -eq 'Designer')
         if ([bool]$Designers -ne $isDesigner) { continue }
         $description = Format-ClusterSession $session
+        Test-UiStop
         try { $Link.Agent.TerminateSession($target.Cluster, $session); $lines.Add(("{0} - команда завершения принята" -f $description)) }
         catch { $lines.Add(("{0} - не завершился: {1}" -f $description, $_.Exception.Message)) }
     }
@@ -634,6 +637,7 @@ function Wait-DeploySessions {
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $nextReport = 0
     do {
+        Test-UiStop
         $sessions = @(Get-BaseSessions $Link $BaseName -Target $Target)
         $errors = @($sessions | Where-Object IsError)
         if ($errors.Count) { throw ("Не удалось прочитать сеансы {0}: {1}" -f $BaseName, ($errors.Text -join '; ')) }
@@ -988,6 +992,11 @@ $cfg = Read-DeployConfig
 # ** Хлебников С.Ю. 20261124 Один журнал на вызов из меню, CMD или планировщика. Код возврата сохраняется.
 . (Join-Path $Root 'operations.ps1')
 $script:GateOperation = $OperationContext
+. (Join-Path $Root 'ui.ps1')
+Initialize-Ui -Channel $UiChannel
+:GateUiWork do {
+$UiStopState.Boundary = $true
+Test-UiStop
 if (-not $OperationContext -and $cfg['PublishOperations'] -and -not $SnapshotTemp) {
     $kind = 'Deploy'
     foreach ($flag in 'Prepare','ApplyPrepared','CancelPrepared','Resume','Rollback','StatusOnly','CompareExtensions','CompareProcessings','BaseState','ProdPreCheck','ComCheck','ManualLocks','CloseBase','OpenBase','PullExtensions','PullProcessings','GitExport','GitImport','GitProd','GitTypical','Delivery') {
@@ -1038,8 +1047,7 @@ if (-not $SnapshotTemp) {
 . (Join-Path $Root 'locks.ps1')
 . (Join-Path $Root 'canary-users.ps1')
 . (Join-Path $Root 'post-update.ps1')
-. (Join-Path $Root 'ui.ps1')
-Initialize-Ui -Channel $UiChannel
+
 
 $script:Server = [string](Get-Setting $cfg 'Server' '')
 $script:TempBase = [string](Get-Setting $cfg 'Base' '')
@@ -1324,6 +1332,7 @@ function Get-TreeHashes {
     $prefixLength = (Resolve-Path -LiteralPath $Dir).ProviderPath.TrimEnd('\').Length + 1
     $sha = [System.Security.Cryptography.SHA256]::Create()
     foreach ($file in @(Get-ChildItem -LiteralPath $Dir -Recurse -File)) {
+        Test-UiStop
         $relative = $file.FullName.Substring($prefixLength).Replace('\', '/')
         if ($relative -eq 'ConfigDumpInfo.xml') { continue }
         $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
@@ -1349,6 +1358,7 @@ function Invoke-UiBackground {
     # Долгий вызов (внешнее соединение 1С) - в отдельном потоке, а в окне - строка хода с временем.
     # Не уложился в TimeoutSec - не ждём (поток бросается), Ok = $false. Ошибка внутри - Ok = $false и её текст.
     param([scriptblock]$Script, [object[]]$Arguments, [string]$Title, [int]$TimeoutSec, [string]$ProgressTitle = $Title)
+    Test-UiStop
     $runspace = [runspacefactory]::CreateRunspace()
     $runspace.ApartmentState = 'STA'
     $runspace.Open()
@@ -1359,15 +1369,18 @@ function Invoke-UiBackground {
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $handle = $shell.BeginInvoke()
     $plan = Get-StatPlan $Title
-    while (-not $handle.IsCompleted) {
-        if ($watch.Elapsed.TotalSeconds -ge $TimeoutSec) {
-            Complete-UiProgress
-            try { [void]$shell.BeginStop($null, $null) } catch { }
-            Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status 'TIMEOUT'
-            return [pscustomobject]@{ Ok = $false; Error = ("нет ответа за {0} с (настройка ComTimeoutSec)" -f $TimeoutSec); Result = $null }
+    try {
+        while (-not $handle.IsCompleted) {
+            if ($watch.Elapsed.TotalSeconds -ge $TimeoutSec) {
+                Complete-UiProgress
+                Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status 'TIMEOUT'
+                return [pscustomobject]@{ Ok = $false; Error = ("нет ответа за {0} с (настройка ComTimeoutSec)" -f $TimeoutSec); Result = $null }
+            }
+            Write-UiProgress -Title $ProgressTitle -Elapsed $watch.Elapsed.TotalSeconds -Expected $plan
+            Start-Sleep -Milliseconds 250
         }
-        Write-UiProgress -Title $ProgressTitle -Elapsed $watch.Elapsed.TotalSeconds -Expected $plan
-        Start-Sleep -Milliseconds 250
+    } finally {
+        if (-not $handle.IsCompleted) { try { [void]$shell.BeginStop($null, $null) } catch { Write-Warning $_.Exception.Message } }
     }
     Complete-UiProgress
     $result = $null
@@ -1982,7 +1995,9 @@ function Invoke-ProdClient {
     Write-RunLog ("> 1cv8c.exe {0}" -f (Format-GateCanaryCommand $argList))
     Write-Host ("  ...  {0}: начато в {1}, жду не дольше {2} мин" -f $Title, (Get-Date -Format 'HH:mm:ss'), [int]($TimeoutSec / 60)) -ForegroundColor DarkGray
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    Test-UiStop
     $process = Start-Process -FilePath $script:V8C -ArgumentList $argLine -PassThru
+    Register-UiProcess $process
     $null = $process.Handle
     # Строка хода. У самопроверки - настоящая полоса по заданиям: последняя часть журнала в папке итога.
     $outDir = Split-Path -Parent $DoneFile
@@ -2023,7 +2038,7 @@ function Invoke-ProdClient {
     }
     Complete-UiProgress
     $done = Test-Path -LiteralPath $DoneFile
-    if ($done) { if (-not $process.WaitForExit(60000)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } } }
+    if ($done) { if (-not (Wait-UiProcess -Process $process -TimeoutSec 60)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } } }
     elseif (-not $process.HasExited) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
     $statStatus = 'TIMEOUT'
     if ($done) { $statStatus = 'OK' }
@@ -2902,6 +2917,7 @@ function Invoke-CloseBase {
         $info['status'] = 'closed'
         $info['closedAt'] = (Get-Date).ToString('dd.MM.yyyy HH:mm:ss')
         Save-CloseRecord $baseName $state $info
+        Test-UiStop
         $keep = $true
         $jobsText = 'регламентные задания запрещены'
         if (-not $state.JobsSet) { $jobsText = 'регламентные задания были запрещены до закрытия' }
@@ -2921,7 +2937,7 @@ function Invoke-CloseBase {
                 }
                 catch { Write-Line ('  завершить сеансы не смог: ' + $_.Exception.Message) 'Yellow' }
             }
-            Start-Sleep -Seconds 3
+            Wait-UiDelay -Seconds 3
             $seen = Get-UserSessions $link $baseName
         }
         $sessionsDone = (-not $seen.Failed -and $seen.Users.Count -eq 0)
@@ -3763,6 +3779,7 @@ function Add-GitSnapshotFiles {
     param([hashtable]$Files, [string]$Dir, [string]$Prefix)
     $full = [System.IO.Path]::GetFullPath($Dir).TrimEnd('\', '/')
     foreach ($file in @(Get-ChildItem -LiteralPath $Dir -Recurse -File)) {
+        Test-UiStop
         $relative = $file.FullName.Substring($full.Length + 1).Replace('\', '/')
         if ($relative -eq 'ConfigDumpInfo.xml') { continue }
         $Files[$Prefix + $relative] = $file.FullName
@@ -3840,6 +3857,7 @@ function Add-GitProcessingSnapshot {
     $toDump = @($withFile | Where-Object { -not (& $isFresh $_) }).Count
     if ($toDump -gt 0) { Write-Line ("  обработок {0} с файлом {1}: выгрузить в файлы {2}, остальные - с прошлого раза" -f $BaseName, $withFile.Count, $toDump) }
     foreach ($item in $withFile) {
+        Test-UiStop
         $folder = [string]$folders[[string]$item.Ref]
         $dir = Join-Path $Root $folder
         $key = '{0}|{1}' -f $item.Hash, $script:V8
@@ -4438,6 +4456,7 @@ function Get-GitRelativeFiles {
     $result = [hashtable]::new([StringComparer]::Ordinal)
     $prefix = $Folder + '/'
     foreach ($path in $Files.Keys) {
+        Test-UiStop
         if ($path.StartsWith($prefix, [StringComparison]::Ordinal)) { $result[$path.Substring($prefix.Length)] = $Files[$path] }
     }
     return $result
@@ -4476,7 +4495,10 @@ function Get-GitSnapshotComparison {
     # Хеши выгрузки считаем один раз. Совпадающие пары XML для основы снимка и main читаем один раз.
     param($Setup, [hashtable]$Local, [hashtable]$KnownFiles, [hashtable]$HeadFiles, [string]$KnownCommit, [string]$HeadCommit)
     $localShas = @{}
-    foreach ($path in $Local.Keys) { $localShas[$path] = Get-GitBlobSha ([IO.File]::ReadAllBytes($Local[$path])) }
+    foreach ($path in $Local.Keys) {
+        Test-UiStop
+        $localShas[$path] = Get-GitBlobSha ([IO.File]::ReadAllBytes($Local[$path]))
+    }
     $cache = @{}
     $known = Get-GitDumpComparisonFiles $Setup $Local $localShas $KnownFiles $cache
     $head = $known
@@ -4822,9 +4844,11 @@ function Invoke-GitImport {
     if (Test-Path -LiteralPath $runsRoot) { foreach ($dir in @(Get-ChildItem -LiteralPath $runsRoot -Directory)) { $before[$dir.Name] = $true } }
     if ($toLoad.Count -gt 0) { Write-Line ("Прогон гейта с комплектом из git: {0}" -f $kitDir) 'Cyan' }
     else { Write-Line ("Прогон гейта с действиями после обновления из git: {0}" -f $actionsDir) 'Cyan' }
+    Test-UiStop
     $process = Start-Process -FilePath 'powershell.exe' -ArgumentList ($runArgs -join ' ') -NoNewWindow -PassThru
     $null = $process.Handle
-    $process.WaitForExit()
+    $process.WaitForExit()  # вложенный гейт сам снимает свои блокировки
+    Test-UiStop
     $runCode = $process.ExitCode
     $fresh = @()
     if (Test-Path -LiteralPath $runsRoot) { $fresh = @(Get-ChildItem -LiteralPath $runsRoot -Directory | Where-Object { -not $before.ContainsKey($_.Name) -and $_.Name -match '^\d{8}-\d{6}$' } | Sort-Object Name | Select-Object -Last 1) }
@@ -6995,7 +7019,7 @@ if ($needExclusive) {
             foreach ($line in @(Stop-BaseSessions -Link $prepLink -BaseName $script:ProdBase -Designers)) { Write-Line ('  ' + $line) }
             $left = @()
             for ($wait = 0; $wait -lt 10; $wait++) {
-                Start-Sleep -Seconds 3
+                Wait-UiDelay -Seconds 3
                 $left = @(Get-BaseSessions $prepLink $script:ProdBase | Where-Object { -not $_.IsError -and $_.IsDesigner })
                 if ($left.Count -eq 0) { break }
             }
@@ -7023,7 +7047,7 @@ if ($needExclusive) {
             foreach ($line in @(Stop-BaseSessions -Link $prepLink -BaseName $script:TempBase -Designers)) { Write-Line ('  ' + $line) }
             $left = @()
             for ($wait = 0; $wait -lt 10; $wait++) {
-                Start-Sleep -Seconds 3
+                Wait-UiDelay -Seconds 3
                 $left = @(Get-BaseSessions $prepLink $script:TempBase | Where-Object { -not $_.IsError -and $_.IsDesigner })
                 if ($left.Count -eq 0) { break }
             }
@@ -8327,5 +8351,7 @@ catch {
 }
 finally {
     if ($null -ne $deployGuard) { $deployGuard.Dispose() }
-    if ($script:DeployReportOutcome) { Complete-DeployReport $script:DeployReportOutcome }
+    if ($script:DeployReportOutcome -and -not $UiStopState.Stopping) { Complete-DeployReport $script:DeployReportOutcome }
 }
+} while ($false)
+if ($UiStopState.Stopping) { throw [OperationCanceledException]::new('остановлено из интерфейса ci.exe') }

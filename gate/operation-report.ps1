@@ -190,6 +190,7 @@ function Complete-GateOperation {
         Add-GateOperationLine $Context $Text
         Save-GateReportJson (Join-Path $Context.Dir 'result.json') @{ outcome = $Outcome; ended = [datetime]::UtcNow.ToString('o') }
         $Context.Done = $true
+        if ((Get-Variable UiStopState -ErrorAction SilentlyContinue) -and $UiStopState.Stopping) { return } # result.json отправит -Pending
         if ($null -ne $Context.Publisher) { & $Context.Publisher -OperationDir $Context.Dir -Config $Context.Config -OperationHelpersLoaded }
         else { & (Join-Path $PSScriptRoot 'publish.ps1') -OperationDir $Context.Dir -Config $Context.Config }
     } catch { Write-Warning ("Не удалось завершить отчёт в {0}. Проверьте result.json в этой папке и повторите публикацию через publish.ps1 -Pending с тем же профилем. {1}" -f $Context.Dir, (Protect-GateReportText $_.Exception.GetBaseException().Message $Context.Secrets)) }

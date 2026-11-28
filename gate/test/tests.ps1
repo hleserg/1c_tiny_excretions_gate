@@ -155,7 +155,7 @@ function Invoke-Script {
     # Запускает скрипт гейта в песочнице, как ci.exe: вывод читается построчно, на вопросы @@ui отвечают правила.
     # Com - состояние подставного COM (test\fakecom.ps1) для deploy.ps1; $null - без него. Состояние после
     # прогона и строки com.log - в ответе (ComState, ComLog); повторный запуск с $null продолжает то же состояние.
-    param([string]$Sandbox, [string]$Script = 'run.ps1', [string]$Arguments = '', [hashtable]$Fake = @{}, $Answers = @(), $Com = $null)
+    param([string]$Sandbox, [string]$Script = 'run.ps1', [string]$Arguments = '', [hashtable]$Fake = @{}, $Answers = @(), $Com = $null, [string]$StopAtProgress = '')
     $channel = Join-Path $Sandbox 'chan'
     New-Item -ItemType Directory -Path $channel -Force | Out-Null
     $scenarioFile = Join-Path $Sandbox 'fake\scenario.json'
@@ -191,6 +191,7 @@ function Invoke-Script {
     $used = New-Object System.Collections.Generic.HashSet[int]
     $rules = @($Answers)
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $stopWatch = $null
     $timedOut = $false
     while ($true) {
         $read = $process.StandardOutput.ReadLineAsync()
@@ -204,6 +205,10 @@ function Invoke-Script {
         if (-not $line.StartsWith('@@ui:')) { continue }
         $message = $null
         try { $message = $line.Substring(5) | ConvertFrom-Json } catch { continue }
+        if ($StopAtProgress -and -not $stopWatch -and $message.kind -eq 'progress' -and ($message.title + ' ' + $message.detail) -match $StopAtProgress) {
+            $stopWatch = [Diagnostics.Stopwatch]::StartNew()
+            [IO.File]::WriteAllText((Join-Path $channel 'stop'), 'stop')
+        }
         if (@('one', 'many', 'confirm', 'text', 'view') -notcontains [string]$message.kind) { continue }
         $questions.Add(('{0}: {1}' -f $message.kind, $message.header))
         $answer = $null
@@ -258,7 +263,7 @@ function Invoke-Script {
         Sandbox = $Sandbox; ExitCode = $exitCode; TimedOut = $timedOut; Output = $lines.ToArray(); Stderr = $stderr
         Questions = $questions.ToArray(); Unexpected = $unexpected.ToArray(); UnusedAnswers = ($rules.Count - $used.Count)
         Calls = $calls; RunDir = $runDir; Verdict = $verdict; Seconds = [int]$watch.Elapsed.TotalSeconds
-        ComState = $comState; ComLog = $comLog
+        ComState = $comState; ComLog = $comLog; StopWatch = $stopWatch
     }
 }
 
@@ -2250,6 +2255,65 @@ $tests = @(
             Check ((Get-Calls $r @('ENTERPRISE', 'regepf', 'name=Печать.epf')).Count -eq 1) 'обработка не записана в рабочую'
             Check (@($r.ComLog | Where-Object { $_ -match 'UpdateInfoBase erp_base scheduledJobsDenied=1' }).Count -gt 0) 'блокировку регламентных заданий не ставили'
             Check-OperationDispatch $sb 'deploy' 'updated' @('Адаптация', 'Печать', 'провер', 'блокиров')
+        }
+    },
+    @{
+        Name = 'emergency-stop-before-start'
+        Text = 'уже переданный q не даёт начать новый шаг с тем же каналом'
+        Run = {
+            param($Name)
+            $sb = New-Sandbox $Name
+            $channel = [IO.Directory]::CreateDirectory((Join-Path $sb 'chan'))
+            [IO.File]::WriteAllText((Join-Path $channel.FullName 'stop'), 'stop')
+            $file = Add-InboxFile $sb $cfeName
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file)
+            Check ($r.ExitCode -ne 0 -and ($r.Output -join ' ') -match 'остановлено из интерфейса') 'скрипт не учёл ранее полученный q'
+            Check ($r.Calls.Count -eq 0 -and -not $r.Verdict) 'после q начался следующий шаг'
+            Check ([IO.File]::Exists((Join-Path $channel.FullName 'stop'))) 'вложенный скрипт поглотил остановку'
+        }
+    },
+    @{
+        Name = 'emergency-stop-selfcheck'
+        Text = 'q при двух активных исполнителях завершает обоих и не загружает комплект'
+        Run = {
+            param($Name)
+            $config = $laneConfig.Clone()
+            $config['RunReportRepo'] = 'owner/reports'
+            $sb = New-Sandbox $Name -Config $config
+            $file = Add-InboxFile $sb $cfeName
+            $fake = @{ selfcheck = @(@{ tasks = $laneTasks; sleep = 4 }) }
+            $r = Invoke-Script -Sandbox $sb -Arguments ('-Kit "{0}"' -f $file) -Fake $fake -StopAtProgress 'исп[.] 1:.*исп[.] 2:'
+            Check ($r.StopWatch -and $r.StopWatch.Elapsed.TotalSeconds -lt 10) 'остановка не прервала двух исполнителей'
+            Check ($r.ExitCode -ne 0 -and ($r.Output -join ' ') -match 'остановлено из интерфейса') 'прогон не отметил остановку'
+            Check (@(Get-Process -Name '1cv8c' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq (Join-Path $sb 'bin\1cv8c.exe') }).Count -eq 0) 'остался исполнитель самопроверки'
+            Check ([IO.File]::Exists((Join-Path $r.RunDir 'end.pending'))) 'нет итога для досылки в GitHub'
+            Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0 -and -not $r.Verdict) 'после q началась загрузка или сформирован вердикт'
+        }
+    },
+    @{
+        Name = 'emergency-stop-deploy'
+        Text = 'q во время записи завершает Конфигуратор и останавливает выпуск со снятием своих блокировок'
+        Run = {
+            param($Name)
+            $sb = New-ReportingDeploySandbox $Name
+            $com = New-ComState -Sessions @(@{ id = 5; base = 'erp_base'; app = '1CV8C'; user = 'Тест'; host = 'fixture' })
+            $com.bases.erp_temp_test.scheduledJobsDenied = $true
+            $fake = @{ designer = @(@{ match = @('/LoadCfg'); sleep = 30 }) }
+            $r = Invoke-Script -Sandbox $sb -Script 'deploy.ps1' -Com $com -Fake $fake -StopAtProgress 'Загрузить Адаптация' -Answers @(
+                @{ Kind = 'one'; Header = 'Обновление erp_base'; Item = '^Обновить выбранные' },
+                @{ Kind = 'many'; Header = 'необновлённые расширения'; Indexes = @(0) },
+                $deployRiskAnswer, $deployNameAnswer,
+                @{ Kind = 'one'; Header = 'В erp_base есть сеансы'; Item = 'Поставить блокировку' })
+            Check ($r.StopWatch -and $r.StopWatch.Elapsed.TotalSeconds -lt 10) 'остановка ждала окончания записи'
+            Check ($r.ExitCode -ne 0 -and ($r.Output -join ' ') -match 'остановлено из интерфейса') 'нет итога остановки'
+            Check ((Get-Calls $r @('/LoadCfg')).Count -eq 0) 'прерванная запись успела завершиться'
+            Check ((Get-Calls $r @('/UpdateDBCfg')).Count -eq 0) 'начался следующий шаг'
+            Check (@(Get-Process -Name '1cv8' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq (Join-Path $sb 'bin\1cv8.exe') }).Count -eq 0) 'Конфигуратор пережил остановку'
+            Check (@($r.ComLog | Where-Object { $_ -match 'UpdateInfoBase erp_base .*sessionsDenied=1' }).Count -gt 0) 'сценарий не поставил блокировку'
+            Check (-not $r.ComState.bases.erp_base.sessionsDenied -and -not $r.ComState.bases.erp_base.scheduledJobsDenied) 'остались блокировки выпуска'
+            Check $r.ComState.bases.erp_temp_test.scheduledJobsDenied 'снята чужая блокировка'
+            $result = @(Get-ChildItem (Join-Path $sb 'runs/operations') -Filter 'result.json' -Recurse)
+            Check ($result.Count -eq 1 -and ((Get-Content $result[0].FullName -Raw -Encoding UTF8 | ConvertFrom-Json).outcome -eq 'cancelled')) 'нет сохранённого итога отмены выпуска'
         }
     },
     @{

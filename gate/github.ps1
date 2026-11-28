@@ -92,10 +92,49 @@ function Write-GhFakeLog {
 
 #region HTTP
 
+function Wait-GhIO {
+    # Асинхронные методы HttpWebRequest оставляют контроль таймаута вызывающему.
+    param([Threading.Tasks.Task]$Task, [Net.HttpWebRequest]$Request, [int]$TimeoutMs, [bool]$CanStop)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $completed = $false
+    try {
+        while ($true) {
+            if ($CanStop) { Test-UiStop }
+            if ($Task.IsCompleted) { break }
+            $left = $TimeoutMs - $clock.ElapsedMilliseconds
+            if ($left -le 0) { throw 'Истекло время ожидания ответа HTTP.' }
+            [void]([IAsyncResult]$Task).AsyncWaitHandle.WaitOne([Math]::Min(200, $left))
+        }
+        $completed = $true
+        return $Task.GetAwaiter().GetResult()
+    } finally { if (-not $completed) { $Request.Abort() } }
+}
+
+function Read-GhResponse {
+    param($Response, [Net.HttpWebRequest]$Request, [bool]$CanStop, [string]$OutFile = '', [switch]$Bytes)
+    $stream = $Response.GetResponseStream()
+    $target = if ($OutFile) { [IO.File]::Create($OutFile) } else { [IO.MemoryStream]::new() }
+    try {
+        # Таймаут действует на отдельное чтение. Большой архив может скачиваться дольше.
+        $buffer = New-Object byte[] 81920
+        do {
+            $count = Wait-GhIO ($stream.ReadAsync($buffer, 0, $buffer.Length)) $Request $Request.ReadWriteTimeout $CanStop
+            if ($count) { $target.Write($buffer, 0, $count) }
+        } while ($count)
+        if ($OutFile) { return $OutFile }
+        if ($Bytes) { return , $target.ToArray() }
+        $target.Position = 0
+        $reader = [IO.StreamReader]::new($target, [Text.Encoding]::UTF8)
+        try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally { $target.Dispose() }
+}
+
 function Invoke-GhApi {
     # Запрос к api.github.com. Возвращает Status и Text (тело ответа). AllowStatus - коды, которые не ошибка
     # (404 - нет ветки, 409 - пустой репозиторий). Прокси - системный, с учёткой Windows.
     param($Gh, [string]$Method, [string]$Path, [string]$Body = '', [int[]]$AllowStatus = @())
+    $canStop = $null -ne (Get-Variable UiStopState -ErrorAction SilentlyContinue) -and [bool]$UiStopState.Path
+    if ($canStop) { Test-UiStop }
     $url = 'https://api.github.com' + $Path
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
     $request = [System.Net.HttpWebRequest]::Create($url)
@@ -114,10 +153,10 @@ function Invoke-GhApi {
             $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($Body)
             $request.ContentType = 'application/json; charset=utf-8'
             $request.ContentLength = $bytes.Length
-            $stream = $request.GetRequestStream()
-            try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+            $stream = Wait-GhIO ($request.GetRequestStreamAsync()) $request $request.Timeout $canStop
+            try { $null = Wait-GhIO ($stream.WriteAsync($bytes, 0, $bytes.Length)) $request $request.ReadWriteTimeout $canStop } finally { $stream.Dispose() }
         }
-        $response = $request.GetResponse()
+        $response = Wait-GhIO ($request.GetResponseAsync()) $request $request.Timeout $canStop
     }
     catch {
         $exception = $_.Exception
@@ -127,8 +166,7 @@ function Invoke-GhApi {
     }
     try {
         $code = [int]$response.StatusCode
-        $reader = New-Object System.IO.StreamReader($response.GetResponseStream(), [System.Text.Encoding]::UTF8)
-        $text = $reader.ReadToEnd()
+        $text = Read-GhResponse $response $request $canStop
         if ($code -ge 300 -and $AllowStatus -notcontains $code) {
             $apiText = $text
             $found = [regex]::Match($text, '"message"\s*:\s*"((?:[^"\\]|\\.)*)"')
@@ -420,6 +458,8 @@ function Test-GhContains {
 function Get-GhBlobBytes {
     # Содержимое блоба байт в байт (Accept: raw) - когда файл из архива не совпал по хешу.
     param($Gh, [string]$Sha)
+    $canStop = $null -ne (Get-Variable UiStopState -ErrorAction SilentlyContinue) -and [bool]$UiStopState.Path
+    if ($canStop) { Test-UiStop }
     $request = [System.Net.HttpWebRequest]::Create(('https://api.github.com/repos/{0}/git/blobs/{1}' -f $Gh.Repo, $Sha))
     $request.UserAgent = 'ci-gate'
     $request.Accept = 'application/vnd.github.raw'
@@ -428,12 +468,8 @@ function Get-GhBlobBytes {
     if ($null -ne $request.Proxy) { $request.Proxy.Credentials = [System.Net.CredentialCache]::DefaultCredentials }
     if ($Gh.Token) { $request.Headers['Authorization'] = 'Bearer ' + $Gh.Token }
     $request.Headers['X-GitHub-Api-Version'] = '2022-11-28'
-    $response = $request.GetResponse()
-    try {
-        $memory = New-Object System.IO.MemoryStream
-        $response.GetResponseStream().CopyTo($memory)
-        return , $memory.ToArray()
-    }
+    $response = Wait-GhIO ($request.GetResponseAsync()) $request $request.Timeout $canStop
+    try { return , (Read-GhResponse $response $request $canStop -Bytes) }
     finally { $response.Close() }
 }
 
@@ -443,6 +479,8 @@ function Save-GhFiles {
     # с правилами .gitattributes (концы строк), поэтому каждый файл сверяется с хешем из дерева (Expected:
     # путь -> хеш, Get-GhFiles того же коммита); не совпал - берётся блобом байт в байт.
     param($Gh, [string]$Commit, [string[]]$Prefixes, [string]$Target, [hashtable]$Expected = @{})
+    $canStop = $null -ne (Get-Variable UiStopState -ErrorAction SilentlyContinue) -and [bool]$UiStopState.Path
+    if ($canStop) { Test-UiStop }
     New-Item -ItemType Directory -Path $Target -Force | Out-Null
     $wanted = {
         param([string]$Path)
@@ -471,17 +509,15 @@ function Save-GhFiles {
     $request.Timeout = 120000
     $request.ReadWriteTimeout = 600000
     if ($null -ne $request.Proxy) { $request.Proxy.Credentials = [System.Net.CredentialCache]::DefaultCredentials }
-    $response = $request.GetResponse()
-    try {
-        $out = [System.IO.File]::Create($zip)
-        try { $response.GetResponseStream().CopyTo($out) } finally { $out.Dispose() }
-    }
+    $response = Wait-GhIO ($request.GetResponseAsync()) $request $request.Timeout $canStop
+    try { $null = Read-GhResponse $response $request $canStop $zip }
     finally { $response.Close() }
     Add-Type -AssemblyName System.IO.Compression
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
     try {
         foreach ($item in $archive.Entries) {
+            if ($canStop) { Test-UiStop }
             $slash = $item.FullName.IndexOf('/')
             if ($slash -lt 0 -or $item.FullName.EndsWith('/')) { continue }
             # В архиве всё лежит в папке «владелец-имя-хеш/».
@@ -720,6 +756,8 @@ function Invoke-GhDownload {
     # CI_FAKE_HTTP - папка, ответ на адрес - файл с именем адреса (не буквы и цифры - «_»), «REDIRECT <адрес>» -
     # переадресация, запросы - в requests.log.
     param([string]$Url, [string]$Accept = 'application/vnd.github+json', [string]$OutFile = '')
+    $canStop = $null -ne (Get-Variable UiStopState -ErrorAction SilentlyContinue) -and [bool]$UiStopState.Path
+    if ($canStop) { Test-UiStop }
     $current = $Url
     for ($hop = 0; $hop -lt 6; $hop++) {
         if ($env:CI_FAKE_HTTP) {
@@ -743,7 +781,7 @@ function Invoke-GhDownload {
         $request.ReadWriteTimeout = 300000
         if ($null -ne $request.Proxy) { $request.Proxy.Credentials = [System.Net.CredentialCache]::DefaultCredentials }
         $response = $null
-        try { $response = $request.GetResponse() }
+        try { $response = Wait-GhIO ($request.GetResponseAsync()) $request $request.Timeout $canStop }
         catch {
             $exception = $_.Exception
             while ($null -ne $exception -and -not ($exception -is [System.Net.WebException])) { $exception = $exception.InnerException }
@@ -759,14 +797,7 @@ function Invoke-GhDownload {
                 continue
             }
             if ($code -ge 400) { throw ("GitHub ответил {0} при скачивании с {1}. Проверьте доступ к файлу релиза и повторите скачивание." -f $code, ([uri]$current).Host) }
-            $stream = $response.GetResponseStream()
-            if ($OutFile) {
-                $target = [System.IO.File]::Create($OutFile)
-                try { $stream.CopyTo($target) } finally { $target.Dispose() }
-                return $OutFile
-            }
-            $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
-            return $reader.ReadToEnd()
+            return (Read-GhResponse $response $request $canStop $OutFile)
         }
         finally { $response.Close() }
     }
@@ -866,7 +897,10 @@ function Invoke-GitCli {
     $info.EnvironmentVariables['LC_ALL'] = 'C'
     $info.EnvironmentVariables['LANGUAGE'] = 'C'
     $info.EnvironmentVariables['GCM_INTERACTIVE'] = 'never'
+    $withUi = $null -ne (Get-Command Register-UiProcess -CommandType Function -ErrorAction SilentlyContinue)
+    if ($withUi) { Test-UiStop }
     $process = [System.Diagnostics.Process]::Start($info)
+    if ($withUi) { Register-UiProcess $process }
     # Снять git целиком: cmd\git.exe портативного git - обёртка, настоящий git.exe и его помощники - дочерние
     # процессы; Kill() снял бы одну обёртку, а остальные работали бы дальше и держали репозиторий.
     $stopGit = {
@@ -881,6 +915,7 @@ function Invoke-GitCli {
     $showResult = ($Title -and $null -ne (Get-Command Write-UiOperationResult -ErrorAction SilentlyContinue))
     if ($Title) { Write-Host ("  ...  {0}: начато в {1}, жду не дольше {2} мин" -f $Title, (Get-Date -Format 'HH:mm:ss'), [int]($TimeoutSec / 60)) -ForegroundColor DarkGray }
     while (-not $process.WaitForExit(250)) {
+        if ($withUi) { Test-UiStop }
         if ($watch.Elapsed.TotalSeconds -ge $TimeoutSec) {
             & $stopGit
             if ($showProgress) { Complete-UiProgress }
@@ -897,6 +932,7 @@ function Invoke-GitCli {
             }
         }
     }
+    if ($withUi) { Test-UiStop }
     if ($showProgress) { Complete-UiProgress }
     $process.WaitForExit()
     $output = ($outTask.Result + $errTask.Result).Trim()

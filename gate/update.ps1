@@ -30,8 +30,12 @@ if ($UiChannel) {
 }
 $Root = $PSScriptRoot
 . (Join-Path $Root 'ui.ps1')
+. (Join-Path $Root 'github.ps1')
 . (Join-Path $Root 'operation-report.ps1')
 Initialize-Ui -Channel $UiChannel
+:GateUiWork do {
+$UiStopState.Boundary = $true
+Test-UiStop
 
 #region Настройки и токен
 
@@ -117,7 +121,8 @@ function Invoke-UpdateHttp {
             $request.Headers['X-GitHub-Api-Version'] = '2022-11-28'
         }
         $response = $null
-        try { $response = $request.GetResponse() }
+        Test-UiStop
+        try { $response = Wait-GhIO ($request.GetResponseAsync()) $request $request.Timeout ([bool]$UiChannel) }
         catch {
             $exception = $_.Exception
             while ($null -ne $exception -and -not ($exception -is [System.Net.WebException])) { $exception = $exception.InnerException }
@@ -133,10 +138,8 @@ function Invoke-UpdateHttp {
                 $current = $next
                 continue
             }
-            $stream = $response.GetResponseStream()
             if ($code -ge 400) {
-                $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
-                $body = $reader.ReadToEnd()
+                $body = Read-GhResponse $response $request ([bool]$UiChannel)
                 $message = $body
                 try { $message = [string](ConvertFrom-Json $body).message } catch { $message = $body }
                 $hint = ''
@@ -144,13 +147,7 @@ function Invoke-UpdateHttp {
                 elseif ($code -eq 404) { $hint = ': нет такого репозитория или у токена нет к нему доступа' }
                 throw ("GitHub ответил {0}{1} ({2})" -f $code, $hint, $message)
             }
-            if ($OutFile) {
-                $target = [System.IO.File]::Create($OutFile)
-                try { $stream.CopyTo($target) } finally { $target.Dispose() }
-                return $OutFile
-            }
-            $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8)
-            return $reader.ReadToEnd()
+            return (Read-GhResponse $response $request ([bool]$UiChannel) $OutFile)
         }
         finally { $response.Close() }
     }
@@ -365,3 +362,5 @@ finally {
     }
 }
 exit $exitCode
+} while ($false)
+if ($UiStopState.Stopping) { throw [OperationCanceledException]::new('остановлено из интерфейса ci.exe') }
