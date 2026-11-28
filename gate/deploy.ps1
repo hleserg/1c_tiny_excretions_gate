@@ -4164,9 +4164,23 @@ function Get-GitDumpComparisonXml {
                     $null = $event.ParentNode.ReplaceChild($copy, $event)
                 }
             }
+            # Конфигуратор ставит условное оформление после всех реквизитов. Порядок самих реквизитов значим.
+            $appearance = $form.SelectSingleNode('f:Attributes[count(f:ConditionalAppearance)=1 and not(*[not(self::f:Attribute or self::f:ConditionalAppearance)] | comment() | processing-instruction() | text()[normalize-space()])]/f:ConditionalAppearance', $ns)
+            if ($appearance) {
+                $attributes = $appearance.ParentNode
+                Remove-GitXmlDumpNode $appearance
+                $null = $attributes.AppendChild($appearance)
+            }
             $qualifiers = $form.SelectNodes("f:Attributes/f:Attribute/f:Type[count(*)=2 and v:Type='xs:string']/v:StringQualifiers[count(*)=2 and v:Length='0' and v:AllowedLength='Variable' and not(@* | */@* | */* | .//comment() | .//processing-instruction() | text()[normalize-space()])]", $ns)
             foreach ($q in $qualifiers) {
                 if ($q.ParentNode.SelectSingleNode('v:Type', $ns).GetNamespaceOfPrefix('xs') -ceq 'http://www.w3.org/2001/XMLSchema') { Remove-GitXmlDumpNode $q }
+            }
+            # В исходнике тип строки может быть записан в одну строку. При выгрузке внутри Type появляются отступы.
+            foreach ($type in $form.SelectNodes("f:Attributes/f:Attribute/f:Type[count(*)=1 and v:Type='xs:string']", $ns)) {
+                if ($type.SelectSingleNode('v:Type', $ns).GetNamespaceOfPrefix('xs') -cne 'http://www.w3.org/2001/XMLSchema') { continue }
+                foreach ($space in @($type.ChildNodes)) {
+                    if ($space.NodeType -eq 'Whitespace') { $null = $type.RemoveChild($space) }
+                }
             }
         }
     }

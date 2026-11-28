@@ -4886,7 +4886,11 @@ $tests = @(
             # Подставной конфигуратор пишет CRLF. В git этот XML хранится с LF.
             $lfSource = [pscustomobject]@{Path=('extensions/Адаптация/' + $single); Bytes=$utf8.GetBytes(([string][char]0xFEFF) + $files[$single])}
             $epfForm = 'processings/Печать/Печать/Forms/Details/Ext/Form.xml'
-            $epfSource = [pscustomobject]@{Path=$epfForm; Bytes=$utf8.GetBytes($files[$details])}
+            $appearance = '<ConditionalAppearance><Rule>Active</Rule></ConditionalAppearance>'
+            $memo = '<Attribute name="Memo"><Type>' + $stringType + '</Type></Attribute>'
+            $secondAttribute = '<Attribute name="Code"><Type>' + $stringType + '</Type></Attribute>'
+            $epfText = $files[$details].Replace($memo, $secondAttribute + $appearance + $memo)
+            $epfSource = [pscustomobject]@{Path=$epfForm; Bytes=$utf8.GetBytes($epfText)}
             $head = New-GhCommit -Gh $gh -Parent $head -Changes @($lfSource, $epfSource) -Message 'XML критерия с LF и форма обработки'
             Set-GhBranch -Gh $gh -Branch 'main' -Sha $head
             [IO.File]::WriteAllText((Join-Path $sb 'run.ps1'), $gitRunStub, $utf8Bom)
@@ -4895,7 +4899,9 @@ $tests = @(
             # Выгрузка того же файла обработки берётся из кэша конфигуратора.
             $cacheForm = Join-Path (Join-Path $sb 'git/ext/work') $epfForm
             [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($cacheForm))
-            [IO.File]::WriteAllText($cacheForm, $files[$details], $utf8Bom)
+            $expanded = $memo.Replace($stringType, "`n    " + $stringType + "`n    " + $stringDefault + "`n")
+            $epfDump = $epfText.Replace($appearance + $memo, $expanded + $appearance)
+            [IO.File]::WriteAllText($cacheForm, $epfDump, $utf8Bom)
             $files[$form] = $files[$form].Replace('<AutoCommandBar/>','<AutoCommandBar/><Attributes/>')
             $files[$criterion] = $files[$criterion].Replace('>A<','>TEMP<').Replace('>B<','>A<').Replace('>TEMP<','>B<')
             $files[$document] = $files[$document].Replace('</InternalInfo>','<r:PropertyState><r:Property>ObjectModule</r:Property><r:State>Extended</r:State></r:PropertyState></InternalInfo>')
@@ -4905,7 +4911,7 @@ $tests = @(
             Check ($export.ExitCode -eq 0 -and ($export.Output -match 'выгружать нечего')) 'ручная выгрузка предложила PR для служебного XML'
             $files[$links] = $files[$links].Replace('<Form>First</Form><Form>Second</Form>','<Form>Second</Form><Form>First</Form>')
             $files[$details] = $files[$details].Replace($eventA + $eventAfter, $eventAfter + $eventA)
-            [IO.File]::WriteAllText($cacheForm, $files[$details].Replace('>0<','>12<'), $utf8Bom)
+            [IO.File]::WriteAllText($cacheForm, $epfDump.Replace('>0<','>12<'), $utf8Bom)
             $unchanged = $files[$criterion]
             $files[$criterion] = $unchanged.Replace('>B<','>C<')
             $files[$single] = $files[$single].Replace('>A<','>C<')
