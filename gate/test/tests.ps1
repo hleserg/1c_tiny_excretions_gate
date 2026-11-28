@@ -3891,6 +3891,15 @@ $tests = @(
             Check-Common $r; Check-Verdict $r 'GREEN' 0
             Check-Step $r 'Модульные тесты' 'OK'
             $step = Get-Step $r 'Модульные тесты'
+            $events = @(foreach ($line in $r.Output) {
+                if ($line.StartsWith('@@ui:')) {
+                    $ev = $line.Substring(5) | ConvertFrom-Json
+                    if ($ev.kind -eq 'test-log') { $ev }
+                }
+            })
+            $logText = $events | ConvertTo-Json -Depth 4
+            Check ($logText -match 'вывод клиента' -and $logText -match '\[INF\]' -and $logText -notmatch 'тестовый-пароль') 'в ходе теста в F3 ожидается вывод клиента со скрытым паролем'
+            Check ($logText -match 'yaxunit\.log' -and $logText -match '\[Информация\]') 'после закрытия клиента в F3 ожидается журнал из файла'
             if ($null -ne $step) { Check ([string]$step.detail -match 'кода возврата YAxUnit нет') ("в шаге нет пометки об итоге по отчёту: {0}" -f $step.detail) }
             Check ($r.Seconds -lt 250) ("гейт ждал зависший клиент: {0} с" -f $r.Seconds)
         }

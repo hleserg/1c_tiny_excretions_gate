@@ -727,7 +727,11 @@ func (d *dialog) View() string {
 		b.WriteString("\n\n" + wrapBlock("enter ок · ctrl+v или правая кнопка мыши - вставить · esc отмена", inner, styleHelp))
 	case "view":
 		b.WriteString(d.view.View())
-		b.WriteString("\n" + styleHelp.Render(fmt.Sprintf("↑↓ PgUp PgDn прокрутка · %d%% · q закрыть", int(d.view.ScrollPercent()*100))))
+		if d.local == "test-log" {
+			b.WriteString("\n" + wrapBlock("↑↓ PgUp PgDn листать · Home/End начало/конец · F2 копировать · F3/Esc назад", d.view.Width, styleHelp))
+		} else {
+			b.WriteString("\n" + styleHelp.Render(fmt.Sprintf("↑↓ PgUp PgDn прокрутка · %d%% · q закрыть", int(d.view.ScrollPercent()*100))))
+		}
 	}
 	if d.copyNotice != "" {
 		b.WriteString("\n" + wrapBlock(d.copyNotice, inner, styleAccent))
