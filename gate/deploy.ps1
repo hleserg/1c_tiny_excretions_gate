@@ -6453,7 +6453,7 @@ else {
         if (-not $Resume -or $resumeSource.mode -ne 'prepared' -or $resumeBeforeWrite -or $prepared.partial -or
             $prepared.runId -cne (Get-JsonValue $resumeSource 'preparedRun' '') -or $prepared.gate -cne $resumeSource.gate.run -or
             $prepared.target -cne $deployTarget.Identity -or $prepared.tempBase -ine $script:TempBase -or
-            @($prepared.extensions).Count -ne @($resumeSource.extensions).Count) { throw (Get-PreparedBusyText 'Обновление' $prepared) }
+            @($prepared.extensions).Count -ne @($resumeSource.extensions).Count) { throw (Get-PreparedBusyText 'Обновление одним проходом' $prepared) }
         foreach ($item in $prepared.extensions) {
             $applied = @($resumeSource.extensions | Where-Object { $_.name -eq $item.name -and (Get-JsonValue $_ 'stage' '') -eq 'applied' -and $_.newHash -ceq $item.tempHash })
             if (-not $item.tempHash -or $applied.Count -ne 1) { throw (Get-PreparedBusyText 'Продолжение' $prepared) }
