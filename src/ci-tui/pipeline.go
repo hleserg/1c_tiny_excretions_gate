@@ -51,15 +51,20 @@ func (m *model) resetRun() {
 	m.sub = nil
 	m.planned = false
 	m.planOps = false
+	m.snapshotDone, m.snapshotTotal = 0, 0
 	m.overall = newOverallBar()
 	m.verdict = ""
 	m.eta = nil
+	m.runLogPath = ""
+	m.testLog = testLog{}
+	m.notice = ""
 }
 
 // setPlan - событие plan: заменяет трубу планом. Отметки, пришедшие раньше плана, сохраняются.
 // parallel - шаги, которые идут параллельно остальным (проверка конфигурации в фоне): их результат может прийти
 // раньше их места в плане и ничего не говорит о шагах перед ними.
 func (m *model) setPlan(names []string, parallel []string, ops bool) {
+	m.snapshotDone, m.snapshotTotal = 0, 0
 	old := m.pipe
 	m.pipe = nil
 	m.parallel = map[string]bool{}
@@ -387,21 +392,36 @@ func (m model) connector(next pipeNode, active bool) string {
 	return styleOk.Render("│")
 }
 
-// timeText - сколько прошло с начала скрипта и (у прогона, если скрипт умеет оценить) сколько осталось:
-// «прошло 1:02:03 · осталось ~12:34+». «+» - есть шаги без статистики. Скрипт не идёт - пусто.
+// timeText показывает, сколько прошло и на какую часть оставшейся работы есть оценка.
 func (m model) timeText() string {
 	if !m.running || m.started.IsZero() {
 		return ""
 	}
 	text := "прошло " + formatDuration(time.Since(m.started).Seconds())
-	if m.eta != nil {
-		left := m.eta.seconds - time.Since(m.eta.at).Seconds()
-		text += " · осталось ~" + formatDuration(left)
-		if m.eta.unknown > 0 {
-			text += "+"
-		}
+	if m.eta == nil {
+		return text
+	}
+	left := max(0, int(m.eta.seconds-time.Since(m.eta.at).Seconds()+0.5))
+	if left == 0 && m.eta.unknown > 0 {
+		return fmt.Sprintf("%s · шагов без оценки: %d", text, m.eta.unknown)
+	}
+	if left < 60 {
+		text += fmt.Sprintf(" · осталось около %d с", left)
+	} else {
+		text += fmt.Sprintf(" · осталось около %d мин", (left+30)/60)
+	}
+	if m.eta.unknown > 0 {
+		text += fmt.Sprintf(" по известным шагам. Без оценки ещё %d", m.eta.unknown)
 	}
 	return text
+}
+
+// В узком окне колонки шагов нет. Прогноз прогона остаётся над журналом.
+func (m model) narrowETA() string {
+	if m.width >= minWidthForSteps || m.eta == nil {
+		return ""
+	}
+	return wrapBlock(m.timeText(), m.width, styleDim)
 }
 
 func (m model) viewPipe(width, height int) string {
@@ -412,9 +432,22 @@ func (m model) viewPipe(width, height int) string {
 			done++
 		}
 	}
-	head := styleSection.Render("Шаги прогона")
-	if len(m.pipe) > 0 {
-		count := styleDim.Render(fmt.Sprintf("%d/%d", done, len(m.pipe)))
+	fullPlan := m.planned && !m.planOps
+	title, count := "Операции", ""
+	if fullPlan {
+		title = "Шаги прогона"
+		count = fmt.Sprintf("%d/%d", done, len(m.pipe))
+	}
+	if m.snapshotTotal > 0 {
+		title = "Выгружено расширений"
+		if m.snapshotDone == m.snapshotTotal {
+			title = "Расширения выгружены"
+		}
+		count = fmt.Sprintf("%d из %d", m.snapshotDone, m.snapshotTotal)
+	}
+	head := styleSection.Render(title)
+	if count != "" {
+		count = styleDim.Render(count)
 		gap := width - lipgloss.Width(head) - lipgloss.Width(count)
 		if gap < 1 {
 			gap = 1
@@ -431,15 +464,20 @@ func (m model) viewPipe(width, height int) string {
 		if m.prog != nil {
 			b.WriteString(hang(styleAccent.Render(m.spin.View())+" ", m.prog.title, width, styleText) + "\n")
 		} else {
-			b.WriteString(styleDim.Render("появятся, когда начнётся прогон") + "\n")
+			b.WriteString(styleDim.Render("Ожидание первой операции") + "\n")
 		}
 		return b.String()
 	}
-	b.WriteString(m.overall.View() + " " + styleDim.Render(fmt.Sprintf("%3d%%", int(m.pipeFraction()*100))) + "\n")
-
-	rows := height - 2
+	rows := height - 1
+	if fullPlan && m.snapshotTotal == 0 {
+		b.WriteString(m.overall.View() + " " + styleDim.Render(fmt.Sprintf("%3d%%", int(m.pipeFraction()*100))) + "\n")
+		rows--
+	}
 	if timeLine != "" {
 		rows -= strings.Count(hang("", timeLine, width, styleDim), "\n") + 1
+	}
+	if rows <= 0 {
+		return b.String()
 	}
 	active := -1
 	if m.running {

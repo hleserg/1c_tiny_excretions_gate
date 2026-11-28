@@ -208,6 +208,9 @@ trap {
     }
     # Итог остановленного прогона - в GitHub: причина, шаги, что успели, конец run.log.
     $reason = $_.Exception.Message
+    if (Get-Variable -Name RunLogPath -Scope Script -ErrorAction SilentlyContinue) {
+        try { Write-RunLog ('Остановлено: ' + $reason) } catch { }
+    }
     if ($script:PublishRunDir) { Invoke-RunPublish -Stage 'crash' -Message $reason }
     elseif ($null -ne $script:ResumeReport) {
         $outcome = 'failed'
@@ -1541,9 +1544,10 @@ function Invoke-CoverageStep {
     $none = @($measured | Where-Object { $_.Level -eq 'none' }).Count
     $detail = "доработок {0}: проверяется {1}, только компиляция {2}, не покрыто {3}" -f $measured.Count, $covered, $compiledOnly, $none
     if ($null -eq $reference) { $detail += '; эталона карты ещё нет, этот прогон станет им' }
-    else { $detail += ("; нового непокрытого {0}" -f $newUncovered.Count) }
+    elseif ($newUncovered.Count -eq 0) { $detail += ". Новых пробелов в покрытии по сравнению с эталоном нет" }
+    else { $detail += (". Новых пробелов в покрытии по сравнению с эталоном: {0}" -f $newUncovered.Count) }
     if ($newUncovered.Count -gt 0) { $detail += ('. Новое непокрытое: ' + (@($newUncovered | Select-Object -First 3 | ForEach-Object { $_.Text }) -join ' | ')) }
-    if ($testHints.Count -gt 0) { $detail += ("; указаний прошедших тестов (@Проверяет) {0}" -f $testHints.Count) }
+    if ($testHints.Count -gt 0) { $detail += (". В описаниях прошедших тестов указано связей с доработками: {0} (@Проверяет)" -f $testHints.Count) }
     $detail += $testsNote
     if ($receiveUnchecked.Count -gt 0) { $detail += ('. Изменён перехват правил обмена на загрузку, а загрузку ничто не проверяло (шаг «Обмены» только выгружает): ' + (@($receiveUnchecked | Select-Object -First 3) -join ' | ')) }
     $detail += '; карта - coverage.txt'
@@ -2433,7 +2437,9 @@ $v8 = Join-Path $binDir '1cv8.exe'
 $v8c = Join-Path $binDir '1cv8c.exe'
 if (-not (Test-Path -LiteralPath $v8)) { throw "Не нашёл конфигуратор: $v8. Поправь V8Bin в config.psd1." }
 
-$knownExtensions = @(Get-Setting $cfg 'Extensions' @() | Where-Object { $_ })
+$excludedExtensions = @(Get-Setting $cfg 'ExcludedExtensions' @() | Where-Object { $_ })
+$excludedProcessings = @(Get-Setting $cfg 'ExcludedProcessings' @() | Where-Object { $_ })
+$knownExtensions = @(Get-Setting $cfg 'Extensions' @() | Where-Object { $_ -and $_ -notin $excludedExtensions })
 
 # Модульные тесты YAxUnit (unittests.ps1). Тестовые расширения (UnitTestExtensions) грузятся из файлов UnitTestsDir\<имя>
 # только в тестовую базу и только ради их тестов: комплектом они не грузятся и в рабочую не уходят. Движок (UnitTestEngine,
@@ -2648,11 +2654,11 @@ function Get-RunListText {
     param($Verdict)
     $verdictNames = @{ GREEN = 'зелёный'; YELLOW = 'жёлтый'; RED = 'красный' }
     $decisionNames = @{ kept = 'оставлен'; rolledBack = 'откачен'; rollbackFailed = 'откат не полностью' }
-    if ($null -eq $Verdict) { return 'нет итога (остановился до вердикта)' }
+    if ($null -eq $Verdict) { return 'Вердикт недоступен' }
     $code = [string]$Verdict.verdict
     $text = $code
     if ($verdictNames.ContainsKey($code)) { $text = $verdictNames[$code] }
-    $kitText = [string]$Verdict.kit
+    $kitText = [string](Get-UiField $Verdict 'kit' '')
     if ($kitText) { $text += ' / ' + $kitText } else { $text += ' / без комплекта' }
     if ($null -ne $Verdict.PSObject.Properties['kitDecision']) {
         $decision = [string]$Verdict.kitDecision
@@ -2732,6 +2738,7 @@ function Show-RecentRuns {
             if (Test-Path -LiteralPath $verdictFile) {
                 try { $verdict = (Get-Content -LiteralPath $verdictFile -Raw -Encoding UTF8) | ConvertFrom-Json } catch { $verdict = $null }
             }
+            if (-not (Get-UiField $verdict 'verdict' '')) { $verdict = $null }
             $rows += [pscustomobject]@{ Dir = $run; Verdict = $verdict }
             $acceptedMark = ''
             if (Test-Path -LiteralPath (Join-Path $run.FullName 'accepted.txt')) { $acceptedMark = ' · принят в эталон' }
@@ -2764,6 +2771,15 @@ function Show-RecentRuns {
                 if ($code -eq 'GREEN') { $kind = 'ok' } elseif ($code -eq 'YELLOW') { $kind = 'warn' } elseif ($code -eq 'RED') { $kind = 'bad' }
             }
             $short = New-Object System.Collections.Generic.List[string]
+            if ($null -eq $row.Verdict) {
+                $logFile = Join-Path $runPath 'run.log'
+                if (Test-Path -LiteralPath $logFile -PathType Leaf) {
+                    $reasonLine = Get-Content -LiteralPath $logFile -Encoding UTF8 -Tail 40 -ErrorAction SilentlyContinue |
+                        Where-Object { $_ -match '^\d{2}:\d{2}:\d{2} Остановлено: ' } | Select-Object -Last 1
+                    if ($reasonLine) { $short.Add($reasonLine.Substring(9)) }
+                    $short.Add(('Журнал прогона — {0}' -f $logFile))
+                } else { $short.Add('Журнал run.log недоступен.') }
+            }
             if (Test-Path -LiteralPath $reportFile) {
                 $inShort = $false
                 foreach ($line in @([System.IO.File]::ReadAllLines($reportFile, [System.Text.Encoding]::UTF8))) {
@@ -2802,7 +2818,7 @@ function Show-RecentRuns {
             switch ($actions[$picked].Key) {
                 'summary' {
                     if (Test-Path -LiteralPath $summaryFile) { Show-UiPager -Lines @([System.IO.File]::ReadAllLines($summaryFile, [System.Text.Encoding]::UTF8)) -Header ('summary.txt, прогон ' + $row.Dir.Name) }
-                    else { Write-Host '  summary.txt нет: прогон остановился до вердикта, смотри run.log.' -ForegroundColor Yellow }
+                    else { Write-Host '  Итог по шагам недоступен. Подробности — в run.log этого прогона.' -ForegroundColor Yellow }
                 }
                 'report' { Show-UiPager -Lines @([System.IO.File]::ReadAllLines($reportFile, [System.Text.Encoding]::UTF8)) -Header ('report.txt, прогон ' + $row.Dir.Name) }
                 'folder' { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $runPath) }
@@ -3978,6 +3994,31 @@ function Test-UtJunitSettled {
     return $text.TrimEnd().EndsWith('</testsuites>')
 }
 
+function Send-UtLogLines {
+    param([string[]]$Lines)
+    # Строки движка идут в отдельное окно как данные, даже если выглядят как вопрос или вердикт.
+    $safe = @(foreach ($line in $Lines) {
+        $text = Get-MaskedLine $line
+        if ($adminPassword) { $text = $text.Replace($adminPassword, '***') }
+        if ($text.Length -gt 16384) { $text.Substring(0, 16384) + '…' } else { $text }
+    })
+    if ($safe.Count -gt 0) { Send-UiEvent @{kind = 'test-log'; lines = $safe} }
+}
+
+function Receive-UtConsole {
+    param($ConsoleRead)
+    if ($null -eq $ConsoleRead) { return }
+    $lines = New-Object System.Collections.Generic.List[string]
+    while ($null -ne $ConsoleRead.Next -and $ConsoleRead.Next.IsCompleted -and $lines.Count -lt 64) {
+        if ($ConsoleRead.Next.IsFaulted -or $ConsoleRead.Next.IsCanceled) { $ConsoleRead.Next = $null; break }
+        $line = $ConsoleRead.Next.GetAwaiter().GetResult()
+        if ($null -eq $line) { $ConsoleRead.Next = $null; break }
+        $lines.Add($line)
+        $ConsoleRead.Next = $ConsoleRead.Reader.ReadLineAsync()
+    }
+    if ($lines.Count) { Send-UtLogLines $lines.ToArray() }
+}
+
 function Invoke-UtSession {
     # Сеанс YAxUnit: тонкий клиент с /C"RunUnitTests=<файл настроек>". Итог - файл кода возврата (exitcode.txt)
     # и отчёт jUnit. Начало работы движка - появился его лог. State: done, exited, nostart, timeout; junit - кода
@@ -3995,6 +4036,11 @@ function Invoke-UtSession {
         filter = $filter; reportFormat = 'jUnit'; reportPath = $junit; closeAfterTests = $true; showReport = $false
         exitCode = $exitFile; logging = [ordered]@{ file = $logFile; level = 'info' }
     }
+    $interactiveLog = [bool]$script:UiChannelDir
+    if ($interactiveLog) {
+        $settings.logging['console'] = $true
+        $priorLog = Get-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
+    }
     $configFile = Join-Path $OutDir 'yaxunit.json'
     [System.IO.File]::WriteAllText($configFile, (ConvertTo-Json -InputObject $settings -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
     if ($configFile -match '[;"]') { throw 'в пути к папке прогона не должно быть точки с запятой и кавычек' }
@@ -4004,47 +4050,82 @@ function Invoke-UtSession {
     Write-RunLog ("> 1cv8c.exe {0}" -f ([regex]::Replace([regex]::Replace($argLine, '/P"[^"]*"', '/P"***"'), '/UC"[^"]*"', '/UC"***"')))
     $expected = Get-ExpectedStepSeconds $Title
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    $process = Start-Process -FilePath $v8c -ArgumentList $argLine -PassThru
+    $consoleRead = $null
+    if ($interactiveLog) {
+        $info = New-Object System.Diagnostics.ProcessStartInfo($v8c, $argLine)
+        $info.WorkingDirectory = (Get-Location).ProviderPath
+        $info.UseShellExecute = $false
+        $info.CreateNoWindow = $true
+        $info.RedirectStandardOutput = $true
+        $info.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $process = [System.Diagnostics.Process]::Start($info)
+        $reader = $process.StandardOutput
+        $consoleRead = @{ Reader = $reader; Next = $reader.ReadLineAsync() }
+        Send-UiEvent @{kind = 'test-log'; title = 'YAxUnit · вывод клиента'}
+    } else {
+        $process = Start-Process -FilePath $v8c -ArgumentList $argLine -PassThru
+    }
     $null = $process.Handle
     $state = ''
     $detail = 'клиент запускается'
-    while ($true) {
-        if (Test-Path -LiteralPath $exitFile) { $state = 'done'; break }
-        if ($process.HasExited) {
-            Start-Sleep -Seconds 2
-            if (Test-Path -LiteralPath $exitFile) { $state = 'done' } else { $state = 'exited' }
-            break
+    try {
+        while ($true) {
+            Receive-UtConsole $consoleRead
+            if (Test-Path -LiteralPath $exitFile) { $state = 'done'; break }
+            if ($process.HasExited) {
+                Start-Sleep -Seconds 2
+                if (Test-Path -LiteralPath $exitFile) { $state = 'done' } else { $state = 'exited' }
+                break
+            }
+            $started = Test-Path -LiteralPath $logFile
+            if (-not $started -and $watch.Elapsed.TotalSeconds -ge $selfCheckStartTimeoutSec) { $state = 'nostart'; break }
+            if ($watch.Elapsed.TotalSeconds -ge $unitTestTimeoutSec) { $state = 'timeout'; break }
+            # Отчёт jUnit дописан, а кода возврата нет и через 15 с: движок упал после отчёта (прогон 19.11 - не смог
+            # дописать свой лог). Итог - по отчёту.
+            if (Test-UtJunitSettled -Path $junit -SettleSec 15) { $state = 'junit'; break }
+            if ($started) {
+                # Лог движка на ходу не читается: YAxUnit открывает его на запись монопольно, и чтение гейта в этот момент
+                # роняет движок («Ошибка совместного доступа к файлу»). Размер файла берётся без открытия.
+                $detail = 'тесты идут'
+                try { $detail = 'тесты идут, лог движка {0} КБ' -f [int]((Get-Item -LiteralPath $logFile -ErrorAction Stop).Length / 1024) } catch { }
+            }
+            Write-UiProgress -Title $Title -Elapsed $watch.Elapsed.TotalSeconds -Expected $expected -Detail $detail
+            if ($consoleRead -and $consoleRead.Next -and $consoleRead.Next.IsCompleted) { continue }
+            Start-Sleep -Milliseconds 500
         }
-        $started = Test-Path -LiteralPath $logFile
-        if (-not $started -and $watch.Elapsed.TotalSeconds -ge $selfCheckStartTimeoutSec) { $state = 'nostart'; break }
-        if ($watch.Elapsed.TotalSeconds -ge $unitTestTimeoutSec) { $state = 'timeout'; break }
-        # Отчёт jUnit дописан, а кода возврата нет и через 15 с: движок упал после отчёта (прогон 19.11 - не смог
-        # дописать свой лог). Итог - по отчёту.
-        if (Test-UtJunitSettled -Path $junit -SettleSec 15) { $state = 'junit'; break }
-        if ($started) {
-            # Лог движка на ходу не читается: YAxUnit открывает его на запись монопольно, и чтение гейта в этот момент
-            # роняет движок («Ошибка совместного доступа к файлу»). Размер файла берётся без открытия.
-            $detail = 'тесты идут'
-            try { $detail = 'тесты идут, лог движка {0} КБ' -f [int]((Get-Item -LiteralPath $logFile -ErrorAction Stop).Length / 1024) } catch { }
+        Complete-UiProgress
+        # Клиент закрылся без кода возврата, но отчёт целый - итог по отчёту.
+        if ($state -eq 'exited' -and (Test-UtJunitSettled -Path $junit -SettleSec 0)) { $state = 'junit' }
+        $windows = @()
+        if ($state -eq 'done') {
+            # Код возврата записан, отчёт - перед ним; клиент закрывается сам.
+            $exitWait = [System.Diagnostics.Stopwatch]::StartNew()
+            while (-not $process.WaitForExit(250) -and $exitWait.Elapsed.TotalSeconds -lt 60) { Receive-UtConsole $consoleRead }
+            if (-not $process.HasExited) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
         }
-        Write-UiProgress -Title $Title -Elapsed $watch.Elapsed.TotalSeconds -Expected $expected -Detail $detail
-        Start-Sleep -Milliseconds 500
+        elseif ($state -eq 'junit') {
+            Write-RunLog '  YAxUnit: отчёт jUnit есть, кода возврата нет - итог по отчёту'
+            if (-not $process.HasExited) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
+        }
+        elseif (-not $process.HasExited) {
+            $windows = @(Save-ProcessWindows -ProcessId $process.Id -FilePrefix (Join-Path $OutDir 'client'))
+            try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { }
+        }
+    } finally {
+        if ($consoleRead) { $consoleRead.Reader.Dispose() }
     }
-    Complete-UiProgress
-    # Клиент закрылся без кода возврата, но отчёт целый - итог по отчёту.
-    if ($state -eq 'exited' -and (Test-UtJunitSettled -Path $junit -SettleSec 0)) { $state = 'junit' }
-    $windows = @()
-    if ($state -eq 'done') {
-        # Код возврата записан, отчёт - перед ним; клиент закрывается сам.
-        if (-not $process.WaitForExit(60000)) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
-    }
-    elseif ($state -eq 'junit') {
-        Write-RunLog '  YAxUnit: отчёт jUnit есть, кода возврата нет - итог по отчёту'
-        if (-not $process.HasExited) { try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { } }
-    }
-    elseif (-not $process.HasExited) {
-        $windows = @(Save-ProcessWindows -ProcessId $process.Id -FilePrefix (Join-Path $OutDir 'client'))
-        try { Stop-Process -Id $process.Id -Force -ErrorAction Stop } catch { }
+    if ($interactiveLog -and $process.WaitForExit(2000)) {
+        # Только закрывшийся клиент освободил файл; там могут быть дополнительные строки с сервера.
+        $item = Get-Item -LiteralPath $logFile -ErrorAction SilentlyContinue
+        if ($item -and ($null -eq $priorLog -or $item.LastWriteTimeUtc -ne $priorLog.LastWriteTimeUtc -or $item.Length -ne $priorLog.Length)) {
+            try {
+                $tail = @(Get-Content -LiteralPath $logFile -Tail 6000 -Encoding UTF8 -ErrorAction Stop)
+                Send-UiEvent @{kind = 'test-log'; title = 'YAxUnit · yaxunit.log'}
+                for ($i = 0; $i -lt $tail.Count; $i += 64) {
+                    Send-UtLogLines $tail[$i..([Math]::Min($i + 63, $tail.Count - 1))]
+                }
+            } catch { Write-RunLog ('  Не удалось показать журнал YAxUnit: ' + $_.Exception.Message) }
+        }
     }
     $code = ''
     if (Test-Path -LiteralPath $exitFile) { $code = ([System.IO.File]::ReadAllText($exitFile, [System.Text.Encoding]::UTF8)).Trim().TrimStart([char]0xFEFF) }
@@ -4147,34 +4228,33 @@ function Invoke-UtStep {
     if (-not $Filter) { $goneCount = @($comparison.Gone).Count }
     $changedCount = @($comparison.ReasonChanged).Count
     # ** Хлебников С.Ю. 20261120 конец
-    $detail = 'тестов {0}: прошло {1}, упало {2}' -f $results.Count, $passed, $failed.Count
-    if ($failed.Count -gt 0) {
-        $newErrors = @($comparison.NewFailed | Where-Object { $_.Status -eq 'ERROR' }).Count
-        $newFails = @($comparison.NewFailed).Count - $newErrors
-        $detail += (' (новых {0}: ERROR - ошибка выполнения {1}, FAIL - не прошло утверждение {2}; известных {3})' -f @($comparison.NewFailed).Count, $newErrors, $newFails, @($comparison.KnownFailed).Count)
-    }
-    if ($changedCount -gt 0) { $detail += (', известных падает по-другому {0} (unittests.changed.txt)' -f $changedCount) }
-    if ($skippedCount -gt 0) { $detail += (', пропущено {0}' -f $skippedCount) }
-    if ($disabled.Count -gt 0 -and -not $Filter) { $detail += (', выключено {0}' -f $disabled.Count) }
-    if (@($comparison.Fixed).Count -gt 0) { $detail += (', починились {0}' -f @($comparison.Fixed).Count) }
-    if ($goneCount -gt 0) { $detail += (', пропало из эталона {0}: эталон не сдвинут, принять - вручную' -f $goneCount) }
-    if (-not $comparison.HasBaseline) { $detail += '; эталона тестов не было' }
-    if ($problems -gt 0) { $detail += ('; замечаний к описаниям тестов {0} (unittests-*.catalog.txt)' -f $problems) }
-    if ($session.State -eq 'junit') { $detail += '; кода возврата YAxUnit нет (движок упал после отчёта, см. unittests\yaxunit.log) - итог по junit.xml' }
-    $detail += ('; {0} с' -f $session.Seconds)
+    $detail = 'Прошло {0} из {1}.' -f $passed, $results.Count
+    if (@($comparison.NewFailed).Count -gt 0) { $detail += (' Новых падений {0}.' -f @($comparison.NewFailed).Count) }
+    if (@($comparison.KnownFailed).Count -gt 0) { $detail += (' Падений, уже принятых в эталон: {0}.' -f @($comparison.KnownFailed).Count) }
+    if ($changedCount -gt 0) { $detail += (' У {0} из них изменилась причина (unittests.changed.txt).' -f $changedCount) }
+    if ($skippedCount -gt 0) { $detail += (' Пропущено {0}.' -f $skippedCount) }
+    if ($disabled.Count -gt 0 -and -not $Filter) { $detail += (' Выключено в настройках тестов: {0}.' -f $disabled.Count) }
+    if (@($comparison.Fixed).Count -gt 0) { $detail += (' Теперь проходят: {0}.' -f @($comparison.Fixed).Count) }
+    if ($goneCount -gt 0) { $detail += (' Тестов из эталона, которых больше нет в каталоге: {0}. Изменение принимается вручную.' -f $goneCount) }
+    if (-not $comparison.HasBaseline) { $detail += ' Эталона для сравнения пока нет.' }
+    if ($problems -gt 0) { $detail += (' Замечаний к описаниям тестов: {0} (unittests-*.catalog.txt).' -f $problems) }
+    if ($session.State -eq 'junit') { $detail += ' Кода возврата YAxUnit нет. Результаты взяты из junit.xml.' }
+    $detail += (' Время {0} с.' -f $session.Seconds)
     $status = 'OK'
     if (@($comparison.NewFailed).Count -gt 0) {
         $status = 'FAIL'
         $newLines = @($comparison.NewFailed | ForEach-Object { Format-UtResultLine $_ })
         [System.IO.File]::WriteAllLines((Join-Path $RunDir 'unittests.new.txt'), [string[]]$newLines, $Utf8Bom)
-        $sample = (@($comparison.NewFailed | Select-Object -First 3 | ForEach-Object {
-                    $message = [string]$_.Message
-                    if ($message.Length -gt 160) { $message = $message.Substring(0, 160) + '...' }
-                    '{0} ({1}): {2}' -f $_.Key, (Get-UtStatusTitle $_.Status), $message
-                }) -join ' | ')
-        $detail += ('. Новые падения в unittests.new.txt: {0}' -f $sample)
     }
     elseif ($problems -gt 0 -or $goneCount -gt 0 -or $changedCount -gt 0) { $status = 'WARN' }
+    if ($failed.Count -gt 0) {
+        $presentations = @{}
+        foreach ($test in $known) { $presentations[$test.Key] = $test.Presentation }
+        $shown = @($comparison.NewFailed)
+        if ($shown.Count -eq 0) { $shown = @($comparison.ReasonChanged | ForEach-Object { $_.Result }) }
+        if ($shown.Count -eq 0) { $shown = @($comparison.KnownFailed) }
+        $detail += ([Environment]::NewLine + '       ' + (Format-UtFailureSummary -Results $shown -Presentations $presentations))
+    }
     if ($changedCount -gt 0) {
         $changedLines = @($comparison.ReasonChanged | ForEach-Object { ("{0}`t{1}`tбыло: {2} {3}`tстало: {4} {5}" -f $_.Result.Status, $_.Result.Key, $_.BeforeStatus, $_.BeforeMessage, $_.Result.Status, (([string]$_.Result.Message) -replace '\s+', ' ')) })
         [System.IO.File]::WriteAllLines((Join-Path $RunDir 'unittests.changed.txt'), [string[]]$changedLines, $Utf8Bom)
@@ -4593,7 +4673,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
             $menu.Add((New-MenuItem 'cmpext' 'Сравнить расширения' 'рабочая и temp'))
             $menu.Add((New-MenuItem 'cmpepf' 'Сравнить внешние обработки' 'рабочая и temp'))
             $menu.Add((New-MenuItem 'precheck' 'Проверка рабочей перед обновлением' 'что изменит загрузка, каких настроек нет; только читает'))
-            $menu.Add((New-MenuItem 'rollback' 'Откатить рабочую базу'))
+            $menu.Add((New-MenuItem 'rollback' 'Откатить изменения выпуска' 'выбрать выпуск и посмотреть, какие расширения и обработки вернутся'))
             $menu.Add((New-MenuItem 'pullext' 'Подтянуть расширения из рабочей' 'в inbox'))
             $menu.Add((New-MenuItem 'pullepf' 'Подтянуть обработки из рабочей' 'в inbox'))
         }
@@ -4608,6 +4688,10 @@ if ($PSCmdlet.ParameterSetName -eq 'Run' -and $menuKeys.Count -eq 0 -and (Test-U
                 $nightlyVerdict = [string]$nightly.verdict
                 if ($nightlyNames.ContainsKey($nightlyVerdict)) { $nightlyVerdict = $nightlyNames[$nightlyVerdict] }
                 $nightlyNote = "ночной прогон {0}: {1}, прогон {2}" -f $nightly.time, $nightlyVerdict, $nightly.runId
+                $nightlyMode = [string](Get-UiField $nightly 'mode' '')
+                if ($nightlyMode) { $nightlyNote += (' · ' + $nightlyMode) }
+                $nightlyCommit = [string](Get-UiField $nightly 'commit' '')
+                if ($nightlyCommit) { $nightlyNote += (' · ' + $nightlyCommit.Substring(0, [Math]::Min(7, $nightlyCommit.Length))) }
                 $nightlyTime = [datetime]::MinValue
                 if ([datetime]::TryParseExact([string]$nightly.time, 'yyyy-MM-dd HH:mm:ss', $null, [System.Globalization.DateTimeStyles]::None, [ref]$nightlyTime) -and ((Get-Date) - $nightlyTime).TotalHours -gt 36) {
                     $nightlyNote += ' - давно: проверь задание (.\nightly.ps1 -Status)'
@@ -4874,6 +4958,7 @@ if ($Tests) { $RunDir = Join-Path (Resolve-RootPath 'tests-runs') ('{0}-{1}' -f 
 if ($SelfCheckGroup) { $RunDir = Join-Path (Resolve-RootPath 'selfcheck-runs') $runId }
 New-Item -ItemType Directory -Path $RunDir -Force | Out-Null
 $script:RunLogPath = Join-Path $RunDir 'run.log'
+if ($UiChannel) { Send-UiEvent @{ kind = 'run-log'; text = $script:RunLogPath } }
 $script:Steps = New-Object System.Collections.Generic.List[object]
 # Сведения для продолжения прогона с упавшего шага: шаги по ходу (steps.jsonl), этапы и комплект (resume.json).
 $kitItems = @()
@@ -6159,7 +6244,7 @@ function Invoke-SelfCheckLanes {
             if ($lane.Finished -or $null -eq $lane.Current) { continue }
             $session = $lane.Current
             if ($lane.Number -eq 2) { $session.Waiting = (-not $go) }
-            else { $session.Waiting = ([string](Get-Setting $session.Header 'wait' '') -eq '1' -and -not $second.Finished) }
+            else { $session.Waiting = ([string](Get-Setting $session.Header 'wait' '') -eq '1' -and -not $first.Signals.Contains('done2=1')) }
             Update-SelfCheckSession $session
             if ($lane.Number -eq 1 -and -not $go -and ([string](Get-Setting $session.Header 'group' '') -eq '1' -or [string](Get-Setting $session.Header 'wait' '') -eq '1')) {
                 $go = $true
@@ -6167,6 +6252,14 @@ function Invoke-SelfCheckLanes {
                 else { Write-RunLog ("Самопроверка: первый исполнитель дошёл до группы «{0}», второму - начинать" -f $Group) }
                 Write-SelfCheckLaneSignal -Lane $second -Signal 'go=1'
             }
+            # ** Хлебников С.Ю. 20261128 Сигнал из части журнала означает, что все чтения второго закончены.
+            # После него второй обращается только к модулям. Его итог и полный список заданий проверяем как обычно.
+            if ($lane.Number -eq 2 -and $go -and ($Extra -contains 'overlapcompile=1') -and
+                -not $first.Signals.Contains('done2=1') -and [string](Get-Setting $session.Header 'compileonly' '') -eq '1') {
+                Write-SelfCheckLaneSignal -Lane $first -Signal 'done2=1'
+                Write-RunLog 'Самопроверка: второй закончил чтение данных и проверяет модули, первый продолжает основные проверки'
+            }
+            # ** Хлебников С.Ю. 20261128 конец
             if (-not $session.State) { continue }
 
             $ended = Complete-SelfCheckSession $session
@@ -6202,7 +6295,7 @@ function Invoke-SelfCheckLanes {
                 }
             }
             if ($lane.Number -eq 2 -and $lane.Finished) {
-                Write-RunLog ("Самопроверка: второй исполнитель закончил ({0}), первому - идти дальше" -f $lane.State)
+                Write-RunLog ("Самопроверка: второй исполнитель закончил ({0})" -f $lane.State)
                 Write-SelfCheckLaneSignal -Lane $first -Signal 'done2=1'
             }
             if ($lane.Number -eq 1 -and $lane.Finished -and -not $second.Finished) {
@@ -6365,7 +6458,7 @@ function Invoke-SelfCheck {
     if ($OnlyGroup) { $splitGroup = $OnlyGroup }
     elseif ($workerCount -ge 2 -and $splitGroup -and [bool](Get-Setting $cfg 'SelfCheckEarlyReads' $false)) {
         # ** Хлебников С.Ю. 20261123 Два сеанса делят чтения до перехода к операциям с документами.
-        $extraParts += 'earlyreads=1'
+        $extraParts += @('earlyreads=1', 'overlapcompile=1')
     }
     $laneRun = $null
     # ** Хлебников С.Ю. 20261120 конец
@@ -6679,11 +6772,13 @@ function Connect-TestBaseAgent {
         Connector       = $null
         Agent           = $null
         Server          = $script:Server
+        AliasBinding    = $cfg['ClusterAliasBinding']
         Clusters        = @()
         Errors          = @()
         ClusterUser     = [string](Get-Setting $cfg 'ClusterAdmin' '')
         ClusterPassword = [string](Get-PlainPassword ([string](Get-Setting $cfg 'ClusterAdminPassFile' '')))
     }
+    if ($link.AliasBinding) { $link | Add-Member NoteProperty RacPath (Join-Path $binDir 'rac.exe') }
     $agentAddress = [string](Get-Setting $cfg 'ClusterAgent' '')
     if (-not $agentAddress) { $agentAddress = 'tcp://' + ($script:Server -split ':')[0] }
     try {
@@ -7295,12 +7390,14 @@ if (-not [string]::IsNullOrWhiteSpace($Kit)) {
     foreach ($entry in $kitFound) {
         if ($entry.Kind -eq 'epf' -or $entry.Kind -eq 'epfdir') {
             # Внешняя обработка или отчёт: в базе это элемент справочника «Дополнительные отчёты и обработки».
-            $kitProcessings += New-KitProcessing -Entry $entry
+            $processing = New-KitProcessing -Entry $entry
+            if ($processing.Name -notin $excludedProcessings) { $kitProcessings += $processing }
             continue
         }
         if ($entry.Kind -eq 'cfe') {
             $file = Get-Item -LiteralPath $entry.Path
             # Принятый формат имени выгрузки: <база>_<расширение>_<дата>.cfe. Годится и просто <расширение>....cfe.
+            if (@($excludedExtensions | Where-Object { $file.BaseName.IndexOf($_, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count) { continue }
             $matched = @($knownExtensions | Where-Object { $file.BaseName.IndexOf([string]$_, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } | Sort-Object { $_.Length } -Descending)
             if ($matched.Count -eq 0) {
                 throw "Не понял, какое расширение лежит в файле $($file.Name). В имени файла должно быть имя расширения из списка Extensions в config.psd1, например erp_temp_Адаптация_20261115.cfe."
@@ -7332,6 +7429,7 @@ if (-not [string]::IsNullOrWhiteSpace($Kit)) {
             throw "Не смог прочитать имя расширения из $configurationXml : $($_.Exception.Message)"
         }
         if ([string]::IsNullOrWhiteSpace($extensionName)) { throw "В $configurationXml пустое имя расширения." }
+        if ($extensionName -in $excludedExtensions) { continue }
         $nameParts = Split-KitName -ItemName $dir.Name -ExtensionName $extensionName
         $kitItems += [pscustomobject]@{ Name = $extensionName; Kind = 'files'; Path = $dir.FullName; Version = $extensionVersion; Source = $nameParts.Source; Label = $nameParts.Label; WasInBase = 'unknown'; Backup = ''; LoadTried = $false; Touched = $false; Loaded = $false; InboxItem = (Get-EntryInboxItem $entry) }
     }
@@ -8799,7 +8897,7 @@ elseif ($anyTouched -gt 0) {
                 if ($verdict -eq 'RED') { $acceptLabel = 'Оставить и принять новое в эталон (прогон КРАСНЫЙ)' }
                 $picked = Read-UiChoice -Header ("Комплект в {0}: оставить или откатить?" -f $baseKey) -Keys @('1', '2', '3') `
                     -Labels @('Оставить', $acceptLabel, 'Откатить') -DefaultKey '1' -Dock -Danger @(2) `
-                    -Notes @('Новое этого прогона - в report.txt и *.new.txt. «Принять в эталон» - оно станет известным и больше не будет красить прогоны.')
+                    -Notes @('Esc оставит комплект в базе. Эталон сохранится прежним.', 'Новое этого прогона - в report.txt и *.new.txt. «Принять в эталон» - оно станет известным и больше не будет красить прогоны.')
                 if ($picked -eq '1') { $answer = '1' }
                 elseif ($picked -eq '2') { $answer = '1'; $acceptAfterDecision = $true }
                 elseif ($picked -eq '3') { $answer = '2' }

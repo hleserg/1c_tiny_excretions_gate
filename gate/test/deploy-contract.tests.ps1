@@ -95,6 +95,43 @@ function New-ActionsKit {
 }
 
 @(
+    @{
+        Name = 'deploy-contract-cluster-alias'
+        Text = 'Регистрация базы при обращении к кластеру по псевдониму'
+        Run = {
+            $sample = [pscustomobject]@{ Name = 'fixture'; HostName = 'worker.invalid'; ClusterId = [guid]::NewGuid(); BaseId = [guid]::NewGuid() }
+            $module = New-ContractDeployModule
+            foreach ($scenario in 'match','host','port','cluster','base','unknown','ambiguous','rac-error','no-binding','direct') {
+                $link = New-ContractCatalogLink @($sample)
+                $link | Add-Member NoteProperty Server 'alias.invalid'
+                $link | Add-Member NoteProperty RacPath 'fake-rac'
+                $pin = @{ Alias = 'alias.invalid'; RasPort = 1545; Host = $sample.HostName; ClusterId = $sample.ClusterId; Bases = @{ fixture = $sample.BaseId } }
+                if ($scenario -eq 'direct') { $link.Server = $sample.HostName }
+                if ($scenario -notin @('direct','no-binding')) { $link | Add-Member NoteProperty AliasBinding $pin }
+                if ($scenario -eq 'host') { $pin.Host = 'elsewhere.invalid' }
+                if ($scenario -eq 'port') { $link.Clusters[0].MainPort = 2541 }
+                if ($scenario -eq 'unknown') { $pin.Bases.Remove('fixture') }
+                $allowed = $true
+                try {
+                    $null = & $module {
+                        param($Link,$Sample,$Scenario)
+                        function Get-GateRacRecords {
+                            param($RacPath,$Arguments)
+                            if ($Scenario -eq 'rac-error') { throw 'Ошибка чтения RAS' }
+                            if ($Arguments[0] -eq 'cluster') {
+                                return @{ cluster = $(if ($Scenario -eq 'cluster') { [guid]::Empty } else { $Sample.ClusterId }); host = $Sample.HostName; port = 1541 }
+                            }
+                            $row = @{ infobase = $(if ($Scenario -eq 'base') { [guid]::Empty } else { $Sample.BaseId }); name = $Sample.Name }
+                            if ($Scenario -eq 'ambiguous') { $row }
+                            $row
+                        }
+                        Resolve-ClusterBase $Link $Sample.Name '' ''
+                    } $link $sample $scenario
+                } catch { $allowed = $false }
+                Check ($allowed -eq ($scenario -in @('match','direct'))) ("Неожиданный результат проверки привязки в сценарии " + $scenario)
+            }
+        }
+    }
     # ** Хлебников С.Ю. 20261124 Кластер может вернуть закрывающийся сеанс после успешного TerminateSession.
     @{
         Name = 'deploy-contract-session-drain'

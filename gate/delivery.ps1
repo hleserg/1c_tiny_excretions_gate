@@ -461,6 +461,10 @@ function Resolve-DeliveryTargets {
         if ($null -ne $file['object'] -and [string]$file['object']['repoPath']) { continue }
         $identity = $file['identity']
         if ($null -eq $identity) { continue }
+        if (([string]$identity['kind'] -eq 'extension' -and [string]$identity['name'] -in $excludedExtensions) -or
+            ([string]$identity['kind'] -ne 'extension' -and [string]$identity['name'] -in $excludedProcessings)) {
+            throw ("Объект {0} исключён из поставок настройками площадки." -f $identity['name'])
+        }
         if ([string]$identity['kind'] -eq 'extension') {
             $name = [string]$identity['name']
             $repo = 'extensions/' + $name
@@ -722,7 +726,7 @@ function Get-DeliveryTempDrift {
     Initialize-GitBinaryShas -Setup $Setup -FileSets @($knownFiles, $HeadFiles)
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$withProcessings
     $skipped = Get-GitSkippedPaths $snapshot $knownFiles
-    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $knownFiles $HeadFiles
+    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $knownFiles $HeadFiles $known $Head
     $drift = Compare-GitSnapshot -Local $snapshot.Files -Remote $comparison.Known -Prefixes $snapshot.Prefixes -Ignore (@('processings/manifest.json') + @($skipped)) -LocalShas $comparison.LocalShas
     if ($drift.Count -gt 0 -and $known -ne $Head) { $drift = @($drift | Where-Object { -not (Test-GitSameAsHead $_ $comparison.Head) }) }
     if ($drift.Count -gt 0) {
@@ -827,7 +831,8 @@ function Wait-DeliveryCi {
             Write-DeliveryEvent $D $State 'ci' ("CI PR #{0}: {1} (head {2}, merge {3})" -f $Number, $result, (Get-GitShort $pull.Head), (Get-GitShort $pull.Merge)) $color
             return [pscustomobject]@{ Result = $result; Merge = $pull.Merge; Head = $pull.Head; Base = $pull.Base; Run = $runId }
         }
-        Write-UiProgress -Title $title -Elapsed $watch.Elapsed.TotalSeconds -Expected $limit -Detail 'жду проверку ERP static для текущего merge SHA'
+        $detail = 'Жду результат проверки ERP static. Лимит ожидания {0} мин.' -f ($limit / 60)
+        Write-UiProgress -Title $title -Elapsed $watch.Elapsed.TotalSeconds -Detail $detail
         Start-Sleep -Seconds 10
     }
 }

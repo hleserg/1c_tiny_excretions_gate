@@ -41,6 +41,48 @@ function Assert-ClusterEndpoint {
     }
 }
 
+function Get-GateRacRecords {
+    param([string]$RacPath, [string[]]$Arguments)
+    $lines = @(& $RacPath @Arguments 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw "Не удалось прочитать регистрации RAS (код $LASTEXITCODE)." }
+    $record = @{}
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace([string]$line)) {
+            if ($record.Count) { $record; $record = @{} }
+        }
+        elseif ([string]$line -match '^\s*(?<key>[\w-]+)\s*:\s*(?<value>.*?)\s*$') {
+            $record.Add($Matches['key'], $Matches['value'].Trim('"'))
+        }
+    }
+    if ($record.Count) { $record }
+}
+
+function Assert-ClusterAliasBinding {
+    param($Link, $Cluster, $ShortBase)
+    $binding = $Link.AliasBinding
+    $server = [uri]('tcp://' + $Link.Server)
+    $port = $server.Port
+    if ($port -lt 0) { $port = 1541 }
+    if ($binding.Alias -ine $Link.Server -or $binding.Host -ine [string]$Cluster.HostName -or $port -ne [int]$Cluster.MainPort) {
+        throw 'Имя или порт кластера отличается от привязки псевдонима.'
+    }
+    $clusterId = [guid]$binding.ClusterId
+    $baseId = [guid]$binding.Bases[[string]$ShortBase.Name]
+    if ($clusterId -eq [guid]::Empty -or $baseId -eq [guid]::Empty) { throw 'В привязке отсутствует UUID кластера или базы.' }
+    $comClusterId = Get-OptionalClusterUuid $Cluster
+    $comBaseId = Get-OptionalClusterUuid $ShortBase
+    if (($comClusterId -and [guid]$comClusterId -ne $clusterId) -or ($comBaseId -and [guid]$comBaseId -ne $baseId)) {
+        throw 'UUID цели, полученный через COM, отличается от привязки.'
+    }
+    $ras = '{0}:{1}' -f $server.Host, $binding.RasPort
+    $clusters = @(Get-GateRacRecords $Link.RacPath @('cluster','list',$ras) |
+        Where-Object { $_['host'] -ieq $Cluster.HostName -and [int]$_['port'] -eq $port })
+    if ($clusters.Count -ne 1 -or [guid]$clusters[0]['cluster'] -ne $clusterId) { throw 'RAS не подтвердил зарегистрированный кластер для псевдонима.' }
+    $bases = @(Get-GateRacRecords $Link.RacPath @('infobase','summary','list',("--cluster=" + $clusterId.ToString('D')),$ras) |
+        Where-Object { $_['name'] -ieq $ShortBase.Name })
+    if ($bases.Count -ne 1 -or [guid]$bases[0]['infobase'] -ne $baseId) { throw 'RAS не подтвердил зарегистрированную базу в этом кластере.' }
+}
+
 function Resolve-ClusterBase {
     param($Link, [string]$BaseName, [string]$User, [string]$Password)
     if (-not $Link.PSObject.Properties['Targets']) { $Link | Add-Member -NotePropertyName Targets -NotePropertyValue @{} }
@@ -62,7 +104,10 @@ function Resolve-ClusterBase {
         }
     }
     if ($null -eq $short) { throw ("В кластерах агента не нашёл базу {0}." -f $BaseName) }
-    if ($Link.PSObject.Properties['Server']) { Assert-ClusterEndpoint $Link.Server $chosenCluster }
+    if ($Link.PSObject.Properties['AliasBinding'] -and $Link.AliasBinding) {
+        Assert-ClusterAliasBinding $Link $chosenCluster $short
+    }
+    elseif ($Link.PSObject.Properties['Server']) { Assert-ClusterEndpoint $Link.Server $chosenCluster }
 
     $workers = @($Link.Agent.GetWorkingProcesses($chosenCluster) | Where-Object { [int]$_.Running -eq 1 })
     $lastError = ''

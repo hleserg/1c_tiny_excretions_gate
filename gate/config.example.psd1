@@ -16,6 +16,9 @@
     # Завершение сеансов тестовой базы при монопольной блокировке (ответ 3 в гейте): через агент
     # сервера 1С, COM-компонента V83.COMConnector. Пусто - tcp://<Server>. Администратор кластера -
     # если он задан в кластере; пароль - файлом от -SavePassword.
+    # Для псевдонима можно закрепить каноническое имя и регистрации из RAS.
+    # ClusterAliasBinding = @{ Alias='service.example'; Host='node.example'; RasPort=1545;
+    #     ClusterId='<UUID кластера>'; Bases=@{ test='<UUID тестовой ИБ>'; prod='<UUID рабочей ИБ>' } }
     ClusterAgent         = ''
     ClusterAdmin         = ''
     ClusterAdminPassFile = ''

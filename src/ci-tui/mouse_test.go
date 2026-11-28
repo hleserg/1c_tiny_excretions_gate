@@ -262,6 +262,39 @@ func TestDangerNeedsSecondClick(t *testing.T) {
 	}
 }
 
+func TestDangerHintBeforeClick(t *testing.T) {
+	for _, ev := range []uiEvent{
+		{Kind: "one", Items: []string{"Продолжить", "Назад"}, Danger: []int{0}},
+		{Kind: "one", Style: "dock", Items: []string{"Продолжить", "Назад"}, Danger: []int{0}},
+		{Kind: "confirm", Yes: "Продолжить", No: "Назад", Danger: []int{0}},
+	} {
+		m := ask(testModel(52, 27), ev)
+		view := ansi.Strip(m.View())
+		if !strings.Contains(view, "Первый щелчок") || !strings.Contains(view, "Второй") || strings.Contains(view, "мышью - сразу") {
+			t.Errorf("%s/%s: до выбора не объяснены два щелчка:\n%s", ev.Kind, ev.Style, view)
+		}
+		x, y := onScreen(t, m, "Продолжить")
+		marked := false
+		for _, row := range strings.Split(view, "\n") {
+			if strings.Contains(row, "Продолжить") && strings.Contains(row, "▲") {
+				marked = true
+				break
+			}
+		}
+		if !marked {
+			t.Errorf("%s/%s: у опасного пункта нет отметки", ev.Kind, ev.Style)
+		}
+		m = mouse(m, x, y, tea.MouseButtonLeft)
+		if m.dialog == nil || !strings.Contains(ansi.Strip(m.View()), "или нажми Enter") {
+			t.Fatalf("%s/%s: после щелчка нет подсказки", ev.Kind, ev.Style)
+		}
+		m = mouse(m, x, y, tea.MouseButtonLeft)
+		if m.dialog != nil || !strings.Contains(lastLine(m), "Продолжить") {
+			t.Errorf("%s/%s: второй щелчок в том же месте не подтвердил выбор", ev.Kind, ev.Style)
+		}
+	}
+}
+
 // F2 - весь журнал в буфер обмена, без раскраски; работает и при открытом вопросе с кнопками внизу.
 func TestCopyLogF2(t *testing.T) {
 	var copied string
@@ -277,7 +310,7 @@ func TestCopyLogF2(t *testing.T) {
 	if copied != "ВЫГРУЗИТЬ temp В GIT\r\n       готово за 6:07" {
 		t.Fatalf("в буфере обмена: %q", copied)
 	}
-	if !strings.Contains(m.notice, "строк 2") {
+	if !strings.Contains(m.notice, "Скопировано строк окна: 2") {
 		t.Fatalf("нет сообщения о копировании: %q", m.notice)
 	}
 	// Вопрос с кнопками внизу открыт: F2 копирует и вопрос не трогает.
@@ -287,5 +320,56 @@ func TestCopyLogF2(t *testing.T) {
 	m = next.(model)
 	if copied == "" || m.dialog == nil {
 		t.Fatalf("при открытом вопросе: скопировано %q, вопрос открыт %v", copied, m.dialog != nil)
+	}
+}
+
+func TestCopyLogEvictionAndRunPath(t *testing.T) {
+	var copied string
+	prev := writeClipboard
+	writeClipboard = func(text string) error { copied = text; return nil }
+	t.Cleanup(func() { writeClipboard = prev })
+	m := testModel(70, 35)
+	m.starting = false
+	const path = `D:\Логи гейта\проверка\run.log`
+	m = ask(m, uiEvent{Kind: "run-log", Text: path})
+	m.appendLine("начало")
+	for i := 1; i < maxLogLines; i++ {
+		m.appendLine("шаг")
+	}
+	f2 := func() {
+		t.Helper()
+		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyF2})
+		m = next.(model)
+	}
+	f2()
+	if !strings.HasPrefix(copied, "начало\r\n") || strings.Contains(m.notice, "последние") || !strings.Contains(m.notice, path) {
+		t.Errorf("Ровно %d строк, начало ещё доступно: %q", maxLogLines, m.notice)
+	}
+	m.appendLine("итог")
+	f2()
+	if strings.Contains(copied, "начало") || !strings.HasSuffix(copied, "\r\nитог") || !strings.Contains(m.notice, "Скопированы последние 6000 строк окна") || !strings.Contains(m.notice, path) {
+		t.Errorf("После вытеснения: %q", m.notice)
+	}
+	for _, ev := range []uiEvent{{Kind: "confirm"}, {Kind: "one", Items: []string{"Показать"}}} {
+		m = ask(m, ev)
+		f2()
+		view := ansi.Strip(m.View())
+		if !strings.Contains(view, "последние 6000") || !strings.Contains(view, "run.log") {
+			t.Errorf("В открытом вопросе %s не виден результат F2", ev.Kind)
+		}
+		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		m = next.(model)
+	}
+	m = ask(m, uiEvent{Kind: "reset"})
+	f2()
+	if strings.Contains(m.notice, "run.log") || !strings.Contains(m.notice, "последние 6000") {
+		t.Errorf("Новое действие сохранило строки окна, путь прогона устарел: %q", m.notice)
+	}
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(model)
+	m.appendLine("новый сеанс")
+	f2()
+	if strings.Contains(m.notice, "последние") || copied != "новый сеанс" {
+		t.Errorf("Новый сеанс с пустым буфером окна: %q", m.notice)
 	}
 }

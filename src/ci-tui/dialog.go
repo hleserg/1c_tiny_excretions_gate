@@ -36,6 +36,8 @@ type dialog struct {
 	height   int
 	finished bool
 	result   answer
+
+	copyNotice string
 	// Где пункты и кнопки по последней отрисовке (для мыши): строки и столбцы внутри окна.
 	hits     []hitArea
 	dockHits []hitArea
@@ -381,6 +383,9 @@ func (d *dialog) Update(msg tea.Msg) tea.Cmd {
 		if d.cursor < d.offset {
 			d.offset = d.cursor
 		}
+		if d.armed != d.cursor {
+			d.armed = -1
+		}
 		// Заголовки групп занимают строки: окно считает windowEnd, а не число пунктов.
 		for d.offset < d.cursor && d.cursor >= d.windowEnd(d.offset) {
 			d.offset++
@@ -389,6 +394,7 @@ func (d *dialog) Update(msg tea.Msg) tea.Cmd {
 		switch s {
 		case "left", "right", "tab", "h", "l":
 			d.yes = !d.yes
+			d.armed = -1
 		case "y", "д":
 			d.yes = true
 			d.finish(answer{Yes: true})
@@ -519,7 +525,6 @@ func (d *dialog) mouse(msg tea.MouseMsg) tea.Cmd {
 			d.yes = i == 0
 		}
 		d.notice = ""
-		d.warning = "это откат: щёлкни по нему ещё раз или нажми Enter"
 		return nil
 	}
 	switch d.ev.Kind {
@@ -689,7 +694,8 @@ func (d *dialog) View() string {
 		}
 		b.WriteString("\n")
 		if d.ev.Kind == "one" {
-			b.WriteString(wrapBlock("↑↓ выбор · enter ок · цифра или буква, щелчок мышью - сразу · esc отмена", inner, styleHelp))
+			b.WriteString(d.dangerMouseHint(inner))
+			b.WriteString(wrapBlock("↑↓ выбор · enter ок · цифра, буква или щелчок · esc отмена", inner, styleHelp))
 		} else {
 			help := "↑↓ выбор · пробел или щелчок - отметить · a все · enter дальше · esc отмена"
 			if d.ev.AllowEmpty {
@@ -721,7 +727,14 @@ func (d *dialog) View() string {
 		b.WriteString("\n\n" + wrapBlock("enter ок · ctrl+v или правая кнопка мыши - вставить · esc отмена", inner, styleHelp))
 	case "view":
 		b.WriteString(d.view.View())
-		b.WriteString("\n" + styleHelp.Render(fmt.Sprintf("↑↓ PgUp PgDn прокрутка · %d%% · q закрыть", int(d.view.ScrollPercent()*100))))
+		if d.local == "test-log" {
+			b.WriteString("\n" + wrapBlock("↑↓ PgUp PgDn листать · Home/End начало/конец · F2 копировать · F3/Esc назад", d.view.Width, styleHelp))
+		} else {
+			b.WriteString("\n" + styleHelp.Render(fmt.Sprintf("↑↓ PgUp PgDn прокрутка · %d%% · q закрыть", int(d.view.ScrollPercent()*100))))
+		}
+	}
+	if d.copyNotice != "" {
+		b.WriteString("\n" + wrapBlock(d.copyNotice, inner, styleAccent))
 	}
 	out := styleDialog.Render(b.String())
 	d.boxW, d.boxH = lipgloss.Width(out), lipgloss.Height(out)
@@ -791,6 +804,21 @@ func (d *dialog) isDanger(i int) bool {
 	return false
 }
 
+// Обе подсказки занимают одинаковое место: второй щелчок попадает на ту же кнопку.
+func (d *dialog) dangerMouseHint(width int) string {
+	if len(d.ev.Danger) == 0 {
+		return ""
+	}
+	first := wrapBlock("Первый щелчок выделяет пункт с ▲. Второй подтверждает выбор.", width, styleWarn)
+	second := wrapBlock("Чтобы подтвердить выбор, щёлкни по нему ещё раз или нажми Enter.", width, styleWarn)
+	hint := first
+	if d.armed >= 0 {
+		hint = second
+	}
+	height := max(lipgloss.Height(first), lipgloss.Height(second))
+	return hint + strings.Repeat("\n", height-lipgloss.Height(hint)+1)
+}
+
 // docked - вопрос да/нет рисуется полосой внизу экрана, а не окном поверх: чтобы решить «оставить или
 // откатить», надо видеть итог прогона. Журнал при этом листается (↑↓ PgUp PgDn).
 func (d *dialog) docked() bool {
@@ -813,28 +841,33 @@ func (d *dialog) ViewDocked(width int) string {
 	}
 	var buttons []string
 	var help string
+	button := func(i int, label string, active bool) string {
+		if d.isDanger(i) {
+			label += " ▲"
+		}
+		st := styleButton
+		if active {
+			st = styleButtonActive
+		}
+		if lipgloss.Width(label)+st.GetHorizontalFrameSize() > inner {
+			st = st.Width(inner)
+		}
+		return st.Render(label)
+	}
 	if d.ev.Kind == "one" {
 		for i, item := range d.ev.Items {
 			label := item
 			if k := hotkeyLabel(i); k != "" {
 				label = k + "  " + item
 			}
-			if i == d.cursor {
-				buttons = append(buttons, styleButtonActive.Render(label))
-			} else {
-				buttons = append(buttons, styleButton.Render(label))
-			}
+			buttons = append(buttons, button(i, label, i == d.cursor))
 		}
-		help = "←→ выбор · enter ок · цифра, щелчок мышью - сразу · ↑↓ PgUp PgDn журнал · F2 журнал в буфер обмена · esc отмена"
+		help = "←→ выбор · enter ок · цифра или щелчок · ↑↓ PgUp PgDn журнал · F2 скопировать журнал окна · esc закрыть вопрос"
 	} else {
 		yes := nonEmpty(d.ev.Yes, "Да")
 		no := nonEmpty(d.ev.No, "Нет")
-		yb, nb := styleButton.Render(yes), styleButtonActive.Render(no)
-		if d.yes {
-			yb, nb = styleButtonActive.Render(yes), styleButton.Render(no)
-		}
-		buttons = []string{yb, nb}
-		help = "←→ выбор · enter ок · y/n, щелчок мышью · ↑↓ PgUp PgDn журнал · F2 журнал в буфер обмена · esc отмена"
+		buttons = []string{button(0, yes, d.yes), button(1, no, !d.yes)}
+		help = "←→ выбор · enter ок · y/n, щелчок мышью · ↑↓ PgUp PgDn журнал · F2 скопировать журнал окна · esc отмена"
 	}
 	// Кнопки в ряд; не влезают в ширину - столбиком. Места кнопок - для щелчка мышью.
 	top := strings.Count(b.String(), "\n")
@@ -866,6 +899,10 @@ func (d *dialog) ViewDocked(width int) string {
 	b.WriteString("\n")
 	if d.warning != "" {
 		b.WriteString(wrapBlock(d.warning, inner, styleWarn) + "\n")
+	}
+	b.WriteString(d.dangerMouseHint(inner))
+	if d.copyNotice != "" {
+		b.WriteString(wrapBlock(d.copyNotice, inner, styleAccent) + "\n")
 	}
 	b.WriteString(wrapBlock(help, inner, styleHelp))
 	return styleDocked.Width(width - 2).Render(b.String())

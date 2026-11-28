@@ -1,12 +1,49 @@
 package main
 
 import (
+	"fmt"
 	"strings"
-
-	"github.com/charmbracelet/lipgloss"
 	"testing"
 	"time"
+
+	"github.com/charmbracelet/lipgloss"
 )
+
+func TestFinishedVerdictInHeaderAndCodeInLog(t *testing.T) {
+	for _, run := range []struct {
+		verdict string
+		code    int
+	}{{"ЗЕЛЁНЫЙ", 0}, {"ЖЁЛТЫЙ", 2}, {"КРАСНЫЙ", 1}} {
+		m := testModel(45, 30)
+		m.starting, m.running = false, true
+		m.appendLine("ВЕРДИКТ: " + run.verdict + ". Подробности в журнале.")
+		next, _ := m.Update(exitMsg{code: run.code})
+		m = next.(model)
+		header := m.viewHeader()
+		if !strings.Contains(header, run.verdict) || strings.Contains(header, "код") || strings.Contains(header, "готово") || lipgloss.Width(header) > m.width {
+			t.Errorf("Шапка законченного прогона: %q", header)
+		}
+		if !strings.Contains(lastLine(m), fmt.Sprintf("Код завершения: %d", run.code)) {
+			t.Errorf("В журнале отсутствует код %d: %q", run.code, lastLine(m))
+		}
+		if h := lipgloss.Height(m.View()); h > m.height {
+			t.Errorf("Шапка уходит с экрана: высота %d строк при окне %d", h, m.height)
+		}
+	}
+	m := testModel(45, 30)
+	m.starting = false
+	m.appendLine("  ВЕРДИКТ: ЗЕЛЁНЫЙ. Из предыдущего прогона.")
+	next, _ := m.Update(exitMsg{code: 1})
+	if header := next.(model).viewHeader(); !strings.Contains(header, "кодом 1") || strings.Contains(header, "ЗЕЛЁНЫЙ") {
+		t.Errorf("Остановившийся скрипт без собственного вердикта: %q", header)
+	}
+	m.appendLine("ВЕРДИКТ: ЖЁЛТЫЙ. Есть замечания.")
+	m.appendLine("Остановлено: ошибка после проверки")
+	next, _ = m.Update(exitMsg{code: 1})
+	if header := next.(model).viewHeader(); !strings.Contains(header, "ЖЁЛТЫЙ") || !strings.Contains(header, "сбой") || strings.Contains(header, "код") {
+		t.Errorf("Сбой после жёлтого вердикта: %q", header)
+	}
+}
 
 // Шапка (#32): база из события context, «ждёт ответа» при открытом вопросе и время последнего сообщения
 // видны и в узком окне, где колонки шагов нет.

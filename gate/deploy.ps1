@@ -12,8 +12,8 @@
         Только показать итог гейта и сравнение, ничего не обновлять.
 
     .\deploy.ps1 -Rollback
-        Откатить рабочую базу: список прошлых обновлений, подробности, откат к состоянию до выбранного
-        (или сразу к состоянию до последнего) из резервных копий; потом можно подтянуть то же в temp.
+        Выбрать выпуск, посмотреть состав отката и вернуть перечисленные объекты.
+        После отката можно подтянуть те же объекты в тестовую базу.
 
     .\deploy.ps1 -PullExtensions / -PullProcessings
         Положить в inbox расширения (внешние обработки) рабочей базы, которые отличаются от temp.
@@ -509,11 +509,13 @@ function Connect-ClusterAgent {
         Connector       = $null
         Agent           = $null
         Server          = $script:Server
+        AliasBinding    = $cfg['ClusterAliasBinding']
         Clusters        = @()
         Errors          = @()
         ClusterUser     = [string](Get-Setting $cfg 'ClusterAdmin' '')
         ClusterPassword = [string](Get-PlainPassword ([string](Get-Setting $cfg 'ClusterAdminPassFile' '')))
     }
+    if ($link.AliasBinding) { $link | Add-Member NoteProperty RacPath (Join-Path $binDir 'rac.exe') }
     $agentAddress = [string](Get-Setting $cfg 'ClusterAgent' '')
     if (-not $agentAddress) { $agentAddress = 'tcp://' + ($script:Server -split ':')[0] }
     try {
@@ -1108,6 +1110,9 @@ foreach ($name in $deployExtensions) {
     }
 }
 # ** Хлебников С.Ю. 20261124 Обработки поставщиков переносятся исходным файлом из проверенной базы.
+$excludedExtensions = @(Get-Setting $cfg 'ExcludedExtensions' @() | Where-Object { $_ })
+$excludedProcessings = @(Get-Setting $cfg 'ExcludedProcessings' @() | Where-Object { $_ })
+$deployExtensions = @($deployExtensions | Where-Object { $_ -notin $excludedExtensions })
 $vendorProcessings = @(Get-Setting $cfg 'VendorProcessings' @() | Where-Object { $_ })
 $retainedVendorProcessings = @{}
 # ** Хлебников С.Ю. 20261124 конец
@@ -1202,6 +1207,7 @@ else {
         catch { Write-Warning ("Не записал ссылку на отчёт операции: {0}" -f $_.Exception.Message) }
     }
 }
+if ($script:UiChannelDir) { Send-UiEvent @{ kind = 'run-log'; text = $script:RunLogPath } }
 if ($script:GateOperation) { Write-OperationEvent $script:GateOperation 'step' @{run=$runId; base=$script:ProdBase; tempBase=$script:TempBase} } # ** Хлебников С.Ю. 20261124
 $runsRoot = Resolve-RootPath ([string](Get-Setting $cfg 'RunsDir' 'runs'))
 
@@ -1319,7 +1325,7 @@ function Get-ExtensionVersion {
 function Invoke-UiBackground {
     # Долгий вызов (внешнее соединение 1С) - в отдельном потоке, а в окне - строка хода с временем.
     # Не уложился в TimeoutSec - не ждём (поток бросается), Ok = $false. Ошибка внутри - Ok = $false и её текст.
-    param([scriptblock]$Script, [object[]]$Arguments, [string]$Title, [int]$TimeoutSec)
+    param([scriptblock]$Script, [object[]]$Arguments, [string]$Title, [int]$TimeoutSec, [string]$ProgressTitle = $Title)
     $runspace = [runspacefactory]::CreateRunspace()
     $runspace.ApartmentState = 'STA'
     $runspace.Open()
@@ -1337,7 +1343,7 @@ function Invoke-UiBackground {
             Add-StatFact -Title $Title -Seconds $watch.Elapsed.TotalSeconds -Status 'TIMEOUT'
             return [pscustomobject]@{ Ok = $false; Error = ("нет ответа за {0} с (настройка ComTimeoutSec)" -f $TimeoutSec); Result = $null }
         }
-        Write-UiProgress -Title $Title -Elapsed $watch.Elapsed.TotalSeconds -Expected $plan
+        Write-UiProgress -Title $ProgressTitle -Elapsed $watch.Elapsed.TotalSeconds -Expected $plan
         Start-Sleep -Milliseconds 250
     }
     Complete-UiProgress
@@ -1740,10 +1746,10 @@ function Export-Processings {
     # с File = ''.
     # Внешнее соединение - в фоне, со строкой хода и таймаутом (ComTimeoutSec, втрое: файлов бывает много):
     # раньше синхронный вызов вешал экран, и до кнопки остановки скрипт не доходил.
-    param([string]$BaseName, [string]$User, [string]$Password, [string]$Dir, [switch]$All, [switch]$WithDates)
+    param([string]$BaseName, [string]$User, [string]$Password, [string]$Dir, [switch]$All, [switch]$WithDates, [switch]$ForGit)
     New-Item -ItemType Directory -Path $Dir -Force | Out-Null
     $reader = {
-        param([string]$Line, [string]$Dir, [string]$FakeScript, [string]$FakeFile, [bool]$All, [bool]$ReadDates)
+        param([string]$Line, [string]$Dir, [string]$FakeScript, [string]$FakeFile, [bool]$All, [bool]$ReadDates, [string[]]$ExcludedProcessings)
         if ($FakeScript) { . $FakeScript; $connector = New-FakeComConnector $FakeFile }
         else { $connector = New-Object -ComObject V83.COMConnector }
         $connection = $null
@@ -1771,7 +1777,7 @@ function Export-Processings {
                 $objName = [string]$selection.Get(1)
                 $version = [string]$selection.Get(2)
                 $kind = [string]$selection.Get(3)
-                if (-not $objName) { continue }
+                if (-not $objName -or $objName -in $ExcludedProcessings) { continue }
                 $extension = '.epf'
                 if ($kind -match 'тч[её]т') { $extension = '.erf' }
                 # ** Хлебников С.Ю. 20261124 Одно имя может относиться к нескольким карточкам.
@@ -1905,7 +1911,9 @@ function Export-Processings {
         }
         return , @($found.ToArray())
     }
-    $call = Invoke-UiBackground -Script $reader -Arguments @((Get-ComConnectionLine $BaseName $User $Password), $Dir, $script:FakeComScript, [string]$env:CI_FAKE_COM, [bool]$All, [bool]($All -or $WithDates)) `
+    $progressTitle = "Читаю внешние отчёты и обработки из $BaseName"
+    if ($ForGit) { $progressTitle += ' для сверки с Git' }
+    $call = Invoke-UiBackground -ProgressTitle $progressTitle -Script $reader -Arguments @((Get-ComConnectionLine $BaseName $User $Password), $Dir, $script:FakeComScript, [string]$env:CI_FAKE_COM, [bool]$All, [bool]($All -or $WithDates), $excludedProcessings) `
         -Title ("Выгрузить обработки {0}" -f $BaseName) -TimeoutSec ($comTimeoutSec * 3)
     $message = $call.Error
     if ($Password -and $message) { $message = $message.Replace($Password, '***') }
@@ -3521,8 +3529,8 @@ function Get-GitFolders {
         $parts = ([string]$path).Split('/')
         if ($parts[0] -eq 'processings' -and $parts.Count -ge 2) { $hasProcessings = $true }
         if ($parts.Count -lt 3) { continue }
-        if ($parts[0] -eq 'extensions' -and -not $extensions.Contains($parts[1])) { $extensions.Add($parts[1]) }
-        elseif ($parts[0] -eq 'processings' -and -not $processings.Contains($parts[1])) { $processings.Add($parts[1]) }
+        if ($parts[0] -eq 'extensions' -and $parts[1] -notin $excludedExtensions -and -not $extensions.Contains($parts[1])) { $extensions.Add($parts[1]) }
+        elseif ($parts[0] -eq 'processings' -and ($parts[1] -split '~', 2)[0] -notin $excludedProcessings -and -not $processings.Contains($parts[1])) { $processings.Add($parts[1]) }
     }
     return [pscustomobject]@{ Extensions = @($extensions | Sort-Object); Processings = @($processings | Sort-Object); HasProcessings = $hasProcessings }
 }
@@ -3609,25 +3617,37 @@ function Get-TempSnapshot {
     $files = @{}
     $missing = New-Object System.Collections.Generic.List[string]
     $prefixes = New-Object System.Collections.Generic.List[string]
-    foreach ($name in @($Extensions)) {
-        $dump = Update-DumpDir -BaseName $script:TempBase -Extension $name -Dir (Join-Path (Join-Path $Setup.Work 'extensions') $name)
-        if ($dump.Absent) { $missing.Add(('расширение ' + $name)); continue }
-        if (-not $dump.Ok) { throw ("{0} из {1} не выгрузилось в файлы: {2}" -f $name, $script:TempBase, $dump.Detail) }
-        Add-GitSnapshotFiles -Files $files -Dir $dump.Dir -Prefix ('extensions/' + $name + '/')
-        $prefixes.Add(('extensions/' + $name + '/'))
+    $names = @($Extensions | Where-Object { $_ -and $_ -notin $excludedExtensions })
+    $exported = 0
+    Send-UiPlan -StepNames @($names | ForEach-Object { 'Выгрузить {0} из {1}' -f $_, $script:TempBase }) -Operations
+    try {
+        if ($script:UiChannelDir) { Send-UiEvent @{ kind = 'snapshot-extensions'; done = 0; total = $names.Count } }
+        foreach ($name in $names) {
+            $dump = Update-DumpDir -BaseName $script:TempBase -Extension $name -Dir (Join-Path (Join-Path $Setup.Work 'extensions') $name)
+            if ($dump.Absent) { $missing.Add(('расширение ' + $name)); continue }
+            if (-not $dump.Ok) { throw ("{0} из {1} не выгрузилось в файлы: {2}" -f $name, $script:TempBase, $dump.Detail) }
+            Add-GitSnapshotFiles -Files $files -Dir $dump.Dir -Prefix ('extensions/' + $name + '/')
+            $prefixes.Add(('extensions/' + $name + '/'))
+            $exported++
+            if ($script:UiChannelDir) { Send-UiEvent @{ kind = 'snapshot-extensions'; done = $exported; total = $names.Count } }
+        }
+        $items = @()
+        $folders = @{}
+        $skipped = @()
+        if ($names.Count -gt 0) { Write-Line ("Выгружено расширений из {0}: {1} из {2}" -f $script:TempBase, $exported, $names.Count) }
+        if ($WithProcessings) {
+            $taken = Add-GitProcessingSnapshot -Files $files -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword `
+                -Root (Join-Path $Setup.Work 'processings') -EpfDir (Join-Path $script:RunDir 'epf') -Source 'temp'
+            $items = $taken.Items
+            $folders = $taken.Folders
+            $skipped = @($taken.Skipped)
+            $prefixes.Add('processings/')
+        }
+        return [pscustomobject]@{ Files = $files; Missing = $missing.ToArray(); Prefixes = $prefixes.ToArray(); Processings = $items; Folders = $folders; Skipped = $skipped }
     }
-    $items = @()
-    $folders = @{}
-    $skipped = @()
-    if ($WithProcessings) {
-        $taken = Add-GitProcessingSnapshot -Files $files -BaseName $script:TempBase -User $script:TempUser -Password $script:TempPassword `
-            -Root (Join-Path $Setup.Work 'processings') -EpfDir (Join-Path $script:RunDir 'epf') -Source 'temp'
-        $items = $taken.Items
-        $folders = $taken.Folders
-        $skipped = @($taken.Skipped)
-        $prefixes.Add('processings/')
+    finally {
+        if ($script:UiChannelDir) { Send-UiEvent @{ kind = 'snapshot-extensions'; done = 0; total = 0 } }
     }
-    return [pscustomobject]@{ Files = $files; Missing = $missing.ToArray(); Prefixes = $prefixes.ToArray(); Processings = $items; Folders = $folders; Skipped = $skipped }
 }
 
 function Add-GitProcessingSnapshot {
@@ -3635,7 +3655,7 @@ function Add-GitProcessingSnapshot {
     # (конфигуратор temp) и manifest.json; в Files - пути processings/... Возвращает Items и Folders.
     param([hashtable]$Files, [string]$BaseName, [string]$User, [string]$Password, [string]$Root, [string]$EpfDir, [string]$Source)
     if (Test-Path -LiteralPath $EpfDir) { Remove-Item -LiteralPath $EpfDir -Recurse -Force }
-    $export = Export-Processings -BaseName $BaseName -User $User -Password $Password -Dir $EpfDir -All
+    $export = Export-Processings -BaseName $BaseName -User $User -Password $Password -Dir $EpfDir -All -ForGit
     if (-not $export.Ok) { throw ("обработки {0} не выгрузил: {1}" -f $BaseName, $export.Error) }
     $items = @($export.Items)
     $folders = Get-GitProcessingFolders $items
@@ -3724,6 +3744,7 @@ function Get-GitBinaries {
     $manifest = Read-GitJsonFile -Setup $Setup -Files $Files -Path 'binaries/manifest.json'
     foreach ($item in @($manifest)) {
         if ($null -eq $item -or $null -eq $item.PSObject.Properties['folder'] -or -not [string]$item.folder) { continue }
+        if ([string](Get-UiField $item 'objectName' '') -in $excludedProcessings -or [string]$item.folder -in $excludedProcessings) { continue }
         $list[[string]$item.folder] = $item
     }
     return $list
@@ -3744,7 +3765,10 @@ function Initialize-GitBinaryShas {
 function Get-GitSkippedPaths {
     # Пути папок processings/<папка>/ коммита, которые выгрузка temp пропустила (обработка принята файлом целиком).
     param($Snapshot, [hashtable]$Files)
-    $paths = @()
+    $paths = @(foreach ($path in $Files.Keys) {
+        $parts = $path.Split('/')
+        if ($parts.Count -ge 3 -and $parts[0] -eq 'processings' -and ($parts[1] -split '~', 2)[0] -in $excludedProcessings) { $path }
+    })
     foreach ($folder in @($Snapshot.Skipped)) {
         $prefix = 'processings/' + $folder + '/'
         $paths += @($Files.Keys | Where-Object { ([string]$_).StartsWith($prefix, [System.StringComparison]::Ordinal) })
@@ -3941,7 +3965,7 @@ function New-GitTempBranch {
     $State['pendingCommit'] = $sha
     Save-GitState $Setup $State
     Write-Line ("Выгрузил: ветка {0}, коммит {1}, pull request #{2}: {3}" -f $branchName, (Get-GitShort $sha), $pull.Number, $pull.Url) 'Green'
-    Write-Line ("Проверь изменения и дождись зелёного CI в PR. Затем слей его в {0} через Create a merge commit и повтори «Загрузить из git»." -f $Setup.Branch)
+    Write-Line ("Чтобы включить снимок в {0}, проверь изменения, дождись успешного CI и выбери Create a merge commit." -f $Setup.Branch)
     return [pscustomobject]@{ Branch = $branchName; Sha = $sha; Number = $pull.Number; Url = $pull.Url; Continued = $false }
 }
 
@@ -3962,8 +3986,6 @@ function Invoke-GitExport {
     $processingsText = 'нет'
     if ($tracked.HasProcessings) { $processingsText = 'все из справочника' }
     Write-Line ("Выгружаю из {0} в файлы: расширения {1}; обработки {2}" -f $script:TempBase, (Get-NonEmpty (@($tracked.Extensions) -join ', ') 'нет'), $processingsText) 'Cyan'
-    # Колонка шагов ci.exe: выгрузки расширений видны заранее, серыми (названия - заголовки самих операций).
-    Send-UiPlan -StepNames @(@($tracked.Extensions) | ForEach-Object { 'Выгрузить {0} из {1}' -f $_, $script:TempBase }) -Operations
     Initialize-GitBinaryShas -Setup $Setup -FileSets @($baseFiles)
     # ** Хлебников С.Ю. 20261123 Перед выгрузкой temp в git спросить о завершении занятого конфигуратора.
     # Иначе первая /DumpConfigToFiles падает, и приёмка поставки прерывается, не предложив оператору выбор.
@@ -3983,8 +4005,12 @@ function Invoke-GitExport {
     $snapshot = Get-TempSnapshot -Setup $Setup -Extensions $tracked.Extensions -WithProcessings:$tracked.HasProcessings
     foreach ($item in $snapshot.Missing) { Write-Line ("  в {0} нет: {1} - в git остаётся как есть" -f $script:TempBase, $item) 'Yellow' }
     # Без @(): функция возвращает массив запятой, @() завернул бы его ещё раз.
-    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $baseFiles $baseFiles
+    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $baseFiles $baseFiles $base $head.Sha
     $changes = Compare-GitSnapshot -Local $snapshot.Files -Remote $comparison.Known -Prefixes $snapshot.Prefixes -Ignore (Get-GitSkippedPaths $snapshot $baseFiles) -LocalShas $comparison.LocalShas
+    if ($changes.Count -gt 0 -and $base -ne $head.Sha -and (Get-Setting $cfg 'GitRoleDumpPairs' @()) -and ($changes.Path -match '/Roles/[^/]+/Ext/Rights\.xml$')) {
+        $currentFiles = Get-GhFiles $Setup.Gh $head.Sha
+        $changes = @($changes | Where-Object { -not (Test-GitRoleDumpPair $Setup $_.Path $_.Sha $currentFiles[$_.Path]) })
+    }
     $manifest = 'processings/manifest.json'
     if ($snapshot.Files.ContainsKey($manifest) -and $baseFiles.ContainsKey($manifest) -and $comparison.LocalShas[$manifest] -ne $baseFiles[$manifest]) {
         $current = Get-GitComparisonManifest ([IO.File]::ReadAllBytes($snapshot.Files[$manifest]))
@@ -3994,7 +4020,8 @@ function Invoke-GitExport {
         }
     }
     if ($changes.Count -eq 0) {
-        Write-Line ("{0} совпадает с git (коммит {1}): выгружать нечего." -f $script:TempBase, (Get-GitShort $base)) 'Green'
+        if ($comparison.PublishedVersion) { Write-Line ("Версия из базы уже есть в истории {0}: выгружать нечего." -f $Setup.Branch) 'Green' }
+        else { Write-Line ("{0} совпадает с git (коммит {1}): выгружать нечего." -f $script:TempBase, (Get-GitShort $base)) 'Green' }
         if (-not [string]$State['commit'] -and $base) { $State['commit'] = $base; $State['how'] = 'export'; Save-GitState $Setup $State }
         $script:DeployBranchOutcome = 'unchanged'
         return
@@ -4052,6 +4079,14 @@ function Save-GitImportResult {
     [System.IO.File]::WriteAllText((Join-Path $Setup.Root 'last-import.json'), (ConvertTo-Json -InputObject $record), $Utf8Bom)
 }
 
+function Remove-GitXmlDumpNode {
+    param([System.Xml.XmlNode]$Node)
+    $parent = $Node.ParentNode
+    $indent = $Node.PreviousSibling
+    if ($null -ne $indent -and $indent.NodeType -eq 'Whitespace') { $null = $parent.RemoveChild($indent) }
+    $null = $parent.RemoveChild($Node)
+}
+
 function Get-GitDumpComparisonXml {
     # Меняем только служебные узлы выгрузки. Пробелы в значениях, комментарии, порядок команд и реквизитов сохраняются.
     param([byte[]]$Bytes, [string]$Kind, [bool]$FromDump)
@@ -4080,20 +4115,72 @@ function Get-GitDumpComparisonXml {
         for ($i = 0; $i -lt $nodes.Count; $i++) { $nodes[$i].InnerText = $names[$i] }
     }
     else {
-        $xpath = '/f:Form/f:Attributes[not(@*|node())] | /f:Form/f:BaseForm/f:Attributes[not(@*|node())]'
-        if ($Kind -eq 'module') {
-            if (-not $FromDump) { return $xml.OuterXml }
-            $xpath = "/m:MetaDataObject/m:Document[m:Properties/m:ObjectBelonging='Adopted']/m:InternalInfo/r:PropertyState[not(@*) and count(*)=2 and r:Property='ObjectModule' and r:State='Extended' and not(*/@* | */* | .//comment() | .//processing-instruction() | text()[normalize-space()])]"
+        if ($Kind -eq 'version') {
+            $versions = $xml.SelectNodes('/m:MetaDataObject/m:Configuration/m:Properties/m:Version', $ns)
+            if ($versions.Count -ne 1 -or $versions[0].HasAttributes -or $versions[0].ChildNodes.Count -ne 1 -or $versions[0].FirstChild.NodeType -ne 'Text') { return $null }
+            $versions[0].InnerText = ''
+            return $xml.OuterXml
         }
-        $optional = $xml.SelectNodes($xpath, $ns)
-        if ($FromDump -and $optional.Count -eq 0) { return $null }
-        foreach ($node in $optional) {
-            $parent = $node.ParentNode
-            if ($Kind -eq 'form' -and $parent.SelectNodes('f:Attributes', $ns).Count -ne 1) { return $null }
-            if ($Kind -eq 'module' -and $parent.SelectNodes("r:PropertyState[r:Property='ObjectModule']", $ns).Count -ne 1) { return $null }
-            $indent = $node.PreviousSibling
-            if ($null -ne $indent -and $indent.NodeType -eq 'Whitespace') { $null = $parent.RemoveChild($indent) }
-            $null = $parent.RemoveChild($node)
+        if ($Kind -in @('module', 'document')) {
+            if (-not $xml.SelectSingleNode('/m:MetaDataObject/m:Document', $ns)) { return $null }
+            # Конфигуратор группирует ссылки на формы. Порядок самих форм и остальных объектов остаётся значимым.
+            $forms = $xml.SelectNodes('/m:MetaDataObject/m:Document/m:ChildObjects/m:Form', $ns)
+            foreach ($form in @($forms)) {
+                if ($form.HasAttributes -or $form.ChildNodes.Count -ne 1 -or $form.FirstChild.NodeType -ne 'Text') { return $null }
+                $parent = $form.ParentNode
+                Remove-GitXmlDumpNode $form
+                $null = $parent.AppendChild($form)
+            }
+            if ($Kind -eq 'module' -and $FromDump) {
+                $markers = $xml.SelectNodes("/m:MetaDataObject/m:Document[m:Properties/m:ObjectBelonging='Adopted']/m:InternalInfo/r:PropertyState[r:Property='ObjectModule']", $ns)
+                if ($markers.Count -eq 1 -and $markers[0].SelectSingleNode("self::*[not(@*) and count(*)=2 and r:State='Extended' and not(*/@* | */* | .//comment() | .//processing-instruction() | text()[normalize-space()])]", $ns)) {
+                    Remove-GitXmlDumpNode $markers[0]
+                }
+            }
+            return $xml.OuterXml
+        }
+        if (-not $xml.SelectSingleNode('/f:Form', $ns)) { return $null }
+        $decl = $xml.FirstChild
+        if ($decl.NodeType -eq 'XmlDeclaration' -and $decl.Encoding -ieq 'utf-8') { $decl.Encoding = '' }
+        if ($xml.LastChild.NodeType -eq 'Whitespace') { $null = $xml.RemoveChild($xml.LastChild) }
+
+        foreach ($form in $xml.SelectNodes('/f:Form | /f:Form/f:BaseForm', $ns)) {
+            $empty = $form.SelectSingleNode('f:Attributes[not(@*|node())]', $ns)
+            if ($empty -and $form.SelectNodes('f:Attributes', $ns).Count -eq 1) { Remove-GitXmlDumpNode $empty }
+            # События с разными именами независимы. Обработчики одного события остаются в исходном порядке.
+            $events = $form.SelectNodes('f:Events/f:Event', $ns)
+            $byName = [Collections.Generic.SortedDictionary[string,Collections.ArrayList]]::new([StringComparer]::Ordinal)
+            foreach ($event in $events) {
+                $name = $event.GetAttribute('name')
+                if (-not $name) { return $null }
+                if (-not $byName.ContainsKey($name)) { $byName.Add($name, [Collections.ArrayList]::new()) }
+                $null = $byName[$name].Add($event.CloneNode($true))
+            }
+            $i = 0
+            foreach ($group in $byName.Values) {
+                foreach ($copy in $group) {
+                    $event = $events[$i++]
+                    $null = $event.ParentNode.ReplaceChild($copy, $event)
+                }
+            }
+            # Конфигуратор ставит условное оформление после всех реквизитов. Порядок самих реквизитов значим.
+            $appearance = $form.SelectSingleNode('f:Attributes[count(f:ConditionalAppearance)=1 and not(*[not(self::f:Attribute or self::f:ConditionalAppearance)] | comment() | processing-instruction() | text()[normalize-space()])]/f:ConditionalAppearance', $ns)
+            if ($appearance) {
+                $attributes = $appearance.ParentNode
+                Remove-GitXmlDumpNode $appearance
+                $null = $attributes.AppendChild($appearance)
+            }
+            $qualifiers = $form.SelectNodes("f:Attributes/f:Attribute/f:Type[count(*)=2 and v:Type='xs:string']/v:StringQualifiers[count(*)=2 and v:Length='0' and v:AllowedLength='Variable' and not(@* | */@* | */* | .//comment() | .//processing-instruction() | text()[normalize-space()])]", $ns)
+            foreach ($q in $qualifiers) {
+                if ($q.ParentNode.SelectSingleNode('v:Type', $ns).GetNamespaceOfPrefix('xs') -ceq 'http://www.w3.org/2001/XMLSchema') { Remove-GitXmlDumpNode $q }
+            }
+            # В исходнике тип строки может быть записан в одну строку. При выгрузке внутри Type появляются отступы.
+            foreach ($type in $form.SelectNodes("f:Attributes/f:Attribute/f:Type[count(*)=1 and v:Type='xs:string']", $ns)) {
+                if ($type.SelectSingleNode('v:Type', $ns).GetNamespaceOfPrefix('xs') -cne 'http://www.w3.org/2001/XMLSchema') { continue }
+                foreach ($space in @($type.ChildNodes)) {
+                    if ($space.NodeType -eq 'Whitespace') { $null = $type.RemoveChild($space) }
+                }
+            }
         }
     }
     return $xml.OuterXml
@@ -4128,11 +4215,12 @@ function Get-GitComparisonManifest {
 
 function Get-GitDumpXmlKind {
     param([string]$Path, [hashtable]$Local, [hashtable]$Remote)
-    if ($Path -match '^extensions/[^/]+/(?:.+/)?Forms/[^/]+/Ext/Form\.xml$') { return 'form' }
+    if ($Path -match '^(?:extensions|processings)/[^/]+/(?:.+/)?Forms/[^/]+/Ext/Form\.xml$') { return 'form' }
     if ($Path -match '^extensions/[^/]+/FilterCriteria/[^/]+\.xml$') { return 'criterion' }
     if ($Path -match '^extensions/[^/]+/Documents/[^/]+\.xml$') {
         $module = $Path.Substring(0, $Path.Length - 4) + '/Ext/ObjectModule.bsl'
         if ($Local.ContainsKey($module) -and $Remote.ContainsKey($module)) { return 'module' }
+        return 'document'
     }
     return ''
 }
@@ -4142,7 +4230,19 @@ function Test-GitDumpXmlMatch {
     $dump = Get-GitDumpComparisonXml $Bytes $Kind $true
     if (-not $dump) { return $false }
     $source = Get-GitDumpComparisonXml (Get-GhBlob -Gh $Setup.Gh -Sha $SourceSha) $Kind $false
-    return [string]::Equals($dump, $source, [StringComparison]::Ordinal)
+    if ([string]::Equals($dump, $source, [StringComparison]::Ordinal)) { return $true }
+    # Когда отметка Extended уже есть в исходнике, сравним документ и с сохранённой отметкой.
+    return ($Kind -eq 'module' -and [string]::Equals((Get-GitDumpComparisonXml $Bytes $Kind $false), $source, [StringComparison]::Ordinal))
+}
+
+function Test-GitRoleDumpPair {
+    # Пара Git blob для роли, проверенной на площадке загрузкой, повторной выгрузкой и тестом права.
+    param($Setup, [string]$Path, [string]$DumpBlob, [string]$SourceBlob)
+    if ($Path -cnotmatch '^extensions/[^/]+/Roles/[^/]+/Ext/Rights\.xml$' -or -not $SourceBlob) { return $false }
+    foreach ($pair in (Get-Setting $cfg 'GitRoleDumpPairs' @())) {
+        if ($pair.Repo -ceq $Setup.Repo -and $pair.Path -ceq $Path -and $pair.SourceBlob -ceq $SourceBlob -and $pair.DumpBlob -ceq $DumpBlob) { return $true }
+    }
+    return $false
 }
 
 function Get-GitDumpComparisonFiles {
@@ -4151,6 +4251,10 @@ function Get-GitDumpComparisonFiles {
     $files = $Remote.Clone()
     foreach ($path in $Local.Keys) {
         if (-not $Remote.ContainsKey($path) -or $LocalShas[$path] -eq $Remote[$path]) { continue }
+        if (Test-GitRoleDumpPair $Setup $path $LocalShas[$path] $Remote[$path]) {
+            $files[$path] = $LocalShas[$path]
+            continue
+        }
         $kind = Get-GitDumpXmlKind $path $Local $Remote
         if (-not $kind) { continue }
         $key = $kind + '/' + $LocalShas[$path] + '/' + $Remote[$path]
@@ -4162,9 +4266,55 @@ function Get-GitDumpComparisonFiles {
     return $files
 }
 
+function Test-GitPublishedVersion {
+    param($Setup, [string]$Path, [byte[]]$Bytes, [string]$Blob, [string]$Before, [string]$Known, [string]$Head)
+    if (-not (Test-GitDumpXmlMatch $Setup $Bytes 'version' $Before)) { return $false }
+    try { return (Test-GhPathInRange $Setup.Gh $Known $Head $Path { param($revision) (Get-GhFileAtRevision $Setup.Gh $revision $Path) -eq $Blob }) }
+    catch { Write-RunLog ("git: история {0} не подтверждена, сохраняю изменение: {1}" -f $Path, $_.Exception.Message); return $false }
+}
+
+function Get-GitRelativeFiles {
+    param([hashtable]$Files, [string]$Folder)
+    $result = [hashtable]::new([StringComparer]::Ordinal)
+    $prefix = $Folder + '/'
+    foreach ($path in $Files.Keys) {
+        if ($path.StartsWith($prefix, [StringComparison]::Ordinal)) { $result[$path.Substring($prefix.Length)] = $Files[$path] }
+    }
+    return $result
+}
+
+function Test-GitPublishedProcessing {
+    param($Setup, [string]$Folder, [hashtable]$Files, [string]$KnownCommit, [string]$HeadCommit, [hashtable]$Before, [hashtable]$Current)
+    $expected = Get-GitRelativeFiles $Files $Folder
+    if ($expected.Count -eq 0) { return $false }
+    # При старой выгрузке в PR не попадали файлы из main. Для неизменённого пути снимка допускаем
+    # также версию из main, но все файлы вместе должны совпасть с одной опубликованной обработкой.
+    $alternates = @{}
+    if ($null -ne $Before -and $null -ne $Current) {
+        foreach ($rel in $expected.Keys) {
+            $path = $Folder + '/' + $rel
+            if ($Before[$path] -eq $expected[$rel] -and $Current[$path]) { $alternates[$rel] = $Current[$path] }
+        }
+    }
+    try {
+        return (Test-GhPathInRange $Setup.Gh $KnownCommit $HeadCommit $Folder {
+            param($revision)
+            if ($Setup.Gh.FakeDir) { $tree = Get-GitRelativeFiles (Get-GhFiles $Setup.Gh $revision) $Folder }
+            else { $tree = Get-GhFiles $Setup.Gh ([uri]::EscapeDataString($revision + ':' + $Folder)) }
+            if ($tree.Count -ne $expected.Count) { return $false }
+            foreach ($rel in $tree.Keys) {
+                if (-not $expected.ContainsKey($rel)) { return $false }
+                if ($tree[$rel] -ne $expected[$rel] -and $tree[$rel] -ne $alternates[$rel]) { return $false }
+            }
+            return $true
+        })
+    }
+    catch { Write-RunLog ("git: не подтвердил версию {0} в истории: {1}" -f $Folder, $_.Exception.Message); return $false }
+}
+
 function Get-GitSnapshotComparison {
     # Хеши выгрузки считаем один раз. Совпадающие пары XML для основы снимка и main читаем один раз.
-    param($Setup, [hashtable]$Local, [hashtable]$KnownFiles, [hashtable]$HeadFiles)
+    param($Setup, [hashtable]$Local, [hashtable]$KnownFiles, [hashtable]$HeadFiles, [string]$KnownCommit, [string]$HeadCommit)
     $localShas = @{}
     foreach ($path in $Local.Keys) { $localShas[$path] = Get-GitBlobSha ([IO.File]::ReadAllBytes($Local[$path])) }
     $cache = @{}
@@ -4173,7 +4323,31 @@ function Get-GitSnapshotComparison {
     if (-not [object]::ReferenceEquals($KnownFiles, $HeadFiles)) {
         $head = Get-GitDumpComparisonFiles $Setup $Local $localShas $HeadFiles $cache
     }
-    return [pscustomobject]@{ LocalShas = $localShas; Known = $known; Head = $head }
+    $publishedVersion = $false
+    if ($KnownCommit -and $HeadCommit -and $KnownCommit -ne $HeadCommit) {
+        # Для загрузки остаются байты текущего main. История влияет только на поиск прямых правок.
+        $known = $known.Clone()
+        $folders = @{}
+        foreach ($path in @($Local.Keys) + @($known.Keys)) {
+            if ($path -cmatch '^(processings/[^/]+)/' -and $localShas[$path] -ne $known[$path] -and $localShas[$path] -ne $head[$path]) { $folders[$Matches[1]] = $true }
+        }
+        foreach ($folder in $folders.Keys) {
+            if (-not (Test-GitPublishedProcessing $Setup $folder $localShas $KnownCommit $HeadCommit)) { continue }
+            foreach ($rel in (Get-GitRelativeFiles $known $folder).Keys) { $known.Remove($folder + '/' + $rel) }
+            foreach ($rel in (Get-GitRelativeFiles $localShas $folder).Keys) { $path = $folder + '/' + $rel; $known[$path] = $localShas[$path] }
+            $publishedVersion = $true
+            Write-RunLog ("git: все файлы {0} совпали с одной опубликованной версией" -f $folder)
+        }
+        foreach ($path in $Local.Keys) {
+            if ($path -notmatch '^extensions/[^/]+/Configuration\.xml$' -or -not $known.ContainsKey($path) -or $localShas[$path] -eq $known[$path]) { continue }
+            if (Test-GitPublishedVersion $Setup $path ([IO.File]::ReadAllBytes($Local[$path])) $localShas[$path] $known[$path] $KnownCommit $HeadCommit) {
+                $known[$path] = $localShas[$path]
+                $publishedVersion = $true
+                Write-RunLog ("git: {0} совпадает с опубликованной версией в истории {1}" -f $path, $Setup.Branch)
+            }
+        }
+    }
+    return [pscustomobject]@{ LocalShas = $localShas; Known = $known; Head = $head; PublishedVersion = $publishedVersion }
 }
 
 function Test-GitSameAsHead {
@@ -4197,6 +4371,8 @@ function Test-GitPendingSourceChanges {
     $before = Get-GhFiles -Gh $Setup.Gh -Commit $base
     $after = Get-GhFiles -Gh $Setup.Gh -Commit $pending
     if ($before.Count -eq 0 -or $before.Count -ne $after.Count) { return $true }
+    $targetFiles = $null
+    $publishedFolders = @{}
     foreach ($path in $after.Keys) {
         if (-not $before.ContainsKey($path)) { return $true }
         if ($after[$path] -eq $before[$path]) { continue }
@@ -4205,9 +4381,21 @@ function Test-GitPendingSourceChanges {
             if (-not (Get-GitComparisonManifest (Get-GhBlob -Gh $Setup.Gh -Sha $before[$path]))) { return $true }
             continue
         }
+        if ($path -cmatch '/Roles/[^/]+/Ext/Rights\.xml$' -and (Get-Setting $cfg 'GitRoleDumpPairs' @())) {
+            if (Test-GitRoleDumpPair $Setup $path $after[$path] $before[$path]) { continue }
+            if ($null -eq $targetFiles) { $targetFiles = Get-GhFiles $Setup.Gh $Head }
+            if (Test-GitRoleDumpPair $Setup $path $after[$path] $targetFiles[$path]) { continue }
+        }
+        if ($path -match '^extensions/[^/]+/Configuration\.xml$' -and (Test-GitPublishedVersion $Setup $path (Get-GhBlob $Setup.Gh $after[$path]) $after[$path] $before[$path] $base $Head)) { continue }
         $kind = Get-GitDumpXmlKind $path $after $before
-        if (-not $kind) { return $true }
-        if (-not (Test-GitDumpXmlMatch $Setup (Get-GhBlob -Gh $Setup.Gh -Sha $after[$path]) $kind $before[$path])) { return $true }
+        if ($kind -and (Test-GitDumpXmlMatch $Setup (Get-GhBlob -Gh $Setup.Gh -Sha $after[$path]) $kind $before[$path])) { continue }
+        if ($path -cnotmatch '^(processings/[^/]+)/') { return $true }
+        $folder = $Matches[1]
+        if (-not $publishedFolders.ContainsKey($folder)) {
+            if ($null -eq $targetFiles) { $targetFiles = Get-GhFiles $Setup.Gh $Head }
+            $publishedFolders[$folder] = Test-GitPublishedProcessing $Setup $folder $after $base $Head $before $targetFiles
+        }
+        if (-not $publishedFolders[$folder]) { return $true }
     }
     return $false
 }
@@ -4215,7 +4403,7 @@ function Test-GitPendingSourceChanges {
 function Invoke-GitImport {
     # «Загрузить из git»: правили ли temp после прошлой загрузки (выгрузка и сравнение с известным коммитом), не висят
     # ли правки temp в неслитом pull request, потом - обычный прогон гейта отдельным процессом с тем, что изменилось
-    # в main. Правки temp можно сохранить веткой и PR. Загрузка после слияния - при следующем запуске.
+    # в main. Правки temp можно сохранить веткой и PR. После публикации оператор может сразу продолжить загрузку выбранного коммита.
     # Комплект оставлен и загрузилось всё - temp соответствует main. Unattended - без вопросов (ночью).
     # Возвращает код прогона.
     # ExpectCommit - грузить только этот коммит (приёмка поставки: проверенный SHA); main другой - не грузить.
@@ -4248,7 +4436,8 @@ function Invoke-GitImport {
     $vendorFolders = @{}
     foreach ($folder in $manifestRefs.Keys) {
         $card = $manifestRefs[$folder]
-        if ($vendorProcessings -notcontains (Get-UiField $card 'objectName' '')) { continue }
+        $objectName = Get-UiField $card 'objectName' ''
+        if ($objectName -in $excludedProcessings -or $vendorProcessings -notcontains $objectName) { continue }
         $wanted = [string](Get-UiField $card 'fileHash' '')
         $ref = [string](Get-UiField $card 'ref' '')
         $originals = @($snapshot.Processings | Where-Object {
@@ -4264,7 +4453,7 @@ function Invoke-GitImport {
     # ** Хлебников С.Ю. 20261124 конец
     # manifest.json правкой temp не считается: версия и хеш обработки меняются от самой загрузки из git. В ветку с
     # правками он идёт, если правки есть.
-    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $knownFiles $headFiles
+    $comparison = Get-GitSnapshotComparison $Setup $snapshot.Files $knownFiles $headFiles $known $head.Sha
     $localShas = $comparison.LocalShas
     $compareKnown = $comparison.Known
     $compareHead = $comparison.Head
@@ -4283,7 +4472,10 @@ function Invoke-GitImport {
         if ($sameAsHead.Count -gt 0) { $drift = @($drift | Where-Object { -not (Test-GitSameAsHead $_ $compareHead) }) }
     }
     # Итог сверки - на экран и когда правок нет: иначе по выводу не понять, чем кончилась проверка.
-    if ($drift.Count -eq 0) { Write-Line ("  правок нет: {0} совпадает с коммитом {1}" -f $script:TempBase, $knownName) 'Green' }
+    if ($drift.Count -eq 0) {
+        if ($comparison.PublishedVersion) { Write-Line ("  новых правок нет. Версия из {0} уже есть в истории {1}." -f $script:TempBase, $Setup.Branch) 'Green' }
+        else { Write-Line ("  правок нет: {0} совпадает с коммитом {1}" -f $script:TempBase, $knownName) 'Green' }
+    }
     if ($drift.Count -gt 0) {
         Write-Line ("В {0} есть правки, которых нет в git (коммит {1}):" -f $script:TempBase, $knownName) 'Yellow'
         if ($null -ne $script:DeployReport) { Add-GateOperationLine -Context $script:DeployReport -Text ((Get-GitFileLines $drift -Limit ([int]::MaxValue)) -join "`n") }
@@ -4294,7 +4486,7 @@ function Invoke-GitImport {
         $saveDrift = $true
         if (-not $Unattended) {
             $choice = Select-UiOne -Header ("В {0} правки после прошлой загрузки из git: что делать?" -f $script:TempBase) -Items @(
-                'Выгрузить правки temp в git (ветка и pull request), загрузку не делать',
+                'Выгрузить правки temp в Git (создать или дополнить PR)',
                 ('Загрузить {0} всё равно: правки temp пропадут' -f $Setup.Branch),
                 'Отмена') -Danger @(1)
             if ($choice -ne 0 -and $choice -ne 1) { Write-Line ("Отмена: {0} не трогаю." -f $script:TempBase); Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note 'отмена' -Outcome 'cancel'; return 0 }
@@ -4305,7 +4497,11 @@ function Invoke-GitImport {
             if ($Unattended) { $note = 'выгружено ночью' }
             $made = New-GitTempBranch -Setup $Setup -State $State -Base $driftBase -Changes $drift -Note $note
             Save-GitImportResult -Setup $Setup -Ran $false -Run '' -Code 0 -Note ("правки temp - веткой {0}, pull request #{1}; temp не трогал" -f $made.Branch, $made.Number) -Outcome 'drift' -Commit $made.Sha
-            return 0
+            if ($Unattended) { return 0 }
+            $next = Select-UiOne -Header ("Правки {0} сохранены в PR #{1}" -f $script:TempBase, $made.Number) -Items @(
+                'Завершить без загрузки',
+                'Продолжить загрузку из Git') -Danger @(1) -Notes @($made.Url, ("В базе правки заменит версия из {0}. Снимок останется в PR." -f $Setup.Branch))
+            if ($next -ne 1) { return 0 }
         }
         Write-Line ("Загружаю {0} поверх правок {1}: так решили." -f $Setup.Branch, $script:TempBase) 'Yellow'
     }
@@ -4332,7 +4528,7 @@ function Invoke-GitImport {
     $binaries = Get-GitBinaries -Setup $Setup -Files $headFiles
     foreach ($name in @($headTracked.Processings)) {
         $prefix = 'processings/' + $name + '/'
-        if ($binaries.ContainsKey($name)) { continue }
+        if ($binaries.ContainsKey($name) -or ($manifestRefs.ContainsKey($name) -and [string]$manifestRefs[$name].objectName -in $excludedProcessings)) { continue }
         # ** Хлебников С.Ю. 20261124 Архивная карточка не обновляется и не требует оригинала для регистрации.
         if ($vendorFolders.ContainsKey($name) -and [bool](Get-UiField $manifestRefs[$name] 'deleted' $false)) {
             Write-Line ("  {0}: карточка помечена на удаление, пропускаю" -f $name) 'Yellow'
@@ -4344,7 +4540,7 @@ function Invoke-GitImport {
             throw ("{0}: исходный EPF с SHA-256 из manifest.json не подтверждён в temp. Нужен оригинал в binaries/." -f $name)
         }
         # ** Хлебников С.Ю. 20261124 конец
-        if ((Get-GitFolderPrint $headFiles $prefix) -eq (Get-GitFolderPrint $localShas $prefix)) { continue }
+        if ((Get-GitFolderPrint $compareHead $prefix) -eq (Get-GitFolderPrint $localShas $prefix)) { continue }
         $ref = ''
         if ($manifestRefs.ContainsKey($name)) { $ref = [string]$manifestRefs[$name].ref }
         # <имя>~<ссылка> - не основной элемент с этим именем объекта: без ссылки из manifest.json загрузка писала бы в
@@ -4795,8 +4991,8 @@ function Invoke-GitTypical {
     # Колонка шагов ci.exe: весь путь типовой виден заранее. Названия - заголовки операций ниже; шаг, которого не
     # было (коммит уже сделан прошлым запуском), останется «не выполнялся».
     Send-UiPlan -Operations -StepNames @(
-        ('Выгрузить типовую {0} в файлы' -f $script:TempBase), 'Типовая: git fetch (что сейчас в GitHub)', 'Типовая: git add (файлы - в pack)',
-        'Типовая: git commit', 'Типовая: git repack (сжать объекты перед отправкой)', 'Типовая: git push (отправка в GitHub)')
+        ('Выгрузить типовую {0} в файлы' -f $script:TempBase), 'Типовая: git fetch (что сейчас в GitHub)', 'Подготовить файлы к коммиту (git add)',
+        'Типовая: git commit', 'Упаковать объекты перед отправкой (git repack)', 'Типовая: git push (отправка в GitHub)')
     Update-TypicalDump -Dir $dump
     # Конфигуратор может оставить повреждённый XML даже при наличии Configuration.xml.
     # Прочитать потоками до записи git-индекса. Пути с # и % передавать как файлы, а не URI.
@@ -4854,7 +5050,7 @@ function Invoke-GitTypical {
     # антивирус при записи и при чтении: первая выгрузка 19.11.2026 упаковывала их часами. В таком pack нет
     # дельта-сжатия - его делает пережатие перед первой отправкой (ниже), уже из одного файла.
     Write-Line '  складываю в git: сотня тысяч файлов - в первый раз десятки минут'
-    $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('add', '-A') -TimeoutSec 14400 -Title 'Типовая: git add (файлы - в pack)' -Config @('core.bigFileThreshold=1')
+    $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('add', '-A') -TimeoutSec 14400 -Title 'Подготовить файлы к коммиту (git add)' -Config @('core.bigFileThreshold=1')
     $staged = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('diff', '--cached', '--quiet') -AllowFail
     $hasHead = ((Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('rev-parse', '--verify', '--quiet', 'HEAD') -AllowFail).ExitCode -eq 0)
     if ($staged.ExitCode -eq 0 -and $fetch.ExitCode -eq 0) {
@@ -4877,7 +5073,7 @@ function Invoke-GitTypical {
         # пересчитывать всю типовую ради нескольких тысяч изменённых файлов незачем. Не вышло - отправка упакует сама.
         $repackArgs = @('repack', '-a', '-d', '-q')
         if ($fetch.ExitCode -ne 0) { $repackArgs = @('repack', '-a', '-d', '-f', '-q') }
-        $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments $repackArgs -TimeoutSec 14400 -AllowFail -Title 'Типовая: git repack (сжать объекты перед отправкой)'
+        $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments $repackArgs -TimeoutSec 14400 -AllowFail -Title 'Упаковать объекты перед отправкой (git repack)'
         Write-Line ("  отправляю в {0} (ветка {1}; первый раз - надолго)" -f $repo, $branch)
         $null = Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('push', '--no-verify', $url, ('HEAD:refs/heads/' + $branch)) -Token $token -TimeoutSec 14400 -Title 'Типовая: git push (отправка в GitHub)'
         $state['commit'] = (Invoke-GitCli -Git $git -GitDir $gitDir -WorkTree $dump -Arguments @('rev-parse', 'HEAD')).Output.Trim()
@@ -5026,7 +5222,7 @@ function Get-PreparedRollbackFailedText {
     if ($null -eq $failure) { return '' }
     $items = @(Get-JsonValue $failure 'items' @()) -join '; '
     if (-not $items) { $items = 'по элементам - в журнале запуска' }
-    return ("откат обновления подготовленным {0} (запуск {1}) прошёл не полностью: {2}. Рабочая частично на новых версиях, новые изменения не начинаю. Восстановить - «Откатить рабочую базу» (вернутся объекты с копией), журнал - deploy\{1}" -f $script:ProdBase, (Get-JsonValue $failure 'run' '?'), $items)
+    return ("откат обновления подготовленным {0} (запуск {1}) прошёл не полностью: {2}. Рабочая частично на новых версиях, новые изменения не начинаю. Для восстановления выбери «Откатить изменения выпуска» и проверь список объектов, журнал - deploy\{1}" -f $script:ProdBase, (Get-JsonValue $failure 'run' '?'), $items)
 }
 
 function Set-PreparedRollbackFailed {
@@ -5319,7 +5515,7 @@ function Resolve-InterruptedDeploys {
         Write-RunLog ("Прерванное обновление {0}: {1}" -f $dir.Name, ($lines -join ' | '))
         $more = @($lines.ToArray()) + @(
             'Блокировки, которые ставил этот запуск, - выше, отдельным вопросом; остальные - «Состояние баз» и консоль кластера.',
-            'Откатить то, что успело, - «Откатить рабочую базу»: это обновление в списке с пометкой ПРЕРВАНО (вернутся только объекты с копией).',
+            'Для отката выбери «Откатить изменения выпуска», затем выпуск с пометкой ПРЕРВАНО. Перед подтверждением появится список объектов.',
             'Проверить рабочую - «Проверить рабочую базу (только читает)».')
         Show-UiTitle -Text ("Обновление {0} {1} прервано (процесс не закончил)" -f $script:ProdBase, $dir.Name) -Kind 'bad' -More $more
     }
@@ -5367,27 +5563,20 @@ if ($Rollback) {
     Write-Host ''
     Write-Host ("ОТКАТ {0}" -f $script:ProdBase) -ForegroundColor Cyan
 
-    # Экран отката - всегда: сверху большая красная кнопка «Откатить последние изменения» (сразу из резервных
-    # копий, снятых перед последним обновлением), под ней - последние обновления рабочей с результатами
-    # лёгкого прогона. Обновлений ещё не было - экран так и говорит, кнопка ничего не делает.
+    $historyTitle = "Откат {0}: последние обновления" -f $script:ProdBase
+    if ($history.Count -eq 0) {
+        $null = Select-UiOne -Header $historyTitle -Items @('Назад') -Notes @('У гейта пока нет сохранённых выпусков для отката.')
+        Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не откатывал.'
+        exit 0
+    }
     $target = $null
     while ($null -eq $target) {
         $items = New-Object System.Collections.Generic.List[string]
-        $notes = @()
-        if ($history.Count -gt 0) {
-            $items.Add(("ОТКАТИТЬ ПОСЛЕДНИЕ ИЗМЕНЕНИЯ - к состоянию до обновления {0:dd.MM.yyyy HH:mm}" -f [datetime]::ParseExact([string]$history[0].runId, 'yyyyMMdd-HHmmss', $null)))
-            foreach ($record in $history) { $items.Add((Get-DeployLabel $record)) }
-            $notes += 'Выбери обновление, чтобы посмотреть подробно и откатить именно его.'
-        }
-        else {
-            $items.Add('ОТКАТИТЬ ПОСЛЕДНИЕ ИЗМЕНЕНИЯ - не к чему: обновлений рабочей скриптом ещё не было')
-            $notes += ("Обновлений {0} скриптом обновления ещё не было: резервных копий перед обновлением нет, откатывать не к чему." -f $script:ProdBase)
-            $notes += 'Список появится после первого «Обновить рабочую базу» - каждое обновление сохраняет резервные копии и итог лёгкого прогона.'
-        }
-        $items.Add('Отмена')
-        $index = Select-UiOne -Header ("Откат {0}: последние обновления" -f $script:ProdBase) -Items $items.ToArray() -Notes $notes -Danger @(0)
+        $items.Add(("Откатить изменения последнего выпуска ({0:dd.MM.yyyy HH:mm})" -f [datetime]::ParseExact([string]$history[0].runId, 'yyyyMMdd-HHmmss', $null)))
+        foreach ($record in $history) { $items.Add((Get-DeployLabel $record)) }
+        $items.Add('Назад')
+        $index = Select-UiOne -Header $historyTitle -Items $items.ToArray() -Notes @('Выбери выпуск. Перед откатом гейт покажет состав изменений.') -Danger @(0)
         if ($index -lt 0 -or $index -eq $items.Count - 1) { Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не откатывал.'; exit 0 }
-        if ($history.Count -eq 0) { continue }
         if ($index -eq 0) { $target = $history[0]; break }
         # Подробно об обновлении - и две кнопки на том же экране: «Откатить» и «Отмена».
         $record = $history[$index - 1]
@@ -5450,12 +5639,14 @@ if ($Rollback) {
     if ($selected.Count -eq 0 -and $selectedProcessings.Count -eq 0) { Write-Line 'В этом обновлении нет ни расширений, ни обработок с резервной копией: откатывать нечего.' 'Yellow'; Set-DeployReportResult 'unchanged'; exit 0 }
 
     $returned = @(@($selected | ForEach-Object { $_.Name }) + @($selectedProcessings | Where-Object { $_.Action -eq 'register' } | ForEach-Object { $_.ObjName }))
-    $question = "Точно откатить {0} к состоянию до обновления {1}? Вернутся: {2}." -f $script:ProdBase, (Get-DeployLabel $target), ($returned -join ', ')
+    $changes = New-Object System.Collections.Generic.List[string]
+    $changes.Add(("Точно откатить изменения выпуска {0} в базе {1}?" -f $target.runId, $script:ProdBase))
+    if ($returned.Count -gt 0) { $changes.Add(('Восстановить из копий: ' + ($returned -join ', '))) }
     $removed = @($selectedProcessings | Where-Object { $_.Action -eq 'unregister' } | ForEach-Object { $_.ObjName })
-    if ($removed.Count -gt 0) { $question += (" Снимутся из справочника новые обработки: {0}." -f ($removed -join ', ')) }
-    if ($skippedNew.Count -gt 0) { $question += (" Новые в том обновлении ({0}) останутся: удалять их - руками." -f ($skippedNew -join ', ')) }
-    if ($skippedProcessings.Count -gt 0) { $question += (" Обработки без резервной копии ({0}) останутся как есть." -f ($skippedProcessings -join ', ')) }
-    $sure = Confirm-Ui -Question $question -Yes 'Да, откатить' -No 'Отмена'
+    if ($removed.Count -gt 0) { $changes.Add(('Снять новые обработки из справочника: ' + ($removed -join ', '))) }
+    if ($skippedNew.Count -gt 0) { $changes.Add(('Останутся в базе новые расширения: ' + ($skippedNew -join ', '))) }
+    if ($skippedProcessings.Count -gt 0) { $changes.Add(('Останутся обработки без копий: ' + ($skippedProcessings -join ', '))) }
+    $sure = Confirm-Ui -Question ($changes -join [Environment]::NewLine) -Yes 'Откатить изменения выпуска' -No 'Отмена' -DangerYes -DefaultNo
     if ($sure -ne $true) { Set-DeployReportResult 'cancelled' -Show -Text 'Выход, ничего не откатывал.'; exit 0 }
     $mode = 'rollback'
     $rollbackOf = [string]$target.runId
@@ -5463,7 +5654,7 @@ if ($Rollback) {
     $rollbackNames = @(@($selected | ForEach-Object { $_.Name }) + @($selectedProcessings | ForEach-Object { $_.ObjName })) -join ', '
     Write-RunLog ("Откат к состоянию до {0}: {1}" -f $target.runId, $rollbackNames)
     Write-Host ''
-    Write-Line ("Откатываю {0} к состоянию до {1}: {2}" -f $script:ProdBase, $target.runId, $rollbackNames) 'Cyan'
+    Write-Line ("Откатываю изменения выпуска {1} в базе {0}: {2}" -f $script:ProdBase, $target.runId, $rollbackNames) 'Cyan'
 }
 else {
     $lastRun = $null

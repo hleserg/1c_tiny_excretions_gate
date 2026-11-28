@@ -61,8 +61,9 @@ type task struct {
 	// Снимки задания (ключ -> текст): уходят в следующую часть журнала после строк задания, как у обработки.
 	Snapshots map[string]string `json:"snapshots"`
 	// Два исполнителя: задание группы, которую делят (@@group=1), и ожидание второго (@@wait=1).
-	group bool
-	wait  bool
+	group       bool
+	compileOnly bool
+	wait        bool
 }
 
 type selfcheck struct {
@@ -637,18 +638,29 @@ func laneTasks(tasks []task, dir string, p map[string]string) []task {
 	}
 	canSplit := count > 1
 	kept := []task{}
+	deferred := []task{}
 	plan := []string{}
 	k := 0
 	for i, t := range picked {
 		lane := 1
 		if canSplit && inGroup(t) {
-			lane = k%2 + 1
-			k++
+			t.compileOnly = p["overlapcompile"] == "1" && p["earlyreads"] == "1" && only == "" && (strings.HasPrefix(t.Key, "КлиентскийМодуль/") ||
+				strings.HasPrefix(t.Key, "КомпиляцияМодулей/ОбщийМодуль|") || strings.HasPrefix(t.Key, "КомпиляцияМодулей/Менеджер|"))
+			if t.compileOnly {
+				lane = 2
+			} else {
+				lane = k%2 + 1
+				k++
+			}
 			t.group = true
 		}
 		plan = append(plan, fmt.Sprintf("%d\t%d\t%s", i, lane, t.Key))
 		if lane == worker {
-			kept = append(kept, t)
+			if t.compileOnly {
+				deferred = append(deferred, t)
+			} else {
+				kept = append(kept, t)
+			}
 		}
 		if canSplit && worker == 1 && i == last {
 			kept = append(kept, task{Key: "Ожидание/Ожидание второго исполнителя: " + split, Title: "Ожидание второго исполнителя", Step: split,
@@ -656,7 +668,7 @@ func laneTasks(tasks []task, dir string, p map[string]string) []task {
 		}
 	}
 	writeUTF8(dir+"plan.txt", strings.Join(plan, "\n"))
-	return kept
+	return append(kept, deferred...)
 }
 
 func selfcheckRun(s selfcheck, dir, known string, start int, p map[string]string) {
@@ -802,6 +814,9 @@ func selfcheckRun(s selfcheck, dir, known string, start int, p map[string]string
 		head := fmt.Sprintf("@@n=%d\n@@total=%d\n@@key=%s\n@@title=%s\n@@step=%s\n", n, len(tasks), t.Key, t.Title, t.Step) + blockLines()
 		if t.group {
 			head += "@@group=1\n"
+		}
+		if t.compileOnly {
+			head += "@@compileonly=1\n"
 		}
 		if t.wait {
 			head += "@@wait=1\n"
@@ -1173,7 +1188,8 @@ func unitRun1(u unitRun, configPath string) {
 		ReportPath string `json:"reportPath"`
 		ExitCode   string `json:"exitCode"`
 		Logging    struct {
-			File string `json:"file"`
+			File    string `json:"file"`
+			Console bool   `json:"console"`
 		} `json:"logging"`
 	}
 	if json.Unmarshal(trimBOM(data), &cfg) != nil {
@@ -1181,6 +1197,9 @@ func unitRun1(u unitRun, configPath string) {
 	}
 	if cfg.Logging.File != "" {
 		writeUTF8(cfg.Logging.File, "------\n01.01.2026 00:00:00 [Клиент][Информация]: Инициализация")
+	}
+	if cfg.Logging.Console {
+		fmt.Println("[Клиент][INF]: Инициализация /P\"тестовый-пароль\"")
 	}
 	if u.Exited {
 		return
